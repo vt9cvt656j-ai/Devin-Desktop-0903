@@ -6722,11 +6722,39 @@ test("缓存仪表不许把「这家没有这个概念」显示成「这家没�
 
   // 命中率的分母要归一：Anthropic 的 prompt_tokens 不含缓存读取，直接拿它当分母
   // 会把 Claude 结构性顶到 100%，而同一个仪表上 GPT 是老实的低值——两个数不可比。
+  //
+  // 形状**必须由服务端下发**，客户端不许反推。反推过一版：拿「有没有缓存写入」当判据，
+  // 当时凑效（非 Anthropic 一律 0），但同一批修复让服务端开始给 GPT 填缓存写入了
+  // （GPT-5.6 起 OpenAI 也报也收）——那条判据当场就会把 GPT 认成 Anthropic，
+  // 分母再多加一次 cached，命中率反向虚高。形状只有收回执那一刻知道，事后推不出来。
   const rec = extractFn("_recordUsage");
-  assert.match(rec, /_anthropicShape \? \(pin \+ cached \+ _writeTok\) : pin/,
-    "命中率分母没有按形状归一，Claude 会被钉在 100%");
-  assert.doesNotMatch(rec, /_tok\.inWithCacheInfo \+= pin;/,
-    "又退回直接拿 prompt_tokens 当分母了");
+  assert.match(rec, /ev\.promptIncludesCached === false \? \(pin \+ cached \+ _writeTok\) : pin/,
+    "命中率分母没有用服务端下发的形状位");
+  assert.doesNotMatch(rec, /_writeTok > 0 \|\|/,
+    "又在拿「有没有缓存写入」反推形状了——GPT-5.6 起它也有写入，会当场认错");
+  // 服务端那一位要真的被接下来，否则上面那条读到的永远是 undefined。
+  assert.match(SRC, /promptIncludesCached: data\?\.prompt_includes_cached !== false/,
+    "结算映射没把服务端的形状位接下来");
+});
+
+test("历史只进不摆——从消息中段抠东西会把上游前缀缓存整段作废", () => {
+  // 这条棘轮本来只守着 _pushNudge 的同类替换路径（那里注释写得很清楚），而同一个
+  // 函数里的淘汰路径、清空路径、以及旧截图回收都漏了。它们删的恰恰是**更早几轮**
+  // 推的消息——从中段抠掉一条，上游前缀缓存从那一点起全部失效，重新计费的是它
+  // 后面的整段历史：为省一条两百字的提醒 / 一张 1.5k 的图，重算几万 token。
+  const loop = stripJsComments(extractFn("_runAgenticLoop"));
+  const splices = [...loop.matchAll(/messages\.splice\(([^,]+), 1\)/g)];
+  assert.ok(splices.length >= 4, `没找到那几处 splice（只有 ${splices.length} 处）`);
+  for (const m of splices) {
+    const idxVar = m[1].trim();
+    const at = loop.indexOf(m[0]);
+    // 往前看一小段，必须能看到这次 splice 是被本轮尾部区间守着的。
+    const guard = loop.slice(Math.max(0, at - 200), at);
+    assert.match(guard, new RegExp(`${idxVar}\\s*>=\\s*_nudgeTurnFloor`),
+      `messages.splice(${idxVar}) 没有被 _nudgeTurnFloor 守着——它会从历史中段抠东西`);
+  }
+  // 尾部区间起点必须每轮重置，否则棘轮一轮之后就恒真。
+  assert.match(loop, /_nudgeTurnFloor = messages\.length/, "尾部区间起点没有每轮重置");
 });
 
 test("automation schema requires state verification and recovery", () => {

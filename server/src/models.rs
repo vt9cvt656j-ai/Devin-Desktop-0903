@@ -3527,6 +3527,7 @@ pub async fn usage_settlement(
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
         i64,
+        bool,
     );
     let row: SettlementRow = sqlx::query_as(
         "SELECT COALESCE(SUM(cost_cents), 0)::bigint, \
@@ -3535,7 +3536,8 @@ pub async fn usage_settlement(
                 COALESCE(SUM(cached_tokens), 0)::bigint, \
                 COALESCE(SUM(cache_creation_tokens), 0)::bigint, \
                 COALESCE(bool_and(NOT estimated), false), \
-                MAX(model_name), MAX(created_at), COUNT(*)::bigint \
+                MAX(model_name), MAX(created_at), COUNT(*)::bigint, \
+                COALESCE(bool_and(prompt_includes_cached), true) \
          FROM model_usage WHERE user_id = $1 AND request_id = $2",
     )
     .bind(uid)
@@ -3560,6 +3562,9 @@ pub async fn usage_settlement(
         "usage_reported": reported,
         "time": row.7,
         "attempt_count": row.8,
+        // 这一份回执里 prompt_tokens 含不含缓存读取。客户端算命中率的分母全靠它，
+        // 而这件事**只有收回执的那一刻知道**——事后从数字反推不出来。
+        "prompt_includes_cached": row.9,
     })))
 }
 
@@ -4617,52 +4622,73 @@ fn strip_cache_control(body: &mut serde_json::Value) {
     }
 }
 
-/// OpenAI 侧的缓存亲和键：**同一份前缀永远拿到同一个键**。
+/// OpenAI / xAI 侧的缓存亲和键：**同一段对话永远拿到同一个键**。
 ///
 /// 为什么必须发：OpenAI 的自动缓存是「机器亲和」的——路由键 = `prompt_cache_key` +
 /// 前 ~256 token 的哈希。不发这个字段时只按前缀哈希路由，负载均衡后面每台机器各存一份，
 /// 同一份提示反复落到没有它的机器上，于是**前缀逐字相同却一直冷未命中**。
-/// 而 GPT-5.6 起官方把它从「可选优化」升成了硬要求（原文：for GPT-5.6, you must set
-/// `prompt_cache_key` to use the more reliable matching）。
+/// GPT-5.6 起官方把它从「可选优化」升成了硬要求。
 ///
 /// 这正是 strip_cache_control 上面那段注释当年实测到、但只能绕开的那个现象：
 /// 「16 次连续调用 sys_hash + tools_hash 完全相同，中转商却几乎每次都收缓存写入、
 /// 读取只偶尔命中——它的缓存看起来是负载均衡后面每实例一份」。前缀那时就是稳的，
 /// 缺的一直是这个键。
 ///
-/// 键取自**真正构成前缀的那两样**：系统提示 + 工具名单（按发送顺序）。不掺用户 id、
-/// 不掺会话 id——掺了就把同一份前缀劈成 N 个键，反而制造未命中；官方也明说缓存在
-/// 组织内共享。模型名要进去：不同模型的缓存本来就不通用。
+/// **粒度取「一次 agent 运行」，不取前缀内容**。第一版拿系统提示 + 工具名单做键，
+/// 那是错的：工具窗口在 run 中途会变（发现新 MCP 服务、窗口重算、画像授权补装），
+/// 而网关把 MCP 工具拼在静态工具**前面**——中途多一个工具就是从第 0 位插入，键必翻，
+/// 于是连本来稳拿的那一截 head 也被路由到另一台机器上去了。按 run 粒度就没有这个问题：
+/// 同一段对话的长后缀本来就只存在于服务过上一轮的那一台上，钉住它才是目的。
 ///
-/// 基数很低（一个模式 × 一份工具窗口 = 一个键），远低于官方提到的
-/// 「单个 (前缀+键) 组合约 15 RPM 之后会被摊到更多机器」这条上限。
-fn openai_prompt_cache_key(body: &serde_json::Value) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    body.get("model").and_then(|v| v.as_str()).unwrap_or("").hash(&mut h);
-    // 系统提示：只取第一条（网关注入的稳定那份）。后面的动态 system 消息本来就不该
-    // 进键——它们变了前缀也确实变了，但键该跟着**稳定段**走，才能继续路由到同一台。
-    if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
-        for m in msgs {
-            if m.get("role").and_then(|v| v.as_str()) == Some("system") {
-                if let Some(t) = m.get("content").and_then(|v| v.as_str()) {
-                    t.len().hash(&mut h);
-                    // 全文进哈希，别只取长度——两份等长的系统提示是不同前缀。
-                    t.hash(&mut h);
+/// 退路（拿不到 run id 时）用模型名 + 首条系统提示：粒度粗一些，但同一份 head 至少还能
+/// 稳定粘同一台。基数很低，远低于官方提到的「单个 (前缀+键) 组合约 15 RPM」那条上限。
+///
+/// 哈希用 SHA-256 而不是 std 的 DefaultHasher：后者的算法**Rust 保留在版本间更换的权利**
+/// （同文件 gw_cache_key 的注释就写着这条）。换一次 Rust，全部键静默改值、亲和性清零，
+/// 而且不报错——正是这类缓存问题最难查的形状。
+fn openai_prompt_cache_key(body: &serde_json::Value, run_id: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(body.get("model").and_then(|v| v.as_str()).unwrap_or("").as_bytes());
+    h.update([0u8]);
+    match run_id.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(rid) => h.update(rid.as_bytes()),
+        None => {
+            // 只取**第一条** system（网关注入的稳定那份）。后面的动态 system 会变，
+            // 掺进来就把同一份 head 劈成多个键，反而制造未命中。
+            if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
+                for m in msgs {
+                    if m.get("role").and_then(|v| v.as_str()) == Some("system") {
+                        if let Some(t) = m.get("content").and_then(|v| v.as_str()) {
+                            h.update(t.as_bytes());
+                        }
+                        break;
+                    }
                 }
-                break;
             }
         }
     }
-    // 工具名单按**发送顺序**进键：顺序变了前缀就变了，键也该跟着变，
-    // 否则会把两份不同的前缀路由到同一台机器上去互相挤掉。
-    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        tools.len().hash(&mut h);
-        for t in tools {
-            t.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("").hash(&mut h);
-        }
-    }
-    format!("mi-{:016x}", h.finish())
+    format!("mi-{:x}", h.finalize())[..19].to_string()
+}
+
+/// 这条线路需不需要机器亲和键。
+///
+/// **不是所有非 Anthropic 都要发**：DeepSeek 的缓存落在硬盘上、账号级隔离，根本没有
+/// 机器亲和这回事（线上 agent 模式零命中只有 2.6%，是全场最好的）；智谱、通义同理。
+/// 给它们塞一个上游不认识的顶层字段，好处为零，风险是被 400 或者改变上游自己的前缀哈希。
+/// 只发给真正需要的那两族。
+fn route_needs_cache_affinity(model_id: &str, base_url: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    let u = base_url.to_ascii_lowercase();
+    m.starts_with("gpt-")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || m.starts_with("grok")
+        || m.starts_with("openai/")
+        || u.contains("api.openai.com")
+        || u.contains("x.ai")
+        || u.contains("openrouter")
 }
 
 /// Deterministic cache key for a chat request. serde_json serializes Map keys sorted, so
@@ -5244,12 +5270,22 @@ pub async fn knowledge_domains(
 }
 
 /// Per-call token detail for the model_usage audit trail.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct BillTokens {
     prompt: i64,
     completion: i64,
     cached: i64,
     cache_creation: i64,
+    /// 这一份回执里，`prompt` 到底含不含缓存读取。
+    ///
+    /// 两家不一样，而**只有收到回执的这一刻知道**：Anthropic 单列
+    /// cache_read_input_tokens、prompt 不含它；OpenAI/DeepSeek/GLM 的 prompt 含。
+    /// 事后从数字反推不出来（cached < prompt 时两种形状完全同形），所以在这里定下来
+    /// 并一路带到库里和结算 API。下游算「缓存命中率」的分母全靠它。
+    ///
+    /// Default = true（OpenAI 形状）：`..Default::default()` 那些构造点都不是真实回执，
+    /// 而且这个默认让分母 = prompt，和加这一位之前的行为一致。
+    prompt_includes_cached: bool,
     model_name: String,
     estimated: bool,
     request_id: Option<String>,
@@ -5265,6 +5301,28 @@ struct BillTokens {
     /// First tool the model called back; None when it answered in prose. A call whose
     /// entire output is one tool dispatch is the prime routing candidate.
     emitted_tool: Option<String>,
+}
+
+// 手写 Default 而不是 derive：`prompt_includes_cached` 的中性值是 **true**（OpenAI 形状，
+// 分母就是 prompt），而 derive 会给 bool 填 false —— 那等于把每一个 `..Default::default()`
+// 构造出来的 0 行都宣布成 Anthropic 形状，下游分母平白多加一次 cached。
+// 这个类型已经有一处 `..Default::default()`（网关自己响应缓存命中时记的那行 0 花费）。
+impl Default for BillTokens {
+    fn default() -> Self {
+        Self {
+            prompt: 0,
+            completion: 0,
+            cached: 0,
+            cache_creation: 0,
+            prompt_includes_cached: true,
+            model_name: String::new(),
+            estimated: false,
+            request_id: None,
+            mode: None,
+            tool_turn: None,
+            emitted_tool: None,
+        }
+    }
 }
 
 // ---- step-type classification (pure, no extra model call) ------------------
@@ -5401,7 +5459,17 @@ fn extract_bill_tokens(
         prompt: gi(&["prompt_tokens", "input_tokens"]),
         completion: gi(&["completion_tokens", "output_tokens"]),
         cached,
-        cache_creation: gi(&["cache_creation_input_tokens"]),
+        // GPT-5.6 起 OpenAI 也报缓存写入（并按 1.25× 收）。这一条是写 model_usage、
+        // 喂结算 API 和 IDE 仪表的那一路——只认 Anthropic 的键名，非 Anthropic 的
+        // 「缓存写入」就永远是 0，用户看到的正是这个。
+        cache_creation: gi(&["cache_creation_input_tokens", "cache_write_tokens"]).max(
+            u.pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+        ),
+        // 形状判据就一条、而且是**结构性**的：Anthropic 独有 cache_read_input_tokens。
+        // 不拿「有没有缓存写入」反推——GPT-5.6 起它也有写入了，那样会当场认错。
+        prompt_includes_cached: u.get("cache_read_input_tokens").is_none(),
         model_name: model_name.to_string(),
         estimated,
         request_id: None,
@@ -5544,8 +5612,8 @@ async fn record_usage_row(
     // model_id 走子查询，理由同下面付费那条：线路被删之后直接绑 conn_id 会撞外键，
     // 这一行用量就永远记不进去。NULL 是这张表既有的「线路已删」表示法。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -5561,6 +5629,7 @@ async fn record_usage_row(
     .bind(tokens.tool_turn)
     .bind(tokens.emitted_tool.as_deref())
     .bind(free_milli_points_spent)
+    .bind(tokens.prompt_includes_cached)
     .execute(&state.db)
     .await
     {
@@ -5958,6 +6027,13 @@ pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::Unsettle
         completion: row.completion_tokens,
         cached: row.cached_tokens,
         cache_creation: row.cache_creation_tokens,
+        // 补扣队列（unsettled）里没有存这一位，所以这里取中性值 true。
+        //
+        // 影响面很小且说得清：这条路只在**当初扣费失败**的那一小撮上跑，而这一位唯一的
+        // 用途是算命中率的分母。真要精确就得给 unsettled 表也加一列 —— 为一个展示分母
+        // 在补扣路径上加一次迁移，不划算。取 true 等于「分母就是 prompt」，也就是加这一位
+        // 之前所有行的行为，不制造新的偏差方向。
+        prompt_includes_cached: true,
         model_name: row.model_name.clone(),
         estimated: row.estimated,
         request_id: row.request_id.clone(),
@@ -6235,8 +6311,8 @@ async fn bill_inner(
     // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
     // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -6252,6 +6328,7 @@ async fn bill_inner(
     .bind(tokens.tool_turn)
     .bind(tokens.emitted_tool.as_deref())
     .bind(settlement_id)
+    .bind(tokens.prompt_includes_cached)
     .execute(&mut *tx)
     .await
     {
@@ -8437,12 +8514,16 @@ pub async fn chat_completions(
                     // 的请求整份重算，而且**不随对话轮次改善**（第 1 轮 38.3%、后续
                     // 39.7%）——前缀问题会越聊越差、TTL 问题会越聊越好，两个都不是。
                     // 同期 deepseek 只有 2.6%，而它的缓存落在硬盘上、根本没有机器亲和这回事。
+                    let _run_id = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok());
+                    let _affinity = route_needs_cache_affinity(&model_id, &candidate.base_url);
                     let mut oai_body = body.clone();
-                    if let Some(o) = oai_body.as_object_mut() {
-                        o.insert(
-                            "prompt_cache_key".into(),
-                            serde_json::Value::String(openai_prompt_cache_key(&body)),
-                        );
+                    if _affinity {
+                        if let Some(o) = oai_body.as_object_mut() {
+                            o.insert(
+                                "prompt_cache_key".into(),
+                                serde_json::Value::String(openai_prompt_cache_key(&body, _run_id)),
+                            );
+                        }
                     }
                     let mut r = req0
                         .header("Authorization", format!("Bearer {}", candidate_key))
@@ -8454,16 +8535,15 @@ pub async fn chat_completions(
                     // xAI 用的是**请求头**而不是请求体字段，而且它要的是「会话」粒度：
                     // 同一段对话回到同一台机器。用 IDE 的 run id（一次 agent 运行 = 一段
                     // 对话），拿不到就退回前缀键——退回后至少同前缀仍然粘同一台。
-                    if model_id.to_ascii_lowercase().starts_with("grok")
-                        || candidate.base_url.to_ascii_lowercase().contains("x.ai")
+                    if _affinity
+                        && (model_id.to_ascii_lowercase().starts_with("grok")
+                            || candidate.base_url.to_ascii_lowercase().contains("x.ai"))
                     {
-                        let conv = headers
-                            .get("x-ide-run-id")
-                            .and_then(|v| v.to_str().ok())
+                        let conv = _run_id
                             .map(str::trim)
                             .filter(|v| !v.is_empty())
                             .map(|v| v.chars().take(64).collect::<String>())
-                            .unwrap_or_else(|| openai_prompt_cache_key(&body));
+                            .unwrap_or_else(|| openai_prompt_cache_key(&body, None));
                         r = r.header("x-grok-conv-id", conv);
                     }
                     r.json(&oai_body)
@@ -10981,7 +11061,7 @@ mod billing_tests {
         while let Some(at) = rest.find("INSERT INTO model_usage") {
             let stmt = &rest[at..(at + 700).min(rest.len())];
             assert!(
-                stmt.contains("VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"),
+                stmt.contains("VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"),
                 "第 {} 条 model_usage 插入没走子查询：线路一删，这条路径上的钱就永远补不回来",
                 checked + 1,
             );
@@ -11077,8 +11157,7 @@ mod billing_tests {
 
         // 记账行要带 settlement_id，端到端可追。
         assert!(
-            body.contains("emitted_tool, settlement_id) \\\n")
-                || body.contains("emitted_tool, settlement_id)"),
+            body.contains("emitted_tool, settlement_id, prompt_includes_cached)"),
             "model_usage 插入必须带 settlement_id 列",
         );
         assert!(
@@ -11163,9 +11242,13 @@ mod billing_tests {
             }
         }
         let binds = stmt.matches(".bind(").count();
-        assert_eq!(cols, 14, "model_usage 列数变了");
-        assert_eq!(max_ph, 14, "占位符和列数对不上");
-        assert_eq!(binds, 14, ".bind() 和列数对不上——结算会运行时报错");
+        // 15 = 原来的 14 列 + prompt_includes_cached。
+        // 加它是因为「prompt_tokens 含不含缓存读取」两家不一样，而这件事**只有收回执
+        // 那一刻知道**——事后从数字反推不出来（cached < prompt 时两种形状完全同形）。
+        // 下游算缓存命中率的分母全靠这一位；不落库的话 Claude 会被结构性顶到 100%。
+        assert_eq!(cols, 15, "model_usage 列数变了");
+        assert_eq!(max_ph, 15, "占位符和列数对不上");
+        assert_eq!(binds, 15, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
@@ -17561,69 +17644,86 @@ mod code_corpus_leg_tests {
             "corpus_wanted 不是从 corpus_leg_requested 来的——多一处解析就多一处会漂的判据");
     }
 
-    /// 缓存亲和键必须**真的发出去**，而且同一份前缀恒等。
+    /// 缓存亲和键必须**真的发出去**，而且同一段对话恒等。
     ///
     /// 这是「非 Anthropic 模型缓存一直不命中」的直接原因：OpenAI/xAI 的自动缓存存在
     /// 具体某台机器上，不给粘性键就只按前缀哈希散列，负载均衡后面每台各存一份。
     /// GPT-5.6 起官方把 prompt_cache_key 列为「要可靠匹配就必须发」。
     #[test]
     fn openai_requests_carry_a_stable_prompt_cache_key() {
-        let mk = |tools: serde_json::Value, sys: &str| {
-            serde_json::json!({
-                "model": "gpt-5.6-sol",
-                "messages": [
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": "这一句每轮都不一样"}
-                ],
-                "tools": tools,
-            })
-        };
         let tools = serde_json::json!([
             {"type":"function","function":{"name":"read_file"}},
             {"type":"function","function":{"name":"run_cmd"}}
         ]);
-        let a = super::openai_prompt_cache_key(&mk(tools.clone(), "STABLE PREFIX"));
-        // 只有用户消息变了 → 键必须不变，否则每轮一个键 = 每轮换一台机器 = 永不命中。
-        let mut b_body = mk(tools.clone(), "STABLE PREFIX");
-        b_body["messages"][1]["content"] = serde_json::json!("完全不同的第二轮提问");
-        let b = super::openai_prompt_cache_key(&b_body);
-        assert_eq!(a, b, "用户消息变了键就变——每轮换一台机器，缓存永远命中不了");
-
-        // 前缀真的变了 → 键必须跟着变，否则两份不同前缀会被路由到同一台互相挤掉。
-        assert_ne!(
-            a,
-            super::openai_prompt_cache_key(&mk(tools.clone(), "DIFFERENT PREFIX")),
-            "系统提示变了键却没变"
-        );
-        let mut reordered = tools.clone();
-        reordered.as_array_mut().unwrap().reverse();
-        assert_ne!(
-            a,
-            super::openai_prompt_cache_key(&mk(reordered, "STABLE PREFIX")),
-            "工具顺序变了键却没变——顺序就是前缀的一部分"
-        );
-        assert_ne!(
-            a,
-            super::openai_prompt_cache_key(&serde_json::json!({
-                "model": "gpt-5.6-terra",
-                "messages": [{"role":"system","content":"STABLE PREFIX"}],
+        let mk = |tools: serde_json::Value, sys: &str, user: &str| {
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": user}
+                ],
                 "tools": tools,
-            })),
+            })
+        };
+        let rid = Some("run-abc123");
+
+        // 同一段对话：**不管内容怎么长、工具怎么变**，键都必须恒等。
+        let a = super::openai_prompt_cache_key(&mk(tools.clone(), "PREFIX", "第一轮"), rid);
+        assert_eq!(
+            a,
+            super::openai_prompt_cache_key(&mk(tools.clone(), "PREFIX", "第二轮完全不同"), rid),
+            "同一段对话里键变了——每轮换一台机器，缓存永远命中不了"
+        );
+        // 工具窗口在 run 中途会变（发现 MCP、窗口重算、画像补装），而网关把 MCP 工具拼在
+        // 静态工具**前面**——中途多一个就是从第 0 位插入。第一版把工具名单放进了键，
+        // 于是这种再正常不过的变化会把请求甩到另一台机器上，连稳拿的那截 head 都丢掉。
+        let mut more_tools = tools.clone();
+        more_tools.as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"type":"function","function":{"name":"mcp__x__y"}}),
+        );
+        assert_eq!(
+            a,
+            super::openai_prompt_cache_key(&mk(more_tools, "PREFIX", "第三轮"), rid),
+            "run 中途多了个工具，键就翻了——这是第一版的错，别改回去"
+        );
+        // 不同的 run / 不同模型必须是不同的键。
+        assert_ne!(a, super::openai_prompt_cache_key(&mk(tools.clone(), "PREFIX", "x"), Some("run-zzz")));
+        assert_ne!(
+            a,
+            super::openai_prompt_cache_key(
+                &serde_json::json!({"model":"gpt-5.6-terra","messages":[]}),
+                rid
+            ),
             "换了模型键却没变——不同模型的缓存本来就不通用"
         );
+        // 拿不到 run id 时退回「模型 + 首条系统提示」：粒度粗些，但同一份 head 仍粘同一台。
+        let f = super::openai_prompt_cache_key(&mk(tools.clone(), "PREFIX", "a"), None);
+        assert_eq!(f, super::openai_prompt_cache_key(&mk(tools.clone(), "PREFIX", "b"), None));
+        assert_ne!(f, super::openai_prompt_cache_key(&mk(tools.clone(), "OTHER", "a"), None));
+
+        // 哈希必须是**跨 Rust 版本稳定**的。DefaultHasher 的算法官方保留更换权利，
+        // 换一次 Rust 全部键静默改值、亲和性清零且不报错。
+        let src = include_str!("models.rs");
+        let keyfn = &src[src.find("fn openai_prompt_cache_key").unwrap()..];
+        let keyfn = &keyfn[..keyfn.find("\nfn ").unwrap_or(keyfn.len())];
+        assert!(keyfn.contains("Sha256"), "亲和键换回了不稳定的哈希");
+        assert!(!keyfn.contains("DefaultHasher"), "DefaultHasher 跨版本会静默换值");
+        assert!(!keyfn.contains("/function/name"), "工具名单又进键了");
+
+        // 只发给真正需要机器亲和的那两族；DeepSeek/智谱/通义不需要，塞未知字段只有风险。
+        assert!(super::route_needs_cache_affinity("gpt-5.6-sol", "https://relay.example/v1"));
+        assert!(super::route_needs_cache_affinity("grok-4.6", "https://relay.example/v1"));
+        assert!(!super::route_needs_cache_affinity("deepseek-v4-pro", "https://relay.example/v1"));
+        assert!(!super::route_needs_cache_affinity("glm-5.3", "https://relay.example/v1"));
 
         // 发送路径上必须真的带上它 + xAI 那个粘性头，否则上面这些都只是个纯函数。
-        //
-        // needle 在运行时拼：这个文件从 1212 行起就有 #[cfg(test)]，按第一个切会把实现
-        // 整段切掉（断言恒假）；不切又会被断言自己的字面量喂饱（断言恒真）。两个坑都躲开。
-        let src = include_str!("models.rs");
+        // needle 运行时拼：这个文件从 1212 行起就有 #[cfg(test)]，按第一个切会把实现整段
+        // 切掉（断言恒假）；不切又会被断言自己的字面量喂饱（恒真）。两个坑都躲开。
         let key_field = format!("\"prompt_cache_{}\".into(),", "key");
         assert!(src.contains(&key_field), "算出来了却没塞进请求体");
         let grok_hdr = format!("x-grok-{}-id", "conv");
-        assert!(
-            src.contains(&grok_hdr),
-            "xAI 要的是请求头做粘性路由，没发就等于没缓存"
-        );
+        assert!(src.contains(&grok_hdr), "xAI 要的是请求头做粘性路由，没发就等于没缓存");
     }
 
     /// GPT-5.6 起 OpenAI 也对缓存写入收 1.25×，回执给 cache_write_tokens。

@@ -143,7 +143,11 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
   assert.match(loopSrc[0], /_nudgeRank\(key\) > _nudgeRank\(worst\)/,
     "超额淘汰没有按 _nudgeRank 挑——又回到了按先来后到");
 
-  const evict = new Function("_nudgeReg", "messages", "cat", "_nudgeRank", `${loopSrc[0]}\nreturn [..._nudgeReg.keys()];`);
+  // _nudgeTurnFloor = 0：这个测试台里全部消息就是那几条提醒本身，索引 0 起，
+  // 也就是「都在本轮尾部」。棘轮（只在尾部才真删）在这里恒真，被测的收敛行为一字不变。
+  const evict = new Function("_nudgeReg", "messages", "cat", "_nudgeRank", "_nudgeTurnFloor", `${loopSrc[0]}\nreturn [..._nudgeReg.keys()];`).bind(null);
+  const _evict0 = evict;
+  const evictWrap = (reg, msgs, c, rank) => _evict0(reg, msgs, c, rank, 0);
   const mk = (names) => {
     const reg = new Map(names.map((n) => [n, { c: n }]));
     return { reg, msgs: names.map((n) => reg.get(n)) };
@@ -151,24 +155,24 @@ test("提醒按重要性淘汰，不是按先来后到", () => {
 
   // ① 事实不再被事实挤掉：三条事实 + 一条建议，第四条事实进来时该走的是建议。
   const a = mk(["buildFix", "diag", "blindEdit", "askBudget"]);
-  assert.deepEqual(evict(a.reg, a.msgs, "subagentResult", rank),
+  assert.deepEqual(evictWrap(a.reg, a.msgs, "subagentResult", rank),
     ["buildFix", "diag", "blindEdit"],
     "第四条事实到达时挤掉的必须是建议——构建失败、盲改警告、子智能体结论互不替代");
   assert.equal(a.msgs.length, 3, "被淘汰的那条也要从消息列表里摘掉，不能只从注册表删");
 
   // ② 总额仍然有界：全是事实且已满额时，最旧的那条事实才让位。
   const b = mk(["buildFix", "diag", "blindEdit", "cmdFail"]);
-  assert.deepEqual(evict(b.reg, b.msgs, "recovery", rank),
+  assert.deepEqual(evictWrap(b.reg, b.msgs, "recovery", rank),
     ["diag", "blindEdit", "cmdFail"], "满额时让位的是最旧的事实，且总数收敛");
 
   // ③ 建议同时只留 1 条（正在推入的那条就是这 1 条），事实不受牵连。
   const c = mk(["buildFix", "askBudget"]);
-  assert.deepEqual(evict(c.reg, c.msgs, "planNudge", rank), ["buildFix"],
+  assert.deepEqual(evictWrap(c.reg, c.msgs, "planNudge", rank), ["buildFix"],
     "两条建议不能同时挂着，而事实要留下");
 
   // ④ steer 永远不被挤。
   const d = mk(["steer", "buildFix", "diag", "blindEdit", "cmdFail"]);
-  assert.deepEqual(evict(d.reg, d.msgs, "recovery", rank),
+  assert.deepEqual(evictWrap(d.reg, d.msgs, "recovery", rank),
     ["steer", "diag", "blindEdit", "cmdFail"], "用户实时插话被挤掉了");
 });
 

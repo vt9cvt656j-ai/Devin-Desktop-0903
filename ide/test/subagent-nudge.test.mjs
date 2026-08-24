@@ -213,12 +213,25 @@ test("同类提醒重发：只有本轮尾部区间里的旧条才 splice，更�
   }
 });
 
-test("超额淘汰仍然从消息里摘掉——尾部区间内的收敛不能因为棘轮被放弃", () => {
-  // gate-tristate.test.mjs 钉着这条（「不能只从注册表删」）。棘轮改的是 sweep 和同类替换，
-  // 不是淘汰：淘汰只发生在活跃条目之间，它们都在尾部。
+test("超额淘汰在尾部照样摘掉，但不许伸进历史中段", () => {
+  // 这条原来的理由是「淘汰只发生在活跃条目之间，它们都在尾部」——**不成立**。
+  // _nudgeReg 跨轮存活，它里面那条是「这个类别上次触发时」推的。toolReminder 每 12 轮
+  // 才推一次，所以第 13 轮去淘汰它时，那条在十几轮之前，位置在消息中段。从中段抠掉一条
+  // 两百字的提醒，上游前缀缓存从那一点起全部失效，重新计费的是它后面的整段历史。
+  //
+  // 所以两件事都要：**尾部区间内照样摘**（gate-tristate 钉着「不能只从注册表删」，
+  // 那条仍然成立，收敛行为一字不变），**更早的留在原地当历史**（它们隔了十几轮，
+  // 早就不构成「同时挂一堆提醒逼模型逐条表态」那个问题了）。
+  // 按**内容边界**切，不用固定字符窗口：注释剥离器把注释换成等长空格，
+  // 函数上多写几行说明就会把窗口撑爆，断言静默失配（本仓库踩过好几次）。
   const src = fnSource("_pushNudge", { code: true });
-  assert.match(src, /const _dropNudge = \(victim\) => \{[\s\S]{0,240}messages\.splice\(oi, 1\)/,
-    "超额淘汰不再把条目从 messages 摘掉了");
+  const at = src.indexOf("const _dropNudge");
+  assert.ok(at >= 0, "_dropNudge 被改名或挪走了");
+  const body = src.slice(at, src.indexOf("_nudgeReg.delete(victim)", at));
+  assert.ok(body, "切不到 _dropNudge 的函数体");
+  assert.match(body, /messages\.splice\(oi, 1\)/, "超额淘汰不再把条目从 messages 摘掉了");
+  assert.match(body, /oi >= _nudgeTurnFloor\) messages\.splice\(oi, 1\)/,
+    "淘汰没有被尾部区间守着——它会伸进历史中段，把整段前缀缓存作废");
 });
 
 // ── ⑤ 单次运行 token 预算 ─────────────────────────────────────────────────

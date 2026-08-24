@@ -13138,6 +13138,10 @@ async function _fetchGatewaySettlement(config, requestId, attempts = 5) {
         completionTokens: usageReported && Number.isFinite(Number(data?.completion_tokens)) ? Math.max(0, Number(data.completion_tokens)) : null,
         cachedTokens: usageReported && Number.isFinite(Number(data?.cached_tokens)) ? Math.max(0, Number(data.cached_tokens)) : null,
         cacheCreationTokens: usageReported && Number.isFinite(Number(data?.cache_creation_tokens)) ? Math.max(0, Number(data.cache_creation_tokens)) : null,
+        // 这一份回执里 prompt_tokens 含不含缓存读取——**服务端说了算**，客户端不猜。
+        // 老服务端不发这个键 → undefined → 下面按 true（分母就是 prompt）走，
+        // 和加这一位之前的行为一致。
+        promptIncludesCached: data?.prompt_includes_cached !== false,
         model: String(data?.model || config?.model || ""),
         attemptCount: Math.max(1, Math.round(Number(data?.attempt_count) || 1)),
       };
@@ -19012,11 +19016,14 @@ function _recordUsage(ev, opts = {}) {
     // 结构性顶到 100%；同一个仪表上 GPT 报的却是老实的低值。两个数不可比，而用户
     // 正是看着这两个数得出「只有 Claude 有缓存」的。
     //
-    // 判据用执行事实，不猜厂商：cacheCreationTokens 只有显式缓存的那条路才会有，
-    // 而它恰好就是「prompt 不含缓存读」的那一族。
+    // 形状**由服务端下发**（prompt_includes_cached），客户端不再反推。
+    //
+    // 上一版拿「有没有缓存写入」当判据，那在当时凑效——非 Anthropic 一律 0。但同一批
+    // 修复里服务端开始给 GPT 填缓存写入了（GPT-5.6 起 OpenAI 也报也收），那条判据当场
+    // 就会把 GPT 认成 Anthropic，分母再多加一次 cached，命中率反向虚高——等于把刚修好的
+    // 分母重新弄坏。形状只有收回执的那一刻知道，事后从数字反推不出来。
     const _writeTok = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens ?? ev.cache_creation_input_tokens) || 0;
-    const _anthropicShape = _writeTok > 0 || (ev.cache_read_input_tokens != null);
-    _tok.inWithCacheInfo += _anthropicShape ? (pin + cached + _writeTok) : pin;
+    _tok.inWithCacheInfo += ev.promptIncludesCached === false ? (pin + cached + _writeTok) : pin;
     _tok.anyCacheInfo = true;
   }
     if (!est) _tok.anyReal = true;
@@ -54196,7 +54203,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     const _dropNudge = (victim) => {
       const oldMsg = _nudgeReg.get(victim);
       const oi = messages.indexOf(oldMsg);
-      if (oi !== -1) messages.splice(oi, 1);
+      // 同一条棘轮：**只在本轮刚推的那一截里才真删**（那是尾部，上游前缀缓存本来就没覆盖到）。
+      //
+      // 6 行之上的同类替换路径早就守着 _nudgeTurnFloor 了，这条淘汰路径漏了——而它删的
+      // 恰恰是**别的类别**的旧提醒，那多半是好几轮之前推的，位置在消息中段。从中段抠掉
+      // 一条，上游前缀缓存从那一点起全部失效，重新计费的是它后面的整段历史：为省下一条
+      // 两百字的提醒，重算几万 token。更早的就留在原地当历史，只从登记表里摘掉
+      // （不再参与替换/计数），模型那边看到的是一条已经过去的提醒，无害。
+      if (oi >= _nudgeTurnFloor) messages.splice(oi, 1);
       _nudgeReg.delete(victim);
     };
     const _incomingRank = _nudgeRank(cat);
@@ -54263,7 +54277,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   const _clearNudges = () => {
     for (const m of _nudgeReg.values()) {
       const i = messages.indexOf(m);
-      if (i !== -1) messages.splice(i, 1);
+      // 同一条棘轮，理由见 _dropNudge：本轮尾部的真删，更早的留在原地当历史。
+      // 登记表照清——它管的是"还要不要替换/计数"，不是"模型能不能看见"。
+      if (i >= _nudgeTurnFloor) messages.splice(i, 1);
     }
     _nudgeReg.clear();
   };
@@ -55080,7 +55096,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 取在模型轮之前：流式中途落盘的和收尾竞速里才落定的，两类都在这条线之后。
       const _ledgerAtTurnStart = (run._writeLedger || []).length;
       let turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: run._toolRegistry, body, session, root, ideMode: run.mode, skillsBlock: run.skillsBlock, narrativeSeen: run._narrativeSeen, renderRejectedToolAttempts: false, onStreamToolReady: isAgent ? run._eagerStreamHook : null, settlementTasks: run._billingTasks, timeline: run.timeline, runId: run._runId, stepKind: "main" });
-      if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i !== -1) messages.splice(_i, 1); }
+      // 这条本来就是纯尾部（推在模型轮之前、删在之后），棘轮在这里恒真——
+      // 加上它是安全网：将来谁把 push 挪到更早的位置，也不会变成从历史中段抠。
+      if (_selfMemMsg) { const _i = messages.indexOf(_selfMemMsg); if (_i >= _nudgeTurnFloor) messages.splice(_i, 1); }
       // User hit Stop DURING this model turn → halt NOW, before executing the turn's tool
       // calls (writing files / running commands). Previously the loop only re-checked _live()
       // at the NEXT iteration's top, so a stopped agent still ran a whole turn of tools first
@@ -56849,7 +56867,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       const _imgs = [];
       for (const it of items) { if (it.rawResult && it.rawResult.image) { _imgs.push(it.rawResult.image); _demoCollectFrame(it.call, it.rawResult); } }
       if (_imgs.length) {
-        while (_shotMsgs.length >= 2) { const old = _shotMsgs.shift(); const oi = messages.indexOf(old); if (oi >= 0) messages.splice(oi, 1); }
+        // 旧截图**只在本轮尾部才删**。
+        //
+        // 原来是无条件从数组里抠掉最旧那张，而它多半是几轮之前推的：一张图约 1.5k token，
+        // 抠掉它却让上游前缀缓存从那一点起全部失效——按线上的平均提示长度算，是为省 1.5k
+        // 而重算两三万。方向反了。更早的那些留在原地：命中缓存后它们只按 0.1× 计，
+        // 比重算整段历史便宜一个数量级；真的长到需要收，交给网关那层压缩统一做
+        // （它本来就会重置一次前缀，一次性付清比每轮付一次划算）。
+        while (_shotMsgs.length >= 2) {
+          const old = _shotMsgs.shift();
+          const oi = messages.indexOf(old);
+          if (oi >= 0 && oi >= _nudgeTurnFloor) messages.splice(oi, 1);
+        }
         // Native image for vision models; auto-transcribed text for text-only ones
         // (DeepSeek & co.) so they can self-correct on what's rendered, not edit blind.
         const imgMsg = await _buildImageFeedback(
