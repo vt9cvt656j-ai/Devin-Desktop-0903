@@ -6391,6 +6391,74 @@ fn oai_content_text(content: Option<&serde_json::Value>) -> String {
 }
 
 /// OpenAI user `content` → Anthropic content (plain string, or blocks incl. images).
+/// Anthropic 的 `input_schema` **顶层**不接受 `oneOf` / `allOf` / `anyOf`，请求会被
+/// 400 掉：`input_schema does not support oneof, allof, or anyof at the top level`。
+///
+/// 而工具目录里确实有三个这么写的（local_discovery / live_environment / run_subagent），
+/// 用它表达「这几个参数二选一」。别的上游（OpenAI 兼容那套）照单全收，所以这个问题
+/// **只在走原生 Anthropic 的线路上炸**——同一份目录，换条线就好了，最难查的那种。
+///
+/// 不能直接从目录里删：客户端拿这个 anyOf 生成工具指引、做本地参数校验，网关侧也有
+/// 测试钉着它的结构。所以在**发出去的这一层**剥掉，同时把它表达的意思生成一句话补进
+/// description —— 模型照样知道该二选一，只是不再靠 schema 的分支语法。
+///
+/// 只动顶层。嵌套在 `properties.*.items` 里的 anyOf 是合法的（run_subagent 的 tasks
+/// 就是），碰它反而会把能用的东西弄坏。
+fn strip_top_level_schema_branches(schema: &mut serde_json::Value) -> Option<String> {
+    let obj = schema.as_object_mut()?;
+    let mut notes: Vec<String> = Vec::new();
+    for key in ["anyOf", "oneOf", "allOf"] {
+        let Some(branches) = obj.remove(key) else {
+            continue;
+        };
+        let Some(arr) = branches.as_array() else {
+            continue;
+        };
+        let mut groups: Vec<String> = Vec::new();
+        for branch in arr {
+            let required: Vec<&str> = branch
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|r| r.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            // 分支里如果还带 `properties: { k: { enum: [...] } }`，那是「k 取这些值时」
+            // 的条件必填 —— 把条件也写出来，否则生成的话是错的。
+            let condition = branch
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|props| {
+                    props.iter().find_map(|(name, spec)| {
+                        let values: Vec<&str> = spec
+                            .get("enum")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect();
+                        if values.is_empty() {
+                            None
+                        } else {
+                            Some(format!("{name}={}", values.join("/")))
+                        }
+                    })
+                });
+            match (condition, required.is_empty()) {
+                (Some(cond), false) => groups.push(format!("{cond} → {}", required.join(" + "))),
+                (Some(cond), true) => groups.push(format!("{cond} → no extra fields")),
+                (None, false) => groups.push(required.join(" + ")),
+                (None, true) => {}
+            }
+        }
+        if !groups.is_empty() {
+            notes.push(format!("Provide exactly one of: {}.", groups.join("  |  ")));
+        }
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" "))
+    }
+}
+
 fn oai_content_to_anthropic(content: Option<&serde_json::Value>) -> serde_json::Value {
     match content {
         Some(serde_json::Value::Array(parts)) => {
@@ -6947,12 +7015,22 @@ fn oai_to_anthropic_with_cache(
                 if let Some(d) = f.get("description") {
                     a.insert("description".into(), d.clone());
                 }
-                a.insert(
-                    "input_schema".into(),
-                    f.get("parameters")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
-                );
+                // 顶层的 oneOf/allOf/anyOf 会被 Anthropic 400 掉。剥掉它，把它表达的
+                // 「二选一」补进 description —— 见 strip_top_level_schema_branches。
+                let mut input_schema = f
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                if let Some(note) = strip_top_level_schema_branches(&mut input_schema) {
+                    let merged = match a.get("description").and_then(serde_json::Value::as_str) {
+                        Some(existing) if !existing.trim().is_empty() => {
+                            format!("{existing}\n\n{note}")
+                        }
+                        _ => note,
+                    };
+                    a.insert("description".into(), json!(merged));
+                }
+                a.insert("input_schema".into(), input_schema);
                 // 细粒度工具流式（fine-grained tool streaming）。**不设它，Anthropic 会把工具
                 // 入参的 JSON 攒完、校验合法之后才发**——对 write_file 这种把整份文件塞在
                 // `content` 里的调用，用户就是盯着一张空的「正在写…」卡片等上几十秒到几分钟，
@@ -9992,7 +10070,8 @@ mod billing_tests {
         is_image_gen_model, official_max_output, official_contexts, model_caps_override,
         mark_thinking_clip, model_price_override, oai_to_anthropic, official_price,
         parse_usage_from_sse, project_quota_package, projected_provider_usd, resolve_cost,
-        response_cache_safe, round_multiplier_up, split_fused_charge, thinking_clip_active,
+        response_cache_safe, round_multiplier_up, split_fused_charge,
+        strip_top_level_schema_branches, thinking_clip_active,
         telemetry_anthropic_event_kind, telemetry_output_config_effort, telemetry_reasoning_effort,
         telemetry_thinking_type,
         tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
@@ -12170,6 +12249,105 @@ mod billing_tests {
             "deepseek-v4-pro",
         ] {
             assert!(!is_image_gen_model(id), "should NOT be image: {id}");
+        }
+    }
+
+    // ---- Anthropic 顶层 schema 分支 ----
+    //
+    // 实际报错（用户机器，走原生 Anthropic 的线路）：
+    //   400 tools.12.custom.input_schema: input_schema does not support oneof,
+    //       allof, or anyof at the top level
+    // 别的上游照单全收，所以同一份目录换条线就好了 —— 最难查的那种。
+
+    #[test]
+    fn top_level_branches_are_stripped_and_folded_into_the_description() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"near": {"type": "string"}, "latitude": {"type": "number"}, "longitude": {"type": "number"}},
+            "required": ["query"],
+            "anyOf": [{"required": ["near"]}, {"required": ["latitude", "longitude"]}]
+        });
+        let note = strip_top_level_schema_branches(&mut schema).expect("应当生成一句说明");
+        assert!(schema.get("anyOf").is_none(), "顶层 anyOf 没被剥掉，请求还是会 400");
+        assert!(schema.get("properties").is_some(), "把 properties 也弄丢了");
+        assert_eq!(schema["required"][0], "query", "原有的 required 不该受影响");
+        assert!(note.contains("near"), "没告诉模型可以只给 near：{note}");
+        assert!(note.contains("latitude + longitude"), "没写出另一条分支：{note}");
+    }
+
+    #[test]
+    fn a_conditional_branch_keeps_its_condition() {
+        // live_environment 那种：kind 取某几个值时才必填经纬度。
+        // 只写「必须给 latitude + longitude」是错的 —— 查地震时并不需要。
+        let mut schema = json!({
+            "type": "object",
+            "required": ["kind"],
+            "anyOf": [
+                {"properties": {"kind": {"enum": ["weather", "marine"]}}, "required": ["latitude", "longitude"]},
+                {"properties": {"kind": {"enum": ["earthquakes"]}}}
+            ]
+        });
+        let note = strip_top_level_schema_branches(&mut schema).expect("应当生成说明");
+        assert!(note.contains("kind=weather/marine"), "条件丢了：{note}");
+        assert!(note.contains("latitude + longitude"), "条件下的必填项丢了：{note}");
+        assert!(note.contains("earthquakes"), "另一条分支丢了：{note}");
+    }
+
+    #[test]
+    fn nested_branches_are_left_alone() {
+        // run_subagent 的 tasks.items 里有合法的 anyOf。碰它会把能用的东西弄坏。
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"tasks": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "object"}]}}}
+        });
+        assert!(strip_top_level_schema_branches(&mut schema).is_none(), "顶层没有分支时不该生成说明");
+        assert!(
+            schema["properties"]["tasks"]["items"]["anyOf"].is_array(),
+            "把嵌套的 anyOf 也剥了 —— 那是合法的，剥掉等于把参数形状说窄了"
+        );
+    }
+
+    #[test]
+    fn no_shipped_tool_reaches_anthropic_with_a_top_level_branch() {
+        // 拿**真实的**工具目录跑一遍完整转换，而不是构造几个假 schema。
+        // 目录里现在有三个顶层带 anyOf 的（local_discovery / live_environment / run_subagent）。
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts/tools.json"),
+        )
+        .expect("读不到 tools.json");
+        let tools: serde_json::Value = serde_json::from_str(&raw).expect("tools.json 不是 JSON");
+        let n = tools.as_array().map(|a| a.len()).unwrap_or(0);
+        assert!(n > 100, "目录只解析出 {n} 个工具，取法多半坏了");
+
+        let body = json!({"model": "claude-opus-4-8", "max_tokens": 64, "messages": [{"role": "user", "content": "hi"}], "tools": tools});
+        let a = oai_to_anthropic(&body).expect("转换失败");
+        let out = a["tools"].as_array().expect("转换后没有 tools");
+        assert_eq!(out.len(), n, "转换把工具弄丢了");
+
+        let offenders: Vec<String> = out
+            .iter()
+            .filter(|t| {
+                let s = &t["input_schema"];
+                ["oneOf", "allOf", "anyOf"].iter().any(|k| s.get(*k).is_some())
+            })
+            .map(|t| t["name"].as_str().unwrap_or("?").to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "这些工具发给 Anthropic 会被 400：{offenders:?}"
+        );
+
+        // 剥掉不等于把意思也扔了：那三个的 description 必须补上二选一的说明。
+        for name in ["local_discovery", "live_environment", "run_subagent"] {
+            let t = out
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("目录里找不到 {name}"));
+            let d = t["description"].as_str().unwrap_or("");
+            assert!(
+                d.contains("Provide exactly one of:"),
+                "{name} 的顶层分支被剥了，却没告诉模型该二选一 —— 那是把约束直接扔了"
+            );
         }
     }
 
