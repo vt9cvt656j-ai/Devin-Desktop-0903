@@ -75409,6 +75409,7 @@ function getMenus() {
         { label: t("premiumDb.menu"), icon: "i-premiumdb", action: () => openMichaelPremium() },
         { sep: true },
         { label: t("menu.featureSettings"), icon: "i-gear", action: () => openFeaturePanel("settings") },
+        { label: "清理旧版残留…", icon: "i-trash", action: () => openCleanupDialog() },
       ],
     },
     {
@@ -76049,6 +76050,136 @@ function _confirmDialog(title, body, confirmLabel, danger) {
     setTimeout(() => { try { card.querySelector("._cd-ok").focus(); } catch {} }, 0);
   });
 }
+
+// ============================================================================
+// 旧版残留清理器
+// ============================================================================
+//
+// 用户反复反馈「装了新版还像旧版」。把每一层摸过一遍之后，成因分三类，
+// 这一段只管第三类，前两类在别处修，也修不了：
+//
+//   1. 有东西在运行时把新版盖掉 —— 例如第三方语言包整份压过内置词典。清缓存没用，
+//      覆盖发生在每次启动。（已修：扩展的 registerLocale 改成只补空缺。）
+//   2. 新版根本没送到用户手上 —— 同一个版本号切了两次内容不同的包，更新器按
+//      semver 严格大于判断，永远不下发。这是发版纪律，不是残留。
+//   3. 真残留 —— 换包留下的旧 .app 副本、失效的站点数据、网络缓存，以及被更高版本
+//      取代之后再没人读的本地存储键。只有这一类清得掉。
+
+/**
+ * 启动时静默清掉「已经被更高版本取代」的本地存储键。
+ *
+ * **判据不是「看起来像缓存」，也不是键名白名单，而是「同一个基名存在更高版本」。**
+ * 这一点很关键：按名字猜的话，`michael_token`（登录凭据）、`michael-ide.chat-sessions`
+ * （聊天镜像）这种都会被误伤；而「有更高版本的同名键」是**结构性证据**——写新版本的
+ * 那段代码已经在用新的了，旧的那个再没人读。
+ *
+ * 这段是从 i18n 那个先例推广来的：initLocale 里手写了一串「删掉 v1..v5」的名单，
+ * 每次涨版本都要有人记得去补一条，漏一条旧键就活下来。这里不需要任何人记得。
+ */
+function _sweepSupersededStorage() {
+  const removed = [];
+  try {
+    // base -> 出现过的版本号
+    const versions = new Map();
+    const parse = (key) => {
+      const m = /^(.*?)[._-]v(\d+)$/.exec(key);
+      return m ? { base: m[1] + "|" + key.slice(m[1].length, key.length - m[2].length), n: Number(m[2]) } : null;
+    };
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      const p = key && parse(key);
+      if (!p) continue;
+      const seen = versions.get(p.base) || [];
+      seen.push({ key, n: p.n });
+      versions.set(p.base, seen);
+    }
+    for (const list of versions.values()) {
+      if (list.length < 2) continue;                 // 只有一个版本 = 它就是现役的
+      const top = Math.max(...list.map((x) => x.n));
+      for (const { key, n } of list) {
+        if (n >= top) continue;
+        removed.push(key);
+      }
+    }
+    for (const key of removed) {
+      try { localStorage.removeItem(key); } catch { /* 单条失败不影响其余 */ }
+    }
+    // 记一条水位线：它是这套机制唯一自己写、且自己永远不清的键。
+    try { localStorage.setItem("michael-ide.cleaner.last-run-version", String(appPackage?.version || "")); } catch {}
+  } catch { /* 存储被禁用/配额满：清扫是锦上添花，绝不能因此挡住启动 */ }
+  if (removed.length) console.info("[cleaner] 清掉已被取代的存储键:", removed);
+  return removed;
+}
+
+/** 把字节数说成人话。 */
+function _cleanupBytes(n) {
+  const b = Number(n) || 0;
+  if (b >= 1024 * 1024 * 1024) return (b / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  if (b >= 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+  if (b >= 1024) return (b / 1024).toFixed(0) + " KB";
+  return b + " B";
+}
+
+/**
+ * 清理器的界面入口。
+ *
+ * 分两次问：`auto` 那档（别处有权威副本，最坏后果是重取一次）一次确认就清；
+ * `manual` 那档（旧版副本＝回滚点，清了就没了）单独再问一次，措辞里说清代价。
+ * 不做成一个「全部清理」按钮 —— 这两档的后果完全不是一个量级。
+ */
+async function openCleanupDialog() {
+  if (!inTauri) { showToast("清理器只在桌面版可用"); return; }
+  let items = [];
+  try { items = await backend.invoke("cleanup_scan"); } catch (e) {
+    showToast("扫描失败：" + String(e?.message || e)); return;
+  }
+  if (!Array.isArray(items) || !items.length) {
+    await _confirmDialog("清理旧版残留", "没有找到可清理的残留。\n\n"
+      + "聊天记录、项目记忆、登录凭据和项目信任决定不在清理范围内——它们不可重建，"
+      + "清理器连扫都不扫。", "知道了", false);
+    return;
+  }
+  const auto = items.filter((i) => i.tier === "auto");
+  const manual = items.filter((i) => i.tier !== "auto");
+  const fmt = (list) => list.map((i) =>
+    `- **${i.label}** · ${_cleanupBytes(i.bytes)}（${i.entries} 项）\n  ${i.detail}`).join("\n");
+
+  if (auto.length) {
+    const total = auto.reduce((s, i) => s + (Number(i.bytes) || 0), 0);
+    const body = `可以安全清理 **${_cleanupBytes(total)}**：\n\n${fmt(auto)}\n\n`
+      + `清掉的东西会先进${/Mac/i.test(navigator.platform || navigator.userAgent) ? "废纸篓" : "隔离区（七天后自动清空）"}，不是直接删除，随时能拿回来。`;
+    if (await _confirmDialog("清理旧版残留", body, "清理", false)) {
+      await _runCleanup(auto.map((i) => i.id));
+    }
+  }
+  if (manual.length) {
+    const total = manual.reduce((s, i) => s + (Number(i.bytes) || 0), 0);
+    const body = `还有 **${_cleanupBytes(total)}** 需要你确认：\n\n${fmt(manual)}\n\n`
+      + `这一档和上面不一样——清掉之后就回不到那些旧版本了。`;
+    if (await _confirmDialog("清理旧版副本", body, "确认清理", true)) {
+      await _runCleanup(manual.map((i) => i.id));
+    }
+  }
+}
+
+async function _runCleanup(ids) {
+  let rep = null;
+  try { rep = await backend.invoke("cleanup_apply", { ids }); } catch (e) {
+    showToast("清理失败：" + String(e?.message || e)); return;
+  }
+  const freed = _cleanupBytes(rep?.freed_bytes);
+  const failed = Array.isArray(rep?.failed) ? rep.failed : [];
+  if (failed.length) {
+    // 失败要说得出是哪条、为什么。静默跳过等于让用户以为清干净了。
+    await _confirmDialog("清理完成，但有几项没动",
+      `已腾出 **${freed}**，可以在${rep?.recovered_from || "废纸篓"}里找回。\n\n`
+      + `没能清理的：\n` + failed.map(([p, why]) => `- \`${p}\`\n  ${why}`).join("\n"),
+      "知道了", false);
+  } else {
+    showToast(`已清理 ${freed} —— 都在${rep?.recovered_from || "废纸篓"}里，需要可以拿回来`);
+  }
+}
+
 // Log out: confirm → clear ALL client session state → refresh UI immediately → toast. Every step is
 // guarded and the UI update runs FIRST, so a slow/failed config write can never leave the "退出登录"
 // button stuck visible (the old handler ran an unguarded saveConfig BEFORE _updateLoginUI).
@@ -81328,7 +81459,16 @@ const extHost = new ExtensionHost({
       }
     }
   },
-  registerLocale: (locale, dict) => registerLocale(locale, dict),
+  // **扩展提供的语言包只补空缺，绝不覆盖应用自带的文案。**
+  //
+  // 默认的 overwrite:true 会让第三方词典整份压过内置词典，于是界面文案被**永久冻结在
+  // 那个包被写出来的那一版**：以后每次升级，新写的文案都会在启动时被按回去。
+  // 实测：一个 2026-06-21 装的「简体中文语言包」把 155 条文案改回六月版，包括产品名
+  // ——用户装了新版，标题栏、关于框、设置页仍然是旧品牌名，看起来就是「更新没生效」。
+  // 而且这个症状不可能靠清缓存解决，因为覆盖发生在每次启动的运行时。
+  //
+  // 语言包真正该做的是**补应用还没翻译的语言/词条**，那件事 overwrite:false 完全能做到。
+  registerLocale: (locale, dict) => registerLocale(locale, dict, { overwrite: false }),
   setLocale: (locale) => setLocale(locale),
 });
 
@@ -81354,6 +81494,7 @@ const palette = createCommandPalette({
     { id: "view.extensions", title: t("ext.title"), category: t("menu.view"), run: () => extPanel.open() },
     { id: "view.terminal", title: panelToggleLabel("terminal"), category: t("menu.view"), run: () => toggleTerminal() },
     { id: "view.livePreview", title: PREVIEW_TAB_NAME, category: t("menu.view"), run: () => openLivePreview() },
+    { id: "tools.cleanup", title: "清理旧版残留", category: t("menu.tools"), run: () => openCleanupDialog() },
     { id: "view.livePreviewReload", title: PREVIEW_TAB_NAME + "：重新加载", category: t("menu.view"), run: () => { openLivePreview(); _previewReload(); } },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
@@ -81393,7 +81534,10 @@ $("paletteBtn").addEventListener("click", () => palette.open());
   }
 })();
 
+// 启动时静默清掉「已被更高版本取代」的存储键。放在 initLocale 之后：它自己那套
+// 「删掉旧版 i18n key」的手写名单是这套机制的先例，让它先跑完，免得两边同时改同一批键。
 initLocale();
+try { _sweepSupersededStorage(); } catch { /* 清扫失败绝不能挡住启动 */ }
 applyPlatformShortcutLabels();
 // 用户规则必须在启动时读一次。
 //
