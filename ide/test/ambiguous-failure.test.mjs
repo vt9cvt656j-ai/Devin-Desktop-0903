@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
+import { load } from "./helpers/source.mjs";
 import { join, extname } from "node:path";
 
 /*
@@ -18,14 +19,11 @@ import { join, extname } from "node:path";
  */
 const SRC = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
 
-function loadDetector() {
-  const i = SRC.indexOf("function _ambiguousFailureInWrite(");
-  assert.ok(i > 0, "检测器不见了");
-  const tail = SRC.indexOf("  flush();\n  return out;", i);
-  assert.ok(tail > i, "检测器的收尾不见了");
-  return new Function(SRC.slice(i, SRC.indexOf("\n}\n", tail) + 2) + "\nreturn _ambiguousFailureInWrite;")();
-}
-const detect = loadDetector();
+// 用仓库自己的 load / fnSource，别再手抄一份「按名字抠函数体」的提取器
+// （有一条元测试专门在拦这个：手抄的那些会在函数改名/加参数时静默失效）。
+// 判据只看代码，所以底座要一起注进来——注释里的 `return null` 不是一条返回路径。
+const detectRaw = load("_ambiguousFailureInWrite", { _splitCodeAndComments: load("_splitCodeAndComments") });
+const detect = (text, max = 3) => detectRaw(text, max, "a.js");
 
 test("抓得住今天那个真形状：catch 回 null + 正常路径也回 null", () => {
   const hits = detect(`async function agentLocate(path, line, kind) {
@@ -121,7 +119,8 @@ test("在真语料上的命中密度要维持在可接受范围", () => {
 
 test("挂在写入建议那个唯一出口上，不另开调用点", () => {
   const adv = SRC.slice(SRC.indexOf("function _sinkRiskAdvice(call)"), SRC.indexOf("function _sinkRiskAdvice(call)") + 2200);
-  assert.match(adv, /_ambiguousFailureInWrite\(body\)/, "没挂上去 —— 检测器写了没人调");
+  assert.match(adv, /_ambiguousFailureInWrite\(body, 3, call\?\.path \|\| ""\)/,
+    "没挂上去，或者没把路径传下去 —— 路径决定按哪种注释语法拆（py 的 # 和 js 的 // 不一样）");
   // 危险汇聚点没命中时不能提前 return，否则把这条也一起吞掉。
   assert.doesNotMatch(adv.slice(0, adv.indexOf("_ambiguousFailureInWrite")), /if \(!risks\.length\) return "";/,
     "sink 没命中就早退了 —— 可维护性这条永远发不出去");
