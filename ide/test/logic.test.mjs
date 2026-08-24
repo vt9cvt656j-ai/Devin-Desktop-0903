@@ -8751,6 +8751,9 @@ test("_dynamicChatChips predicts context-aware starters (not a fixed hardcoded l
     workspaceRoots: ["/ws"],
     t: tZh,
     _isGeneratedDependencyDiagnostic: () => false,
+    // 实时预览页签的伪路径不是文件，不能当成「当前文件」推给用户。
+    // 真实现只挡那一个常量，用例里注入等价桩即可。
+    _realFilePath: (path) => (path && path !== "mrdayone:live-preview" ? path : ""),
   };
   const run = (over) => load("_dynamicChatChips", { ...base, ...over })();
   const labels = (chips) => chips.map((c) => c.label).join(" | ");
@@ -16512,20 +16515,30 @@ test("context overflow can be squeezed explicitly but does not auto-replay the A
 });
 
 test("browser runs keep ONE persistent live preview instead of per-turn screenshots", () => {
-  // 常驻实时预览卡：本地 dev server 走 iframe（真实时），外部站点走 CDP 轮询刷帧
-  assert.match(SRC, /function _ensureLiveBrowserPreview\(step, url, run\)/);
-  assert.match(SRC, /\(localhost\|127\\\.0\\\.0\\\.1\|0\\\.0\\\.0\\\.0\|\\\[::1\\\]\|::1\)/,
-    "iframe 只允许本机地址族——外部站点绝不嵌 iframe");
-  assert.match(SRC, /body\.insertBefore\(card, step\);/,
-    "预览卡原地复用，不随每次调用追加");
-  assert.match(SRC, /browser_screenshot"\);\s*\n\s*const im = stage/,
-    "外部站点用 CDP 轮询刷帧");
-  // 接线：browser 执行成功后喂给常驻卡；有它在，逐轮截图卡默认收起（screenshot 验收除外）
+  // 实时预览现在住在编辑器标签栏（一个页签，不是一张随消息滚走的卡片）。
+  // 这条用例守的是**接线**那一半：browser 工具跑完要把那个页签接管到当前地址，
+  // 并且逐轮截图卡因此默认收起。窗格自身的行为在 test/live-preview.test.mjs。
+  const ensure = extractFn("_ensureLiveBrowserPreview", { code: true });
+  assert.match(ensure, /function _ensureLiveBrowserPreview\(step, url, run\)/);
+  assert.match(ensure, /openLivePreview\(href, \{ focus: firstTime \|\| wasActive \}\);/,
+    "浏览器工具没有把预览页签接管到当前地址");
+  // 引擎按目标在哪儿选：本地 dev server 用 iframe（真实时），外部站点用 CDP 回投
+  assert.match(ensure, /_previewSetEngine\(isLocal \? "live" : "cdp"\)/,
+    "外部站点走 iframe 会被 X-Frame-Options 挡掉，本地服务走轮询截图又白白慢一截");
+  assert.match(ensure, /const isLocal = _previewIsLocalUrl\(href\);/);
+  // 一个 run 只留一行指路条，原地复用，不随每次调用追加
+  assert.match(ensure, /body\.querySelector\(":scope > \.mi-preview-jump"\)/,
+    "指路条没有原地复用，agent 每调一次浏览器就会多出一行");
+  assert.match(ensure, /body\.insertBefore\(row, step\);/);
+
+  // 接线：browser 执行成功后喂给它；有它在，逐轮截图卡默认收起（screenshot 验收除外）
   assert.match(SRC, /_liveCard = _ensureLiveBrowserPreview\(step, state\.url \|\| call\.url \|\| "", run\);/);
   assert.match(SRC, /if \(!_liveCard \|\| act === "screenshot"\) step\.classList\.add\("is-open"\);/);
   assert.doesNotMatch(SRC.slice(RAW_SRC.indexOf('} else if (call.type === "browser") {')), /^\s*step\.classList\.add\("is-open"\);$/m,
     "无条件展开的旧行为不能残留在 browser 分支");
-  assert.match(APP_CSS, /\.mi-live-preview__frame \{[^}]*height: 420px/);
+  // 窗格铺满页签区，不再是固定 420px 的卡片
+  assert.match(APP_CSS, /\.lp__frame \{[^}]*height: 100%/);
+  assert.match(APP_CSS, /\.mi-preview-jump \{/);
 });
 
 test("context menu survives unrelated scrolls and root name is never squeezed out", () => {
@@ -17465,11 +17478,17 @@ test("terminal and live-preview background work do not outlive their UI owners",
   assert.ok(resizeBlock.includes("scheduleLayout();"));
 
   // A slow remote browser screenshot must not stack another CDP/IPC request every
-  // 2.5 seconds; previews only need the latest completed frame.
-  const previewBlock = SRC.slice(RAW_SRC.indexOf('function _ensureLiveBrowserPreview'), RAW_SRC.indexOf('function _attachElementPicker'));
-  assert.ok(previewBlock.includes("if (card._pollInFlight) return;"));
-  assert.ok(previewBlock.includes("card._pollInFlight = true;"));
-  assert.ok(previewBlock.includes("finally { card._pollInFlight = false; }"));
+  // poll tick; previews only need the latest completed frame.
+  // 实时预览从聊天卡片搬进了编辑器页签，这个不变量跟着搬到了窗格的状态对象上——
+  // 持有者换了，「绝不排队叠加」这条没变。
+  const pump = extractFn("_previewPumpFrame", { code: true });
+  assert.ok(pump.includes("if (_preview.frameInFlight) return;"), "取帧没有防重入，慢截图会排队堆叠");
+  assert.ok(pump.includes("_preview.frameInFlight = true;"));
+  assert.ok(pump.includes("finally { _preview.frameInFlight = false; }"), "异常路径没有把重入标志放掉，一次失败就永久卡死");
+  // 日志轮询是第二条会叠加的 IPC，同样要有
+  const logs = extractFn("_previewPumpLogs", { code: true });
+  assert.ok(logs.includes("if (_preview.logInFlight"), "日志轮询没有防重入");
+  assert.ok(logs.includes("finally { _preview.logInFlight = false; }"));
 });
 
 test("closing a terminal before termOpen resolves reaps the late PTY without touching disposed xterm", async () => {
