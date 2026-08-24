@@ -359,3 +359,124 @@ test("编辑器里的补全/跳转选择器要覆盖到 .vue 所在的那个 Mon
   const one = withSelector[0][1];
   assert.ok(one.length < 40, "选择器被扩得太宽了");
 });
+
+// ── 冷启动那几十秒里敲的字不许丢 ────────────────────────────────────────────
+//
+// ensureServer 里那次 initialize 对 gopls / pyright 是几十秒级别的。原来 didOpen 在
+// await **之前**同步取样 version/text，等 initialize 完成才发出去——发的是「打开那一刻」
+// 的内容；而这几十秒里的每次击键，didChange 都在 `!client.initialized` 上早退，既不排队
+// 也不缓存。于是服务器拿到的是几十秒前的旧文本：红线整体偏移十几行，报的是已经不存在
+// 的问题，只有再敲一个字符才会自愈——用户停下来看错误列表的那一刻，看到的全是错的。
+test("initialize 期间的编辑要跟上，didOpen 发的是最新内容而不是打开那一刻的", async () => {
+  let releaseInit = null;
+  const sent = [];
+  const backend = {
+    async lspStart(_c, cb) { this._cb = cb; },
+    async lspSend(_lang, raw) {
+      const m = JSON.parse(raw);
+      sent.push(m);
+      if (m.id === undefined) return;
+      // initialize 卡住，直到测试放行——模拟 gopls 冷启动。
+      await new Promise((r) => { releaseInit = () => r(); });
+      this._cb({ kind: "message", data: JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { capabilities: {} } }) });
+    },
+    async lspStop() {}, async lspCheckAvailable() { return true; },
+  };
+  let text = "package main\n";
+  const model = {
+    uri: { toString: () => "file:///p/main.go" },
+    getLanguageId: () => "go",
+    getValue: () => text,
+    getVersionId: () => text.length,
+    isAttachedToEditor: () => true,
+  };
+  monaco.editor.getModel = () => model;
+  const manager = createLspManager({ backend, isWorkspaceTrusted: () => true });
+
+  manager.didOpen("/p/main.go", model);           // 打开：initialize 开始，卡住
+  await new Promise((r) => setImmediate(r));
+  text = "package main\nimport \"fmt\"\nfunc helper() {}\n";   // 这几十秒里用户敲的
+  manager.didChange("/p/main.go", model);
+  await new Promise((r) => setTimeout(r, 220));   // 让防抖到点
+
+  assert.ok(releaseInit, "initialize 没被发出去");
+  releaseInit();                                   // 服务器终于就绪
+  await new Promise((r) => setTimeout(r, 60));
+
+  // 断言的是**服务器最终看到的内容**，不是某一条消息 —— 先发 didOpen 还是先 flush
+  // didChange 取决于微任务顺序，而要保证的性质只有一个：尘埃落定后它手里是最新的。
+  const docMsgs = sent.filter((m) => m.method === "textDocument/didOpen" || m.method === "textDocument/didChange");
+  assert.ok(docMsgs.length, "一条文档消息都没发");
+  const finalView = JSON.stringify(docMsgs[docMsgs.length - 1].params || {});
+  assert.match(finalView, /func helper/,
+    "服务器手里停在「打开那一刻」的内容 —— 它按几十秒前的旧文本分析，红线整体偏移十几行，"
+    + "报的是已经不存在的问题，而且只有再敲一个字符才会自愈");
+
+  monaco.editor.getModel = () => null;
+  await manager.stop("go");
+});
+
+test("client 已存在但还在握手时，编辑要排队，不能直接丢", async () => {
+  // 这是 didOpen 覆盖不到的那个窗口：服务器重启时 client 还在、initialized 为假，
+  // 而 didOpen 不会重来一次。原来 didChange 在 `!client.initialized` 上一并早退，
+  // 这段时间里的编辑就此消失，服务器手里停在重启前那份文本。
+  let releaseInit = null;
+  const sent = [];
+  const backend = {
+    async lspStart(_c, cb) { this._cb = cb; },
+    async lspSend(_lang, raw) {
+      const m = JSON.parse(raw);
+      sent.push(m);
+      if (m.id === undefined) return;
+      await new Promise((r) => { releaseInit = () => r(); });
+      this._cb({ kind: "message", data: JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { capabilities: {} } }) });
+    },
+    async lspStop() {}, async lspCheckAvailable() { return true; },
+  };
+  let text = "fn main() {}\n";
+  const model = {
+    uri: { toString: () => "file:///p/a.rs" },
+    getLanguageId: () => "rust",
+    getValue: () => text,
+    getVersionId: () => text.length,
+    isAttachedToEditor: () => true,
+  };
+  monaco.editor.getModel = () => model;
+  const manager = createLspManager({ backend, isWorkspaceTrusted: () => true });
+
+  const starting = manager.startManual("rust");     // 不 await：client 已在 map 里，但没 initialized
+  await new Promise((r) => setImmediate(r));
+  text = "fn main() { println!(\"x\"); }\n";
+  manager.didChange("/p/a.rs", model);              // 握手期间的编辑
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.ok(releaseInit, "initialize 没发出去");
+  releaseInit();
+  await starting;
+  await new Promise((r) => setTimeout(r, 60));
+
+  // 断言的是**内容到没到**，不是方法名：文档句柄还在就发 didChange，不在（重启窗口）
+  // 就得发 didOpen —— 对没 didOpen 过的文档发 didChange，在协议上是空操作。
+  const carried = sent.find((m) =>
+    (m.method === "textDocument/didChange" || m.method === "textDocument/didOpen")
+    && /println/.test(JSON.stringify(m.params || {})));
+  assert.ok(carried, "握手期间的编辑没到服务器手里 —— 它停在重启前那份文本，"
+    + "红线位置整体错开，而且只有再敲一个字符才会自愈");
+
+  monaco.editor.getModel = () => null;
+  await manager.stop("rust");
+});
+
+test("didOpen 的取样在 await 之后，不在之前", () => {
+  // 这一条是**纵深防御**，如实说明：didChange 排队修好之后，握手期间的编辑靠那条也能
+  // 补上，所以单独退掉这一半测试仍是绿的（上面那条真跑的用例只在两半都退掉时才红）。
+  // 但它自己也有独占的场景：程序化改动会**故意抑制 didChange**（main.js 里那段注释写着
+  // 「这个抑制同时挡掉了 lspManager.didChange」），那种情况下只有 didOpen 现取才救得回。
+  const seg = source.slice(source.indexOf("function didOpen(path, model)"), source.indexOf("function didChange(path, model)"));
+  assert.match(seg, /ensureServer\(langId\)\.then\(\(client\) => \{[\s\S]*?monaco\.editor\.getModel\(model\.uri\)/,
+    "取样又回到 await 之前了 —— 发出去的是「打开那一刻」的内容，而 gopls/pyright 的 "
+    + "initialize 是几十秒级别的");
+  const iSample = seg.indexOf("getVersionId()");
+  const iThen = seg.indexOf(".then((client)");
+  assert.ok(iThen > 0 && iSample > iThen, "版本号仍在 then 之外取");
+});
