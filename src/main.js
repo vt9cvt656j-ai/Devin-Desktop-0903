@@ -5224,6 +5224,13 @@ function _previewNormalizeUrl(input, base = "") {
   let parsed;
   try { parsed = new URL(candidate); } catch { return ""; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  // 0.0.0.0 是**绑定**地址，不是**目标**地址。`vite --host` /
+  // `python manage.py runserver 0.0.0.0:8000` / `rails s -b 0.0.0.0` / docker-compose
+  // 打印出来的都是它，用户会照抄、IDE 也会从终端里把它刮成候选。但它作为目标：
+  // macOS/Linux 上碰巧能连（被当成回环），Windows 上直接无效。
+  // 在这里统一改写成 127.0.0.1——三条入口（终端刮取、地址栏手敲、agent 传入）
+  // 都会经过这个函数，改一处全覆盖，而且顺带让 Windows 也能用。
+  if (parsed.hostname === "0.0.0.0") parsed.hostname = "127.0.0.1";
   return parsed.href;
 }
 
