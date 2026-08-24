@@ -6709,6 +6709,26 @@ test("盯着界面等不算验证证据", () => {
     "screen 类型的监视器仍然被记成验证证据——盯着界面等会顶替真正的验证");
 });
 
+test("缓存仪表不许把「这家没有这个概念」显示成「这家没缓存」", () => {
+  // 用户原话：「只有 claude 会创建缓存，其他的模型都不会」。查下来一半是这里造成的。
+  //
+  // 「cache write」是**显式缓存**才有的事件：Anthropic 让你打断点、单收 1.25× 写入费。
+  // OpenAI（5.6 之前）/xAI/DeepSeek/GLM 都是自动前缀缓存——不产生写入事件、不收写入费。
+  // 无条件打印这一位，非 Claude 模型就永远显示 "cache write 0"，而同一行的 cache read
+  // 是几千万。读起来像「这个模型不会建缓存」，是假话。
+  const title = extractFn("_turnStatsTitle");
+  assert.match(title, /cacheWriteTok > 0 \? ` · cache write/,
+    "缓存写入又变成无条件打印了——非 Claude 模型会显示成「没有缓存」");
+
+  // 命中率的分母要归一：Anthropic 的 prompt_tokens 不含缓存读取，直接拿它当分母
+  // 会把 Claude 结构性顶到 100%，而同一个仪表上 GPT 是老实的低值——两个数不可比。
+  const rec = extractFn("_recordUsage");
+  assert.match(rec, /_anthropicShape \? \(pin \+ cached \+ _writeTok\) : pin/,
+    "命中率分母没有按形状归一，Claude 会被钉在 100%");
+  assert.doesNotMatch(rec, /_tok\.inWithCacheInfo \+= pin;/,
+    "又退回直接拿 prompt_tokens 当分母了");
+});
+
 test("automation schema requires state verification and recovery", () => {
   const description = SRC.match(/name: "automation", description: "([^"]+)"/)?.[1] || "";
   assert.match(description, /Use it as a state machine/);
