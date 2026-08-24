@@ -159,3 +159,76 @@ test("挂在交付事实那条路上，且说清了后果", () => {
   assert.match(seg, /照它理解会得出一个已经不成立的结论/, "只说了「注释旧了」，没说为什么要管");
   assert.match(SRC, /_missingWhyInWrite\(body, call\?\.path \|\| ""\)/, "缺注释那条没挂到写入建议出口上");
 });
+
+// ── 三、注释点名了一个这一轮被删掉的本地符号 ────────────────────────────
+//
+// 人工取样里这一类占 5/20：`_stopSessionRun` / `_warmupWorkspaceAgent` /
+// `_predictComposerNext` / `_thinkingRequestParams` —— 注释理直气壮地说「走的是它那条」，
+// 而那个函数全仓根本不存在。照它去理解，会顺着一条不存在的路径找半天。
+test("注释点名的本地符号被这一轮删掉了", () => {
+  const before = "function _oldHelper(x) { return x; }\n"
+    + "// 走的是 `_oldHelper()` 那条路，不要绕开它。\n"
+    + "export function run(x) { return _oldHelper(x); }";
+  const after = "// 走的是 `_oldHelper()` 那条路，不要绕开它。\n"
+    + "export function run(x) { return inline(x); }";
+  const hits = stale(mkRun(before, after));
+  assert.equal(hits.length, 1, `没抓到：${JSON.stringify(hits)}`);
+  assert.equal(hits[0].token, "_oldHelper");
+});
+
+test("跨文件引用不算——测试和脚本本来就在引别的文件的符号", () => {
+  // 标定时这是唯一的误报来源：542 次真实改动里那 3 条（_KNOWN_TOOLS /
+  // _mcpServerApprovalMode / _live）全是 test/ 和 scripts/ 在点名主文件里的符号。
+  const before = "// 走的是 `_otherFile()` 那条路。\nexport function run(x) { return x + 1; }";
+  assert.deepEqual(stale(mkRun(before, before.replace("x + 1", "x + 2"))), [],
+    "本来就不在这份文件里的名字被当成了「这一轮删掉的」");
+});
+
+test("全文件那条分支只认「被点名」，不认「顺口提到」", () => {
+  /*
+   * 两条分支的严格程度不一样，这是有意的：
+   *   · 局部分支（值/名字在注释旁边那十几行里变了）——顺口提到也算，因为「旁边刚改过」
+   *     本身就是很强的证据。上面那条 `_oldHelper` 被删的用例走的就是它。
+   *   · 全文件分支（这个名字整份文件里都没有了）——只认反引号包着或写成 `_foo()` 的
+   *     **点名**。散文里提一句和点名它是两回事，标定时那 3 条误报全出在这上面。
+   */
+  const src = SRC.slice(SRC.indexOf("function _staleCommentFindings"), SRC.indexOf("function _hardcodedDeliveryFindings"));
+  assert.match(src, /const named = new Set\(\);/, "全文件分支没了");
+  assert.match(src, /note\.matchAll\(\/`\(_\[A-Za-z\]/, "点名的判据被放宽成「提到就算」了");
+  assert.match(src, /fileTokens\.has\(t\) \|\| !beforeFileTokens\.has\(t\)/,
+    "「这一轮弄没的」这条没了 —— 跨文件引用会全变成误报");
+});
+
+// ── 四、底座：跨行字符串与正则字面量 ────────────────────────────────────
+test("正则字面量里的斜杠不是注释起点", () => {
+  /*
+   * 这是已上线代码里的一个真 bug，标定时才发现：main.js 里有一处 url.replace(正则, "")，
+   * 那个正则以「反斜杠 斜杠 星号」结尾——在扫描器眼里就是块注释的起点，于是从那一行起
+   * **整片文件都被判成注释**，7440 行那个 function 直接进了 comments。所有只看代码的
+   * 判据在那之后全哑了，而且一声不响。
+   */
+  const src = String.raw`const a = url.replace(/^sqlite:\/*/, "");` + "\nfunction _later() { return 1; }";
+  const { code, comments } = split(src, "a.js");
+  assert.match(code[1], /function _later/, "正则之后的整片代码被判成了注释");
+  assert.equal(comments[1], "", "代码跑到 comments 里去了");
+  // 真的除号不能被当成正则开头。
+  assert.match(split("const r = a / b; // 注释", "a.js").code[0], /a \/ b;/);
+  assert.equal(split("const r = a / b; // 注释", "a.js").comments[0].trim(), "注释");
+  // 字符类里的 / 不算收尾：/[^/]+/ 的第一个 / 在方括号里，扫描器提前收尾的话
+  // 后面那段代码会整片被吃掉。
+  const cls = split(String.raw`const m = s.match(/[^/]+\//); // 注释` + "\nconst z = 1;", "a.js");
+  assert.match(cls.code[0], /\[\^\/\]\+/, "字符类里的斜杠把正则提前收尾了");
+  assert.equal(cls.comments[0].trim(), "注释");
+  assert.match(cls.code[1], /const z = 1;/, "正则之后的代码被吃掉了");
+});
+
+test("跨行的模板串和三引号要跨行保持", () => {
+  const html = ["const h = `", '  <a onclick="_go(1)">x</a>', "  // 这不是注释", "`;", "// 这才是"].join("\n");
+  const r = split(html, "a.js");
+  assert.match(r.code[2], /这不是注释/, "模板串里的 // 被当成了注释起点");
+  assert.equal(r.comments[2], "", "模板串内容跑到 comments 里去了");
+  assert.equal(r.comments[4].trim(), "这才是");
+  const py = split(['s = """', "多行 # 不是注释", '"""', "x = 1  # 真注释"].join("\n"), "a.py");
+  assert.match(py.code[1], /不是注释/, "Python 三引号没跨行");
+  assert.equal(py.comments[3].trim(), "真注释");
+});

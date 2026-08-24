@@ -41306,10 +41306,20 @@ function _splitCodeAndComments(text, path = "") {
   const code = [];
   const comments = [];
   let inBlock = false;     // /* … */   （dash 那档是 --[[ … ]]，这里一并用它表示）
+  /*
+   * 跨行的字符串定界符（JS 的模板串、Python 的三引号）**必须跨行保持**，不能每行重置。
+   *
+   * 第一版就是每行重置的，代价很实：main.js 里那些几百行的 HTML 模板串，后续行被当成
+   * 代码，串里随便一个 `//`（URL、JSX 注释、CSS 里的 //）就把那一行剩下的全判成注释。
+   * 标定时它以「注释里点名了 120 个全仓不存在的下划线标识符」的形式露出来——那些名字
+   * （_mpmDeleteConn / _mpmFilterDom …）其实好端端地住在模板串里的 onclick 上。
+   */
+  let multi = "";          // 跨行未闭合的定界符：反引号 或 三引号
   for (const line of lines) {
     let out = "";
     let note = "";
-    let quote = "";        // 当前所在的字符串定界符
+    let quote = multi;     // 上一行没闭合就接着算在串里
+    multi = "";
     let i = 0;
     while (i < line.length) {
       const c = line[i];
@@ -41322,11 +41332,53 @@ function _splitCodeAndComments(text, path = "") {
       if (quote) {
         out += c;
         if (c === "\\") { if (i + 1 < line.length) { out += line[i + 1]; i += 2; continue; } }
-        else if (c === quote) quote = "";
+        else if (quote.length === 3) {
+          if (line.slice(i, i + 3) === quote) { out += line.slice(i + 1, i + 3); i += 3; quote = ""; continue; }
+        } else if (c === quote) quote = "";
         i++;
         continue;
       }
+      // Python 的三引号也跨行。先试三引号再试单引号，否则它会被当成一个空串加一个引号。
+      const triple = line.slice(i, i + 3);
+      if (triple === '"""' || triple === "'''") { quote = triple; out += triple; i += 3; continue; }
       if (c === '"' || c === "'" || c === "`") { quote = c; out += c; i++; continue; }
+      /*
+       * 正则字面量要先认出来，否则它里面的斜杠会被当成注释起点。
+       *
+       * 这不是假想：main.js 里有一处 url.replace(正则, "")，那个正则以「反斜杠 斜杠 星号」
+       * 结尾——在扫描器眼里就是块注释的起点，于是从那一行起**整片文件都被判成注释**，
+       * 7440 行那个 `function _mpmDeleteConn(id) {` 直接进了 comments。所有只看代码的
+       * 判据在那之后就全哑了，而且一声不响。标定时是以「注释里点名了 120 个全仓不存在的
+       * 标识符」这种奇怪形式露出来的。
+       *
+       * 「这个 / 是正则还是除号」是 JS 词法的老问题，用标准那条启发式：看前一个有意义的
+       * 字符——它是运算符、括号、逗号、分号、关键字结尾，那就是正则的开头；是标识符、
+       * 数字、右括号，那就是除号。
+       */
+      if (slash && c === "/" && line[i + 1] !== "/" && line[i + 1] !== "*") {
+        const prev = out.replace(/\s+$/, "").slice(-1);
+        const prevWord = /[\w$)\]]/.test(prev);
+        if (!prevWord) {
+          let k = i + 1;
+          let closed = false;
+          let inClass = false;
+          for (; k < line.length; k++) {
+            const d = line[k];
+            if (d === "\\") { k++; continue; }
+            if (inClass) { if (d === "]") inClass = false; continue; }
+            if (d === "[") { inClass = true; continue; }
+            if (d === "/") { closed = true; break; }
+          }
+          if (closed) {
+            // 连同结尾的标志位（g/i/m/s/u/y）一起原样带过去。
+            let end = k + 1;
+            while (end < line.length && /[gimsuyd]/.test(line[end])) end++;
+            out += line.slice(i, end);
+            i = end;
+            continue;
+          }
+        }
+      }
       if (slash && c === "/" && line[i + 1] === "/") { note += line.slice(i + 2); out += " ".repeat(line.length - i); break; }
       if (slash && c === "/" && line[i + 1] === "*") { inBlock = true; i += 2; out += "  "; continue; }
       if (dash && c === "-" && line[i + 1] === "-") {
@@ -41337,6 +41389,8 @@ function _splitCodeAndComments(text, path = "") {
       out += c;
       i++;
     }
+    // 只有跨行的定界符能带到下一行；普通引号在行尾未闭合是语法错误，不顺延。
+    if (quote === "`" || quote.length === 3) multi = quote;
     code.push(out);
     comments.push(note);
   }
@@ -41765,6 +41819,7 @@ function _staleCommentFindings(run, maxItems = 4) {
 
     const b = _splitCodeAndComments(before, String(absPath));
     const a = _splitCodeAndComments(after, String(absPath));
+    const afterCode = a.code.join("\n");
 
     // 改前的注释原文 → 它在改前的行号（用来把局部窗口对齐到改动之前的位置）。
     const beforeAt = new Map();
@@ -41801,6 +41856,34 @@ function _staleCommentFindings(run, maxItems = 4) {
       const localDecl = new Set();
       for (const m of beforeWin.matchAll(/(?:const|let|var|static|class|function|fn|struct|enum|type)\s+([A-Za-z_$][\w$]*)/g)) localDecl.add(m[1]);
       for (const m of beforeWin.matchAll(/[A-Za-z_$][\w$]*\s*[:=]\s*(\d[\d_]+)\b/g)) localDecl.add(m[1]);
+
+      /*
+       * 第二种形态：注释**点名**了一个下划线打头的本地符号（用反引号包着，或者写成
+       * `_foo()`），而它在改后的这份文件里已经不存在了。
+       *
+       * 这一类在人工取样里占 5/20（`_stopSessionRun` / `_warmupWorkspaceAgent` /
+       * `_predictComposerNext` / `_thinkingRequestParams` 全是这样）。要求「被点名」
+       * 而不是「被提到」——散文里顺口提一个名字和用反引号点名它，是两回事；
+       * 跨文件引用的误报也基本被这条挡住（那种多半是叙述，不是点名）。
+       */
+      const named = new Set();
+      for (const m of note.matchAll(/`(_[A-Za-z][\w$]{3,})`|\b(_[A-Za-z][\w$]{3,})\(\)/g)) named.add(m[1] || m[2]);
+      const fileTokens = tokensOf(afterCode);
+      const beforeFileTokens = tokensOf(b.code.join("\n"));
+      for (const t of named) {
+        // 必须是**这一轮**弄没的：改前这份文件里有、改后没了。
+        // 不加这条的话，测试/脚本文件里引用主文件的符号会全变成误报——标定时
+        // 542 次真实改动里那 3 条误报（_KNOWN_TOOLS / _mcpServerApprovalMode / _live）
+        // 全是这种跨文件引用，它们本来就不在这份文件里。
+        if (fileTokens.has(t) || !beforeFileTokens.has(t)) continue;
+        out.push({
+          path: String(absPath).split("/").slice(-2).join("/"),
+          line: i + 1, token: t, text: note.slice(0, 90),
+        });
+        break;
+      }
+      if (out.length >= maxItems) break;
+      if (out.length && out[out.length - 1].line === i + 1) continue;
 
       for (const t of tokensOf(note)) {
         if (!CODEY(t) || afterTokens.has(t) || !localDecl.has(t)) continue;
