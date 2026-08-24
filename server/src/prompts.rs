@@ -8513,7 +8513,7 @@ mod readonly_tool_injection_tests {
                 .filter(|n| !strict.contains(n) && !allowed_static_tool(mode, n))
                 .collect();
             // 客户端只读模式**一次都不会执行**的那几个，丢掉描述是对的。
-            // 这份名单不再手抄：见下面 per_call_types()，按调用判的一律不许出现在这里。
+            // 这份名单不再手抄：见上面 per_call_readonly_types()，按调用判的一律不许出现在这里。
             let deliberate: HashSet<&str> = [
                 "create_project", "docker_compose_up", "capture_replay", "capture_start",
             ]
