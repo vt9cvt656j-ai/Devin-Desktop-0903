@@ -156,6 +156,14 @@ function stripJsComments(source) {
 }
 // Build the real function with its module-level deps injected as parameters.
 let AUTO_LOAD_DEPS = Object.create(null);
+// 品牌图标的真实数据源。用真的而不是造一份假的：这几条断言的价值之一就是
+// 「brandOf 指到的符号在 sprite 里真的存在」，喂假数据就把那一半验证丢了。
+const { MONO_BRANDS: BRAND_MONO, hasBrandMark: BRAND_HAS } = await import("../src/brand-sprite.js");
+const BRAND_MARK = (vendor) => ({
+  sym: "i-brand-" + vendor,
+  cls: BRAND_MONO.has(vendor) ? "brand--" + vendor : "",
+});
+
 function load(name, deps = {}) {
   const resolvedDeps = { ...AUTO_LOAD_DEPS, ...deps };
   const keys = Object.keys(resolvedDeps);
@@ -7282,17 +7290,27 @@ test("网关的实时能力目录压过名字表，但只在它真有答案时",
 });
 
 test("Kimi and Grok models use dedicated brand icons", () => {
+  // 符号名统一成了网关那套厂商标识（moonshot / xai），图标本体也从 index.html 搬到了
+  // src/brand-sprite.js —— 那里放的是 149 家的官方 logo。这条测试钉的仍是同一件事：
+  // 这两家有自己的标，不会掉进 i-cpu 那个通用兜底。
   const brandOf = load("brandOf", {
     _CUSTOM_MODEL_PREFIX: "custom:",
     _customModelById: () => null,
+    // 网关没下发厂商时走名字兜底，这条测试要的就是兜底那一支。
+    MODEL_VENDORS: {},
+    MONO_BRANDS: BRAND_MONO,
+    hasBrandMark: BRAND_HAS,
+    _brandMark: BRAND_MARK,
   });
-  assert.deepEqual(brandOf("kimi-k2.6"), { sym: "i-brand-kimi", cls: "brand--kimi" });
-  assert.deepEqual(brandOf("moonshot-v1-128k"), { sym: "i-brand-kimi", cls: "brand--kimi" });
-  assert.deepEqual(brandOf("grok-4.5"), { sym: "i-brand-grok", cls: "brand--grok" });
-  assert.match(INDEX_HTML, /id="i-brand-kimi"/);
-  assert.match(INDEX_HTML, /id="i-brand-grok"/);
-  assert.match(APP_CSS, /\.ic\.brand--kimi/);
-  assert.match(APP_CSS, /\.ic\.brand--grok/);
+  assert.deepEqual(brandOf("kimi-k2.6"), { sym: "i-brand-moonshot", cls: "brand--moonshot" });
+  assert.deepEqual(brandOf("moonshot-v1-128k"), { sym: "i-brand-moonshot", cls: "brand--moonshot" });
+  assert.deepEqual(brandOf("grok-4.5"), { sym: "i-brand-xai", cls: "brand--xai" });
+  // 图标本体必须真的在 sprite 里，否则 `<use>` 会画出一块空白且不报错。
+  assert.ok(BRAND_HAS("moonshot"));
+  assert.ok(BRAND_HAS("xai"));
+  // 这两家的官方标本来就是单色，所以仍然吃 CSS 的品牌色。
+  assert.match(APP_CSS, /\.ic\.brand--kimi|\.ic\.brand--moonshot/);
+  assert.match(APP_CSS, /\.ic\.brand--grok|\.ic\.brand--xai/);
 });
 
 test("thinking depth is based on real per-model capabilities instead of fixed fake tiers", () => {
