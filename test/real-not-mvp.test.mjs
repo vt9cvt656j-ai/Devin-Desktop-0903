@@ -14,8 +14,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, load, fnSource } from "./helpers/source.mjs";
 
+// 注入清单是手工的：检测器里新引用一个函数，这里不同步就是 ReferenceError
+// （不是断言失败——排查方向完全不同）。
+const splitCC = load("_splitCodeAndComments");
 const scan = load("_stubDeliveryFindings", {
   _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i,
+  _splitCodeAndComments: splitCC,
 });
 const one = (code, maxItems = 8) =>
   scan({ checkpoint: new Map([["/p/src/a.ts", { content: "", current: code }]]) }, maxItems);
@@ -104,14 +108,28 @@ test("结构判据必须锚在窗口首行行首", () => {
   }
 });
 
-test("判据全部定义在函数体内，不引入新的外部标识符", () => {
-  // 本仓库的注入清单是手工维护的：给这个函数加一个外部引用，
-  // 那些 load() 站点会直接 ReferenceError，而不是断言失败。
+test("外部标识符必须逐个登记——注入清单是手工的，漏一个就是 ReferenceError", () => {
+  /*
+   * 本仓库的测试用 load("<名字>") 把单个函数抠出来跑，外部引用要在调用处逐个注入。
+   * 漏了不是断言失败，是 ReferenceError —— 排查方向完全不同，已经栽过两次。
+   *
+   * 所以这条不再是「不许有外部引用」（那太死，_splitCodeAndComments 就是一次必要的
+   * 新增），而是「**有哪几个必须说得出来**」：加一个就得在这里登记，登记的时候自然
+   * 会想起 load() 那几处也要同步。
+   */
   const body = fnSource("_stubDeliveryFindings", { code: true });
   assert.match(body, /const STRUCT = \[/, "结构判据不在函数体内了");
   assert.match(body, /const MARKS = \[/, "原来那五条不见了");
-  assert.match(body, /lines\.slice\(i, i \+ 3\)/,
-    "3 行窗口没了——真实代码里的空壳是跨行的，单行判据一条都抓不到");
+  assert.match(body, /codeLines\.slice\(i, i \+ 3\)/,
+    "3 行窗口没了，或者不再从代码行取——真实代码里的空壳是跨行的，"
+    + "而注释里贴的「老写法」不该被算成这次写出来的东西");
+
+  // 函数体里出现、但不是本地声明的下划线标识符。
+  const used = new Set([...body.matchAll(/\b(_[A-Za-z]\w*)/g)].map((m) => m[1]));
+  const declared = new Set([...body.matchAll(/(?:const|let|var|function)\s+(_[A-Za-z]\w*)/g)].map((m) => m[1]));
+  const free = [...used].filter((n) => !declared.has(n)).sort();
+  assert.deepEqual(free, ["_CODE_FILE_RE", "_splitCodeAndComments"],
+    `外部引用变了：${free.join(", ")} —— 每一个都要在 load() 的注入清单里有对应的一项`);
 });
 
 // ── 四、这本账必须**双向**跟着落盘内容走 ──────────────────────────────
@@ -168,10 +186,10 @@ test("放宽命名之后不许开始误报（负向，本仓库实测 0.10/万�
 // 那条契约是对的——写个登录功能不该平白背上整张表。所以走另一条路：不按「这轮是什么任务」
 // 挂整表，按**这一次写进去的代码碰到了什么**递对应的那几条，挂在 _mutationAdvice 上，
 // 跟着这一次写入的工具结果一起回给模型 —— 写的当下就知道，不是收尾时才知道。
-const risks = load("_sinkRisksInWrite");
+const risks = load("_sinkRisksInWrite", { _splitCodeAndComments: splitCC });
 // 注入清单是手工的：_sinkRiskAdvice 里新引用一个函数，这里不同步就是 ReferenceError
 // （不是断言失败——排查方向完全不同）。仓库里已经因为这个栽过。
-const ambiguous = load("_ambiguousFailureInWrite");
+const ambiguous = load("_ambiguousFailureInWrite", { _splitCodeAndComments: splitCC });
 const sinkAdvice = load("_sinkRiskAdvice", {
   _sinkRisksInWrite: risks,
   _ambiguousFailureInWrite: ambiguous,

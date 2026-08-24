@@ -31663,7 +31663,12 @@ test("那次付费评审必须真的收到验收契约", () => {
 
 // ---- 交付是真的还是假的：判据来自落盘内容，且要基线相减 ----
 test("这一轮新引入的占位要被点名，文件里本来就有的不算账", () => {
-  const scan = load("_stubDeliveryFindings", { _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i });
+  // 注入清单是手工的：结构类判据现在只看代码部分（注释里贴的「老写法」不算这次写的），
+  // 底座要一起注进来，漏了是 ReferenceError 而不是断言失败。
+  const scan = load("_stubDeliveryFindings", {
+    _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i,
+    _splitCodeAndComments: load("_splitCodeAndComments"),
+  });
   const mk = (pairs) => ({ checkpoint: new Map(pairs) });
   // 基线相减：改前就有的 TODO 不算这次交付的账——和「诊断只认新增错误」同一套哲学。
   const old = scan(mk([["/p/a.ts", { content: "// TODO: 以后再说\nexport const a = 1;", current: "// TODO: 以后再说\nexport const a = 2;" }]]));

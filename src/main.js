@@ -41274,7 +41274,76 @@ function _removedDeclarationsUnchecked(run, searchedTerms, maxItems = 6) {
  * 量出来被砍掉的：裸 `.innerHTML =`（21.22/万行——界面密集的应用里遍地都是）。
  * 假警报比漏报贵：每次写文件都跳一条，模型和用户都会学会略过它。
  */
-function _sinkRisksInWrite(text, before = null) {
+/*
+ * 把每一行拆成「代码部分」和「注释部分」。
+ *
+ * 存在的理由是用户那句话：「不能光看注释，要代码一起看——注释会欺骗 IDE，
+ * 有的还会用旧注释让 IDE 发现不了问题。」两个方向都要防：
+ *
+ *   ① 注释里的东西不许被当成代码。实测：模型写
+ *        // 老写法，已经废弃：
+ *        // db.query("SELECT * FROM users WHERE id = " + id)
+ *      然后被告知它写了 SQL 注入。既是噪音，也让这套机制显得不可信。
+ *   ② 代码里的东西不许被注释盖住。写一句「这里已经参数化了，不用担心注入」，
+ *      拼接还是拼接——判据只看代码，注释一个字都不参与，所以这个方向天然成立。
+ *
+ * 行数和每行长度都保持不变（注释处填空格），行号/列号照旧对得上——这套机制
+ * 区别于泛泛提醒的全部所在就是「指到了哪一行」。
+ *
+ * 注释语法按扩展名分。**默认不认 `#`**：JS 的私有字段 `this.#x` 会被它整段抹掉。
+ */
+function _splitCodeAndComments(text, path = "") {
+  // 两张表放在函数**里面**：这个仓库的测试用 load("<名字>") 把单个函数抠出来跑，
+  // 引用一个外部常量就是 ReferenceError（不是断言失败，排查方向完全不同，已经栽过）。
+  const HASH_EXT = new Set(["py","rb","sh","bash","zsh","fish","yml","yaml","toml","tf","tfvars","pl","r","rake","gemspec","dockerfile","makefile","mk","conf","ini","env"]);
+  const DASH_EXT = new Set(["sql","lua","hs","elm","ada"]);
+  const ext = String(path || "").split("/").pop().split(".").pop().toLowerCase();
+  const hash = HASH_EXT.has(ext);
+  const dash = DASH_EXT.has(ext);
+  const slash = !hash && !dash;
+  const src = String(text || "");
+  const lines = src.split("\n");
+  const code = [];
+  const comments = [];
+  let inBlock = false;     // /* … */   （dash 那档是 --[[ … ]]，这里一并用它表示）
+  for (const line of lines) {
+    let out = "";
+    let note = "";
+    let quote = "";        // 当前所在的字符串定界符
+    let i = 0;
+    while (i < line.length) {
+      const c = line[i];
+      if (inBlock) {
+        const end = dash ? line.indexOf("]]", i) : line.indexOf("*/", i);
+        if (end < 0) { note += line.slice(i); out += " ".repeat(line.length - i); i = line.length; }
+        else { const n = end + 2; note += line.slice(i, end); out += " ".repeat(n - i); i = n; inBlock = false; }
+        continue;
+      }
+      if (quote) {
+        out += c;
+        if (c === "\\") { if (i + 1 < line.length) { out += line[i + 1]; i += 2; continue; } }
+        else if (c === quote) quote = "";
+        i++;
+        continue;
+      }
+      if (c === '"' || c === "'" || c === "`") { quote = c; out += c; i++; continue; }
+      if (slash && c === "/" && line[i + 1] === "/") { note += line.slice(i + 2); out += " ".repeat(line.length - i); break; }
+      if (slash && c === "/" && line[i + 1] === "*") { inBlock = true; i += 2; out += "  "; continue; }
+      if (dash && c === "-" && line[i + 1] === "-") {
+        if (line[i + 2] === "[" && line[i + 3] === "[") { inBlock = true; i += 4; out += "    "; continue; }
+        note += line.slice(i + 2); out += " ".repeat(line.length - i); break;
+      }
+      if (hash && c === "#") { note += line.slice(i + 1); out += " ".repeat(line.length - i); break; }
+      out += c;
+      i++;
+    }
+    code.push(out);
+    comments.push(note);
+  }
+  return { code, comments };
+}
+
+function _sinkRisksInWrite(text, before = null, path = "") {
   const src = String(text || "");
   if (!src) return [];
   const RULES = [
@@ -41293,6 +41362,9 @@ function _sinkRisksInWrite(text, before = null) {
   ];
   const seen = before instanceof Set ? before : null;
   const lines = src.split("\n");
+  // 判据只看**代码**：注释掉的危险写法不算数（实测模型会在注释里贴一段"老写法，已废弃"，
+  // 然后被告知它写了 SQL 注入）。反过来注释里的辩解也拦不住——注释一个字都不参与判定。
+  const codeLines = _splitCodeAndComments(src, path).code;
   // 按**类别**去重、首次命中为准。两个理由：
   //   ① 3 行窗口会让同一处连报三次（窗口从第 1、2、3 行各命中一次），刷屏且全是同一条。
   //   ② 每类的处置办法是同一句，重复说没有任何新信息——真正的信息在「哪一行、原文是什么」。
@@ -41301,8 +41373,10 @@ function _sinkRisksInWrite(text, before = null) {
   const byKind = new Map();
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
+    // 整行只有注释时代码部分是空的，直接跳过——省掉一次注定不成立的窗口匹配。
+    if (!codeLines[i].trim()) continue;
     if (!trimmed || (seen && seen.has(trimmed))) continue;
-    const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
+    const win = codeLines.slice(i, i + 3).map((l) => l.trim()).join(" ");
     for (const [re, kind, ask] of RULES) {
       if (byKind.has(kind) || !re.test(win)) continue;
       // 行号要指准。窗口是从第 i 行起的三行拼平，命中的往往是里面第 2、第 3 行——
@@ -41311,10 +41385,11 @@ function _sinkRisksInWrite(text, before = null) {
       // 那种，比如模板字符串里的多行 SQL）才退回窗口起点。
       let at = -1;
       for (let k = 0; k < 3 && i + k < lines.length; k++) {
-        if (re.test(lines[i + k].trim())) { at = i + k; break; }
+        if (re.test(codeLines[i + k].trim())) { at = i + k; break; }
       }
       // 单行就成立 → 报那一行的原文；真正跨行的（模板字符串里的多行 SQL）→ 报窗口起点和
       // 拼平后的三行。只报起点那一行会给出 `const q = \`` 这种什么都没说的"原文"。
+      // 回显用**原始行**（带注释），让模型一眼认出自己写的是哪一句；判定用的才是代码行。
       byKind.set(kind, at >= 0
         ? { line: at + 1, kind, ask, text: lines[at].trim().slice(0, 100) }
         : { line: i + 1, kind, ask, text: win.slice(0, 100) });
@@ -41340,8 +41415,9 @@ function _sinkRisksInWrite(text, before = null) {
  * 同一轮里量过的另外三条判据都没过关，最接近的一条（会改变结果的操作被空 catch 吞掉）
  * 收紧到 7 处之后逐个看仍有七成误报（那些空 catch 大多在别处补偿过），所以没有采用。
  */
-function _ambiguousFailureInWrite(text, maxItems = 3) {
-  const lines = String(text || "").split("\n");
+function _ambiguousFailureInWrite(text, maxItems = 3, path = "") {
+  // 同样只看代码：注释里写一句「拿不到就 return null」不是一条返回路径。
+  const lines = _splitCodeAndComments(String(text || ""), path).code;
   if (lines.length < 3) return [];
   // 函数起点 + 缩进。没有 AST，用缩进划块——这里只需要"大致是同一个函数"，
   // 划错一两行不会把结论变反：两种 return 必须都在同一块里才报。
@@ -41395,13 +41471,13 @@ function _sinkRiskAdvice(call) {
   const path = String(call?.path || "").split("/").slice(-2).join("/");
   let out = "";
 
-  const risks = _sinkRisksInWrite(body);
+  const risks = _sinkRisksInWrite(body, null, call?.path || "");
   if (risks.length) {
     out += "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
       + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
   }
 
-  const amb = _ambiguousFailureInWrite(body);
+  const amb = _ambiguousFailureInWrite(body, 3, call?.path || "");
   if (amb.length) {
     out += "\n\n⚠ 这次写的代码里，失败和「没有」回的是同一个值——调用方分不出来：\n"
       + amb.map((a) => `· ${path}:${a.line} \`${a.name}\` 在 catch 里回 null，第 ${a.other} 行的正常路径也回 null。`
@@ -41468,6 +41544,15 @@ function _stubDeliveryFindings(run, maxItems = 8) {
     // 改前原文按行建集合：只有新增的行才算这次交付引入的。
     const before = new Set(String(snap?.content || "").split("\n").map((l) => l.trim()));
     const lines = cur.split("\n");
+    /*
+     * 两组规则看的东西不一样，不能混：
+     *   · MARKS（TODO / 未实现 / lorem / 假数据 / 占位实现）是**自我招供**，它本来就写在
+     *     注释里——必须看原始行。
+     *   · STRUCT（鉴权恒真、空函数体、取数回空、编造的地址）判的是**代码形状**，注释里
+     *     贴一段"老写法，已废弃"不该被算成这次写出来的东西。
+     * 用户的原话：不能光看注释，要代码一起看。这就是那条界线落在代码里的样子。
+     */
+    const codeLines = _splitCodeAndComments(cur, String(absPath)).code;
     const mine = [];
     for (let i = 0; i < lines.length && mine.length < maxItems; i++) {
       const raw = lines[i];
@@ -41481,8 +41566,9 @@ function _stubDeliveryFindings(run, maxItems = 8) {
         break;
       }
       if (matched) continue;
-      // 3 行窗口：起始行必须是新增的（上面已判），后两行只用来补全结构。
-      const win = lines.slice(i, i + 3).map((l) => l.trim()).join(" ");
+      // 3 行窗口：起始行必须是新增的（上面已判），后两行只用来补全结构。**只取代码部分**。
+      if (!codeLines[i].trim()) continue;
+      const win = codeLines.slice(i, i + 3).map((l) => l.trim()).join(" ");
       for (const [re, kind] of STRUCT) {
         if (!re.test(win)) continue;
         // 3 行窗口会让**同一处**连报两三次（窗口从它前面一两行就开始命中了）。
@@ -41495,7 +41581,7 @@ function _stubDeliveryFindings(run, maxItems = 8) {
         // 那种，比如模板串里的多行函数签名）才退回窗口起点并给拼平后的三行。
         let at = -1;
         for (let k = 0; k < 3 && i + k < lines.length; k++) {
-          if (re.test(lines[i + k].trim())) { at = i + k; break; }
+          if (re.test(codeLines[i + k].trim())) { at = i + k; break; }
         }
         const hitLine = at >= 0 ? at + 1 : i + 1;
         const hitText = at >= 0 ? lines[at].trim().slice(0, 90) : win.slice(0, 90);
