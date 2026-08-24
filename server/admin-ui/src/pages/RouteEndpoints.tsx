@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, CircleSlash, ListChecks, Plus, RefreshCw, Trash2, X, Zap } from "lucide-react";
+import {
+  Check,
+  CircleSlash,
+  ListChecks,
+  PauseCircle,
+  PlayCircle,
+  Plus,
+  RefreshCw,
+  Timer,
+  Trash2,
+  X,
+  Zap,
+} from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
@@ -65,6 +77,8 @@ type Endpoint = {
   enabled_models: string[];
   protocol: string;
   capacity: number | null;
+  sched: string;
+  retry_in: number | null;
   live: string;
 };
 
@@ -77,6 +91,8 @@ type Route = {
   active: boolean;
   model_count: number;
   models: string[];
+  sched: string;
+  retry_in: number | null;
   live: string;
   endpoints: Endpoint[];
 };
@@ -152,6 +168,32 @@ function LiveDot({ live, className }: { live: string; className?: string }) {
       title={title}
       aria-label={title}
     />
+  );
+}
+
+/**
+ * 调度器眼里它现在是什么状态。
+ *
+ * 三种「现在别用它」的理由分开显示，不合成一个「不可用」—— 恢复方式完全不同：
+ * 没额度要去充值、密钥被拒要去换密钥、限流什么都不用做。混成一个红点，
+ * 运维看到了不知道该干什么。
+ */
+function SchedBadge({ sched, retryIn }: { sched: string; retryIn: number | null }) {
+  if (sched === "live") return null;
+  const mins = retryIn == null ? null : Math.max(1, Math.round(retryIn / 60));
+  if (sched === "saturated") {
+    return (
+      <Badge variant="outline" className="shrink-0 border-warning/40 text-warning">
+        <Timer /> 限流让位中
+      </Badge>
+    );
+  }
+  const label = sched === "no_quota" ? "已下架 · 没额度" : "已下架 · 密钥被拒";
+  return (
+    <Badge variant="outline" className="shrink-0 border-destructive/40 text-destructive">
+      <PauseCircle /> {label}
+      {mins != null && ` · ${mins} 分钟后再试`}
+    </Badge>
   );
 }
 
@@ -287,6 +329,17 @@ export function RouteEndpoints() {
       setNote({ text: e instanceof Error ? e.message : "拉取失败", ok: false });
     } finally {
       setFetching(false);
+    }
+  }
+
+  async function relist(id: string) {
+    setNote(null);
+    try {
+      await api.post(`/api/admin/route-endpoints/${id}/relist`, {});
+      setNote({ text: "已放回轮转。真不行的话下一个请求会把它再下架。", ok: true });
+      await load();
+    } catch (e) {
+      setNote({ text: e instanceof Error ? e.message : "恢复失败", ok: false });
     }
   }
 
@@ -457,6 +510,10 @@ export function RouteEndpoints() {
                             <Badge variant={e && e.cost_ratio < 1 ? "success" : "outline"}>
                               {ratioText(e ? e.cost_ratio : 1)}
                             </Badge>
+                            <SchedBadge
+                              sched={e ? e.sched : r.sched}
+                              retryIn={e ? e.retry_in : r.retry_in}
+                            />
                             {e ? (
                               <ProbeBadge ok={e.probe_ok} ms={e.probe_ms} note={e.probe_note} />
                             ) : (
@@ -471,6 +528,14 @@ export function RouteEndpoints() {
                               >
                                 <Zap /> {probing === id ? "测…" : "测一下"}
                               </Button>
+                              {/* 充完钱不想等调度器那一轮时用。放回去它就是普通候选，
+                                  真不行会立刻再被下架 —— 点了不会留下任何坏状态。 */}
+                              {(e ? e.sched : r.sched).startsWith("no_quota") ||
+                              (e ? e.sched : r.sched) === "auth" ? (
+                                <Button size="sm" variant="ghost" onClick={() => void relist(id)}>
+                                  <PlayCircle /> 立刻恢复
+                                </Button>
+                              ) : null}
                               {e && (
                                 <>
                                   <Button

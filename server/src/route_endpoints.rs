@@ -49,6 +49,7 @@
 //! 躺在库里。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -368,6 +369,194 @@ pub async fn load_for_routes(
         map.entry(r.route_id).or_default().push(r);
     }
     map
+}
+
+// ---------------------------------------------------------------- 调度
+
+/// 下架的持久化前缀。和让位分开存：两者的恢复方式完全不同 ——
+/// 让位是**到点自己回来**（时长由上游给），下架是**试通了才回来**（时长不知道）。
+const DELIST_KEY_PREFIX: &str = "rh:delist:";
+/// 下架状态在 Redis 里最多留多久。比最长退避（1 小时）长一截，
+/// 但不能无限 —— 一个被删掉的出口不该在库里留一辈子。
+const DELIST_TTL_SECS: i64 = 6 * 3600;
+
+/// 调度器多久扫一轮。
+///
+/// 30 秒：最短的退避是 60 秒，扫得比它快一档就够，再快只是空转。
+/// 它不发请求，只是看一眼有没有到点的 —— 到点了才去探。
+const SCHEDULER_TICK: Duration = Duration::from_secs(30);
+
+/// 把下架落一份到 Redis，发版后能承接。火后不管。
+pub fn persist_delisting(state: &AppState, id: uuid::Uuid, why: crate::models::Delisted) {
+    let mut conn = state.redis.clone();
+    let word = why.word().to_string();
+    tokio::spawn(async move {
+        let key = format!("{DELIST_KEY_PREFIX}{id}");
+        let _: Result<(), _> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&word)
+            .arg("EX")
+            .arg(DELIST_TTL_SECS)
+            .query_async(&mut conn)
+            .await;
+    });
+}
+
+async fn forget_delisting(state: &AppState, id: uuid::Uuid) {
+    let mut conn = state.redis.clone();
+    let _: Result<(), _> = redis::cmd("DEL")
+        .arg(format!("{DELIST_KEY_PREFIX}{id}"))
+        .query_async(&mut conn)
+        .await;
+}
+
+/// 启动时承接上一个进程的下架名单。
+///
+/// 不承接的话，发版后第一批请求会把流量铺回一个明知道没额度的出口，
+/// 每个都白烧一个来回 —— 而蓝绿切换那几秒正好是流量最集中的时候。
+pub async fn restore_delisting(state: &AppState) {
+    let mut conn = state.redis.clone();
+    let mut cursor: u64 = 0;
+    let mut n = 0usize;
+    loop {
+        let res: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{DELIST_KEY_PREFIX}*"))
+            .arg("COUNT")
+            .arg(200)
+            .query_async(&mut conn)
+            .await;
+        let (next, keys) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "下架名单没读回来，本进程从空名单开始");
+                return;
+            }
+        };
+        for key in keys {
+            let word: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await.ok();
+            let Some(id) = key
+                .strip_prefix(DELIST_KEY_PREFIX)
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            else {
+                continue;
+            };
+            let why = match word.as_deref() {
+                Some("auth") => crate::models::Delisted::AuthRejected,
+                Some("no_quota") => crate::models::Delisted::OutOfQuota,
+                _ => continue,
+            };
+            crate::models::delist_endpoint(id, why);
+            n += 1;
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    if n > 0 {
+        tracing::info!(delisted = n, "下架名单已从上一个进程承接");
+    }
+}
+
+/// 调度器：什么时候该动什么。
+///
+/// # 它只管一件事：把下架的出口试回来
+///
+/// 别的状态都有自己的到期机制，不需要人管：
+///   · **让位**（429）—— 上游在 Retry-After 里说了多久，到点自己回来；
+///   · **冷却**（502/503/504）—— 20 秒后自然过期；
+///   · **卡死** —— 120 秒记号 + 已有的 `spawn_stall_recovery` 探针，通了自己撤记号。
+///
+/// 只有**下架**不一样：没额度、密钥被拒，都不知道什么时候好，时间到了也不会自己好。
+/// 所以只有这一种需要「定期去敲门」，也就是这个调度器存在的全部理由。
+///
+/// # 为什么用真请求去试，而不是等下一个用户去撞
+///
+/// 等用户撞的代价是：恢复判定由用户的请求付费（他多等一个来回），而且流量越少
+/// 恢复越慢 —— 一个半夜充了钱的出口可能到早上才被发现能用。
+/// 主动探一次只花个位数 token。
+pub fn spawn_scheduler(state: AppState) {
+    tokio::spawn(async move {
+        // 起步先让服务起完；也避开部署瞬间那段状态刚承接完的窗口。
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let mut tick = tokio::time::interval(SCHEDULER_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(e) = sweep_delisted(&state).await {
+                tracing::warn!(error = %e, "下架恢复这一轮没跑完");
+            }
+        }
+    });
+}
+
+async fn sweep_delisted(state: &AppState) -> anyhow::Result<()> {
+    let due = crate::models::delisted_due(std::time::Instant::now());
+    if due.is_empty() {
+        return Ok(());
+    }
+    // 出口和线路一次性取回来，别在循环里逐个查库。
+    let eps: Vec<Endpoint> = sqlx::query_as("SELECT * FROM route_endpoints")
+        .fetch_all(&state.db)
+        .await?;
+    let routes: Vec<Model> = sqlx::query_as("SELECT * FROM models")
+        .fetch_all(&state.db)
+        .await?;
+    let by_route: HashMap<uuid::Uuid, &Model> = routes.iter().map(|m| (m.id, m)).collect();
+    let by_ep: HashMap<uuid::Uuid, &Endpoint> = eps.iter().map(|e| (e.id, e)).collect();
+
+    for (id, why) in due {
+        // id 可能是一个出口，也可能是线路自带的地址（health_id 两者共用一个命名空间）。
+        let (route, base, key_raw, proto, only) = if let Some(e) = by_ep.get(&id) {
+            let Some(r) = by_route.get(&e.route_id) else {
+                // 线路没了 → 这条下架记录也没意义了。
+                crate::models::relist_endpoint(id);
+                forget_delisting(state, id).await;
+                continue;
+            };
+            let k = if e.api_key.trim().is_empty() { &r.api_key } else { &e.api_key };
+            (*r, e.base_url.clone(), k.clone(), e.protocol.clone(), e.enabled_models.clone())
+        } else if let Some(r) = by_route.get(&id) {
+            (*r, r.base_url.clone(), r.api_key.clone(), String::new(), Vec::new())
+        } else {
+            crate::models::relist_endpoint(id);
+            forget_delisting(state, id).await;
+            continue;
+        };
+
+        let out = probe_once(
+            &probe_client(),
+            route,
+            &base,
+            &crate::models::model_key(&key_raw),
+            &proto,
+            &only,
+        )
+        .await;
+        if out.ok {
+            crate::models::relist_endpoint(id);
+            forget_delisting(state, id).await;
+            tracing::info!(
+                endpoint = %id,
+                why = why.word(),
+                ms = out.ms,
+                "下架的出口试通了，已恢复"
+            );
+        } else {
+            crate::models::defer_relist(id);
+            tracing::info!(
+                endpoint = %id,
+                why = why.word(),
+                note = %out.note,
+                "下架的出口还是不通，退避加长"
+            );
+        }
+        // 别把一堆探测同时打到同一家转卖商头上。
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    Ok(())
 }
 
 /// 让位状态的跨进程承接。
@@ -905,6 +1094,10 @@ pub struct EndpointOut {
     pub protocol: String,
     /// 能扛多少（相对值）。null = 没填。
     pub capacity: Option<f64>,
+    /// 调度器眼里它现在是什么状态：live / saturated / no_quota / auth。
+    pub sched: &'static str,
+    /// 下架的话，还有多少秒去试下一次。
+    pub retry_in: Option<u64>,
     /// 真实流量的结论：ok / degraded / error / unknown。和探测是两个来源，都要看得见。
     pub live: String,
 }
@@ -921,8 +1114,50 @@ pub struct RouteOut {
     pub model_count: usize,
     /// 这条线路开放的模型 id。出口只能在这个范围里做减法，所以编辑出口时要看到它。
     pub models: Vec<String>,
+    /// 线路自带那个地址的调度状态（它也是一个出口）。
+    pub sched: &'static str,
+    pub retry_in: Option<u64>,
     pub live: String,
     pub endpoints: Vec<EndpointOut>,
+}
+
+/// 调度器眼里这个出口现在是什么状态。
+///
+/// 三个词各对应一种「现在别用它」的理由，恢复方式完全不同 —— 所以界面上必须分开显示，
+/// 混成一个「不可用」的话，运维看到红点不知道该去充值、去换密钥、还是什么都不用做。
+fn sched_word(id: uuid::Uuid) -> &'static str {
+    if let Some(r) = crate::models::endpoint_delisted(id) {
+        return r.why.word();
+    }
+    if crate::models::endpoint_saturated(id, std::time::Instant::now(), Duration::ZERO) {
+        return "saturated";
+    }
+    "live"
+}
+
+fn retry_in_secs(id: uuid::Uuid) -> Option<u64> {
+    crate::models::endpoint_delisted(id).map(|r| {
+        r.next_probe
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs()
+    })
+}
+
+/// `POST /api/admin/route-endpoints/:id/relist` —— 手动把一个下架的出口放回去。
+///
+/// 充完钱不想等调度器那一轮时用。放回去之后它就是普通候选，真不行会立刻再被下架 ——
+/// 所以这个按钮不会造成任何持久的坏状态。
+pub async fn admin_relist(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let was = crate::models::relist_endpoint(id);
+    if was {
+        forget_delisting(&state, id).await;
+    }
+    Ok(Json(serde_json::json!({ "relisted": was })))
 }
 
 /// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。
@@ -968,6 +1203,8 @@ pub async fn admin_list(
                 enabled_models: e.enabled_models,
                 protocol: e.protocol,
                 capacity: e.capacity,
+                sched: sched_word(e.id),
+                retry_in: retry_in_secs(e.id),
                 live: crate::route_health::classify(&h, now).to_string(),
             });
         }
@@ -980,6 +1217,8 @@ pub async fn admin_list(
             active: r.active,
             model_count: crate::models::allowed_ids(r).len(),
             models: crate::models::allowed_ids(r),
+            sched: sched_word(r.id),
+            retry_in: retry_in_secs(r.id),
             live: aggregate_live(&state, r.id, now).await.to_string(),
             endpoints: list,
         });
@@ -1711,7 +1950,9 @@ mod tests {
     fn the_key_is_never_returned_to_the_browser() {
         let s = src();
         let i = s.find("pub struct EndpointOut").expect("出参结构不见了");
-        let body = &s[i..i + 900];
+        // 按**结构体边界**切，不用定长窗口：这个结构会长，而定长窗口既会把新字段挤出
+        // 检查范围（漏判），也会在中文注释上切到半个汉字里直接 panic —— 两种都发生过。
+        let body = &s[i..s[i..].find("\n}").map(|j| i + j).unwrap_or(s.len())];
         assert!(body.contains("has_key"), "改成回密钥本身了");
         assert!(
             !body.contains("pub api_key"),

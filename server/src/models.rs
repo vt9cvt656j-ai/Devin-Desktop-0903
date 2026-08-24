@@ -594,6 +594,134 @@ static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant
 /// 等一分钟只换回一条错误。记下来之后同一条线路改用短探测预算：仍然每次都试
 /// （所以上游一恢复就自动恢复，不需要任何人去后台改配置），但失败得起，客户端
 /// 的重试预算还剩得下。
+/// 一个出口为什么被下架。
+///
+/// 和「满了」「坏了」都不同：这两种是**等一会儿自己会好**，而下架是
+/// **上游明确说了「现在不行」**，且不知道什么时候行 —— 得靠定期去试。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Delisted {
+    /// 402 / 余额不足 / 欠费。充值或到了新周期就会恢复。
+    OutOfQuota,
+    /// 401 / 403 / 密钥被拒。通常要人去换密钥，但也可能是运维刚好在轮换，
+    /// 所以照样定期试 —— 只是退避得更狠。
+    AuthRejected,
+}
+
+impl Delisted {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Delisted::OutOfQuota => "no_quota",
+            Delisted::AuthRejected => "auth",
+        }
+    }
+    /// 第 n 次重试该等多久。
+    ///
+    /// 额度：60s → 2m → 5m → 10m → 30m 封顶。充值通常几分钟内的事，
+    /// 但也可能等到下一个计费周期，所以封在半小时，别把一个已经充好钱的出口晾一天。
+    ///
+    /// 密钥：起步就 5 分钟，封顶 1 小时。换密钥要人动手，每分钟去试一次纯属浪费
+    /// —— 而且失败的鉴权请求在有些上游那儿是会计入风控的。
+    fn backoff(self, attempts: u32) -> Duration {
+        let ladder: &[u64] = match self {
+            Delisted::OutOfQuota => &[60, 120, 300, 600, 1800],
+            Delisted::AuthRejected => &[300, 600, 1800, 3600],
+        };
+        let i = (attempts as usize).min(ladder.len() - 1);
+        Duration::from_secs(ladder[i])
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DelistRecord {
+    pub why: Delisted,
+    pub since: Instant,
+    pub next_probe: Instant,
+    pub attempts: u32,
+}
+
+/// 被下架的出口。派单时排到最后，由后台调度器定期去试，通了就立刻恢复。
+static ENDPOINT_DELISTED: LazyLock<Mutex<HashMap<uuid::Uuid, DelistRecord>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 下架一个出口。已经下架的不重置计数 —— 否则每来一个请求撞一次，退避永远回到起点，
+/// 变成每分钟都去试。
+pub(crate) fn delist_endpoint(id: uuid::Uuid, why: Delisted) {
+    let now = Instant::now();
+    if let Ok(mut g) = ENDPOINT_DELISTED.lock() {
+        g.entry(id)
+            .and_modify(|r| {
+                // 换了个理由（比如充了钱但密钥又过期）→ 按新理由重排退避。
+                if r.why != why {
+                    r.why = why;
+                    r.attempts = 0;
+                    r.next_probe = now + why.backoff(0);
+                }
+            })
+            .or_insert(DelistRecord {
+                why,
+                since: now,
+                next_probe: now + why.backoff(0),
+                attempts: 0,
+            });
+    }
+}
+
+/// 这个出口现在被下架了吗。
+pub(crate) fn endpoint_delisted(id: uuid::Uuid) -> Option<DelistRecord> {
+    ENDPOINT_DELISTED.lock().ok().and_then(|g| g.get(&id).copied())
+}
+
+/// 探测通过 → 立刻恢复。
+pub(crate) fn relist_endpoint(id: uuid::Uuid) -> bool {
+    ENDPOINT_DELISTED.lock().ok().is_some_and(|mut g| g.remove(&id).is_some())
+}
+
+/// 探测又失败 → 退避加长，等下一轮。
+pub(crate) fn defer_relist(id: uuid::Uuid) {
+    if let Ok(mut g) = ENDPOINT_DELISTED.lock() {
+        if let Some(r) = g.get_mut(&id) {
+            r.attempts = r.attempts.saturating_add(1);
+            r.next_probe = Instant::now() + r.why.backoff(r.attempts);
+        }
+    }
+}
+
+/// 到点该去试的那些出口。
+pub(crate) fn delisted_due(now: Instant) -> Vec<(uuid::Uuid, Delisted)> {
+    ENDPOINT_DELISTED
+        .lock()
+        .map(|g| {
+            g.iter()
+                .filter(|(_, r)| now >= r.next_probe)
+                .map(|(id, r)| (*id, r.why))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 上游这个错误是不是「额度没了」。
+///
+/// 402 是明确的。除此之外只认**强特征**词：像 "quota" 这种单独一个词在限流文案里
+/// 也常出现（"quota exceeded" 可能是 RPM 配额），认宽了会把一次限流误判成没钱，
+/// 把出口按小时退避晾在那儿。
+pub(crate) fn looks_out_of_quota(status: u16, low: &str) -> bool {
+    if status == 402 {
+        return true;
+    }
+    [
+        "insufficient_quota",
+        "insufficient balance",
+        "insufficient_user_quota",
+        "credit balance is too low",
+        "exceeded your current quota",
+        "余额不足",
+        "额度不足",
+        "欠费",
+    ]
+    .iter()
+    .any(|m| low.contains(m))
+}
+
 /// 「这个出口**此刻**满了」——和「它坏了」是两回事，所以不共用冷却表。
 ///
 /// # 为什么必须分开
@@ -8554,14 +8682,15 @@ pub async fn chat_completions(
                 % (ENDPOINT_SATURATION_JITTER.as_millis() as u64).max(1);
             Duration::from_millis(ms)
         };
-        let free: Vec<&Model> = candidates
-            .iter()
-            .filter(|c| !endpoint_saturated(c.health_id(), now, jitter_for(c.health_id())))
-            .collect();
-        let held: Vec<&Model> = candidates
-            .iter()
-            .filter(|c| endpoint_saturated(c.health_id(), now, jitter_for(c.health_id())))
-            .collect();
+        // 「现在别用它」的三种理由合成一个判据：满了（429，按 Retry-After 让位）、
+        // 没额度、密钥被拒。三种都只是**排到最后**，不是排除 —— 全都不可用时
+        // 照样发第一个，绝不因为「都不行」就把请求打死。
+        let step_aside = |c: &Model| -> bool {
+            endpoint_saturated(c.health_id(), now, jitter_for(c.health_id()))
+                || endpoint_delisted(c.health_id()).is_some()
+        };
+        let free: Vec<&Model> = candidates.iter().filter(|c| !step_aside(c)).collect();
+        let held: Vec<&Model> = candidates.iter().filter(|c| step_aside(c)).collect();
         let candidates: Vec<Model> = if free.is_empty() {
             // 全部在让位：保持原序照常发。真正的等待交给 429 排队那一支。
             candidates.clone()
@@ -9019,6 +9148,32 @@ pub async fn chat_completions(
                                 "upstream rejected the request body; not failing over"
                             );
                             break 'routes;
+                        }
+                        // 上游说「现在不行」的两种：没额度、密钥被拒。
+                        //
+                        // 这两种和「满了」「坏了」不同 —— 后两者等一会儿自己会好，而这两种
+                        // 不知道什么时候好，只能定期去试。以前 402 既不冷却也不下架，
+                        // 于是每一个请求都会再撞它一次、白烧一个来回，无限循环。
+                        if looks_out_of_quota(err_status, &err_low) {
+                            delist_endpoint(candidate.health_id(), Delisted::OutOfQuota);
+                            crate::route_endpoints::persist_delisting(
+                                &state,
+                                candidate.health_id(),
+                                Delisted::OutOfQuota,
+                            );
+                            tracing::warn!(
+                                model = %model_id,
+                                endpoint = %candidate.health_id(),
+                                label = %candidate.endpoint_label,
+                                "出口没额度了，已下架；后台会定期去试，通了自动恢复"
+                            );
+                        } else if persistent {
+                            delist_endpoint(candidate.health_id(), Delisted::AuthRejected);
+                            crate::route_endpoints::persist_delisting(
+                                &state,
+                                candidate.health_id(),
+                                Delisted::AuthRejected,
+                            );
                         }
                         if persistent || !transient {
                             // 持久鉴权失败 → 冷却这条线路（见 route_failed_persistent），
@@ -17560,6 +17715,84 @@ mod audit_20260822_tests {
     /// 这是防「不小心开始分散」的主闸。主动分散在成本上从不占优：429 不消耗 token，
     /// 而进价折扣是每次调用都复现的真金 —— 在最便宜的出口还有余量时把流量送给贵的，
     /// 是纯亏。分散只该是**被限流逼出来的**，不是默认策略。
+    /// 「没额度」的识别不能认宽。
+    ///
+    /// 认宽的代价是不对称的：把一次限流误判成没钱，那个出口会被按分钟级退避晾着
+    /// （最长 30 分钟），而它其实几秒后就能用。反过来漏判只是多撞一个来回。
+    /// 所以除了 402 这个明确信号，只认强特征词。
+    #[test]
+    fn 没额度的识别只认强特征() {
+        assert!(super::looks_out_of_quota(402, ""));
+        assert!(super::looks_out_of_quota(400, "your credit balance is too low"));
+        assert!(super::looks_out_of_quota(429, "insufficient_quota"));
+        assert!(super::looks_out_of_quota(403, "账户余额不足，请充值"));
+        // 这些是限流/并发，不是没钱 —— 认错了会把一个几秒后就能用的出口晾半小时
+        assert!(!super::looks_out_of_quota(429, "rate limit exceeded"));
+        assert!(!super::looks_out_of_quota(429, "requests per minute quota exceeded"));
+        assert!(!super::looks_out_of_quota(503, "server overloaded"));
+        assert!(!super::looks_out_of_quota(500, ""));
+    }
+
+    /// 反复撞同一个下架出口，不能把退避重置回起点。
+    ///
+    /// 重置的话，高并发下每秒都有请求撞它，退避永远停在第一档 —— 等于每分钟探一次，
+    /// 而这正是退避阶梯要避免的事。
+    #[test]
+    fn 反复下架不会把退避打回起点() {
+        let id = uuid::Uuid::new_v4();
+        super::delist_endpoint(id, super::Delisted::OutOfQuota);
+        let first = super::endpoint_delisted(id).expect("没下架成功").next_probe;
+        for _ in 0..5 {
+            super::delist_endpoint(id, super::Delisted::OutOfQuota);
+        }
+        assert_eq!(
+            super::endpoint_delisted(id).unwrap().next_probe,
+            first,
+            "重复下架把下次重试时间往前推了 —— 退避阶梯形同虚设"
+        );
+        super::defer_relist(id);
+        assert!(super::endpoint_delisted(id).unwrap().next_probe > first, "探测失败没有加长退避");
+        assert!(super::relist_endpoint(id));
+        assert!(super::endpoint_delisted(id).is_none());
+        assert!(!super::relist_endpoint(id), "重复恢复该回 false");
+    }
+
+    /// 换了理由要重排退避；密钥失效比没额度退得更狠。
+    #[test]
+    fn 下架理由决定退避快慢() {
+        let id = uuid::Uuid::new_v4();
+        super::delist_endpoint(id, super::Delisted::AuthRejected);
+        let auth_next = super::endpoint_delisted(id).unwrap().next_probe;
+        super::delist_endpoint(id, super::Delisted::OutOfQuota);
+        let quota = super::endpoint_delisted(id).unwrap();
+        assert_eq!(quota.why, super::Delisted::OutOfQuota);
+        assert!(
+            quota.next_probe < auth_next,
+            "从密钥失效变成没额度，重试该变快（充值比换密钥快得多）"
+        );
+        super::relist_endpoint(id);
+    }
+
+    /// 402 必须真的接上派单路径，而不是只定义了函数没人调。
+    ///
+    /// 「机制写好了、零调用点」是这个仓库反复出现的失败模式。
+    #[test]
+    fn 没额度真的接上了派单路径() {
+        let body = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        assert!(
+            body.contains("if looks_out_of_quota(err_status, &err_low) {"),
+            "识别没接进热路径 —— 402 会继续每个请求撞一次"
+        );
+        assert!(
+            body.contains("delist_endpoint(candidate.health_id(), Delisted::OutOfQuota)"),
+            "识别出来了却没下架"
+        );
+        assert!(
+            body.contains("|| endpoint_delisted(c.health_id()).is_some()"),
+            "下架的出口没有排到最后 —— 下架了个寂寞"
+        );
+    }
+
     #[test]
     fn 没人限流时头一个仍然是最便宜的那个() {
         let body = fn_body(&gateway_code(), "pub async fn chat_completions(");

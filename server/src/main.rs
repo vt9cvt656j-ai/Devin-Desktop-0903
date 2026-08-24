@@ -149,6 +149,10 @@ async fn main() -> anyhow::Result<()> {
     // 承接上一个进程学到的「哪些出口还在让位」。放在起服务之前：晚一步，第一批请求
     // 就会按空表把流量铺回刚被打满的出口。
     route_endpoints::restore_saturation(&state).await;
+    // 下架名单同理：不承接的话，发版后第一批请求会铺回一个明知道没额度的出口。
+    route_endpoints::restore_delisting(&state).await;
+    // 调度器：只管把下架的出口试回来。让位/冷却/卡死都有自己的到期机制，不需要人管。
+    route_endpoints::spawn_scheduler(state.clone());
 
     // Catch payments the webhook never delivered. Every grant in this service hangs off a
     // single webhook call; without this, one missed delivery means a customer paid and got
@@ -456,6 +460,10 @@ async fn main() -> anyhow::Result<()> {
         )
         // 问一个中转「你有哪些模型」。必须能在保存之前问 —— 出口的价值就在于
         // 「这家有没有我要的那几个」，先存再看等于先把一个不知道行不行的出口放进候选池。
+        .route(
+            "/api/admin/route-endpoints/:id/relist",
+            post(route_endpoints::admin_relist),
+        )
         .route(
             "/api/admin/route-endpoints/available",
             post(route_endpoints::admin_available),
