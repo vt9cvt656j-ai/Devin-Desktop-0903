@@ -322,7 +322,10 @@ test("a long filename does not take over the tab strip or the title bar", () => 
     /text-overflow: ellipsis;/, "the tab label must not ellipsise");
   assert.match(tab, /\.tab > \.ic,\s*\.tab > \.x \{ flex: none; \}/,
     "only the label may shrink — a close button that moves as you switch files is worse");
-  assert.match(SRC, /tab\.title = f\.name;/, "a truncated label needs the full name on hover");
+  // 形状变了，契约没变：预览页签的名字是固定的三个字，把当前地址放进 tooltip 才有
+  // 信息量；文件页签仍然是完整文件名。断言钉的是「hover 一定能看到完整的那个东西」。
+  assert.match(SRC, /tab\.title = f\.isPreview \? \(_preview\.url \|\| f\.name\) : f\.name;/,
+    "a truncated label needs the full name on hover");
 
   // The title bar shortens from the middle: end-truncation drops the extension, which is the part
   // that says what the file is.

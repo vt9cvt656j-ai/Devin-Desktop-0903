@@ -125,6 +125,8 @@ function chipsWith(entryCount) {
     openFiles: new Map(), _isGeneratedDependencyDiagnostic: () => false, _lastGitFiles: [],
     rootPath: "/w", workspaceRoots: ["/w"],
     _workspaceRootEntryCounts: new Map([["/w", entryCount]]), _treePath: (x) => x,
+    // 实时预览页签的伪路径不是文件，不能当成「当前文件」推给用户；真实现只挡那一个常量。
+    _realFilePath: (path) => (path && path !== "mrdayone:live-preview" ? path : ""),
   };
   const keys = Object.keys(deps);
   return new Function(...keys, grab("_dynamicChatChips") + "\n;return _dynamicChatChips;")(...keys.map((k) => deps[k]))();

@@ -15255,7 +15255,10 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 [data-theme="dark"] .ex__sum,
 .dark .ex__sum,
 
-/* ── 常驻实时预览卡（browser 工具：一 run 一张，iframe 活预览 / CDP 轮询刷帧）── */
+/* ── 旧的「常驻实时预览卡」（聊天流里那张内嵌 iframe / 轮询帧的卡片）。
+   实时预览已经搬到编辑器标签栏（.lp，见文件末尾），新对话不再产出这个结构。
+   样式留着是因为**对话是按 HTML 快照持久化的**：在那次改动之前存下来的会话里
+   仍然躺着 .mi-live-preview 节点，删掉这段会让历史记录变成一堆没有样式的裸元素。 */
 .mi-live-preview { margin: 10px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--panel-solid); }
 .mi-live-preview__head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .mi-live-preview__dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 0 3px rgba(16, 185, 129, .16); animation: miLivePulse 2s ease-in-out infinite; flex: none; }
@@ -15982,3 +15985,200 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 @media (prefers-reduced-motion: reduce) {
   .agent-recovery::before { animation: none; }
 }
+
+/* ══ 实时预览页签：编辑器里的浏览器窗格 ══════════════════════════════════════
+   位置和 .pdf-preview / .image-preview 一套约定：绝对定位盖住 editorContainer，
+   由 activate() 决定显示哪一个。z-index 3 与它们同层，浮动调试工具条在更上层。 */
+.lp {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column;
+  background: var(--bg, #e9e9ec);
+}
+.lp[hidden] { display: none; }
+
+/* 两侧面板都打开时编辑区可以窄到 350px 左右，而工具栏里的固定项加起来就要 390px。
+   不换行的话最右边那两个按钮（指元素、控制台）会被裁在窗格外——按钮还在、点不到，
+   是最难查的一种"功能失踪"。放不下就换第二行，什么都不丢。 */
+.lp__bar {
+  display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line, rgba(0,0,0,.09));
+  background: var(--panel-solid, #f5f5f7);
+  flex: none;
+}
+.lp__nav { display: flex; align-items: center; gap: 2px; flex: none; }
+
+.lp__btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; flex: none;
+  border: 0; border-radius: 6px;
+  background: transparent; color: var(--text-dim, #6e6e73);
+  cursor: pointer; transition: background .12s, color .12s;
+}
+.lp__btn .ic { width: 16px; height: 16px; }
+.lp__btn:hover:not(:disabled) { background: var(--line, rgba(0,0,0,.09)); color: var(--text, #1c1c1e); }
+/* 灰掉的按钮要看得出是"现在不能用"，而不是"图标就长这样"。 */
+.lp__btn:disabled { opacity: .32; cursor: default; }
+.lp__btn.is-on { background: var(--accent, #0a84ff); color: #fff; }
+
+/* 地址栏。整条是一个可点区域，输入框自己不带边框——和系统浏览器一样。 */
+.lp__omni {
+  /* 180px 是地址栏还能看清一个 localhost:端口 的下限；再窄就让整条换行，
+     而不是把地址挤成三个字符。 */
+  flex: 1 1 180px; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 4px 0 10px;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14));
+  border-radius: 8px;
+  background: var(--bg, #fff);
+}
+.lp__omni:focus-within { border-color: var(--accent, #0a84ff); }
+.lp__url {
+  flex: 1; min-width: 0; height: 100%;
+  border: 0; outline: 0; background: none;
+  font: 12px/1 var(--mono, ui-monospace);
+  color: var(--text, #1c1c1e);
+}
+.lp__url::placeholder { color: var(--text-dim, #6e6e73); opacity: .75; font-family: inherit; }
+.lp__btn--in { width: 22px; height: 22px; }
+.lp__btn--in .ic { width: 14px; height: 14px; }
+
+/* 连接指示点：绿色常亮＝画面是活的。用动画而不是静态点，因为"实时"这件事
+   只有在它动的时候才说得出来。 */
+.lp__live {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: #10b981; box-shadow: 0 0 0 3px rgba(16, 185, 129, .16);
+  animation: lpPulse 2s ease-in-out infinite;
+}
+@keyframes lpPulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+.lp__device {
+  flex: none; height: 26px; max-width: 132px;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14)); border-radius: 6px;
+  background: var(--bg, #fff); color: var(--text, #1c1c1e);
+  font-size: 11px; cursor: pointer;
+}
+
+/* 引擎切换：分段控件。两个模式能做的事不一样，得让人一眼看出现在在哪一档。 */
+.lp__engine {
+  display: inline-flex; flex: none;
+  padding: 2px; gap: 2px;
+  border-radius: 7px; background: var(--line, rgba(0,0,0,.09));
+}
+.lp__seg {
+  border: 0; border-radius: 5px; padding: 3px 9px;
+  background: transparent; color: var(--text-dim, #6e6e73);
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.lp__seg:hover { color: var(--text, #1c1c1e); }
+.lp__seg.is-on { background: var(--panel-solid, #fff); color: var(--text, #1c1c1e); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+
+.lp__body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.lp__stage {
+  flex: 1; min-height: 0; position: relative;
+  overflow: auto; background: #fff;
+}
+[data-theme="dark"] .lp__stage { background: #1b1b1d; }
+/* 选了设备预设就变成"画布上摆着一台设备"：居中、留边、灰底衬出边界。 */
+.lp__stage.is-deviced {
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 16px; background: var(--bg, #e9e9ec);
+}
+.lp__frame { display: block; width: 100%; height: 100%; border: 0; background: #fff; }
+.lp__stage.is-deviced .lp__frame,
+.lp__stage.is-deviced .lp__shot {
+  border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.18); border: 1px solid var(--line-strong, rgba(0,0,0,.14));
+}
+.lp__shot { display: block; width: 100%; cursor: crosshair; }
+.lp__wait {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim, #6e6e73); font-size: 13px; pointer-events: none;
+}
+
+/* 还没有地址时的落地页 */
+.lp__empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 28px; text-align: center;
+  background: var(--bg, #e9e9ec); color: var(--text, #1c1c1e);
+}
+.lp__empty h3 { margin: 0; font-size: 17px; font-weight: 650; }
+.lp__sub, .lp__hint { margin: 0; max-width: 460px; font-size: 12.5px; line-height: 1.6; color: var(--text-dim, #6e6e73); }
+.lp__cands { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; width: min(460px, 100%); }
+.lp__cand {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 9px 12px; text-align: left;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14)); border-radius: 9px;
+  background: var(--panel-solid, #f5f5f7); color: var(--text, #1c1c1e);
+  cursor: pointer; transition: border-color .12s, background .12s;
+}
+.lp__cand:hover { border-color: var(--accent, #0a84ff); background: var(--bg, #fff); }
+.lp__cand b { font: 12px var(--mono, ui-monospace); font-weight: 600; }
+.lp__cand em { margin-left: auto; font-style: normal; font-size: 11px; color: var(--text-dim, #6e6e73); }
+.lp__rescan {
+  margin-top: 2px; padding: 5px 12px;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14)); border-radius: 7px;
+  background: transparent; color: var(--text-dim, #6e6e73); font-size: 12px; cursor: pointer;
+}
+.lp__rescan:hover { color: var(--text, #1c1c1e); }
+
+/* 控制台 / 网络面板 */
+.lp__dock {
+  flex: none; max-height: 40%; min-height: 120px;
+  display: flex; flex-direction: column;
+  border-top: 1px solid var(--line, rgba(0,0,0,.09));
+  background: var(--panel-solid, #f5f5f7);
+}
+.lp__dock[hidden] { display: none; }
+.lp__dockhead {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; flex: none;
+  font-size: 11px; font-weight: 600; color: var(--text-dim, #6e6e73);
+  border-bottom: 1px solid var(--line, rgba(0,0,0,.09));
+}
+.lp__dockbtn {
+  margin-left: auto; padding: 2px 8px;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14)); border-radius: 5px;
+  background: transparent; color: inherit; font-size: 11px; cursor: pointer;
+}
+.lp__docknote { padding: 12px 14px; font-size: 12px; line-height: 1.6; color: var(--text-dim, #6e6e73); }
+.lp__loglist { flex: 1; min-height: 0; overflow: auto; padding: 4px 0; }
+.lp__log {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 12px;
+  font: 11.5px/1.55 var(--mono, ui-monospace);
+  border-left: 2px solid transparent;
+}
+.lp__log--err { border-left-color: #ef4444; }
+.lp__log--warn { border-left-color: #f59e0b; }
+.lp__loglv { flex: none; font-size: 10px; opacity: .75; }
+.lp__log--err .lp__loglv { color: #ef4444; }
+.lp__log--warn .lp__loglv { color: #f59e0b; }
+.lp__logmsg { flex: 1; min-width: 0; color: var(--text, #1c1c1e); word-break: break-word; }
+.lp__logsrc { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim, #6e6e73); }
+.lp__pickhost { padding: 8px 12px 0; }
+
+/* 对话里的指路条：预览本体已经搬进标签栏，这里只留一行"它在那边、点这里过去"。 */
+.mi-preview-jump {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  margin: 8px 0; padding: 7px 11px;
+  border: 1px solid var(--line-strong, rgba(0,0,0,.14)); border-radius: 10px;
+  background: var(--panel-solid, #f5f5f7); color: var(--text, #1c1c1e);
+  font-size: 12px; text-align: left; cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.mi-preview-jump:hover { border-color: var(--accent, #0a84ff); }
+.mi-preview-jump__dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: #10b981; box-shadow: 0 0 0 3px rgba(16, 185, 129, .16);
+  animation: lpPulse 2s ease-in-out infinite;
+}
+.mi-preview-jump__label { font-weight: 600; flex: none; }
+.mi-preview-jump__url {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 11px var(--mono, ui-monospace); color: var(--text-dim, #6e6e73);
+}
+.mi-preview-jump__go { flex: none; font-size: 11px; color: var(--accent, #0a84ff); font-weight: 600; }

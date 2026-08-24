@@ -2150,3 +2150,88 @@ test("函数作用域里不许先用后声明——node --check 查不出的 TDZ
     `这些标识符在**声明之前**就被读了——运行时抛 "Cannot access X before initialization"，\n`
     + `而 node --check 和源码文本断言都查不出来：\n  ${shown.join("\n  ")}`);
 });
+
+test("模块顶层调用的函数不许读到更靠后声明的模块级变量", () => {
+  // 已有那条 TDZ 守卫只在**同一个函数体内**比文本顺序，跨函数边界一律放过——那是对的，
+  // `const f = () => later; const later = 1;` 完全合法，因为 f 是后来才被调用的。
+  //
+  // 但有一种跨边界的情况就是错的：函数在**模块顶层被同步调用**。那一刻整份模块还没求值完，
+  // 它读到的任何"声明在调用点之后"的 let/const 都在 TDZ 里。
+  //
+  // 这不是假想。实测抓到 _schedStart()：它写在 `let _schedTimer = null` 前面约一千行，
+  // 函数第一句就是 `if (_schedTimer) return;`，于是每次启动都抛 ReferenceError，
+  // 被 `void` 吞成一条 unhandled rejection —— **整个定时任务功能从来没启动过**，
+  // 界面上照常能添加任务，只是永远不触发。node --check 查不出，已有的 TDZ 守卫也放过。
+  //
+  // 判据：只看被调函数体里「第一个 await 之前、且不在嵌套函数里」的引用——那一段才是
+  // 模块求值期间真正跑到的代码。实测全仓库 32 条模块顶层同步调用，命中 1 条（就是上面那个），
+  // 零误报。
+  const ast = acorn.parse(SRC, { ecmaVersion: "latest", sourceType: "module" });
+  const moduleDecls = new Map();
+  const fnDecls = new Map();
+  for (const st of ast.body) {
+    const n = st.type === "ExportNamedDeclaration" ? st.declaration : st;
+    if (!n) continue;
+    if (n.type === "VariableDeclaration" && n.kind !== "var") {
+      for (const d of n.declarations) {
+        if (d.id?.type !== "Identifier") continue;
+        moduleDecls.set(d.id.name, d.end);
+        if (d.init && /Function/.test(d.init.type)) fnDecls.set(d.id.name, d.init);
+      }
+    }
+    if (n.type === "ClassDeclaration" && n.id) moduleDecls.set(n.id.name, n.end);
+    if (n.type === "FunctionDeclaration" && n.id) fnDecls.set(n.id.name, n);
+  }
+
+  const calls = [];
+  const scanExpr = (e, at) => {
+    if (!e) return;
+    if (e.type === "AwaitExpression" || e.type === "UnaryExpression") { scanExpr(e.argument, at); return; }
+    if (e.type === "CallExpression" && e.callee.type === "Identifier") calls.push({ name: e.callee.name, at });
+  };
+  for (const st of ast.body) if (st.type === "ExpressionStatement") scanExpr(st.expression, st.start);
+  assert.ok(calls.length > 10, `只找到 ${calls.length} 条模块顶层调用——取法坏了，这条等于没跑`);
+
+  const prologueIdents = (fn) => {
+    const out = [];
+    let stopped = false;
+    const walk = (n) => {
+      if (stopped || !n || typeof n !== "object") return;
+      if (Array.isArray(n)) { for (const c of n) walk(c); return; }
+      if (typeof n.type !== "string") return;
+      if (n !== fn && /Function/.test(n.type)) return;          // 嵌套函数晚于模块求值才跑
+      if (n.type === "AwaitExpression") { stopped = true; return; } // 第一个 await 之后已经不在同步段里
+      if (n.type === "Identifier") { out.push(n); return; }
+      if (n.type === "MemberExpression" && !n.computed) { walk(n.object); return; }
+      if (n.type === "Property" && !n.computed) { walk(n.value); return; }
+      for (const k of Object.keys(n)) {
+        if (k === "type" || k === "start" || k === "end") continue;
+        walk(n[k]);
+      }
+    };
+    walk(fn.body ?? fn);
+    return out;
+  };
+
+  const hits = [];
+  const seen = new Set();
+  for (const { name, at } of calls) {
+    const fn = fnDecls.get(name);
+    if (!fn) continue;
+    const params = new Set((fn.params || []).flatMap((p) => (p.type === "Identifier" ? [p.name] : [])));
+    for (const id of prologueIdents(fn)) {
+      if (params.has(id.name)) continue;
+      const declEnd = moduleDecls.get(id.name);
+      if (declEnd === undefined || declEnd <= at) continue;
+      const key = name + "|" + id.name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push(`${name}() 在第 ${SRC.slice(0, at).split("\n").length} 行被调用，`
+        + `而它同步读的 ${id.name} 声明在第 ${SRC.slice(0, declEnd).split("\n").length} 行`);
+    }
+  }
+  assert.deepEqual(hits, [],
+    "这些调用发生在模块还没求值完的时候，读到的变量还在 TDZ 里——启动时抛 ReferenceError，"
+    + "被 void / .catch 吞掉之后表现为「这个功能就是不工作」：\n  " + hits.join("\n  ")
+    + "\n把调用点移到那些声明之后。");
+});
