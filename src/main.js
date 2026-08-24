@@ -5181,6 +5181,7 @@ const _preview = {
   picking: false,
   dockOpen: false,
   bridgeSeen: false,   // 页面是否接过调试桥（决定控制台面板显示日志还是显示怎么接）
+  loadSeq: 0,          // 每次导航 +1；异步的失败判定回来时对不上就丢弃
 };
 
 /// 设备预设。宽高是 CSS 像素，auto 表示铺满窗格（不缩放）。
@@ -5477,6 +5478,14 @@ function _previewNavigate(url, { push = true } = {}) {
       _preview.hpos = _preview.history.length - 1;
     }
   }
+  // 实时（iframe）引擎只嵌得了本机地址。桌面壳的 CSP 里 frame-src **故意**只放行
+  // localhost/127.0.0.1，没有放行整个 https:——给一个桌面应用开放"任意站点都能嵌"
+  // 是实打实的攻击面，而外部站点本来也大多带 X-Frame-Options 嵌不进来。
+  // 外部地址改走「浏览器」引擎，那条路本来就是为它们准备的。
+  if (_preview.engine === "live" && !_previewIsLocalUrl(next)) {
+    showToast("外部站点要用「浏览器」引擎打开——iframe 嵌不了它们。已为你切换。");
+    _previewSetEngine("cdp");
+  }
   _preview.url = next;
   _preview.bridgeSeen = false;
   _previewPersistUrl(next);
@@ -5582,7 +5591,10 @@ function _previewRenderStage() {
       frame.setAttribute("allow", "clipboard-read; clipboard-write");
       stage.appendChild(frame);
     }
-    if (frame.getAttribute("src") !== _preview.url) frame.setAttribute("src", _preview.url);
+    if (frame.getAttribute("src") !== _preview.url) {
+      frame.setAttribute("src", _preview.url);
+      _previewWatchLiveLoad(frame, _preview.url);
+    }
   } else {
     let img = stage.querySelector("img");
     if (!img) {
@@ -5599,6 +5611,62 @@ function _previewRenderStage() {
     }
   }
   _previewApplyDevice();
+}
+
+/**
+ * 实时引擎的失败信号。
+ *
+ * iframe 加载失败在页面这一侧是**完全静默**的，而且三种原因长得一模一样——都是一片白：
+ *   · 服务没在跑           → 请求发出去了，连不上
+ *   · 被应用自己的 CSP 拦住 → 请求**根本没发出去**，dev server 一条日志都没有
+ *   · 页面自己不让被嵌      → 请求成功了，但拿到的是个空文档（X-Frame-Options / frame-ancestors）
+ *
+ * 实测踩过第二种：桌面壳的 frame-src 少了 localhost，预览白屏、终端零请求，
+ * 从界面上完全看不出是谁拦的。所以这里分两路取证再合起来说一句人话：
+ * ① 从应用这一层 fetch 一下，回答"服务在不在"（connect-src 已放行本机地址）；
+ * ② 等 iframe 的 load 事件，回答"它让不让被嵌"。
+ */
+function _previewWatchLiveLoad(frame, url) {
+  const seq = ++_preview.loadSeq;
+  let loaded = false;
+  _previewClearStageNote();
+  frame.addEventListener("load", () => {
+    loaded = true;
+    if (seq === _preview.loadSeq) _previewClearStageNote();
+  }, { once: true });
+
+  void (async () => {
+    let reachable = null;
+    try {
+      // no-cors：只关心"连不连得上"，不需要读响应内容
+      await fetch(url, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(4000) });
+      reachable = true;
+    } catch { reachable = false; }
+    // 给 iframe 一点时间把 load 事件发出来，再下结论
+    await new Promise((r) => setTimeout(r, 2500));
+    if (seq !== _preview.loadSeq || loaded) return;  // 已经换地址了，或者其实加载成功了
+    _previewShowStageNote(reachable
+      ? { title: "服务在，但这个页面不让被嵌",
+          body: "它带了 X-Frame-Options 或 frame-ancestors。切到「浏览器」引擎能打开它——那条路不走 iframe。" }
+      : { title: "连不上这个地址",
+          body: "服务没在跑，或者端口不对。看一眼终端里那个 dev server 还活着吗，再按重新加载。" });
+  })();
+}
+
+function _previewShowStageNote(note) {
+  const stage = _preview.el?.querySelector('[data-lp="stage"]');
+  if (!stage) return;
+  _previewClearStageNote();
+  const box = document.createElement("div");
+  box.className = "lp__note";
+  const h = document.createElement("h4"); h.textContent = note.title;
+  const p = document.createElement("p"); p.textContent = note.body;
+  box.appendChild(h); box.appendChild(p);
+  stage.appendChild(box);
+}
+
+function _previewClearStageNote() {
+  _preview.el?.querySelector(".lp__note")?.remove();
 }
 
 /** 还没有地址时的落地页：把探到的 dev server 直接列出来，点一下就打开。 */
