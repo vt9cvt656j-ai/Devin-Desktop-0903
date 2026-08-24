@@ -292,8 +292,20 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
         // 「在服务端抄一份必然漂移，那正是『两份工具目录』那个老坑」。
         //
         // 真正的权限边界在客户端 agent/tool-policy.js 的 blockedInReadOnlyMode —— 那里才决定
-        // 能不能执行。这里只负责别把描述弄丢，所以拒绝清单只要覆盖"客户端本来就不会执行的"
-        // 那些即可，并且逐字对齐客户端的 _STRICT_MUTATING_TOOL_NAMES（有测试钉着不许漂）。
+        // 能不能执行。这里只负责别把描述弄丢，所以判据只有一条：
+        //
+        //   **只拒那些客户端在只读模式下一次都不会执行的。**
+        //
+        // 「一次都不会」这几个字是关键。客户端的只读门已经从「按工具名一刀切」进化成
+        // 「按这一次调用判」：worktree list 放行（Plan 要做的正是"先看看有哪些候选"）、
+        // browser 的观察类动作放行（看页面、截图、量视口）、system 的只读动作放行
+        // （列应用、列窗口）。这三个曾经躺在下面这份名单里，于是它们的描述在 Plan /
+        // Explorer / Reviewer 模式下**根本进不了请求**——模型连这个工具的名字都看不到，
+        // 那几条明写着"该放行"的动作从来没有生效过一次。
+        //
+        // 所以：readOnlyModeBlocked 是**函数**（按调用判）的工具一律不进这份名单；
+        // 是 `true`（一刀切）的才进。下面那条 Rust 测试直接读 tool-policy.js 判定，
+        // 不再靠人抄一遍 _STRICT_MUTATING_TOOL_NAMES。
         "plan" | "explorer" | "reviewer" => !matches!(
             name,
             // ── 客户端 _STRICT_MUTATING_TOOL_NAMES 逐字镜像 ──
@@ -309,7 +321,6 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "run_cmd"
                 | "run_in_terminal"
                 | "deploy_site"
-                | "worktree"
                 | "git_commit"
                 | "git_branch"
                 | "git_push"
@@ -336,17 +347,19 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "ui_click"
                 | "db_query"
                 | "remote"
-                // ── 客户端 blockedInReadOnlyMode 里、上面那份没有的几个 ──
-                // create_project 会在用户主目录下建目录并把工作区顶掉；browser 能执行任意 JS、
-                // 读会话 cookie、上传本机文件；docker_compose_up 起一整套容器；capture_replay
-                // 是 http 审批门的旁路；capture_start 改**操作系统级**代理；system 开 App、
-                // 切前台窗口。这六个在只读模式下客户端都会拒，描述也就不必回填。
+                // ── 客户端 blockedInReadOnlyMode 里一刀切挡住、而上面那份没有的 ──
+                // create_project 会在用户主目录下建目录并把当前工作区顶掉；
+                // docker_compose_up 起一整套容器；capture_replay 是 http 审批门的旁路；
+                // capture_start 改**操作系统级**代理。这四个在只读模式下客户端一次都不会
+                // 执行，描述也就不必回填。
+                //
+                // browser 和 system 曾经也在这里，理由写的是"只读模式下客户端都会拒"——
+                // 那句话现在是错的：它们改成了按调用判，观察类动作是放行的。留着就等于
+                // 把它们**能用的那一半**也一起藏了起来。
                 | "create_project"
-                | "browser"
                 | "docker_compose_up"
                 | "capture_replay"
                 | "capture_start"
-                | "system"
         ),
         // Agent mode can request mutating tools, but still goes through a server-side cap.
         "agent" | "ui" => true,
@@ -8417,6 +8430,72 @@ mod readonly_tool_injection_tests {
             .collect()
     }
 
+    /// 客户端 tool-policy.js 里，只读判定是**按调用判**（函数值）的那些类型。
+    ///
+    /// 直接读源码而不是手抄一份：手抄的那份正是这个坑本身——客户端把 worktree /
+    /// browser / system 从「一刀切挡住」改成「按调用判」（worktree list 放行、browser
+    /// 的观察动作放行、system 的只读动作放行），而服务端这份名单还停在旧判据上，于是
+    /// 那几条明写着"该放行"的动作**在只读模式下从来没有生效过一次**：工具描述进不了
+    /// 请求，模型连它的名字都看不到。
+    fn per_call_readonly_types() -> HashSet<String> {
+        let src = std::fs::read_to_string(repo_root().join("ide/src/agent/tool-policy.js"))
+            .expect("读不到 tool-policy.js");
+        let mut out = HashSet::new();
+        let mut at = 0usize;
+        while let Some(i) = src[at..].find("defineTool(") {
+            let start = at + i;
+            // defineTool("name", { ... })  —— 取名字，再取到这次调用结尾为止的那段
+            let Some(q1) = src[start..].find('"') else { break };
+            let name_start = start + q1 + 1;
+            let Some(q2) = src[name_start..].find('"') else { break };
+            let name = src[name_start..name_start + q2].to_string();
+            let body_end = src[name_start..]
+                .find(");")
+                .map(|e| name_start + e)
+                .unwrap_or(src.len());
+            let body = &src[name_start..body_end];
+            if let Some(f) = body.find("readOnlyModeBlocked:") {
+                let val = body[f + "readOnlyModeBlocked:".len()..].trim_start();
+                // `true` / `false` 是一刀切；`(call) => …` 或一个函数名是按调用判。
+                let per_call = !val.starts_with("true") && !val.starts_with("false");
+                if per_call {
+                    out.insert(name);
+                }
+            }
+            at = body_end.max(start + 1);
+        }
+        out
+    }
+
+    /// 按调用判的工具，绝不许在只读模式下被服务端整个拒掉。
+    ///
+    /// 服务端这道门只决定「描述进不进请求」。一个 worktree list 客户端明明会执行，
+    /// 而服务端把整个 worktree 的描述删掉 —— 模型手上根本没有这个工具，那条放行等于不存在。
+    #[test]
+    fn readonly_modes_never_drop_a_per_call_tool() {
+        let per_call = per_call_readonly_types();
+        assert!(
+            per_call.len() >= 3,
+            "只解析出 {} 个按调用判的类型，取法多半坏了：{per_call:?}",
+            per_call.len()
+        );
+        let catalog: HashSet<String> = catalog_names().into_iter().collect();
+        for mode in ["plan", "explorer", "reviewer"] {
+            for name in &per_call {
+                // 类型名和工具名同名的那些才检查得了（worktree / browser / system 都是）。
+                if !catalog.contains(name) {
+                    continue;
+                }
+                assert!(
+                    allowed_static_tool(mode, name),
+                    "{mode} 模式把 {name} 的描述整个丢了，而客户端对它是**按调用判**的：\
+                     那些明写着该放行的动作（worktree list / browser 看页面 / system 列应用）\
+                     模型根本看不到这个工具，一次都用不上"
+                );
+            }
+        }
+    }
+
     /// 只读模式的注入门是**描述回填**，不是权限边界 —— 它只加不减。被它拒掉的工具不是
     /// "不许用"，而是在请求里彻底不存在：客户端刚用 search_tools 告诉模型「已加载，可直接
     /// 调用」，下一轮那个工具连名字都没有。
@@ -8433,10 +8512,10 @@ mod readonly_tool_injection_tests {
                 .into_iter()
                 .filter(|n| !strict.contains(n) && !allowed_static_tool(mode, n))
                 .collect();
-            // 客户端只读模式也会拒的那几个（见实现里的说明），丢掉描述是对的。
+            // 客户端只读模式**一次都不会执行**的那几个，丢掉描述是对的。
+            // 这份名单不再手抄：见下面 per_call_types()，按调用判的一律不许出现在这里。
             let deliberate: HashSet<&str> = [
-                "create_project", "browser", "docker_compose_up",
-                "capture_replay", "capture_start", "system",
+                "create_project", "docker_compose_up", "capture_replay", "capture_start",
             ]
             .into_iter()
             .collect();
@@ -8464,13 +8543,23 @@ mod readonly_tool_injection_tests {
         }
     }
 
-    /// 改动类工具在只读模式下不该被回填描述 —— 拒绝清单必须逐字覆盖客户端那份。
+    /// 改动类工具在只读模式下不该被回填描述。
+    ///
+    /// **例外是按调用判的那些**：`_STRICT_MUTATING_TOOL_NAMES` 回答的是「这个工具的参数
+    /// 要不要严格校验」，不是「只读模式能不能用」。worktree 两边都在——它 add 时是改动、
+    /// list 时是纯读取，而客户端的只读门早就按调用判了。对这种工具，「整个拒掉」等于把
+    /// 它能用的那一半也一起藏起来（那正是这条例外要防的回退，见
+    /// readonly_modes_never_drop_a_per_call_tool）。
     #[test]
     fn readonly_modes_still_refuse_every_mutating_tool() {
         let catalog: HashSet<String> = catalog_names().into_iter().collect();
+        let per_call = per_call_readonly_types();
         for name in client_strict_names() {
             if !catalog.contains(&name) {
                 continue; // 客户端有、网关目录里没有的，不归这条管
+            }
+            if per_call.contains(&name) {
+                continue; // 按调用判：能不能执行由客户端逐次决定，描述必须给到
             }
             for mode in ["plan", "explorer", "reviewer"] {
                 assert!(
