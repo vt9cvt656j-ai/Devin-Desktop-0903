@@ -9,6 +9,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { load, loadConst, fnSource, CODE } from "./helpers/source.mjs";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const normalize = load("_previewNormalizeUrl");
 const isLocal = load("_previewIsLocalUrl");
@@ -343,4 +348,56 @@ test("只收当前预览源发来的桥消息", () => {
   assert.match(src.slice(0, 900), /new URL\(_preview\.url\)\.origin !== ev\.origin/,
     "没有校验消息来源，任何嵌套 iframe 都能往控制台面板里写东西");
   assert.match(src.slice(0, 900), /d\.__mrdayone !== "preview-log"/);
+});
+
+test("桌面壳的 CSP 必须放行实时预览真正要嵌的来源", () => {
+  // 这条守的是一整类 bug：开发时跑 vite dev server，**那里没有任何 CSP**，所以
+  // 功能在浏览器里怎么试都是好的；打包成桌面应用之后 CSP 才生效，被它挡住的东西
+  // 不报错、不提示，只是静默什么都不发生。
+  //
+  // 实测踩过：frame-src 里没有 localhost，于是实时预览在桌面端永远白屏，
+  // dev server 那边一条请求日志都收不到——从界面上完全看不出是谁拦的。
+  const conf = JSON.parse(readFileSync(join(HERE, "../src-tauri/tauri.conf.json"), "utf8"));
+  const csp = String(conf?.app?.security?.csp || "");
+  assert.ok(csp.length > 40, "读不到 CSP —— 这条用例等于没跑");
+  const directive = (name) => {
+    const hit = csp.split(";").map((s) => s.trim()).filter((s) => s.startsWith(name + " "));
+    assert.equal(hit.length, 1, `CSP 里 ${name} 出现了 ${hit.length} 次`);
+    return hit[0].split(/\s+/).slice(1);
+  };
+
+  // 实时引擎用 iframe 直嵌本机 dev server。三种回环写法都要放行——
+  // vite 默认打印 localhost，python 的 http.server 打印 127.0.0.1，IPv6 环境是 [::1]。
+  const frame = directive("frame-src");
+  for (const src of ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"]) {
+    assert.ok(frame.includes(src), `frame-src 少了 ${src}：桌面端的实时预览会白屏，而且不报任何错`);
+  }
+  // 但**不许**放行整个 https:——给桌面应用开放"任意站点都能嵌"是实打实的攻击面，
+  // 外部站点走 CDP 那条引擎（见 _previewNavigate 里的自动切换）。
+  assert.ok(!frame.includes("https:"), "frame-src 放开了整个 https: —— 外部站点该走「浏览器」引擎，不该嵌进应用窗口");
+
+  // 失败信号要能从应用这一层探到本机服务，否则"连不上"和"不让被嵌"分不开。
+  const connect = directive("connect-src");
+  for (const src of ["http://localhost:*", "http://127.0.0.1:*"]) {
+    assert.ok(connect.includes(src), `connect-src 少了 ${src}：预览分不清「服务没跑」和「页面不让被嵌」`);
+  }
+});
+
+test("实时引擎遇到外部地址要自己切走，而不是白屏", () => {
+  const src = fnSource("_previewNavigate", { code: true });
+  assert.match(src, /_preview\.engine === "live" && !_previewIsLocalUrl\(next\)/,
+    "没有判断「实时引擎 + 外部地址」——CSP 会把它拦成一片白，用户看不出原因");
+  assert.match(src, /_previewSetEngine\("cdp"\)/);
+});
+
+test("iframe 加载失败要说得出是哪一种失败", () => {
+  // 三种原因在页面这侧长得一模一样（都是一片白）：服务没跑 / 被 CSP 拦（请求都没发出去）/
+  // 页面不让被嵌。分不开的话，用户只能看到"预览坏了"。
+  const src = fnSource("_previewWatchLiveLoad", { code: true });
+  assert.match(src, /fetch\(url, \{ mode: "no-cors"/, "没有从应用这层探服务在不在");
+  assert.match(src, /addEventListener\("load"/, "没有等 iframe 的 load 事件");
+  assert.match(src, /seq !== _preview\.loadSeq \|\| loaded/, "异步结论没有对导航序号，换了地址还会弹旧的提示");
+  assert.match(src, /X-Frame-Options/, "「不让被嵌」这一种没有单独的说法");
+  // 两种结论必须真的分岔，不能都说同一句
+  assert.match(src, /reachable\s*\?/);
 });
