@@ -276,8 +276,15 @@ test("项目记忆要落到项目里的文件，而不是只活在浏览器存�
   // 读回：只在本地存储确实为空时导入，否则一份旧文件会把刚记的东西抹掉。
   const imp = /async function _importProjectMemoryFile\(root\)[\s\S]*?\n\}/.exec(SRC);
   assert.ok(imp, "读回函数不见了");
-  assert.match(imp[0], /if \(_kgLoad\(root\)\.length\) return 0;/,
+  // 钉判据，不钉写法：这段后来加了「本地有、文件没有 → 反向补一次」那一半，
+  // 原来那句一行式的 `if (_kgLoad(root).length) return 0;` 被拆成了变量 + 分支，
+  // 行为一个字没变（本地有记忆就绝不导入），断言却红了。
+  assert.match(imp[0], /_kgLoad\(root\)/, "不再读本地记忆，就无从判断该不该导入");
+  assert.match(imp[0], /if \(_localNotes\.length\)[\s\S]{0,1200}?return 0;/,
     "必须只在本地记忆为空时导入——否则旧文件会静默回退掉新记的内容，那是最难查的一类问题");
+  // 反向那半也钉住：本地有、文件没有时要补写，否则存量项目永远不会产出 memory.md。
+  assert.match(imp[0], /_mirrorProjectMemoryFile\(root\)/,
+    "本地有记忆而文件不存在时没有补写——存量项目永远导不出 memory.md");
   assert.match(imp[0], /if \(!line\.startsWith\("- "\)\) continue;/,
     "只认列表项：标题和注释不是记忆");
   assert.match(SRC, /void _importProjectMemoryFile\(path\);/, "打开项目时没有读回");
