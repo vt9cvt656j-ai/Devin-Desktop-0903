@@ -19002,7 +19002,23 @@ function _recordUsage(ev, opts = {}) {
     const _tc = Number(ev.thinking_chars ?? ev.thinkingChars) || 0;
     if (_tc) _lastThinkChars = _tc;
     _tok.in += pin; _tok.out += out;
-    if (hasCacheInfo) { _tok.cached += cached; _tok.inWithCacheInfo += pin; _tok.anyCacheInfo = true; }
+    if (hasCacheInfo) {
+    _tok.cached += cached;
+    // 分母要**归一到同一个含义**：「这一轮总共读进去多少提示 token」。
+    //
+    // 两家形状不同：Anthropic 的 prompt_tokens **不含**缓存读取（它单列
+    // cache_read_input_tokens），OpenAI/DeepSeek/GLM 的 prompt_tokens **含**。
+    // 直接拿 prompt_tokens 当分母，Claude 的分母里被扣掉了命中的那部分，命中率就被
+    // 结构性顶到 100%；同一个仪表上 GPT 报的却是老实的低值。两个数不可比，而用户
+    // 正是看着这两个数得出「只有 Claude 有缓存」的。
+    //
+    // 判据用执行事实，不猜厂商：cacheCreationTokens 只有显式缓存的那条路才会有，
+    // 而它恰好就是「prompt 不含缓存读」的那一族。
+    const _writeTok = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens ?? ev.cache_creation_input_tokens) || 0;
+    const _anthropicShape = _writeTok > 0 || (ev.cache_read_input_tokens != null);
+    _tok.inWithCacheInfo += _anthropicShape ? (pin + cached + _writeTok) : pin;
+    _tok.anyCacheInfo = true;
+  }
     if (!est) _tok.anyReal = true;
     // 子代理/辅助调用（aux）只进累计账，**不得覆写上下文仪表**——它们的小 prompt 会把
     // 主对话几十 k 的读数直接“归零”，用户看到的就是每轮重置。
@@ -19274,7 +19290,13 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
   const cacheWriteTok = Math.max(0, Math.round(Number(settlement?.cacheCreationTokens) || 0));
   const tokenTitle = !settlement ? "Tokens: waiting for the first server settlement"
     : settlement.usageReported
-      ? `Tokens: input ${_tokenExact(settlement.promptTokens)} · output ${_tokenExact(settlement.completionTokens)} · cache read ${_tokenExact(cacheReadTok)} · cache write ${_tokenExact(cacheWriteTok)} (server-reported usage${unreported ? `; ${_tokenExact(unreported)} calls unreported` : ""})`
+      // 「cache write」只有 Anthropic 这类**显式缓存**的厂商才会报。
+      // OpenAI（GPT-5.6 之前）、xAI、DeepSeek、GLM 都是自动前缀缓存：不产生「写入」这个
+      // 事件、也不收写入费，所以这一位对它们是**按构造恒为 0**，不是测出来的 0。
+      // 之前无条件打印，于是每个非 Claude 模型都显示 "cache write 0"，读起来像
+      // 「这个模型不会建缓存」——用户看到的正是这句话，而它是假的：同一行的
+      // cache read 明明是几千万。没有这个概念就别印这一位。
+      ? `Tokens: input ${_tokenExact(settlement.promptTokens)} · output ${_tokenExact(settlement.completionTokens)} · cache read ${_tokenExact(cacheReadTok)}${cacheWriteTok > 0 ? ` · cache write ${_tokenExact(cacheWriteTok)}` : ""} (server-reported usage${unreported ? `; ${_tokenExact(unreported)} calls unreported` : ""})`
       : "Tokens: provider usage unavailable";
   const costTitle = settlement && Number.isInteger(settlement.costCents)
     ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)`
