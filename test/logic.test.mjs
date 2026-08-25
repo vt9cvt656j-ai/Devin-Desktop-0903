@@ -26336,11 +26336,18 @@ test("共享知识广播要给人看得懂的正文，不是丢个对象过去",
 
 test("新派的子智能体拿到的是同伴**最新**的发现，不是最旧的", () => {
   const ce = readFileSync(new URL("../src/agent/collaboration-engine.js", import.meta.url), "utf8");
-  // collectRelatedFindings 末尾按 timestamp 降序排（新的在前）
-  assert.match(ce, /return allFindings\.sort\(\(a, b\) => \(b\.timestamp \|\| 0\) - \(a\.timestamp \|\| 0\)\);/);
-  // 对降序数组取 slice(-10) 拿到的是**最旧**的 10 条——注释还写着"最新 10 条"，正好相反
+  // collectRelatedFindings 末尾按 **seq 优先、timestamp 兜底** 降序排（新的在前）。
+  // 只按 timestamp 排定不了序：Date.now() 是毫秒分辨率，而子体一轮里连写十几条发现是
+  // 常态，它们 timestamp 完全相同 → sort 稳定 → 保持插入顺序（升序）→ 下游按"降序"
+  // 取前 N 条拿到的正好是最旧的。seq 是写入端的单调计数，同一毫秒也能定序。
+  assert.match(ce, /if \(Number\.isFinite\(sa\) && Number\.isFinite\(sb\) && sa !== sb\) return sb - sa;/,
+    "排序没有按 seq 定序——同一毫秒写入的发现会退回插入顺序，'最新 N 条'又变成最旧的");
+  assert.match(ce, /return \(b\.timestamp \|\| 0\) - \(a\.timestamp \|\| 0\);/, "timestamp 兜底不见了");
+  // 取前 N 条 = 最新 N 条。**两处**都要：正常那条和上下文超预算的裁剪分支。
   assert.match(ce, /enhanced\.relatedFindings = relatedFindings\.slice\(0, 10\);/);
-  assert.doesNotMatch(ce, /relatedFindings\.slice\(-10\)/, "又取回最旧的那批了");
+  assert.match(ce, /enhanced\.relatedFindings\.slice\(0, 5\)\.map/,
+    "裁剪分支又取回最旧的那批了——降级本来就有损，但不该反着损");
+  assert.doesNotMatch(ce, /relatedFindings\.slice\(-\d/, "又取回最旧的那批了");
 });
 
 // ══ 子智能体：看得见的工具必须真的能调 ═════════════════════════════════════
