@@ -7,6 +7,7 @@
 // 从目录本身长出用例：任何工具、任何以后新加的工具，只要"声明了必填参数却在归一化里
 // 把它丢了"，就会在这里当场红掉。
 import { readFileSync } from "node:fs";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -18,7 +19,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
 
 function extractConst(name) {
   const m = new RegExp(`const\\s+${name}\\s*=`).exec(SRC);
@@ -38,9 +39,12 @@ const EMPTY_CAPS = { tools: [], commands: [], disabled: [], errors: [] };
 /** 真实内置目录（不含用户声明——那有自己的测试）。 */
 function buildCatalog() {
   const build = new Function(
-    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools",
+    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools", "baseTools", "readonlyExternalTools", "writeTools",
     `${extractFn("_applyUserRoleEnums")}\n${extractFn("_withoutDisabledTools")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-  )(true, (t) => t, () => EMPTY_CAPS, compileToolSchema, undefined);
+  )(true, (t) => t, () => EMPTY_CAPS, compileToolSchema, undefined,
+    // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块注入。
+    baseTools, readonlyExternalTools, writeTools,
+  );
   return build(true, []);
 }
 

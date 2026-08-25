@@ -19,6 +19,7 @@
 // Run: node build/sync-tools-json.mjs         (writes tools.json, prints a summary)
 //      node build/sync-tools-json.mjs --check  (exit 1 if out of sync, writes nothing)
 import { readFileSync, writeFileSync } from "node:fs";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -100,8 +101,13 @@ const buildFn = new Function(
   // `_withoutDisabledTools` 抽真源码进来，不塞桩：它自己只依赖 _userCapabilities，
   // 而塞一个 identity 桩的话，将来这个过滤器改了逻辑这边不会跟着变，会静静地生成
   // 一份和运行时不一样的目录——那正是这个脚本存在的意义的反面。
+  // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块**注入**，
+  // 组装逻辑仍抠真源码。这样生成的目录和运行时构建出来的是同一份。
+  "baseTools",
+  "readonlyExternalTools",
+  "writeTools",
   `${extractIfPresent("_withoutDisabledTools")}\n${extractIfPresent("_applyUserRoleEnums")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
-)(true, (tools) => tools, () => ({ tools: [], disabled: [] }));
+)(true, (tools) => tools, () => ({ tools: [], disabled: [] }), baseTools, readonlyExternalTools, writeTools);
 
 const registry = buildFn(true, []);
 const registryByName = new Map();

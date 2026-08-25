@@ -19,14 +19,23 @@ import { stripToolIp } from "../build/strip-tool-ip.mjs";
 import { CODE as SRC } from "./helpers/source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const RAW = readFileSync(join(HERE, "../src/main.js"), "utf8");
+// 工具目录字面量已搬到 src/agent/tool-catalog.js —— 两份拼起来读，
+// 否则所有按 schema 文本的断言会以「这条工具不见了」的形式假红。
+const RAW = readFileSync(join(HERE, "../src/main.js"), "utf8")
+  + "\n" + readFileSync(join(HERE, "../src/agent/tool-catalog.js"), "utf8");
 
 function registryFrom(src) {
   const build = /function _buildAgentToolSchemas\([\s\S]*?\n\}/.exec(src);
   const dis = /function _withoutDisabledTools\([\s\S]*?\n\}/.exec(src);
   assert.ok(build, "_buildAgentToolSchemas 抠不出来");
+  // 目录字面量已搬进 src/agent/tool-catalog.js。这里**不能** import 真模块：
+  // 这条测试要的正是「剥除之后那份源码构建出来的注册表」，import 拿到的永远是开发版。
+  // 所以从传进来的 src 里把目录连同三个 getter 一起抠出来，随 builder 一起注入。
+  const catAt = src.indexOf("const BASE = [");
+  assert.ok(catAt > 0, "工具目录（tool-catalog.js 的 BASE）抠不出来");
+  const catalog = src.slice(catAt).replace(/^export /gm, "");
   const fn = new Function("inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_applyUserRoleEnums",
-    `${dis ? dis[0] : "const _withoutDisabledTools = (t) => t;"}\n${build[0]}\n;return _buildAgentToolSchemas;`)
+    `${catalog}\n${dis ? dis[0] : "const _withoutDisabledTools = (t) => t;"}\n${build[0]}\n;return _buildAgentToolSchemas;`)
     (true, (t) => t, () => ({ tools: [], commands: [], roles: [], disabled: [], errors: [] }), (t) => t, (t) => t);
   return fn(true, []);
 }

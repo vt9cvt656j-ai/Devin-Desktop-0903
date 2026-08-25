@@ -10,10 +10,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
+// 目录字面量 2026-08-25 从 main.js 搬到了 src/agent/tool-catalog.js。
+// 这里把两份拼起来读：函数名之类的抽取判据仍指向 main.js，而 141 条 schema 在另一边。
 const SOURCE = resolve(here, "../../src/main.js");
+const CATALOG_SOURCE = resolve(here, "../../src/agent/tool-catalog.js");
 const OUT = resolve(here, "../public/tools.json");
 
 const src = readFileSync(SOURCE, "utf8");
+const srcCatalog = readFileSync(CATALOG_SOURCE, "utf8");
 
 function skipString(source, index, quote) {
   for (index++; index < source.length; index++) {
@@ -107,7 +111,10 @@ const buildCatalog = new Function(
   "inTauri",
   "_applyCloudToolDescs",
   "_userCapabilities",
-  `${extractFunction("_withoutDisabledTools")}
+  // 目录字面量已搬到 src/agent/tool-catalog.js —— 整份拼进来（去掉 export，
+  // 因为这里是 new Function 不是模块），组装逻辑仍从 main.js 抠。
+  `${srcCatalog.replace(/^(\s*)export\s+/gm, "$1")}
+   ${extractFunction("_withoutDisabledTools")}
    ${extractFunction("_applyUserRoleEnums")}
    ${extractFunction("_buildAgentToolSchemas")}
    ;return _buildAgentToolSchemas;`,

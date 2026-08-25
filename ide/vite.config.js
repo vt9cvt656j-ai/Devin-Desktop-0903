@@ -16,21 +16,27 @@ function stripToolIpPlugin() {
     apply: "build",
     enforce: "pre",
     transform(code, id) {
-      if (!/\/src\/main\.js$/.test(id.replace(/\\/g, "/"))) return null;
+      // 目录字面量 2026-08-25 从 main.js 搬到了 src/agent/tool-catalog.js，两个都要过。
+      const path = id.replace(/\\/g, "/");
+      const isCatalog = /\/src\/agent\/tool-catalog\.js$/.test(path);
+      if (!/\/src\/main\.js$/.test(path) && !isCatalog) return null;
       const { code: out, changed, found } = stripToolIp(code);
-      if (!found) {
+      // main.js 里现在只剩组装逻辑（描述已搬走），所以那一侧不再要求剥到东西；
+      // **目录模块那一侧才是要保护的**，它必须剥到、而且要剥到足够多。
+      if (isCatalog && !found) {
         throw new Error(
-          "[strip-tool-ip] _buildAgentToolSchemas not found in src/main.js — the tool-IP " +
-          "strip did not run. A rename/move would ship tool descriptions in the bundle. " +
-          "Update build/strip-tool-ip.mjs before building.",
+          "[strip-tool-ip] 目录字面量在 src/agent/tool-catalog.js 里找不到 —— 剥离没有执行，" +
+          "构建出来的包会带着全部工具描述。改了那个文件的结构就要同步 build/strip-tool-ip.mjs。",
         );
       }
-      if (changed < 40) {
+      if (isCatalog && changed < 100) {
         throw new Error(
-          `[strip-tool-ip] only ${changed} description lines blanked (expected many more) — ` +
-          "the strip likely missed tools. Refusing to ship a partially-stripped bundle.",
+          `[strip-tool-ip] 目录里只剥掉了 ${changed} 条描述（141 条工具，预期远不止），` +
+          "多半漏了某一段。拒绝发布一个剥了一半的包。",
         );
       }
+      // main.js 那一侧：描述已经搬走，剥到几条都正常，不设阈值也不要求 found。
+      // 它仍然要过一遍是因为组装逻辑里还留着少量内联描述（实测 31 条）。
       return { code: out, map: null };
     },
   };

@@ -6,6 +6,7 @@
 // 这半边断掉的样子是最讨厌的一种——两边都编译、两边测试都绿，只是用户填了半天配置，
 // 模型那边什么都没多出来，而且没有任何报错。
 import { readFileSync } from "node:fs";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -17,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
 
 // main.js 没有导出，按名抠函数源码再注入依赖执行——测的是真正发出去的那份代码。
 
@@ -26,7 +27,7 @@ const CAPS = (raw) => normalizeCapabilities(raw, "测试配置");
 /** 用给定的用户声明构建一次工具目录，返回工具名数组。 */
 function toolNamesWith(caps) {
   const build = new Function(
-    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools",
+    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema", "_withoutDisabledTools", "baseTools", "readonlyExternalTools", "writeTools",
     `${extractFn("_applyUserRoleEnums")}\n${extractFn("_withoutDisabledTools")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(
     true,
@@ -34,6 +35,9 @@ function toolNamesWith(caps) {
     () => caps,
     compileToolSchema,
     undefined, // 用上面抠出来的真实现，不注入桩
+  
+    // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块注入。
+    baseTools, readonlyExternalTools, writeTools,
   );
   return build(true, []).map((t) => String(t?.function?.name || "")).filter(Boolean);
 }

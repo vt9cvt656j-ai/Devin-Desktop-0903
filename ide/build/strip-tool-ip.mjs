@@ -61,23 +61,33 @@ function blankDescriptionsInLine(line) {
 export function stripToolIp(source) {
   const newline = source.includes("\r\n") ? "\r\n" : "\n";
   const lines = source.split(/\r?\n/);
-  const start = lines.findIndex((l) => l.startsWith(FN_MARKER));
-  if (start === -1) return { code: source, changed: 0, found: false };
-  let end = -1;
-  for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i] === "}") {
-      end = i;
-      break;
+  // 两个入口：main.js 的 `_buildAgentToolSchemas`（历史位置），和 src/agent/tool-catalog.js
+  // 里的三段字面量（2026-08-25 从前者搬出去的）。**必须都认**——只认前者的话，
+  // 目录搬家之后这一步会一个描述都剥不到，而它剥的是要保护的东西。
+  // 好在插件那边有「剥到的行数少于阈值就让构建失败」的兜底，所以搬家当时是**响亮地**
+  // 失败的，不是静默泄漏。这里把第二个入口补上。
+  // 逐个区间收集，**不是首个匹配赢**：main.js 里 _buildAgentToolSchemas 仍有 31 条
+  // 描述（用户声明派生的那些），目录模块里另有 145 条。first-match-wins 在两份源码
+  // 拼在一起时只会剥前者，后者原样漏出去——发布产物里就是完整的工具描述。
+  const regions = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith(FN_MARKER)) {
+      for (let j = i + 1; j < lines.length; j++) {
+        if (lines[j] === "}") { regions.push([i, j]); i = j; break; }
+      }
+    } else if (/^const (BASE|READONLY_EXTERNAL|WRITE) = \[/.test(lines[i])) {
+      for (let j = i + 1; j < lines.length; j++) {
+        if (lines[j] === "];") { regions.push([i, j]); i = j; break; }
+      }
     }
   }
-  if (end === -1) return { code: source, changed: 0, found: false };
+  if (!regions.length) return { code: source, changed: 0, found: false };
   let changed = 0;
-  for (let i = start; i <= end; i++) {
-    if (!lines[i].includes("description:")) continue;
-    const next = blankDescriptionsInLine(lines[i]);
-    if (next !== lines[i]) {
-      changed++;
-      lines[i] = next;
+  for (const [start, end] of regions) {
+    for (let i = start; i <= end; i++) {
+      if (!lines[i].includes("description:")) continue;
+      const next = blankDescriptionsInLine(lines[i]);
+      if (next !== lines[i]) { changed++; lines[i] = next; }
     }
   }
   return { code: lines.join(newline), changed, found: true };

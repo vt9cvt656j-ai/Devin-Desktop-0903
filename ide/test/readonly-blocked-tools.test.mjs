@@ -10,6 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import * as pol from "../src/agent/tool-policy.js";
 
 function registry(includeWrite) {
@@ -19,8 +20,10 @@ function registry(includeWrite) {
   assert.ok(build && helper, "锚点函数抠不出来");
   const fn = new Function("inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema",
     "_applyUserRoleEnums", "toolPolicy",
+    // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块注入。
+    "baseTools", "readonlyExternalTools", "writeTools",
     `${dis ? dis[0] : "const _withoutDisabledTools=(t)=>t;"}\n${helper[0]}\n${build[0]}\n;return _buildAgentToolSchemas;`)
-    (true, (t) => t, () => ({ tools: [], commands: [], roles: [], disabled: [], errors: [] }), (t) => t, (t) => t, pol.toolPolicy);
+    (true, (t) => t, () => ({ tools: [], commands: [], roles: [], disabled: [], errors: [] }), (t) => t, (t) => t, pol.toolPolicy, baseTools, readonlyExternalTools, writeTools);
   return fn(includeWrite, []).map((t) => t.function?.name).filter(Boolean);
 }
 

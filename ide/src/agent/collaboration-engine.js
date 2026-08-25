@@ -339,11 +339,6 @@ class CollaborationEngine {
   }
 }
 
-// ===== Factory Function =====
-export function createCollaborationEngine(options = {}) {
-  return new CollaborationEngine(options);
-}
-
 // ===== Singleton Pattern =====
 let collaborationEngineInstance = null;
 
