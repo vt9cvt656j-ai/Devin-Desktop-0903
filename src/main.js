@@ -51707,6 +51707,28 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         if (_ok && write && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path) {
           _writesDone.push(_normRel(call.path, root) || String(call.path));
         }
+        // **命令写盘也算写盘。**
+        //
+        // 这本账是收尾那条「系统核对·非 worker 自述」唯一的依据，而它原来只认
+        // write/edit/multi_edit 三种工具。一个用 run_cmd 干活的 worker——跑脚手架、
+        // 跑 codegen、`cat > file`、`npm init`——文件是真的落了盘，账上却一条没有，
+        // 于是简报末尾被钉上一句「该 worker 全程未写盘任何文件——若简报声称已完成改动
+        // 即为虚报，不要采信」。**核对腿反过来指控它虚报**，主智能体照着这句话把一份
+        // 真实完成的工作重派一遍，或者自己再做一遍。
+        //
+        // 判据用主循环那条同一个权威 _commandWroteCode（它看的是真落盘的路径，不是从
+        // 命令字符串猜意图），别在这里另写一套。
+        if (_ok && write && (call.type === "cmd" || call.type === "termtask") && _commandWroteCode(call, result)) {
+          const _paths = Array.isArray(result?._fsPaths) ? result._fsPaths : [];
+          if (_paths.length) {
+            for (const wp of _paths) _writesDone.push(_normRel(wp, root) || String(wp));
+          } else {
+            // 拿不到具体路径时也要记一笔——记「有」比记「无」重要：
+            // 漏记会变成一句指控，多记最多让主体多抽查一次。
+            _writesDone.push(`（命令写盘：${String(call.command || "").slice(0, 60)}）`);
+          }
+          if (typeof onMutation === "function") onMutation(_paths[0] || String(call.command || "cmd"));
+        }
         if (run && run.ctx) {
           if (_ok && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path && run.ctx.modified) {
             run.ctx.modified.set(String(call.path).split("/").pop(), write ? "worker改" : "改");
@@ -58294,7 +58316,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if ((t === "cmd" || t === "termtask") && _commandWroteCode(it.call, it.rawResult)) {
             run._codeWrittenByCommand = true;
           }
-          if (mutationPath && t !== "cmd" && t !== "termtask") {
+          // worker 的真实写盘路径在 it._workerMutationPaths 里，**不在 it.call.path**。
+          //
+          // worker 的 call.path 是它的**任务描述**（映射层：path: args.description）。
+          // 原来这里一律走 mutationPath，于是 _mutatedFiles 收进去的是一句中文描述，
+          // 而 worker 真正改的那些文件一个都没进去。后果不是"多一条脏数据"：
+          // _mutatedFiles 是 _deliveryFacts 的输入，它算的是「这一轮改了哪些代码文件、
+          // 跑没跑验证」——于是一个由 worker 完成全部实现的 run，交付事实里写着
+          // **0 个代码文件改动**，验证义务整条不武装。_strayScratchFiles 同源失效。
+          if (t === "worker") {
+            for (const wp of (it._workerMutationPaths || [])) {
+              const rel = _normRel(wp, root);
+              if (rel) {
+                _mutatedFiles.add(rel);
+                _pad.modified.set(rel.split("/").pop(), "worker改");
+              }
+            }
+          } else if (mutationPath && t !== "cmd" && t !== "termtask") {
             const actualPath = _normRel(mutationPath, root);
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
