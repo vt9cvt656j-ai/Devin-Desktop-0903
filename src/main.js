@@ -977,7 +977,15 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       }
       // status 必须结构化带上：下游的重试/续传/收尾文案全靠它分类，从文案里反解析
       // 是这套机制上一版最脆的地方（见 _aiFailureKind 上面那段）。
-      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, errorText), status: resp.status });
+      onEvent({
+        kind: "error",
+        message: _formatAiHttpError(resp.status, resp.statusText, errorText),
+        status: resp.status,
+        // 网关一个请求最多换两个上游出口就收手，撞上的那两个已经被记了让位/冷却 ——
+        // 所以**重发一次会落到别的出口上**。置位时就别走 15 秒的限流退避了，
+        // 那是在白等一个本可以立刻成功的请求。从文案里认这件事不行：措辞一改就失效。
+        retryElsewhere: resp.headers?.get?.("x-mide-retry-elsewhere") === "1",
+      });
       onEvent({ kind: "done" });
       return;
     }
@@ -989,7 +997,15 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       } catch (error) {
         t = String(error?.message || error || "");
       }
-      onEvent({ kind: "error", message: _formatAiHttpError(resp.status, resp.statusText, t), status: resp.status });
+      onEvent({
+        kind: "error",
+        message: _formatAiHttpError(resp.status, resp.statusText, t),
+        status: resp.status,
+        // 网关一个请求最多换两个上游出口就收手，撞上的那两个已经被记了让位/冷却 ——
+        // 所以**重发一次会落到别的出口上**。置位时就别走 15 秒的限流退避了，
+        // 那是在白等一个本可以立刻成功的请求。从文案里认这件事不行：措辞一改就失效。
+        retryElsewhere: resp.headers?.get?.("x-mide-retry-elsewhere") === "1",
+      });
       onEvent({ kind: "done" });
       return;
     }
@@ -16139,6 +16155,26 @@ function _thinkingProfileFor(id) {
   return { ...base, levels, defaultLevel, booleanToggle: !!base.booleanToggle && graded <= 1 };
 }
 
+/**
+ * 这个模型的「关思考」在线上是不是 Anthropic 那种形状。
+ *
+ * 网关是按**线路协议**分叉的，不是按模型名：`let anthropic = conn.protocol == "anthropic"`。
+ * 走 anthropic 桥的请求会被翻译成 Anthropic body（thinking 形状、max_tokens 地板都长在
+ * 那条路上）；其余协议的线路**原样透传** body —— 客户端塞什么枚举，上游就收到什么枚举。
+ *
+ * 名字是客户端能拿到的最接近的判据：Claude 一族基本只挂在 anthropic 线路上。
+ * 不能改用 `_thinkingProfileFor().kind` —— Haiku 那一族的 kind 是 "none"（没有可调档位），
+ * 但它照样走 anthropic 桥，按 kind 判会把它整族漏掉。
+ *
+ * 仓库里眼下有三处同样的名单（这里、`_modelSupportsPowerRoute`、`_builtinThinkingProfileFor`
+ * 的 Claude 分支），**刻意不合并**：三处问的是三个不同的问题 —— 功能资格、露出哪种思考
+ * 旋钮、线材是什么形状。合成一个判据等于断言它们永远同进同退，哪天强力版名单收窄，
+ * 就会顺手把线材形状也改掉，而那种改动在测试里是看不见的。
+ */
+function _isAnthropicWireFamily(id = "") {
+  return /claude|opus|sonnet|haiku|fable|mythos/i.test(String(id || ""));
+}
+
 function _builtinThinkingProfileFor(id) {
   // Custom entries use an internal selector id, but thinking capability belongs
   // to the real upstream model name. Preferences remain keyed by the selector id.
@@ -28358,10 +28394,23 @@ async function _predictNextAsk(sess) {
          * 显式关闭照样把 max_tokens 抬到 32000 —— 关思考反而把预算放大 500 倍。
          * 而 `reasoning_effort` 那一支明写着 `e != "off"`，"off" 是唯一被放行的值。
          *
-         * 只对网关发：自定义端点的上游未知，塞一个它不认的枚举可能直接 400，
-         * 那会把这个功能对这批用户整个打死。他们靠上面抬高的 max_tokens 兜底。
+         * 只对**网关上的 Anthropic 一族**发，两个条件缺一不可。
+         *
+         * 自定义端点不发，是因为上游未知，塞一个它不认的枚举可能直接 400。
+         * 网关也不能一律发，是因为分叉判的是**线路协议**（`let anthropic =
+         * conn.protocol == "anthropic"`）而不是模型名：非 anthropic 的线路把 body 原样
+         * 透传，"off" 就这么落到上游手里。2026-08-25 线上实测，stealth/ox-alpha 当天
+         * 7 次 400，报文写着 `reasoning_effort: invalid option: expected one of
+         * "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"` —— "off" 不在它的枚举里。
+         * 表现和这段注释当初要修的病一模一样：那个模型上预测一条都不出，而且是安静的
+         * （只在 `_askPredictReject` 里留下 request_failed）。
+         *
+         * 非 anthropic 那边**不发**是对的，不是将就：40000 那道地板只长在 anthropic 桥
+         * 里（网关的 oai_to_anthropic_with_cache），别的线路上没有任何东西会去抬
+         * max_tokens，上面那个 60 原样生效。主发送路径早就是这么干的 —— 那边 off 经
+         * effortMap 变成 "none"，再被 `effort !== "none"` 挡掉，字段根本不上路。
          */
-        ...(_predictCfg.viaGateway ? { reasoning_effort: "off" } : {}),
+        ...(_predictCfg.viaGateway && _isAnthropicWireFamily(_predictCfg.model) ? { reasoning_effort: "off" } : {}),
       }, ctrl ? ctrl.signal : undefined);
     // 网络失败/非 200/解析失败都会走到这里。原来是直接 return，`_askPredictReject`
     // 保持上一轮的旧值或空 —— 「为什么这儿没有预测」那句承诺在最常见的失败路径上是空的。
@@ -45052,6 +45101,13 @@ function _toolMsgForModel(call, result) {
     // 只见得到那两截。放进 30000 档，和 web_fetch / git_diff / read_skill 同一个理由。
     // MCP **工具**照旧留在 8000：那才是"输出可以任意大且很吵"的那一类。
     : _rt === "mcp" && (call?.kind === "resource" || call?.kind === "prompt") ? 30000
+    // 读屏（read_screen / ui_extract）和 read_file 是同性质的：调它的**全部目的就是把
+    // 那棵可访问性树取回来**，然后按 ref 去点。落在下面 8000 那一档的后果是实测过的：
+    // 500 个元素只有约 39 个到得了模型（头 19 + 尾 20），中间 462 个被 _headTailModelText
+    // 挖空——而目标控件通常就在中段。模型于是看不到要点的东西，转去重读同一份被挖空的
+    // 结果、或改用 OCR、或猜坐标，每一次都再付一整轮往返。
+    // 两者都天然有界（后端 cap 500 个元素 / 200 行），放进 30000 档不会失控。
+    : _rt === "readscreen" || _rt === "uiextract" ? 30000
     : _rt === "web" || _rt === "git" ? 30000
     : _rt && _rt.endsWith("_search") ? 20000
     // cmd/http/mcp output can be arbitrarily huge and noisy → keep the tight guard.
@@ -46745,12 +46801,15 @@ async function _runModelRequestWithRetry({
     try { onAttempt({ attempt, maxAttempts, retry: attemptIndex, retryLimit: boundedRetryLimit }); } catch {}
     let attemptError = "";
     let attemptStatus = 0;
+    // 网关说「还有没试过的上游出口」——重发会落到别处，不该走限流的长退避。
+    let attemptRetryElsewhere = false;
     let attemptProgress = false;
     try {
       await currentInvoke((ev) => {
         if (ev?.kind === "error") {
           attemptError = String(ev.message || "模型线路出现问题");
           attemptStatus = Number(ev.status) || 0;
+          attemptRetryElsewhere = ev.retryElsewhere === true;
           return;
         }
         if (ev?.kind === "done") return;
@@ -46838,6 +46897,9 @@ async function _runModelRequestWithRetry({
     // 只在**还没产出任何内容**时才等——已经出了内容就该走下面的续传，重发会重复正文和计费。
     const canWaitOutRateLimit = !attemptProgress
       && !hadModelProgress
+      // 网关还有没试过的出口时不走这条路：那 15 秒是为「所有上游都在限流」准备的，
+      // 而这种情况下重发一次就会换一个出口、多半立刻成功。走普通重试（2 秒）。
+      && !attemptRetryElsewhere
       && rateLimitWaitsUsed < _AI_MODEL_RATE_LIMIT_WAITS
       && _isRateLimitedAiError(attemptError, attemptStatus);
     if (canWaitOutRateLimit) {
@@ -64154,10 +64216,15 @@ async function _executeToolStepInner(step, call, root, run) {
         });
         const elements = Array.isArray(output?.elements) ? output.elements : [];
         const limitations = Array.isArray(output?.limitations) ? output.limitations : [];
-        const structured = JSON.stringify({ source: output?.source || "unknown", elements: elements.slice(0, 500), limitations }, null, 2);
+        const _rsPayload = { source: output?.source || "unknown", elements: elements.slice(0, 500), limitations };
+        // 给模型的这份**不缩进**。缩进在这里不是可读性，是纯损失：500 个元素 pretty-print
+        // 是 101KB，紧凑只要 60KB，多出来的 68% 全部换成了被 _toolMsgForModel 挖空的元素——
+        // 而挖掉的是中段，正文控件通常就在中段。面板那份照旧缩进，那是给人看的。
+        const structured = JSON.stringify(_rsPayload);
+        const structuredForView = JSON.stringify(_rsPayload, null, 2);
         res.className = "atc-result " + (elements.length ? "atc-result--ok" : "atc-result--err");
         res.textContent = elements.length ? `${_rsWho} · ${elements.length} 个可访问元素` : `${_rsWho} · 未读取到元素`;
-        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 24000))}</pre>`;
+        if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structuredForView.slice(0, 24000))}</pre>`;
         if (vp) step.classList.add("is-open");
         return { type: "readscreen", path: output?.source || "", content: `read_screen 真实结果：\n${structured}` };
       } catch (error) {
