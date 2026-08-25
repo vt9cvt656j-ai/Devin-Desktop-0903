@@ -1,6 +1,21 @@
 import type { LucideIcon } from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { BookOpen, BarChart3, Calculator, ChevronRight, History, LogOut, Mail, Package, Receipt, Route, Share2, SlidersHorizontal, Users } from "lucide-react";
+import {
+  BarChart3,
+  BookOpen,
+  Bot,
+  Calculator,
+  ChevronRight,
+  History,
+  LogOut,
+  Mail,
+  Package,
+  Receipt,
+  Route,
+  Share2,
+  SlidersHorizontal,
+  Users,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { endConsoleSession } from "@/lib/api";
 
@@ -26,9 +41,11 @@ export type NavKey =
   | "mail"
   | "mail-log"
   | "routing"
+  | "routing-health"
   | "routing-groups"
   | "routing-endpoints"
   | "routing-icons"
+  | "employees"
   | "pricing"
   | "commission"
   | "commission-pending"
@@ -89,6 +106,8 @@ export const NAV: (Leaf | Group)[] = [
     label: "模型线路",
     icon: Route,
     children: [
+      // 健康放最上面：出事时第一眼看的是「现在能不能用」，不是「怎么配」。
+      { key: "routing-health", label: "健康" },
       { key: "routing", label: "线路" },
       { key: "routing-groups", label: "分组" },
       // 一条线路挂多个上游出口。和「线路」是两件事：那里改的是这条线路是什么、卖多少钱，
@@ -99,6 +118,9 @@ export const NAV: (Leaf | Group)[] = [
       { key: "routing-icons", label: "模型图标" },
     ],
   },
+  // 智能员工紧跟在模型线路后面：它干的多数事情就是盯着线路，
+  // 而且它用的模型也是上面配的那些线路。
+  { key: "employees", label: "智能员工", icon: Bot },
   { key: "pricing", label: "定价试算", icon: Calculator },
   // 分销是四屏，不是一屏：规则、待结算的钱、谁在推荐、被谁推荐来的。挤在一页里
   // 要滚过两块无关内容才能结算一笔佣金。

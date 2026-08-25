@@ -142,7 +142,44 @@ pub fn own_order_key() -> (u8, f64) {
     (0, 1.0)
 }
 
-/// 把「线路」展开成「实际要发请求的出口」。
+/// 这条线路**连同它的出口**一共能提供哪些模型。
+///
+/// 出口可以带来线路本身没有的模型：你新挂一个中转，它那儿多了两款货，那两款就该出现在
+/// IDE 的模型列表里。所以这里是**并集**，不是线路自己那一份。
+///
+/// 但有一条闸：能不能开放给用户，还要看这个模型**算不算得出价格**（见 `priceable`）。
+/// 算不出价格的模型如果开放出去，用户被扣 0、上游照收你的钱 —— 那不是功能，是漏洞。
+pub fn effective_models(route: &Model, outlets: &[Endpoint]) -> Vec<String> {
+    let mut all = crate::models::allowed_ids(route);
+    for e in outlets.iter().filter(|e| e.active) {
+        for m in &e.enabled_models {
+            if !all.iter().any(|x| x == m) {
+                all.push(m.clone());
+            }
+        }
+    }
+    all
+}
+
+/// 这个模型在这条线路上算不算得出价格。
+///
+/// 三条来源，任一条有就行：每模型覆盖 → 实时目录 → 线路自己的兜底价。
+/// 三条都没有时 `compute_cost` 会算出 0 —— 用户一分不付，而上游照收你的钱。
+/// 所以算不出价的模型**不开放**，宁可它不出现在列表里，也不能让它静默地白送。
+pub fn priceable(route: &Model, model_id: &str) -> bool {
+    let (mi, mo) = crate::models::model_price_override(&route.model_prices, model_id);
+    if mi > 0.0 || mo > 0.0 {
+        return true;
+    }
+    if crate::models::official_price(model_id).is_some() {
+        return true;
+    }
+    // 线路兜底价。实测线上这几条都是 0，所以这一支基本等于「没有」，
+    // 但配了的话就该认。
+    route.input_price > 0.0 || route.output_price > 0.0
+}
+
+/// 把「线路」展开成「实际要发请求的出口」。/// 把「线路」展开成「实际要发请求的出口」。
 ///
 /// 每条线路自带的 `base_url` / `api_key` 也算一个出口，而且是**成本 1.0 的那个**：
 /// 它是原价直连，运维加的转卖出口只要填了折扣就自动排到它前面。这样「不配任何多路由」
@@ -161,13 +198,21 @@ pub fn expand(
         // (排序键, 线路克隆)
         let mut targets: Vec<((u8, f64), Model)> = Vec::new();
 
+        // 线路自带的地址只在**它自己**有这个模型时才算候选。
+        //
+        // 出口能带来线路本身没有的模型（新挂的中转多了两款货）。那种模型的请求派给
+        // 线路自带地址只会撞一个 404 —— 而每个请求只有两次机会，白撞一次就浪费掉一半。
+        let own_has = model_id.is_empty()
+            || crate::models::allowed_ids(r).iter().any(|x| x == model_id);
         // 线路自带的地址：在任的那个。见 own_order_key —— 同价位它留在前面，
         // 真便宜的出口才越得过它。
         let mut own = r.clone();
         own.endpoint_id = None;
         own.endpoint_label = String::new();
         own.endpoint_cost = Some(1.0);
-        targets.push((own_order_key(), own));
+        if own_has {
+            targets.push((own_order_key(), own));
+        }
 
         for e in by_route.get(&r.id).into_iter().flatten() {
             if !e.active || e.base_url.trim().is_empty() {
@@ -180,7 +225,14 @@ pub fn expand(
             // 两次机会（CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED），这一撞就浪费掉一半。
             //
             // 空 = 承载线路的全部模型，也就是不填时和以前完全一样。
-            if !e.enabled_models.is_empty() && !e.enabled_models.iter().any(|x| x == model_id) {
+            // 空 = 承载**线路自己**开放的那些（不是并集 —— 别的出口带来的货，
+            // 这个出口未必有）。非空 = 就这几款。
+            let serves = if e.enabled_models.is_empty() {
+                crate::models::allowed_ids(r).iter().any(|x| x == model_id)
+            } else {
+                e.enabled_models.iter().any(|x| x == model_id)
+            };
+            if !model_id.is_empty() && !serves {
                 continue;
             }
             let mut m = r.clone();
@@ -369,6 +421,127 @@ pub async fn load_for_routes(
         map.entry(r.route_id).or_default().push(r);
     }
     map
+}
+
+// ---------------------------------------------------------------- 观测
+
+/// 记一次出口用量。**火后不管**：丢几条对看板毫无影响，而阻塞一次真实回答的代价是实打实的。
+///
+/// 归属用 `health_id`（出口，或线路自带地址），和计费的 `model_id`（线路）刻意分开 ——
+/// 计费归属换不得，那会让用量静默记成 NULL。
+pub fn note_endpoint_usage(
+    state: &AppState,
+    endpoint_id: uuid::Uuid,
+    route_id: uuid::Uuid,
+    cost_cents: i64,
+    // 直接收三个数，不收计费那边的内部类型 —— 观测不该有能力碰到计费的结构。
+    prompt: i64,
+    completion: i64,
+    cached: i64,
+) {
+    let db = state.db.clone();
+    // 分转微美元。看板要看得见「三分钱」这种量级，按分存会全是 0。
+    let micro = cost_cents.max(0).saturating_mul(10_000);
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO endpoint_usage \
+               (day, endpoint_id, route_id, calls, cost_micro_usd, \
+                prompt_tokens, completion_tokens, cached_tokens) \
+             VALUES (current_date, $1, $2, 1, $3, $4, $5, $6) \
+             ON CONFLICT (day, endpoint_id) DO UPDATE SET \
+               calls = endpoint_usage.calls + 1, \
+               cost_micro_usd = endpoint_usage.cost_micro_usd + EXCLUDED.cost_micro_usd, \
+               prompt_tokens = endpoint_usage.prompt_tokens + EXCLUDED.prompt_tokens, \
+               completion_tokens = endpoint_usage.completion_tokens + EXCLUDED.completion_tokens, \
+               cached_tokens = endpoint_usage.cached_tokens + EXCLUDED.cached_tokens, \
+               updated_at = now()",
+        )
+        .bind(endpoint_id)
+        .bind(route_id)
+        .bind(micro)
+        .bind(prompt)
+        .bind(completion)
+        .bind(cached)
+        .execute(&db)
+        .await;
+    });
+}
+
+/// 问一个中转「我还剩多少额度」。
+///
+/// # 没有标准，所以是尽力而为
+///
+/// 各家中转的余额接口互不相同，也没有任何一个标准。这里按三种线上最常见的形态各试一次：
+///   · One API / New API 那一族（国内转卖用得最多）：`/api/user/self` → `quota`/`used_quota`
+///   · OpenRouter：`/api/v1/auth/key` → `limit_remaining`
+///   · OpenAI 官方那套：`/dashboard/billing/subscription`
+///
+/// **查不到就明确回「查不到」，绝不猜、绝不填 0。** 一个显示成 0 的余额会让人以为
+/// 没钱了去充值，而实际可能只是这家没有这个接口 —— 报错的信息量为零，误导的代价却是真的。
+async fn query_balance(http: &reqwest::Client, base_url: &str, key: &str) -> Option<String> {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let bearer = format!("Bearer {key}");
+
+    // 形态一：One API / New API
+    if let Ok(r) = http
+        .get(format!("{root}/api/user/self"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+    {
+        if r.status().is_success() {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                let d = v.get("data").unwrap_or(&v);
+                if let Some(q) = d.get("quota").and_then(|x| x.as_f64()) {
+                    let used = d.get("used_quota").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    // 这一族的 quota 是「点」，惯例 500000 点 = 1 美元。
+                    return Some(format!(
+                        "${:.2}（已用 ${:.2}）",
+                        q / 500_000.0,
+                        used / 500_000.0
+                    ));
+                }
+            }
+        }
+    }
+
+    // 形态二：OpenRouter
+    if let Ok(r) = http
+        .get(format!("{root}/api/v1/auth/key"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+    {
+        if r.status().is_success() {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                let d = v.get("data").unwrap_or(&v);
+                let used = d.get("usage").and_then(|x| x.as_f64());
+                let left = d.get("limit_remaining").and_then(|x| x.as_f64());
+                match (left, used) {
+                    (Some(l), _) => return Some(format!("${l:.2}")),
+                    (None, Some(u)) => return Some(format!("已用 ${u:.2}（未设上限）")),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 形态三：OpenAI 官方
+    if let Ok(r) = http
+        .get(format!("{root}/dashboard/billing/subscription"))
+        .header("authorization", &bearer)
+        .send()
+        .await
+    {
+        if r.status().is_success() {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                if let Some(x) = v.get("hard_limit_usd").and_then(|x| x.as_f64()) {
+                    return Some(format!("上限 ${x:.2}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------- 调度
@@ -1112,8 +1285,16 @@ pub struct RouteOut {
     pub base_url: String,
     pub active: bool,
     pub model_count: usize,
-    /// 这条线路开放的模型 id。出口只能在这个范围里做减法，所以编辑出口时要看到它。
+    /// 这条线路开放的模型 id。
     pub models: Vec<String>,
+    /// 这条线路怎么计费。出口窗口里**只读显示** —— 加一个出口时你要知道它的流量
+    /// 会被按什么价计费，但计费是线路的属性，不能在出口这一层改。
+    pub billing_mode: String,
+    pub rate: f64,
+    pub cache_disabled: bool,
+    /// 单模型定价和显示名（线路上的那一份），出口窗口里可以就地编辑。
+    pub model_prices: serde_json::Value,
+    pub model_names: serde_json::Value,
     /// 线路自带那个地址的调度状态（它也是一个出口）。
     pub sched: &'static str,
     pub retry_in: Option<u64>,
@@ -1160,7 +1341,177 @@ pub async fn admin_relist(
     Ok(Json(serde_json::json!({ "relisted": was })))
 }
 
-/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。
+#[derive(Serialize)]
+pub struct HealthRow {
+    pub endpoint_id: uuid::Uuid,
+    pub route_id: uuid::Uuid,
+    pub route_label: String,
+    pub vendor: &'static str,
+    /// 出口备注；线路自带地址回「直连」。
+    pub label: String,
+    pub base_url: String,
+    pub is_own: bool,
+    pub active: bool,
+    pub cost_ratio: f64,
+    pub capacity: Option<f64>,
+    /// 调度状态：live / saturated / no_quota / auth
+    pub sched: &'static str,
+    pub retry_in: Option<u64>,
+    /// 真实流量的结论：ok / degraded / error / unknown
+    pub live: String,
+    pub consecutive_failures: i64,
+    pub last_ok_secs_ago: Option<i64>,
+    /// 最近一次主动探测
+    pub probe_ok: Option<bool>,
+    pub probe_ms: Option<i32>,
+    pub probe_note: String,
+    /// 用量：今天 / 最近 7 天
+    pub calls_today: i64,
+    pub cost_today_usd: f64,
+    pub calls_7d: i64,
+    pub cost_7d_usd: f64,
+    pub cached_tokens_7d: i64,
+    /// 余额。null = 这家没有可识别的余额接口，或者查失败 —— **不是 0**。
+    pub balance: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UsageRow {
+    endpoint_id: uuid::Uuid,
+    calls_today: i64,
+    cost_today: i64,
+    calls_7d: i64,
+    cost_7d: i64,
+    cached_7d: i64,
+}
+
+/// `GET /api/admin/route-health` —— 健康面板要的全部事实。
+///
+/// 一次把「它现在什么状态、最近成不成、花了多少、还剩多少钱」凑齐。分散在几个接口里
+/// 的话，页面要串行等好几轮，而这一页的用途正是「出事时快速看一眼」。
+///
+/// `?balance=1` 才去问上游余额 —— 那是几个网络往返，不该让每次刷新都付这个钱。
+pub async fn admin_health(
+    State(state): State<AppState>,
+    claims: Claims,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let want_balance = q.get("balance").map(|v| v == "1").unwrap_or(false);
+
+    let routes: Vec<Model> = sqlx::query_as("SELECT * FROM models ORDER BY sort, created_at")
+        .fetch_all(&state.db)
+        .await?;
+    let eps: Vec<Endpoint> = sqlx::query_as("SELECT * FROM route_endpoints ORDER BY cost_ratio")
+        .fetch_all(&state.db)
+        .await?;
+    // 用量一次查完，别在循环里逐个查。
+    let usage: Vec<UsageRow> = sqlx::query_as(
+        "SELECT endpoint_id, \
+            COALESCE(SUM(calls) FILTER (WHERE day = current_date), 0)::bigint AS calls_today, \
+            COALESCE(SUM(cost_micro_usd) FILTER (WHERE day = current_date), 0)::bigint AS cost_today, \
+            COALESCE(SUM(calls), 0)::bigint AS calls_7d, \
+            COALESCE(SUM(cost_micro_usd), 0)::bigint AS cost_7d, \
+            COALESCE(SUM(cached_tokens), 0)::bigint AS cached_7d \
+         FROM endpoint_usage WHERE day >= current_date - 6 GROUP BY endpoint_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let by_ep: HashMap<uuid::Uuid, &UsageRow> =
+        usage.iter().map(|u| (u.endpoint_id, u)).collect();
+
+    let now_ts = chrono::Utc::now().timestamp();
+    let http = probe_client();
+    let mut rows: Vec<HealthRow> = Vec::new();
+
+    for r in &routes {
+        let vendor = vendor_of(&r.provider, &crate::models::allowed_ids(r), &r.base_url);
+        // 线路自带的地址也是一个出口，必须出现在面板里 —— 它往往是最常出问题的那个。
+        let mut entries: Vec<(uuid::Uuid, String, String, bool, f64, Option<f64>, bool, Option<bool>, Option<i32>, String, String)> =
+            vec![(
+                r.id,
+                "直连".into(),
+                r.base_url.clone(),
+                true,
+                1.0,
+                None,
+                r.active,
+                None,
+                None,
+                String::new(),
+                r.api_key.clone(),
+            )];
+        for e in eps.iter().filter(|e| e.route_id == r.id) {
+            let key = if e.api_key.trim().is_empty() { r.api_key.clone() } else { e.api_key.clone() };
+            entries.push((
+                e.id,
+                if e.label.trim().is_empty() { "未命名出口".into() } else { e.label.clone() },
+                e.base_url.clone(),
+                false,
+                e.cost_ratio,
+                e.capacity,
+                e.active,
+                e.probe_ok,
+                e.probe_ms,
+                e.probe_note.clone(),
+                key,
+            ));
+        }
+
+        for (id, label, base, is_own, cost, cap, active, pok, pms, pnote, key) in entries {
+            let h = crate::route_health::snapshot(&state, id).await;
+            let u = by_ep.get(&id);
+            let balance = if want_balance && !key.trim().is_empty() {
+                query_balance(&http, &base, &crate::models::model_key(&key)).await
+            } else {
+                None
+            };
+            rows.push(HealthRow {
+                endpoint_id: id,
+                route_id: r.id,
+                route_label: r.label.clone(),
+                vendor,
+                label,
+                base_url: base,
+                is_own,
+                active,
+                cost_ratio: cost,
+                capacity: cap,
+                sched: sched_word(id),
+                retry_in: retry_in_secs(id),
+                live: crate::route_health::classify(&h, now_ts).to_string(),
+                consecutive_failures: h.consecutive_failures,
+                last_ok_secs_ago: h.last_ok_at.map(|t| now_ts.saturating_sub(t)),
+                probe_ok: pok,
+                probe_ms: pms,
+                probe_note: pnote,
+                calls_today: u.map(|x| x.calls_today).unwrap_or(0),
+                cost_today_usd: u.map(|x| x.cost_today as f64 / 1_000_000.0).unwrap_or(0.0),
+                calls_7d: u.map(|x| x.calls_7d).unwrap_or(0),
+                cost_7d_usd: u.map(|x| x.cost_7d as f64 / 1_000_000.0).unwrap_or(0.0),
+                cached_tokens_7d: u.map(|x| x.cached_7d).unwrap_or(0),
+                balance,
+            });
+        }
+    }
+
+    // 告警收件人：一个 admin 把 email 填成用户名，就永远收不到线路告警，
+    // 而这件事只在启动日志里闪一下。放到面板上。
+    let admins = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE role = 'admin'")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let usable = admins.iter().filter(|e| e.contains('@') && e.len() > 3).count();
+
+    Ok(Json(serde_json::json!({
+        "rows": rows,
+        "alarm": { "usable": usable, "total": admins.len() },
+        "balance_included": want_balance,
+    })))
+}
+
+/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。
 pub async fn admin_list(
     State(state): State<AppState>,
     claims: Claims,
@@ -1217,6 +1568,11 @@ pub async fn admin_list(
             active: r.active,
             model_count: crate::models::allowed_ids(r).len(),
             models: crate::models::allowed_ids(r),
+            billing_mode: r.billing_mode.clone(),
+            rate: r.rate,
+            cache_disabled: r.cache_disabled,
+            model_prices: r.model_prices.clone(),
+            model_names: r.model_names.clone(),
             sched: sched_word(r.id),
             retry_in: retry_in_secs(r.id),
             live: aggregate_live(&state, r.id, now).await.to_string(),
@@ -1226,31 +1582,71 @@ pub async fn admin_list(
     Ok(Json(serde_json::json!({ "routes": out })))
 }
 
+/// 前端送来的保存请求。
+///
+/// # 每个字段都要能吃 `null`
+///
+/// `#[serde(default)]` 只管**字段缺失**，管不了字段在、值是 `null`。而前端里
+/// `x ? f(x) : null`、以及 `Number(...)` 出 NaN 被 `JSON.stringify` 写成 `null`，
+/// 都太常见了 —— 一个显式 null 打在 `String` 或 `f64` 上，请求会在**进入处理函数
+/// 之前**被提取器拒掉，报一句英文 serde 错，服务端一行日志都没有。
+///
+/// 那正是「点保存没反应、查不出原因」的形状。所以这里一律用 `null_as_*`：
+/// null 一律当成没填，真正的校验交给下面那几个 `clean_*`，它们会说人话。
 #[derive(Deserialize)]
 pub struct SaveReq {
+    #[serde(default)]
     pub id: Option<uuid::Uuid>,
     pub route_id: uuid::Uuid,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub label: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub base_url: String,
-    /// 空字符串 = 不改（改地址时不用把密钥再抄一遍）。要清空得填一个空格以外的显式值。
-    #[serde(default)]
+    /// 空字符串 = 不改（改地址时不用把密钥再抄一遍）。
+    #[serde(default, deserialize_with = "null_as_default")]
     pub api_key: String,
-    #[serde(default = "one")]
+    #[serde(default = "one", deserialize_with = "null_as_one")]
     pub cost_ratio: f64,
-    #[serde(default = "yes")]
+    #[serde(default = "yes", deserialize_with = "null_as_yes")]
     pub active: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub note: String,
     /// 这个出口实际有哪些模型。空数组 = 线路的全部。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub enabled_models: Vec<String>,
     /// 空串 = 跟线路一样。只收 anthropic / openai。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub protocol: String,
     /// 能扛多少（相对值）。None / 0 = 不填。
     #[serde(default)]
     pub capacity: Option<f64>,
+    /// 顺手改的单模型定价，形状 `{ "模型id": {"in": 3.0, "out": 15.0} }`。
+    ///
+    /// **写到线路上，不写到出口上。** 价格是线路的属性，同一条线路的几个出口共用一份。
+    /// 放在这个窗口里只是因为「发现新模型」和「给它定价」是同一件事的两半 ——
+    /// 让人跑去另一页再回来，多数人会直接放弃，然后那个模型就永远开放不了。
+    #[serde(default)]
+    pub model_prices: Option<serde_json::Value>,
+    /// 单模型显示名，同上，也写到线路。
+    #[serde(default)]
+    pub model_names: Option<serde_json::Value>,
+}
+
+/// 把 `null` 当成「没填」。见 SaveReq 上面那段。
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+fn null_as_one<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(1.0))
+}
+
+fn null_as_yes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(d)?.unwrap_or(true))
 }
 
 fn one() -> f64 {
@@ -1325,30 +1721,76 @@ fn clean_url(v: &str) -> ApiResult<String> {
 pub async fn admin_save(
     State(state): State<AppState>,
     claims: Claims,
-    Json(req): Json<SaveReq>,
+    // 收原始字节自己解，不用 `Json<SaveReq>`。
+    //
+    // 这是被一次真实故障逼出来的：控制台连着 5 次 400，而 axum 的提取器在字段类型
+    // 对不上时**先于处理函数**就把请求拒了 —— 那种 400 是英文的 serde 报错、不进
+    // 任何日志、也不经过这里加的任何一行代码。于是「它到底为什么不让我存」在服务端
+    // 一点线索都没有，只能靠猜。
+    //
+    // 自己解之后：解不出来是一句说得清的中文 + 一条带字段名的日志。多一次
+    // from_slice 的开销，换掉一整类查不出来的失败。
+    body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
+    let req: SaveReq = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            bytes = body.len(),
+            "出口保存：请求体解不出来（字段类型对不上，或者前端发了个意外的形状）"
+        );
+        AppError::bad(format!("请求格式不对：{e}"))
+    })?;
 
-    let base_url = clean_url(&req.base_url)?;
-    let cost_ratio = clean_ratio(req.cost_ratio)?;
+    // 被拒的保存要留痕。
+    //
+    // 这一段是真实故障逼出来的：控制台连着 5 次 400，而 400 不进错误日志、响应又走
+    // MSE 加密（nginx 记的是密文长度），于是「它到底为什么不让我存」在服务端**一点
+    // 线索都没有**。校验失败是运维每天都会撞到的事，不是异常，所以它该有日志 ——
+    // 带够定位用的字段，唯独不带密钥。
+    let reject = |why: AppError| -> AppError {
+        tracing::warn!(
+            route_id = %req.route_id,
+            base_url = %req.base_url,
+            models = req.enabled_models.len(),
+            protocol = %req.protocol,
+            editing = req.id.is_some(),
+            reason = %why.msg,
+            "出口没存成"
+        );
+        why
+    };
+
+    let base_url = clean_url(&req.base_url).map_err(reject)?;
+    let cost_ratio = clean_ratio(req.cost_ratio).map_err(reject)?;
     let label: String = req.label.trim().chars().take(MAX_LABEL).collect();
     let note: String = req.note.trim().chars().take(MAX_NOTE).collect();
-    let protocol = clean_protocol(&req.protocol)?;
-    let capacity = clean_capacity(req.capacity)?;
+    let protocol = clean_protocol(&req.protocol).map_err(reject)?;
+    let capacity = clean_capacity(req.capacity).map_err(reject)?;
 
     let route: Option<Model> = sqlx::query_as("SELECT * FROM models WHERE id = $1")
         .bind(req.route_id)
         .fetch_optional(&state.db)
         .await?;
     let Some(route) = route else {
-        return Err(AppError::bad("线路不存在"));
+        return Err(reject(AppError::bad("线路不存在")));
     };
 
-    // 出口只能承载线路**已经开放**的模型的子集。
+    // 先把这次顺手填的定价并进线路，再做价格闸校验。
     //
-    // 允许填线路之外的模型，就等于从这里悄悄开了一个后门：那个模型没有价格、没有能力
-    // 兜底、也不在 IDE 的列表里，但请求真的会被发出去、真的会产生上游账单。
-    // 开放哪些模型是线路的事，这里只做减法。
+    // 顺序不能反：新模型的价就是在这个窗口里填的，先校验的话它永远查不到价、永远存不上，
+    // 而报错还让人「去线路那页填」—— 那页根本没有这个模型。
+    let mut route = route;
+    if req.model_prices.is_some() || req.model_names.is_some() {
+        merge_route_pricing(&state, &mut route, &req).await?;
+    }
+
+    // 出口可以带来线路本身没有的模型 —— 新挂一个中转，它那儿多了两款货，
+    // 那两款就该出现在 IDE 的列表里。
+    //
+    // 但有一条闸：**算不出价格的不许开放**。价格有三条来源（每模型覆盖 → 实时目录 →
+    // 线路兜底价），三条都没有时 `compute_cost` 会算出 0，用户一分不付而上游照收你的钱。
+    // 那不是功能，是漏洞。所以这里拒掉，并在报错里说清楚该去哪儿补价。
     let allowed = crate::models::allowed_ids(&route);
     let mut enabled_models: Vec<String> = req
         .enabled_models
@@ -1358,14 +1800,24 @@ pub async fn admin_save(
         .collect();
     enabled_models.sort();
     enabled_models.dedup();
-    if let Some(bad) = enabled_models.iter().find(|m| !allowed.contains(m)) {
-        return Err(AppError::bad(format!(
-            "「{bad}」不在这条线路开放的模型里 —— 出口只能承载线路已有模型的一部分"
-        )));
+    if let Some(bad) = enabled_models
+        .iter()
+        .find(|m| !allowed.contains(m) && !priceable(&route, m))
+    {
+        return Err(reject(AppError::bad(format!(
+            "「{bad}」是这条线路没有的新模型，但算不出它的价格 —— 开放出去用户一分不付、\
+             上游照收你的钱。去线路那页给它填一个单模型价，或者先别勾它。"
+        ))));
     }
-    // 全选和不选是同一件事，都存成空：这样以后线路加了新模型，出口会自动跟着有，
-    // 而不是停在保存那天的那一份名单上。
-    if enabled_models.len() == allowed.len() {
+    // 「正好等于线路那一份」和「不选」是同一件事，都存成空：这样以后线路加了新模型，
+    // 出口会自动跟着有，而不是停在保存那天的那一份名单上。
+    //
+    // 判据必须是**集合相等**，不能是长度相等。出口现在能带来线路没有的模型 ——
+    // 线路有 6 个，勾了 4 个原有 + 2 个新的也是 6 个，按长度判会把整份选择清空，
+    // 那两个新模型**静默消失**：存的时候不报错，只是它们再也不会被派到这个出口。
+    let is_exactly_the_routes_own = enabled_models.len() == allowed.len()
+        && enabled_models.iter().all(|m| allowed.contains(m));
+    if is_exactly_the_routes_own {
         enabled_models.clear();
     }
 
@@ -1446,7 +1898,57 @@ pub async fn admin_save(
         None => serde_json::Value::Null,
     };
 
+    tracing::info!(route_id = %req.route_id, endpoint = %id, "出口已保存");
     Ok(Json(serde_json::json!({ "id": id, "probe": probe })))
+}
+
+/// 把这次填的单模型定价合并进**线路**。
+///
+/// # 为什么不存到出口上
+///
+/// 价格是线路的属性 —— 同一条线路的几个出口对用户完全等价，只有我的进价不同。
+/// 要是每个出口各存一份价，同一个模型用户被扣多少钱就要看当时哪家先答；这正是整套
+/// 多路由设计第一天就堵死的那个洞，不能从这个窗口再开一次。
+///
+/// 所以这里是「在出口窗口里编辑线路的定价」，不是「给出口定价」。合并而不是覆盖：
+/// 这个窗口只列了这一家有的那些模型，整份覆盖会把线路上别的模型的价抹掉。
+async fn merge_route_pricing(
+    state: &AppState,
+    route: &mut Model,
+    req: &SaveReq,
+) -> ApiResult<()> {
+    fn merge(base: &serde_json::Value, patch: &serde_json::Value) -> serde_json::Value {
+        let mut out = base.as_object().cloned().unwrap_or_default();
+        if let Some(p) = patch.as_object() {
+            for (k, v) in p {
+                // null / 空对象 = 把这一条删掉，而不是写一个空进去。
+                if v.is_null() {
+                    out.remove(k);
+                } else {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        serde_json::Value::Object(out)
+    }
+
+    let prices = match &req.model_prices {
+        Some(p) => merge(&route.model_prices, p),
+        None => route.model_prices.clone(),
+    };
+    let names = match &req.model_names {
+        Some(n) => merge(&route.model_names, n),
+        None => route.model_names.clone(),
+    };
+    sqlx::query("UPDATE models SET model_prices = $2, model_names = $3 WHERE id = $1")
+        .bind(route.id)
+        .bind(&prices)
+        .bind(&names)
+        .execute(&state.db)
+        .await?;
+    route.model_prices = prices;
+    route.model_names = names;
+    Ok(())
 }
 
 /// 唯一索引撞了就说人话。原始报错里有表名、索引名和列值，对运维没用。
@@ -1596,9 +2098,20 @@ pub async fn admin_available(
     let allowed = crate::models::allowed_ids(&route);
     let here: Vec<String> = allowed.iter().filter(|m| ids.contains(m)).cloned().collect();
     let missing: Vec<String> = allowed.iter().filter(|m| !ids.contains(m)).cloned().collect();
+    // 这家有、而线路没有的 —— 勾上就会**新增**到 IDE 的模型列表里。
+    //
+    // 分成能开放和不能开放两堆：算不出价格的开放出去，用户一分不付而上游照收你的钱。
+    // 所以这里先替运维把这件事分好，而不是等他保存时才报错。
+    let (extra_ok, extra_no_price): (Vec<String>, Vec<String>) = ids
+        .iter()
+        .filter(|m| !allowed.contains(m))
+        .cloned()
+        .partition(|m| priceable(&route, m));
     Ok(Json(serde_json::json!({
         "here": here,
         "missing": missing,
+        "extra": extra_ok,
+        "extra_no_price": extra_no_price,
         "upstream_total": ids.len(),
     })))
 }
@@ -1815,6 +2328,180 @@ mod tests {
         );
     }
 
+    /// 出口可以带来线路本身没有的模型。
+    #[test]
+    fn an_endpoint_can_bring_models_the_route_never_had() {
+        let mut r = model("anthropic");
+        r.enabled_models = vec!["claude-opus-5".into()];
+        let mut e = ep(0.3, Some(true), "https://extra.example.com");
+        e.enabled_models = vec!["claude-opus-5".into(), "claude-haiku-9".into()];
+        let all = effective_models(&r, &[e]);
+        assert!(all.contains(&"claude-haiku-9".to_string()), "出口带来的新模型没进并集");
+        assert!(all.contains(&"claude-opus-5".to_string()));
+        assert_eq!(all.len(), 2, "并集里出现了重复");
+        // 停用的出口不该贡献模型。
+        let mut off = ep(0.3, Some(true), "https://off.example.com");
+        off.enabled_models = vec!["ghost-model".into()];
+        off.active = false;
+        assert!(!effective_models(&r, &[off]).contains(&"ghost-model".to_string()));
+    }
+
+    /// 线路自带的地址没有那款货时，不能把请求派给它。
+    ///
+    /// 派过去只会撞一个 404，而每个请求只有两次机会 —— 白撞一次就浪费掉一半。
+    #[test]
+    fn the_direct_address_is_skipped_for_a_model_it_does_not_have() {
+        let mut r = model("anthropic");
+        r.enabled_models = vec!["claude-opus-5".into()];
+        let mut e = ep(0.3, Some(true), "https://extra.example.com");
+        e.enabled_models = vec!["claude-haiku-9".into()];
+        let mut map = HashMap::new();
+        map.insert(r.id, vec![e]);
+
+        // 只有出口有的那款：候选里不该出现线路自带地址
+        let urls: Vec<String> = expand(&[r.clone()], &map, "claude-haiku-9")
+            .into_iter()
+            .map(|m| m.base_url)
+            .collect();
+        assert_eq!(urls, vec!["https://extra.example.com"], "把新模型派给了没有它的直连");
+
+        // 线路自己那款：出口没有它，所以只剩直连
+        let urls: Vec<String> = expand(&[r], &map, "claude-opus-5")
+            .into_iter()
+            .map(|m| m.base_url)
+            .collect();
+        assert_eq!(urls, vec!["https://own.example.com"]);
+    }
+
+    /// 算不出价格的模型不许开放。
+    ///
+    /// 价格有三条来源：每模型覆盖 → 实时目录 → 线路兜底价。三条都没有时
+    /// `compute_cost` 会算出 0 —— 用户一分不付，而上游照收你的钱。这不是少收了点钱，
+    /// 是每一次调用都在白送，而且账面上完全看不出来。
+    #[test]
+    fn a_model_with_no_resolvable_price_is_refused() {
+        let mut r = model("anthropic");
+        // 线路兜底价为 0（线上实测就是这样），目录里也没有这个自造的名字
+        r.input_price = 0.0;
+        r.output_price = 0.0;
+        assert!(!priceable(&r, "some-relay-private-name-v9"), "查不到价却说能开放");
+
+        // 填了单模型价就能开放
+        r.model_prices = serde_json::json!({ "some-relay-private-name-v9": { "in": 3.0, "out": 15.0 } });
+        assert!(priceable(&r, "some-relay-private-name-v9"));
+
+        // 线路兜底价也算一条来源
+        let mut r2 = model("anthropic");
+        r2.input_price = 2.0;
+        assert!(priceable(&r2, "anything-at-all"));
+    }
+
+    /// 「全选归一成空」的判据必须是集合相等，不能是长度相等。
+    ///
+    /// 出口能带来线路没有的模型之后，长度判就错了：线路 6 个，勾 4 个原有 + 2 个新的
+    /// 也是 6 个 —— 按长度判会把整份选择清空，那两个新模型**静默消失**。
+    /// 保存不报错，只是它们再也不会被派到这个出口，而界面上还显示勾着。
+    #[test]
+    fn the_normalise_to_empty_rule_compares_sets_not_lengths() {
+        let s = src();
+        let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
+        let body = &s[i..];
+        assert!(
+            body.contains("enabled_models.iter().all(|m| allowed.contains(m))"),
+            "还在按长度判：勾了同样多但含新模型时，那几个新模型会被静默清掉"
+        );
+        // 纯逻辑复现一遍，防止实现改成别的等价写法后这条断言失去意义。
+        let allowed = vec!["a".to_string(), "b".into(), "c".into()];
+        let same_len_but_different = vec!["a".to_string(), "b".into(), "新模型".into()];
+        let exactly = vec!["a".to_string(), "b".into(), "c".into()];
+        let judge = |sel: &Vec<String>| {
+            sel.len() == allowed.len() && sel.iter().all(|m| allowed.contains(m))
+        };
+        assert!(!judge(&same_len_but_different), "含新模型的选择被当成了「就是线路那一份」");
+        assert!(judge(&exactly));
+    }
+
+    /// 在出口窗口里填的价，必须写到**线路**上，不能写到出口上。
+    ///
+    /// 这是新开的一条写入路径，也是最容易把不变量弄丢的地方：每个出口各存一份价的话，
+    /// 同一个模型用户被扣多少钱就要看当时哪家先答 —— 那正是整套多路由第一天堵死的洞。
+    #[test]
+    fn prices_edited_in_the_outlet_dialog_are_stored_on_the_route() {
+        let s = src();
+        let i = s.find("async fn merge_route_pricing(").expect("合并函数不见了");
+        let body = &s[i..s[i..].find("\n/// 唯一索引").map(|j| i + j).unwrap_or(s.len())];
+        assert!(
+            body.contains("UPDATE models SET model_prices"),
+            "定价没写到 models 表 —— 写到出口上就等于每个出口一份价"
+        );
+        assert!(
+            !body.contains("UPDATE route_endpoints"),
+            "定价被写到出口表上了：同一个模型的账单会随出口变"
+        );
+        // route_endpoints 表结构里也不许出现价格列。
+        for mig in [
+            include_str!("../migrations/20260851_route_endpoints.sql"),
+            include_str!("../migrations/20260852_route_endpoint_scope.sql"),
+            include_str!("../migrations/20260853_route_endpoint_capacity.sql"),
+        ] {
+            for col in ["input_price", "output_price", "model_prices", "rate ", "billing_mode"] {
+                assert!(
+                    !mig.contains(&format!("ADD COLUMN IF NOT EXISTS {col}"))
+                        && !mig.contains(&format!("    {col}")),
+                    "出口表上出现了计价列 {col} —— 换出口就会换账单"
+                );
+            }
+        }
+    }
+
+    /// 合并，不是覆盖。
+    ///
+    /// 出口窗口只列了这一家有的那几个模型。整份覆盖会把线路上别的模型的价**抹掉**，
+    /// 而那个后果要等到别人用那个模型时才显现：突然一分钱不收。
+    #[test]
+    fn merging_prices_never_wipes_the_rest() {
+        let s = src();
+        let i = s.find("async fn merge_route_pricing(").expect("合并函数不见了");
+        let body = &s[i..];
+        assert!(
+            body.contains("fn merge(base: &serde_json::Value, patch: &serde_json::Value)"),
+            "不是合并了 —— 整份覆盖会把线路上别的模型的价抹掉"
+        );
+        assert!(
+            body.contains("out.remove(k)"),
+            "没有删除语义：想去掉某个模型的价就只能留一个空对象在那儿"
+        );
+    }
+
+    /// 先合并定价，再做价格闸校验。
+    ///
+    /// 顺序反了的话，新模型的价明明就在这次请求里，却因为「查不到价」被拒 ——
+    /// 而报错还让人去线路那页填，那页根本没有这个模型。死循环。
+    #[test]
+    fn pricing_is_merged_before_the_price_gate_runs() {
+        let s = src();
+        let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
+        let body = &s[i..];
+        let merged = body.find("merge_route_pricing(&state, &mut route, &req)").expect("没合并定价");
+        let gate = body.find("!allowed.contains(m) && !priceable(&route, m)").expect("价格闸不见了");
+        assert!(
+            merged < gate,
+            "价格闸跑在合并之前：这次填的价还没落库，新模型必然被判成「查不到价」"
+        );
+    }
+
+    /// 保存出口时，新模型必须先有价格。
+    #[test]
+    fn saving_an_unpriceable_new_model_is_rejected() {
+        let s = src();
+        let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
+        let body = &s[i..];
+        assert!(
+            body.contains("!allowed.contains(m) && !priceable(&route, m)"),
+            "价格闸没了 —— 出口能开放一个用户不付钱、你照付的模型"
+        );
+    }
+
     /// 不填模型 = 承载线路的全部。不填时行为必须和加这个功能之前一模一样。
     #[test]
     fn an_endpoint_with_no_model_list_serves_everything() {
@@ -1861,19 +2548,17 @@ mod tests {
         assert!(clean_protocol("anthropic-v2").is_err());
     }
 
-    /// 出口不能开出线路之外的模型。
+    /// 全选要归一成空。
+    ///
+    /// 不归一的话，线路以后加了新模型，这个出口会停在保存那天的名单上 —— 而运维
+    /// 当初勾的是「全部」，不是「这七个」。
     #[test]
-    fn an_endpoint_cannot_open_a_model_the_route_never_offered() {
+    fn selecting_everything_is_stored_as_empty() {
         let s = src();
         let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
         let body = &s[i..];
         assert!(
-            body.contains("不在这条线路开放的模型里"),
-            "出口能填线路之外的模型了 —— 那个模型没有价格、不在 IDE 列表里，\
-             但请求真会发出去、真会产生上游账单"
-        );
-        assert!(
-            body.contains("if enabled_models.len() == allowed.len()"),
+            body.contains("if is_exactly_the_routes_own {"),
             "全选没有归一成空 —— 线路以后加了新模型，这个出口会停在保存那天的名单上"
         );
     }
@@ -1902,6 +2587,114 @@ mod tests {
         assert!(clean_ratio(f64::NAN).is_err());
         // NaN 尤其要挡：它参与排序时所有比较都返回 false，会让次序变成
         // 「取决于库里的行序」——一个看起来随机、永远查不出来的 bug。
+    }
+
+    /// 前端真实发出的那个载荷，必须能反序列化。
+    ///
+    /// 这一条钉的是一个真实故障：控制台点「保存」连着 5 次 400，而 `admin_save` 自己的
+    /// 任何一条校验文案都对不上响应体长度 —— 说明请求**在进入处理函数之前**就被
+    /// 提取器拒了。这种 400 不进错误日志、文案是英文的 serde 报错，最难查。
+    ///
+    /// 载荷逐字抄自 admin-ui 的 save()：新建时 `id` 是 undefined，JSON.stringify 会
+    /// 把这个键整个丢掉。
+    #[test]
+    fn the_exact_payload_the_console_sends_deserialises() {
+        // 新建：没有 id，capacity 是 null
+        let create = serde_json::json!({
+            "route_id": "11111111-1111-1111-1111-111111111111",
+            "label": "转卖A",
+            "base_url": "https://relay.example.com/v1",
+            "api_key": "sk-test",
+            "cost_ratio": 0.3,
+            "note": "",
+            "protocol": "",
+            "active": true,
+            "enabled_models": ["claude-opus-5"],
+            "capacity": serde_json::Value::Null,
+        });
+        let got = serde_json::from_value::<SaveReq>(create);
+        assert!(got.is_ok(), "新建的载荷反序列化失败：{:?}", got.err().map(|e| e.to_string()));
+
+        // 编辑：带 id，capacity 是个数
+        let update = serde_json::json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "route_id": "11111111-1111-1111-1111-111111111111",
+            "label": "", "base_url": "https://relay.example.com/v1", "api_key": "",
+            "cost_ratio": 1, "note": "", "protocol": "openai", "active": true,
+            "enabled_models": [], "capacity": 600,
+        });
+        assert!(
+            serde_json::from_value::<SaveReq>(update).is_ok(),
+            "编辑的载荷反序列化失败"
+        );
+
+        // 最小载荷：只有必填的两个。其余都该有默认值，
+        // 否则一个旧版前端就会把整条链路打成 400。
+        let minimal = serde_json::json!({
+            "route_id": "11111111-1111-1111-1111-111111111111",
+            "base_url": "https://relay.example.com/v1",
+        });
+        let got = serde_json::from_value::<SaveReq>(minimal);
+        assert!(got.is_ok(), "最小载荷反序列化失败：{:?}", got.err().map(|e| e.to_string()));
+    }
+
+    /// 每个字段被显式打成 `null` 时都不能把请求打死。
+    ///
+    /// 这一条钉的是「点保存没反应、服务端查不出原因」那类故障的根：`#[serde(default)]`
+    /// 只管字段**缺失**，管不了值是 `null`。而前端里 `x ? f(x) : null`、以及
+    /// `Number("abc")` 出 NaN 被 JSON.stringify 写成 `null`，随手就会产生一个显式 null。
+    /// 那种请求在**进入处理函数之前**就被提取器拒了，报英文 serde 错、不进任何日志。
+    #[test]
+    fn an_explicit_null_on_any_field_never_kills_the_request() {
+        let fields = [
+            "id", "label", "base_url", "api_key", "cost_ratio", "active", "note",
+            "enabled_models", "protocol", "capacity", "model_prices", "model_names",
+        ];
+        for f in fields {
+            let mut v = serde_json::json!({
+                "route_id": "11111111-1111-1111-1111-111111111111",
+                "base_url": "https://relay.example.com/v1",
+            });
+            v[f] = serde_json::Value::Null;
+            let got = serde_json::from_value::<SaveReq>(v);
+            assert!(
+                got.is_ok(),
+                "字段 {f} 被打成 null 就解不出来了：{:?}",
+                got.err().map(|e| e.to_string())
+            );
+        }
+        // null 要落到「没填」，不是落到别的值上。
+        let v = serde_json::json!({
+            "route_id": "11111111-1111-1111-1111-111111111111",
+            "base_url": "https://a.example.com/v1",
+            "cost_ratio": serde_json::Value::Null,
+            "active": serde_json::Value::Null,
+            "protocol": serde_json::Value::Null,
+        });
+        let r = serde_json::from_value::<SaveReq>(v).expect("解不出来");
+        assert_eq!(r.cost_ratio, 1.0, "null 折扣该落到默认的原价");
+        assert!(r.active, "null 该落到「投入轮转」");
+        assert_eq!(r.protocol, "", "null 协议该落到「跟线路一样」");
+    }
+
+    /// 请求体由处理函数自己解，不交给提取器。
+    ///
+    /// 交给 `Json<SaveReq>` 的话，解析失败是一句英文 serde 错，发生在这个函数之前 ——
+    /// 服务端没有任何日志，运维只能看到一个 400。这一整类失败查不出来。
+    #[test]
+    fn the_handler_parses_the_body_itself_so_failures_are_visible() {
+        let s = src();
+        let i = s.find("pub async fn admin_save(").expect("保存入口不见了");
+        let head = &s[i..s[i..].find("admin_only").map(|j| i + j).unwrap_or(s.len())];
+        assert!(
+            head.contains("body: axum::body::Bytes"),
+            "又交回给提取器了：解析失败会变成一个查不出原因的 400"
+        );
+        let body = &s[i..];
+        assert!(
+            body.contains("请求格式不对："),
+            "解析失败没有转成中文报错"
+        );
     }
 
     #[test]
@@ -2468,6 +3261,131 @@ mod tests {
         assert!(
             body.contains(r#"classify(&health, now) == "ok""#),
             "自动探测不再跳过真实流量证明过的出口 —— 白烧 token，还占上游限流额度"
+        );
+    }
+
+    /// 前端在「加一个出口」里发的那份 JSON，后端必须原样解得出来。
+    ///
+    /// 这条是踩出来的，不是防御性的：出口保存连着 5 次 400，而 400 是 axum 的
+    /// **提取器**在进 handler 之前吐的 —— handler 里一行日志都不会打，网关日志干干净净，
+    /// 从服务端完全看不出发生过什么。查了很久才定位到「前端多发/少发了一个字段」这一类。
+    ///
+    /// 所以判据要跨语言对齐：直接读前端源码里那个对象字面量的键，逐个查后端认不认。
+    /// 手写一份期望清单没用 —— 它和真正被发出去的东西是两个东西，会各自漂移。
+    #[test]
+    fn 前端发的每个字段后端都认识() {
+        let ui = include_str!("../admin-ui/src/pages/RouteEndpoints.tsx");
+        // 定位真正的保存调用，而不是同文件里别的 post。
+        let at = ui
+            .find(r#""/api/admin/route-endpoints",
+        {"#)
+            .expect("保存调用的形状变了 —— 这条测试已经不在看真正发出去的东西了");
+        let body = &ui[at..];
+        let end = body.find("\n      );").expect("找不到调用的收尾");
+        let body = &body[..end];
+
+        // 对象字面量的顶层键：行首缩进恰好 10 空格的 `名字:`。
+        let sent: Vec<&str> = body
+            .lines()
+            .filter_map(|l| {
+                let k = l.strip_prefix("          ")?;
+                if k.starts_with(' ') || k.starts_with("//") {
+                    return None;
+                }
+                let name = k.split(':').next()?.trim();
+                (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+                .then_some(name)
+            })
+            .collect();
+        assert!(
+            sent.len() >= 12,
+            "只认出 {} 个字段（{sent:?}）—— 解析规则和前端排版对不上了，\
+             这时候测试会**恒真**，比失败还危险",
+            sent.len()
+        );
+
+        // 后端认识的字段：SaveReq 里的 `pub 名字:`。
+        let me = include_str!("route_endpoints.rs");
+        let sat = me.find("pub struct SaveReq {").expect("SaveReq 改名了");
+        let sblock = &me[sat..sat + me[sat..].find("\n}").expect("SaveReq 没有收尾")];
+        let known: Vec<&str> = sblock
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub "))
+            .filter_map(|l| l.split(':').next())
+            .map(str::trim)
+            .collect();
+        assert!(known.len() >= 12, "SaveReq 的字段没解出来：{known:?}");
+
+        let unknown: Vec<&&str> = sent.iter().filter(|k| !known.contains(k)).collect();
+        assert!(
+            unknown.is_empty(),
+            "前端发了后端不认识的字段：{unknown:?}。\n\
+             serde 默认会忽略多余字段，所以这**不一定**报错 —— 更常见的是静默丢掉，\
+             用户填了东西、保存成功、结果没生效。"
+        );
+    }
+
+    /// 新建出口那一发（没有 id、capacity 显式 null、两个空对象）必须能解开。
+    ///
+    /// `#[serde(default)]` 治的是「字段缺失」，治不了「字段是 null」—— 这两件事在
+    /// serde 里是两条不同的路径，而前端 `capacity: x.trim() ? Number(x) : null`
+    /// 发的恰好是后者。
+    #[test]
+    fn 新建出口的那份请求体解得开() {
+        let rid = uuid::Uuid::new_v4();
+        let raw = format!(
+            r#"{{"route_id":"{rid}","label":"","base_url":"https://x.com/v1",
+               "api_key":"sk-1","cost_ratio":1,"note":"","protocol":"",
+               "active":true,"enabled_models":[],"capacity":null,
+               "model_prices":{{}},"model_names":{{}}}}"#
+        );
+        let got: SaveReq = serde_json::from_str(&raw)
+            .expect("新建出口的请求体解不开 —— 这就是那 5 次 400 的形状");
+        assert_eq!(got.route_id, rid);
+        assert_eq!(got.id, None, "没带 id 应该当成新建");
+        assert_eq!(got.cost_ratio, 1.0);
+        assert!(got.active);
+        assert_eq!(got.capacity, None, "显式 null 必须当成没填，而不是解析失败");
+    }
+
+    /// 每个可空字段单独喂 null，逐个确认。
+    ///
+    /// 上面那条只覆盖了「前端今天恰好这么发」。前端改一行、或者中间层把空串规整成
+    /// null，就会换成别的组合 —— 而每一种组合都是一次 400，症状还是同一个「点了没反应」。
+    #[test]
+    fn 任何一个字段是null都不会让请求失败() {
+        let rid = uuid::Uuid::new_v4();
+        let nullable = [
+            "id",
+            "label",
+            "base_url",
+            "api_key",
+            "cost_ratio",
+            "active",
+            "note",
+            "enabled_models",
+            "protocol",
+            "capacity",
+            "model_prices",
+            "model_names",
+        ];
+        for f in nullable {
+            let raw = format!(r#"{{"route_id":"{rid}","{f}":null}}"#);
+            let got: Result<SaveReq, _> = serde_json::from_str(&raw);
+            assert!(
+                got.is_ok(),
+                "字段 `{f}` 是 null 就整发请求失败 —— 用户看到的是「点了没反应」，\
+                 而 400 由提取器吐出，服务端不留任何日志"
+            );
+        }
+        // 反面：route_id 是**唯一**必须有的字段，缺了就该失败。
+        // 没有这一半的话，上面那圈断言用「什么都接受」也能全过。
+        assert!(
+            serde_json::from_str::<SaveReq>(r#"{"label":"x"}"#).is_err(),
+            "route_id 都没有也能解开 —— 那这个结构体就不再校验任何东西了"
         );
     }
 }

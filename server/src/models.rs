@@ -1743,7 +1743,7 @@ fn model_caps_override(model_caps: &serde_json::Value, model_id: &str) -> (Vec<i
 /// Per-MODEL (input, output) USD/1M price override from a connection's model_prices map.
 /// Returns (0.0, 0.0) when this model has no override — compute_cost then uses the built-in
 /// official price, then the connection-level fallback. Admin per-model prices beat both.
-fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f64, f64) {
+pub(crate) fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f64, f64) {
     match model_prices.get(model_id) {
         Some(p) => (
             p.get("in").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0),
@@ -3225,6 +3225,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
     )
     .fetch_all(&state.db)
     .await?;
+    // 出口可能带来线路本身没有的模型，列表要把它们算进去。
+    let ep_map = crate::route_endpoints::load_for_routes(
+        &state.db,
+        &rows.iter().map(|m| m.id).collect::<Vec<_>>(),
+    )
+    .await;
     /*
      * Resolve the heading each route's models are filed under.
      *
@@ -3275,7 +3281,19 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             .and_then(|target| label_of.get(&target).copied())
             .unwrap_or(m.label.as_str());
 
-        for mid in allowed_ids(m) {
+        // 出口带来的新模型也要出现在列表里 —— 新挂一个中转多了两款货，那两款就该能选。
+        // 但只放**算得出价格**的：算不出价的开放出去，用户一分不付而上游照收，
+        // 那是漏洞不是功能。见 route_endpoints::priceable。
+        for mid in crate::route_endpoints::effective_models(m, ep_map.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]))
+        {
+            if !allowed_ids(m).contains(&mid) && !crate::route_endpoints::priceable(m, &mid) {
+                tracing::warn!(
+                    model = %mid,
+                    route = %m.label,
+                    "出口带来的模型算不出价格，没有开放给 IDE —— 去线路那页给它填个单模型价"
+                );
+                continue;
+            }
             // 强力线路的条目：普通线路也有这个 id 就不推（用按钮去它那儿），
             // 只有它有才推（否则这个模型就再也选不到了）。
             if m.power_route && plain_ids.contains(&mid) {
@@ -4332,7 +4350,7 @@ fn official_max_output(model_id: &str) -> Option<i64> {
 fn official_context(model_id: &str) -> Option<i64> {
     official_contexts(model_id).first().map(|(tokens, _)| *tokens)
 }
-fn official_price(model_id: &str) -> Option<(f64, f64)> {
+pub(crate) fn official_price(model_id: &str) -> Option<(f64, f64)> {
     // 实时目录优先。手写价表和 official_contexts 一个毛病，而且这半边直接是钱：
     // 实测 claude-sonnet-5 表里写 3/15、真实 2/10（多算 50%），而 opus-5、gpt-5.x、
     // qwen、kimi、deepseek、glm 这 8 款表里**根本没有**，一路掉到"连接价"靠人手填。
@@ -8260,9 +8278,23 @@ pub async fn chat_completions(
         .get("x-ide-power-route")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // 出口先取出来：候选匹配要认「出口带来的模型」，所以不能等到收窄之后再加载。
+    let endpoint_map = crate::route_endpoints::load_for_routes(
+        &state.db,
+        &conns.iter().map(|m| m.id).collect::<Vec<_>>(),
+    )
+    .await;
     let mut candidates: Vec<Model> = conns
         .into_iter()
-        .filter(|m| allowed_ids(m).contains(&model_id))
+        .filter(|m| {
+            // 出口带来的模型也算这条线路能接。真正派给哪个出口由 expand 再筛一次 ——
+            // 线路自带地址没有这款货时，它不会成为候选。
+            crate::route_endpoints::effective_models(
+                m,
+                endpoint_map.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+            )
+            .contains(&model_id)
+        })
         .collect();
     if want_power {
         let power: Vec<Model> = candidates.iter().filter(|m| m.power_route).cloned().collect();
@@ -8367,9 +8399,6 @@ pub async fn chat_completions(
     // 没配多路由的线路展开成一份、就是它自己，所以这一行对现有配置是恒等变换。
     //
     // 位置在免费池收窄**之后**：先决定用哪些线路，再决定每条线路走哪个门。
-    let endpoint_map =
-        crate::route_endpoints::load_for_routes(&state.db, &candidates.iter().map(|c| c.id).collect::<Vec<_>>())
-            .await;
     if !endpoint_map.is_empty() {
         candidates = crate::route_endpoints::expand(&candidates, &endpoint_map, &model_id);
     }
@@ -9330,12 +9359,23 @@ pub async fn chat_completions(
                     rate_limit_exhausted_note(err_status, rate_limit_waited)
                 );
                 if headers.contains_key("x-ide-mode") {
+                    // 告诉客户端「这次失败之后还有没试过的出口」。
+                    //
+                    // 一个请求最多换两个出口就收手。撞上的那两个刚被记了让位/冷却，
+                    // 所以**重发一次会落到别的出口上**——而客户端并不知道这件事：
+                    // 它看到 429 就会走 15 秒的限流退避，白等一个本可以立刻成功的请求。
+                    //
+                    // 只在真的还有余量时才置位：候选比试过的多，且剩下的里确实有
+                    // 没在让位的。置错了比不置更糟——那会让客户端对着一堆全挂的出口快速重发。
+                    let untried = candidates.len().saturating_sub(attempted_sends as usize);
+                    let elsewhere = untried > 0 && free.len() > attempted_sends as usize;
                     return Response::builder()
                         .status(downstream_status)
                         .header(
                             axum::http::header::CONTENT_TYPE,
                             "text/plain; charset=utf-8",
                         )
+                        .header("x-mide-retry-elsewhere", if elsewhere { "1" } else { "0" })
                         .body(Body::from(msg))
                         .map_err(|e| AppError::internal(e.to_string()));
                 }
@@ -9367,6 +9407,9 @@ pub async fn chat_completions(
             .to_string();
         let st = state.clone();
         let cid = conn.id;
+        // 观测用：这一轮实际走的是哪个出口。**只进 endpoint_usage 那张观测表**，
+        // 计费归属仍然是 cid（线路 id）——换出口不许换账单，那条有测试钉着。
+        let hid = conn.health_id();
         let rate = conn.rate;
         let admin_in = conn.input_price;
         let admin_out = conn.output_price;
@@ -9754,6 +9797,11 @@ pub async fn chat_completions(
                 }
             }
             bill(&st, uid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
+            // 出口用量：火后不管，丢几条无所谓。绝不放进结算事务——为了一个报表
+            // 让钱的路径多一次写，不划算。
+            crate::route_endpoints::note_endpoint_usage(
+                &st, hid, cid, cost, tokens.prompt, tokens.completion, tokens.cached,
+            );
         });
         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -11392,7 +11440,13 @@ mod billing_tests {
             .expect("read models.rs");
 
         let at = src.find("pub async fn list_for_client").expect("list_for_client 改名了");
-        let body: String = src[at..].chars().take(9_000).collect();
+        // 切到下一个 pub async fn，不用定长窗口：函数一变长，定长窗口就不再守它的尾部，
+        // 而且是**静默**不守——断言照样绿。
+        let end = src[at + 10..]
+            .find("\npub async fn ")
+            .map(|j| at + 10 + j)
+            .unwrap_or(src.len());
+        let body: String = src[at..end].to_string();
         assert!(
             !body.contains("\"rate\": m.rate"),
             "未鉴权接口又开始下发加价倍率——一条 curl 即可还原毛利率",
@@ -17320,7 +17374,13 @@ mod power_route_tests {
         let at = src
             .find("let want_power")
             .expect("强力版筛选整段没了，后台那个开关就没人读了");
-        let block = &src[at..(at + 900).min(src.len())];
+        // 切到这一段真正的结尾，不用定长窗口：往这段前面插一行代码就会把判据挤出
+        // 900 字符之外，而定长窗口在别的形状下是**静默变绿**——这仓库踩过。
+        let end = src[at..]
+            .find("let primary_conn")
+            .map(|j| at + j)
+            .unwrap_or(src.len());
+        let block = &src[at..end];
         assert!(
             block.contains("return Err("),
             "没有强力线路时没报错——请求会静默落到普通线路上，用户看不出自己被降级了"
@@ -17604,7 +17664,11 @@ mod power_route_tests {
         // 要在**派单那一段**里读到，不是"整个文件里出现过这个名字"——后台的
         // 增删改查里到处都是 power_route，照名字找会被它们喂饱。
         let at = src.find("let want_power").expect("强力版筛选整段没了");
-        let block = &src[at..(at + 900).min(src.len())];
+        let end = src[at..]
+            .find("let primary_conn")
+            .map(|j| at + j)
+            .unwrap_or(src.len());
+        let block = &src[at..end];
         assert!(
             block.contains("m.power_route"),
             "派单时压根没读这个字段，后台勾选不影响任何行为"

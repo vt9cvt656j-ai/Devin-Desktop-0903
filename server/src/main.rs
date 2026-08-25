@@ -15,6 +15,7 @@ mod docs;
 mod field_backfill;
 mod field_crypto;
 mod email;
+mod employees;
 mod error;
 mod game;
 mod handoff;
@@ -153,6 +154,8 @@ async fn main() -> anyhow::Result<()> {
     route_endpoints::restore_delisting(&state).await;
     // 调度器：只管把下架的出口试回来。让位/冷却/卡死都有自己的到期机制，不需要人管。
     route_endpoints::spawn_scheduler(state.clone());
+    // 智能员工的定时工。
+    employees::spawn(state.clone());
 
     // Catch payments the webhook never delivered. Every grant in this service hangs off a
     // single webhook call; without this, one missed delivery means a customer paid and got
@@ -460,6 +463,26 @@ async fn main() -> anyhow::Result<()> {
         )
         // 问一个中转「你有哪些模型」。必须能在保存之前问 —— 出口的价值就在于
         // 「这家有没有我要的那几个」，先存再看等于先把一个不知道行不行的出口放进候选池。
+        // 健康面板：状态、真实流量结论、探测、用量、余额，一次凑齐。
+        // 智能员工。能力白名单 + 风险档位，越过档位的动作一律进审批队列。
+        .route(
+            "/api/admin/employees",
+            get(employees::list).post(employees::save),
+        )
+        .route("/api/admin/employees/runs", get(employees::runs))
+        .route("/api/admin/employees/:id", delete(employees::remove))
+        .route("/api/admin/employees/:id/run", post(employees::run_now))
+        .route(
+            "/api/admin/employees/actions/:id/decide",
+            post(employees::decide),
+        )
+        .route("/api/admin/route-health", get(route_endpoints::admin_health))
+        // 发一封真的测试告警：「地址在列表里」和「这封信真能到」是两件事，
+        // QQ 邮箱对陌生发件域尤其严，静默丢掉在服务端看也是「已发送」。
+        .route(
+            "/api/admin/route-health/test-alarm",
+            post(route_health::test_alarm),
+        )
         .route(
             "/api/admin/route-endpoints/:id/relist",
             post(route_endpoints::admin_relist),

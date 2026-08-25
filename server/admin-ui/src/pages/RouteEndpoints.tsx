@@ -91,6 +91,11 @@ type Route = {
   active: boolean;
   model_count: number;
   models: string[];
+  billing_mode: string;
+  rate: number;
+  cache_disabled: boolean;
+  model_prices: Record<string, { in?: number; out?: number }>;
+  model_names: Record<string, string>;
   sched: string;
   retry_in: number | null;
   live: string;
@@ -112,6 +117,10 @@ type Draft = {
   enabled_models: string[];
   /// 空串 = 不填。
   capacity: string;
+  /// 就地编辑的单模型定价。**存到线路上**，同一条线路的几个出口共用一份 ——
+  /// 每个出口各存一份价的话，用户被扣多少钱就要看当时哪家先答。
+  prices: Record<string, { in: string; out: string }>;
+  names: Record<string, string>;
 };
 
 /** 网关一个请求最多试几个出口。和 models.rs 的常量对齐 —— 改那边要改这里。 */
@@ -145,10 +154,11 @@ function ordered(r: Route): Array<Endpoint | null> {
 }
 
 function ratioText(v: number): string {
-  if (v >= 1) return "原价";
+  if (v >= 1) return "进价原价";
   // 0.3 → 三折。中文习惯说折，小数点后一位足够；0.35 这种就直接给倍数。
+  // 一律带「进价」二字：不带的话，列表里一个孤零零的「3 折」很容易被当成卖价。
   const tenth = Math.round(v * 100) / 10;
-  return Number.isInteger(tenth) ? `${tenth} 折` : `${v}×`;
+  return Number.isInteger(tenth) ? `进价 ${tenth} 折` : `进价 ${v}×`;
 }
 
 /**
@@ -234,7 +244,14 @@ export function RouteEndpoints() {
   const [probing, setProbing] = useState<string | null>(null);
   // 「拉取」的结果：这家有哪些、缺哪些。缺的那部分才是运维真正要看的 ——
   // 它直接回答「这个出口能不能顶上」。
-  const [fetched, setFetched] = useState<{ here: string[]; missing: string[] } | null>(null);
+  const [fetched, setFetched] = useState<{
+    here: string[];
+    missing: string[];
+    /// 这家有、线路没有的：勾上就会新增到 IDE 列表
+    extra: string[];
+    /// 同上，但算不出价格 —— 开放出去用户一分不付、上游照收
+    extra_no_price: string[];
+  } | null>(null);
   const [fetching, setFetching] = useState(false);
 
   const load = useCallback(async () => {
@@ -270,6 +287,16 @@ export function RouteEndpoints() {
           active: draft.active,
           enabled_models: draft.enabled_models,
           capacity: draft.capacity.trim() ? Number(draft.capacity) : null,
+          // 只把**改动过的**送上去，服务端做合并而不是覆盖 ——
+          // 整份覆盖会把线路上别的模型的价抹掉。
+          model_prices: Object.fromEntries(
+            Object.entries(draft.prices)
+              .filter(([, v]) => v.in.trim() || v.out.trim())
+              .map(([k, v]) => [k, { in: Number(v.in) || 0, out: Number(v.out) || 0 }]),
+          ),
+          model_names: Object.fromEntries(
+            Object.entries(draft.names).filter(([, v]) => v.trim()),
+          ),
         },
       );
       // 保存后立刻回探测结论：填错密钥最想马上知道，而不是等它在候选池里躺 15 分钟。
@@ -312,7 +339,13 @@ export function RouteEndpoints() {
     setFetching(true);
     setNote(null);
     try {
-      const r = await api.post<{ here: string[]; missing: string[]; upstream_total: number }>(
+      const r = await api.post<{
+        here: string[];
+        missing: string[];
+        extra: string[];
+        extra_no_price: string[];
+        upstream_total: number;
+      }>(
         "/api/admin/route-endpoints/available",
         {
           id: draft.id,
@@ -321,10 +354,15 @@ export function RouteEndpoints() {
           api_key: draft.api_key,
         },
       );
-      setFetched({ here: r.here ?? [], missing: r.missing ?? [] });
-      // 直接把「它没有的」取消掉：拉取的意义就是省掉人工比对，
-      // 只把结果显示出来还要人自己去点，等于没省。
-      setDraft({ ...draft, enabled_models: r.here ?? [] });
+      setFetched({
+        here: r.here ?? [],
+        missing: r.missing ?? [],
+        extra: r.extra ?? [],
+        extra_no_price: r.extra_no_price ?? [],
+      });
+      // 它有的全勾上（含线路本来没有、但能定价的新模型 —— 那些勾上就会出现在
+      // IDE 的模型列表里）；它没有的取消掉。拉取的意义就是省掉人工比对。
+      setDraft({ ...draft, enabled_models: [...(r.here ?? []), ...(r.extra ?? [])] });
     } catch (e) {
       setNote({ text: e instanceof Error ? e.message : "拉取失败", ok: false });
     } finally {
@@ -440,6 +478,8 @@ export function RouteEndpoints() {
                           active: true,
                           enabled_models: [],
                           capacity: "",
+                          prices: {},
+                          names: {},
                         })
                       }
                     >
@@ -555,6 +595,8 @@ export function RouteEndpoints() {
                                         active: e.active,
                                         enabled_models: e.enabled_models,
                                         capacity: e.capacity == null ? "" : String(e.capacity),
+                                        prices: {},
+                                        names: {},
                                       })
                                     }
                                   >
@@ -628,16 +670,19 @@ export function RouteEndpoints() {
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <div>
-                  <Label htmlFor="e-ratio">进价折扣</Label>
+                  <Label htmlFor="e-ratio">进价倍率</Label>
                   <Input
                     id="e-ratio"
                     value={draft.cost_ratio}
                     placeholder="0.3"
                     onChange={(ev) => setDraft({ ...draft, cost_ratio: ev.target.value })}
                   />
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    0.3 = 三折。只决定先用谁，<b>不进用户账单</b>。
-                  </p>
+                  {/*
+                    叫「进价倍率」不叫「折扣」：线路那页那个加价的也叫倍率，同一类东西
+                    该用同一族词，否则读起来像两个不相干的设置。用「进价」前缀区分方向 ——
+                    一个是我付出去的，一个是用户付进来的。数值上 0.3 折扣 = 0.3 倍，
+                    换个词不改任何行为。
+                  */}
                 </div>
                 <div>
                   <Label htmlFor="e-cap">能扛多少</Label>
@@ -651,10 +696,6 @@ export function RouteEndpoints() {
                     只在「首选被限流、要挑替补」时起作用。平时所有流量都走最便宜那个，
                     这个数一点作用都没有 —— 所以不填是完全正常的默认。
                   */}
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    同条线路下用同一把尺（RPM 或随便一个相对值）。只在别的出口被限流、
-                    要挑替补时才用到。
-                  </p>
                 </div>
                 <div>
                   <Label htmlFor="e-label">备注</Label>
@@ -666,6 +707,19 @@ export function RouteEndpoints() {
                   />
                 </div>
               </div>
+              {/*
+                说明文字通栏放，不塞进三列格子里。塞进去的话每列只有一百来像素宽，
+                一句话被切成六行四个字的豆腐块 —— 字都在，但没人会去读。
+                输入框适合并排，解释性文字不适合。
+              */}
+              <p className="-mt-1 text-xs leading-relaxed text-muted-foreground">
+                <b>进价倍率</b>：0.3 = 三折，我按官方价的三成进货。和线路那边的
+                <b>加价倍率是两回事</b> —— 那个决定用户付多少，这个只决定先用哪个出口，
+                <b>不进用户账单</b>。
+                <br />
+                <b>能扛多少</b>：同条线路下用同一把尺（RPM 或随便一个相对值），
+                只在别的出口被限流、要挑替补时才用到，平时留空就行。
+              </p>
               <div>
                 <Label htmlFor="e-proto">上游协议</Label>
                 <Select
@@ -700,22 +754,62 @@ export function RouteEndpoints() {
                   </Button>
                 </div>
                 {/*
-                  只列线路已开放的模型：出口只能做减法。允许填线路之外的，等于从这里
-                  开一个后门——那个模型没有价格、不在 IDE 列表里，但请求真会发出去。
+                  计费只读显示。加一个出口时你要知道它的流量会被按什么价计费，
+                  但**计费是线路的属性**——同一条线路的几个出口对用户完全等价，
+                  只有我的进价不同。让它在出口这一层可改，同一个模型用户被扣多少钱
+                  就要看当时哪家先答，那正是整套多路由第一天就堵死的洞。
                 */}
-                <div className="mt-1.5 max-h-44 overflow-y-auto rounded-lg border border-border">
-                  {(routeOf(draft.route_id)?.models ?? []).map((m) => {
+                {(() => {
+                  const r = routeOf(draft.route_id);
+                  if (!r) return null;
+                  return (
+                    <div className="mt-1.5 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs">
+                      <span className="text-muted-foreground">这条线路怎么计费：</span>
+                      <b>
+                        {r.billing_mode === "per_call" ? "按次" : "按 Token"} × {r.rate} 倍
+                      </b>
+                      {r.cache_disabled && <span className="text-muted-foreground">（缓存不收钱）</span>}
+                      <span className="text-muted-foreground">
+                        {" "}
+                        · 走这个出口的流量按同一套价扣 —— 换出口不改用户账单，所以计费只能在
+                        「线路」那页改。
+                      </span>
+                    </div>
+                  );
+                })()}
+                <div className="mt-1.5 overflow-hidden rounded-lg border border-border">
+                  {/* 表头：三个空输入框不写标题的话，没人分得出哪个是入价哪个是出价。
+                      列宽和下面的行用同一套 grid，改一处要一起改。 */}
+                  <div className="grid grid-cols-[auto_minmax(0,1fr)_7rem_4.5rem_4.5rem_auto] items-center gap-2 border-b border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+                    <span className="w-3" />
+                    <span>模型</span>
+                    <span>显示名</span>
+                    <span>入价</span>
+                    <span>出价</span>
+                    <span />
+                  </div>
+                  <div className="max-h-56 overflow-y-auto">
+                  {[
+                    ...(routeOf(draft.route_id)?.models ?? []),
+                    // 这家有、线路没有的：勾上会新增到 IDE 列表。算不出价的也列出来，
+                    // 但标红且勾不动 —— 让人看见「为什么这个不能用」，而不是它凭空消失。
+                    ...(fetched?.extra ?? []),
+                    ...(fetched?.extra_no_price ?? []),
+                  ].map((m) => {
+                    const isNew = (fetched?.extra ?? []).includes(m);
+                    const noPrice = (fetched?.extra_no_price ?? []).includes(m);
                     const on =
                       draft.enabled_models.length === 0 || draft.enabled_models.includes(m);
                     const absent = fetched?.missing.includes(m);
                     return (
                       <label
                         key={m}
-                        className="flex cursor-pointer items-center gap-2 border-b border-border px-3 py-1.5 text-[13px] last:border-b-0 hover:bg-accent/40"
+                        className="grid cursor-pointer grid-cols-[auto_minmax(0,1fr)_7rem_4.5rem_4.5rem_auto] items-center gap-2 border-b border-border px-3 py-1.5 text-[13px] last:border-b-0 hover:bg-accent/40"
                       >
                         <input
                           type="checkbox"
-                          checked={on}
+                          checked={on && (!noPrice || !!draft.prices[m]?.in)}
+                          disabled={noPrice && !draft.prices[m]?.in}
                           onChange={(ev) => {
                             const all = routeOf(draft.route_id)?.models ?? [];
                             const cur = draft.enabled_models.length ? draft.enabled_models : all;
@@ -725,17 +819,97 @@ export function RouteEndpoints() {
                             setDraft({ ...draft, enabled_models: next });
                           }}
                         />
-                        <span className="font-mono">{m}</span>
+                        <span
+                          className={cn("truncate font-mono", noPrice && "text-destructive")}
+                          title={m}
+                        >
+                          {m}
+                        </span>
+                        {/*
+                          就地填价。它写到**线路**上（同线路的出口共用一份），不是写到
+                          这个出口上。放在这儿只是因为「发现新模型」和「给它定价」是同一件事
+                          的两半 —— 让人跑去另一页再回来，多数人会直接放弃，然后这个模型
+                          就永远开放不了。
+                        */}
+                        <Input
+                          className="h-7 w-full text-xs"
+                          placeholder="显示名"
+                          value={draft.names[m] ?? routeOf(draft.route_id)?.model_names?.[m] ?? ""}
+                          onClick={(ev) => ev.preventDefault()}
+                          onChange={(ev) =>
+                            setDraft({ ...draft, names: { ...draft.names, [m]: ev.target.value } })
+                          }
+                        />
+                        <Input
+                          className="h-7 w-full text-xs"
+                          placeholder="入价"
+                          value={
+                            draft.prices[m]?.in ??
+                            (routeOf(draft.route_id)?.model_prices?.[m]?.in
+                              ? String(routeOf(draft.route_id)!.model_prices[m].in)
+                              : "")
+                          }
+                          onClick={(ev) => ev.preventDefault()}
+                          onChange={(ev) =>
+                            setDraft({
+                              ...draft,
+                              prices: {
+                                ...draft.prices,
+                                [m]: { in: ev.target.value, out: draft.prices[m]?.out ?? "" },
+                              },
+                            })
+                          }
+                        />
+                        <Input
+                          className="h-7 w-full text-xs"
+                          placeholder="出价"
+                          value={
+                            draft.prices[m]?.out ??
+                            (routeOf(draft.route_id)?.model_prices?.[m]?.out
+                              ? String(routeOf(draft.route_id)!.model_prices[m].out)
+                              : "")
+                          }
+                          onClick={(ev) => ev.preventDefault()}
+                          onChange={(ev) =>
+                            setDraft({
+                              ...draft,
+                              prices: {
+                                ...draft.prices,
+                                [m]: { in: draft.prices[m]?.in ?? "", out: ev.target.value },
+                              },
+                            })
+                          }
+                        />
+                        <span className="flex shrink-0 items-center gap-1">
+                        {isNew && (
+                          <Badge variant="success" className="shrink-0">
+                            新增
+                          </Badge>
+                        )}
+                        {noPrice && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 border-destructive/40 text-destructive"
+                            title="目录里查不到这个模型的官方价。在左边填上入价/出价（每百万 token 美元）就能开放。不填的话用户一分不付、上游照收你的钱。"
+                          >
+                            要填价
+                          </Badge>
+                        )}
                         {absent && (
-                          <Badge variant="outline" className="ml-auto border-destructive/40 text-destructive">
+                          <Badge variant="outline" className="border-destructive/40 text-destructive">
                             它没有
                           </Badge>
                         )}
+                        </span>
                       </label>
                     );
                   })}
+                  </div>
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
+                  勾上「线路没有」的那些，它们会<b>新增到 IDE 的模型列表</b>，按这条线路的
+                  倍率计费。入价/出价是每百万 token 美元，<b>填了会存到线路上</b>（同一条线路
+                  的几个出口共用一份价）；目录里有官方价的可以不填。
                   全勾 = 承载这条线路的全部模型（以后线路加了新模型也自动跟着有）。
                   取消勾选的模型不会被派到这个出口——转卖商之间的货不一样，
                   派过去只会撞一个 404，而每个请求只有 2 次机会。

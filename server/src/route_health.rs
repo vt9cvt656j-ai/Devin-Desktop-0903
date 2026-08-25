@@ -445,7 +445,63 @@ async fn notify(state: &AppState, subject: &str, body: &str) -> bool {
     any_ok
 }
 
-/// 判定一条线路要不要发告警 / 恢复通知。状态存 Redis，不存进程内存。
+/// `POST /api/admin/route-health/test-alarm` —— 往真实收件人发一封测试告警。
+///
+/// # 为什么需要这个按钮
+///
+/// 「地址在收件人列表里」和「这封信真能到」是两件事。QQ 邮箱对陌生发件域尤其严 ——
+/// 可能静默丢掉，也可能进垃圾箱，而两种在服务端看都是「已发送」。线路真挂掉那天
+/// 才发现收不到，就晚了。
+///
+/// 所以这里发一封真的：走和真告警**完全同一条路**（同一个收件人清单、同一个发信通道），
+/// 只是内容写明是测试。它逐个报告每个地址成没成功，失败原因原样带出来。
+pub async fn test_alarm(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    claims: crate::auth::Claims,
+) -> crate::error::ApiResult<axum::Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(crate::error::AppError::forbidden("需要管理员权限"));
+    }
+    if !state.cfg.mail_enabled() {
+        return Err(crate::error::AppError::bad(
+            "邮件没配置（brevo_api_key / mail_from 为空），任何告警都发不出去",
+        ));
+    }
+    let all = sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE role = 'admin'")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    let (good, bad): (Vec<_>, Vec<_>) = all.into_iter().partition(|e| looks_like_email(e));
+    if good.is_empty() {
+        return Err(crate::error::AppError::bad(
+            "没有一个 admin 账号的 email 字段是邮箱地址 —— 线路挂了不会有任何人收到通知",
+        ));
+    }
+
+    let mut results = Vec::new();
+    for addr in &good {
+        let r = crate::email::send_mail(
+            &state.cfg,
+            addr,
+            "[测试] Mr. Day One 线路告警自检",
+            "这是一封测试信，用来确认线路告警发得到你这儿。\n\n             收到了就说明真出问题时你也会收到。没收到的话先翻垃圾箱；\n             还是没有的话，是发件域在这家邮箱那边没过，得去配 SPF/DKIM。",
+            false,
+        )
+        .await;
+        results.push(serde_json::json!({
+            "to": addr,
+            "ok": r.is_ok(),
+            "error": r.err().map(|e| e.msg),
+        }));
+    }
+    Ok(axum::Json(serde_json::json!({
+        "sent": results,
+        // 填了用户名而不是邮箱的那些：它们永远收不到，得让人看见。
+        "skipped": bad.len(),
+    })))
+}
+
+/// 判定一条线路要不要发告警 / 恢复通知。状态存 Redis，不存进程内存。/// 判定一条线路要不要发告警 / 恢复通知。状态存 Redis，不存进程内存。
 ///
 /// 进程内存在这里是错的：发一次版就清零，而蓝绿切换时新旧两版还会各记各的 ——
 /// 一次部署就能把「已经坏了 30 分钟」重置成「刚刚开始坏」，告警永远攒不满。
