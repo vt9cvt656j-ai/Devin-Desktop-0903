@@ -15,6 +15,7 @@ import { Releases } from "@/pages/Releases";
 import { Changelog, type ChangelogView } from "@/pages/Changelog";
 import { Docs } from "@/pages/Docs";
 import { Commission, type CommissionView } from "@/pages/Commission";
+import { Reconcile } from "@/pages/Reconcile";
 import { Mail, type MailView } from "@/pages/Mail";
 import { api, auth, endConsoleSession } from "@/lib/api";
 import { loadSettings } from "@/lib/settings";
@@ -88,6 +89,7 @@ export default function App() {
       {page === "routing-health" && <RouteHealth />}
       {page === "routing-endpoints" && <RouteEndpoints />}
       {page === "routing-icons" && <VendorIcons />}
+      {page === "routing-reconcile" && <Reconcile />}
       {page.startsWith("routing") &&
         !["routing-endpoints", "routing-icons", "routing-health"].includes(page) && (
         <Routing view={page as RoutingView} />

@@ -26,6 +26,8 @@ mod route_health;
 mod integrations;
 mod code_corpus;
 mod knowledge;
+mod manifest_check;
+mod reconcile;
 mod model_catalog;
 mod model_probe;
 mod models;
@@ -154,6 +156,10 @@ async fn main() -> anyhow::Result<()> {
     route_endpoints::restore_delisting(&state).await;
     // 调度器：只管把下架的出口试回来。让位/冷却/卡死都有自己的到期机制，不需要人管。
     route_endpoints::spawn_scheduler(state.clone());
+    // 「线路声明开放的模型，上游是不是每款都真有」。探活只探第一款，发现不了这件事。
+    manifest_check::spawn(state.clone());
+    // 中转账户余额的定时快照 —— 对账里「成本」那一侧的唯一真实来源。
+    reconcile::spawn(state.clone());
     // 智能员工的定时工。
     employees::spawn(state.clone());
 
@@ -477,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
             post(employees::decide),
         )
         .route("/api/admin/route-health", get(route_endpoints::admin_health))
+        .route("/api/admin/reconciliation", get(reconcile::admin_reconciliation))
         // 发一封真的测试告警：「地址在列表里」和「这封信真能到」是两件事，
         // QQ 邮箱对陌生发件域尤其严，静默丢掉在服务端看也是「已发送」。
         .route(
@@ -580,12 +587,17 @@ async fn main() -> anyhow::Result<()> {
             TraceLayer::new_for_http()
                 .on_failure(DefaultOnFailure::new().level(tracing::Level::WARN)),
         )
-        // 跨源必须显式暴露 X-Mse-* 响应头。官网在 mrday.one，网关在 code.mrday.one；
-        // 不暴露的话浏览器会把这些头对脚本藏起来，官网每一个请求都解不开 —— 而且症状
-        // 是「解密失败」，不是「CORS 错误」，查起来会绕很远。
+        // 跨源必须显式暴露自定义响应头。官网在 mrday.one、桌面端在 tauri://localhost，
+        // 网关在 code.mrday.one；不暴露的话浏览器会把这些头对脚本藏起来 —— 而且症状不是
+        // 「CORS 错误」而是那个头恒为 null，功能像没写一样，查起来会绕很远。
+        //
+        // X-Mse-* 漏了的表现是「解密失败」；x-mide-retry-elsewhere 漏了的表现是客户端
+        // 照旧白等 15 秒的限流退避。**任何新的自定义响应头都要加进这个名单**。
         .layer(CorsLayer::permissive().expose_headers(
             mse::EXPOSED_HEADERS
                 .iter()
+                .copied()
+                .chain(std::iter::once(models::RETRY_ELSEWHERE_HEADER))
                 .filter_map(|h| h.parse::<axum::http::HeaderName>().ok())
                 .collect::<Vec<_>>(),
         ))

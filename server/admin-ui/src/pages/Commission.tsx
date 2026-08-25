@@ -431,9 +431,9 @@ export function Commission({ view }: { view: CommissionView }) {
             `填上转账流水号（银行回单号、支付宝订单号等），以后对账要用。没有就留空。\n` +
             `标记之后不能改回待处理。`,
           "",
-        ) ?? " ";
+        ) ?? "\0";
       // 取消对话框返回 null，那是「别记了」，不是「记一个空的」。
-      if (reference === " ") return;
+      if (reference === "\0") return;
     } else if (
       !confirm(`驳回 ${w.email} 的 ${usd(w.amount_cents)} 提现申请？这笔钱会退回他的可提现余额。`)
     ) {

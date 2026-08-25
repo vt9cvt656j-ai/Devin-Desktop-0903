@@ -80,6 +80,15 @@ const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 1;
 const CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED: usize = 2;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
+/// 「这次失败之后还有没试过的上游出口」这件事告诉客户端时用的响应头。
+///
+/// 名字写在这里而不是就地写字面量，是因为它必须同时出现在**两个**地方：产生点（下面
+/// 返回错误响应时）和 `main.rs` 的 CORS `expose_headers`。客户端是跨源读它的
+/// （`tauri://localhost` → `https://code.mrday.one`），没在 expose 名单里的响应头
+/// 浏览器会对脚本藏起来，`headers.get()` 恒为 null —— 表现不是 CORS 报错，是这个功能
+/// **像没写一样**，客户端照旧白等 15 秒。X-Mse-* 上已经踩过一次同样的坑。
+pub const RETRY_ELSEWHERE_HEADER: &str = "x-mide-retry-elsewhere";
+
 /// What the IDE waits for response headers before it gives up. The upstream relay
 /// holds the HTTP response until its first SSE event, so this includes provider
 /// prefill time. After headers open, the stream has its own long idle deadline.
@@ -9375,7 +9384,7 @@ pub async fn chat_completions(
                             axum::http::header::CONTENT_TYPE,
                             "text/plain; charset=utf-8",
                         )
-                        .header("x-mide-retry-elsewhere", if elsewhere { "1" } else { "0" })
+                        .header(RETRY_ELSEWHERE_HEADER, if elsewhere { "1" } else { "0" })
                         .body(Body::from(msg))
                         .map_err(|e| AppError::internal(e.to_string()));
                 }

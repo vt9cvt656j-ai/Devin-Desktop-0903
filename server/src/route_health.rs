@@ -423,6 +423,12 @@ async fn alarm_recipients(state: &AppState) -> Vec<String> {
     good
 }
 
+/// 给管理员发一封。别的模块要发告警时走这里，**不要**去改 `notify` 的签名 ——
+/// 下面有一条源码断言逐字钉着那一行（它守的是「告警必须真发出去才算发过」）。
+pub(crate) async fn notify_admins(state: &AppState, subject: &str, body: &str) -> bool {
+    notify(state, subject, body).await
+}
+
 /// 发出去。返回**是否至少有一封成功** —— 调用方靠它决定要不要保留冷却。
 async fn notify(state: &AppState, subject: &str, body: &str) -> bool {
     if !state.cfg.mail_enabled() {

@@ -478,7 +478,36 @@ pub fn note_endpoint_usage(
 ///
 /// **查不到就明确回「查不到」，绝不猜、绝不填 0。** 一个显示成 0 的余额会让人以为
 /// 没钱了去充值，而实际可能只是这家没有这个接口 —— 报错的信息量为零，误导的代价却是真的。
-async fn query_balance(http: &reqwest::Client, base_url: &str, key: &str) -> Option<String> {
+/// 一次余额读数。
+///
+/// `text` 是给人看的，`remaining_usd` / `used_usd` 是给对账算的。两者必须同源 ——
+/// 面板显示一个数、成本按另一个数算，是最难发现的一类错。
+#[derive(Clone, Debug)]
+pub struct BalanceReading {
+    pub text: String,
+    /// 还剩多少美元。None = 这家只给了「已用」或只给了上限。
+    pub remaining_usd: Option<f64>,
+    /// 累计已用多少美元。None = 这家不给。
+    ///
+    /// **算成本时优先用它**：余额会被充值打断（充一次就变成负成本），
+    /// 而「已用」是单调递增的，充值不影响。
+    pub used_usd: Option<f64>,
+}
+
+/// 给面板用的那层：只要展示串。
+pub(crate) async fn query_balance(
+    http: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+) -> Option<String> {
+    read_balance(http, base_url, key).await.map(|b| b.text)
+}
+
+pub(crate) async fn read_balance(
+    http: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+) -> Option<BalanceReading> {
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
     let bearer = format!("Bearer {key}");
 
@@ -495,11 +524,13 @@ async fn query_balance(http: &reqwest::Client, base_url: &str, key: &str) -> Opt
                 if let Some(q) = d.get("quota").and_then(|x| x.as_f64()) {
                     let used = d.get("used_quota").and_then(|x| x.as_f64()).unwrap_or(0.0);
                     // 这一族的 quota 是「点」，惯例 500000 点 = 1 美元。
-                    return Some(format!(
-                        "${:.2}（已用 ${:.2}）",
-                        q / 500_000.0,
-                        used / 500_000.0
-                    ));
+                    let left = q / 500_000.0;
+                    let spent = used / 500_000.0;
+                    return Some(BalanceReading {
+                        text: format!("${left:.2}（已用 ${spent:.2}）"),
+                        remaining_usd: Some(left),
+                        used_usd: Some(spent),
+                    });
                 }
             }
         }
@@ -518,8 +549,20 @@ async fn query_balance(http: &reqwest::Client, base_url: &str, key: &str) -> Opt
                 let used = d.get("usage").and_then(|x| x.as_f64());
                 let left = d.get("limit_remaining").and_then(|x| x.as_f64());
                 match (left, used) {
-                    (Some(l), _) => return Some(format!("${l:.2}")),
-                    (None, Some(u)) => return Some(format!("已用 ${u:.2}（未设上限）")),
+                    (Some(l), u) => {
+                        return Some(BalanceReading {
+                            text: format!("${l:.2}"),
+                            remaining_usd: Some(l),
+                            used_usd: u,
+                        })
+                    }
+                    (None, Some(u)) => {
+                        return Some(BalanceReading {
+                            text: format!("已用 ${u:.2}（未设上限）"),
+                            remaining_usd: None,
+                            used_usd: Some(u),
+                        })
+                    }
                     _ => {}
                 }
             }
@@ -536,7 +579,13 @@ async fn query_balance(http: &reqwest::Client, base_url: &str, key: &str) -> Opt
         if r.status().is_success() {
             if let Ok(v) = r.json::<serde_json::Value>().await {
                 if let Some(x) = v.get("hard_limit_usd").and_then(|x| x.as_f64()) {
-                    return Some(format!("上限 ${x:.2}"));
+                    // 上限**不是**余额，也不是已用。拿它去算成本会算出一个纯属虚构的数字，
+                    // 所以这里只给展示串，两个数值都留空。
+                    return Some(BalanceReading {
+                        text: format!("上限 ${x:.2}"),
+                        remaining_usd: None,
+                        used_usd: None,
+                    });
                 }
             }
         }
@@ -1373,6 +1422,14 @@ pub struct HealthRow {
     pub cached_tokens_7d: i64,
     /// 余额。null = 这家没有可识别的余额接口，或者查失败 —— **不是 0**。
     pub balance: Option<String>,
+    /// 我们声明开放、而上游清单里没有的模型。这些请求会撞 404。
+    ///
+    /// 空数组和 `manifest_note` 非空是两件事：前者是「比对过，没缺货」，
+    /// 后者是「没比对成」。都塌成空数组的话，一家不提供 /models 的中转
+    /// 看起来会和一家完全正常的一模一样。
+    pub missing_models: Vec<String>,
+    /// 没比对成时的原因。空 = 比对出结论了。
+    pub manifest_note: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1462,6 +1519,7 @@ pub async fn admin_health(
         for (id, label, base, is_own, cost, cap, active, pok, pms, pnote, key) in entries {
             let h = crate::route_health::snapshot(&state, id).await;
             let u = by_ep.get(&id);
+            let mf = crate::manifest_check::report_for(id);
             let balance = if want_balance && !key.trim().is_empty() {
                 query_balance(&http, &base, &crate::models::model_key(&key)).await
             } else {
@@ -1492,6 +1550,12 @@ pub async fn admin_health(
                 cost_7d_usd: u.map(|x| x.cost_7d as f64 / 1_000_000.0).unwrap_or(0.0),
                 cached_tokens_7d: u.map(|x| x.cached_7d).unwrap_or(0),
                 balance,
+                missing_models: mf.as_ref().map(|r| r.missing.clone()).unwrap_or_default(),
+                // 还没轮到它比对时，note 说清楚是「还没测」，而不是留空冒充「没问题」。
+                manifest_note: match &mf {
+                    Some(r) => r.note.clone(),
+                    None => "还没比对过".to_string(),
+                },
             });
         }
     }
@@ -1508,6 +1572,8 @@ pub async fn admin_health(
         "rows": rows,
         "alarm": { "usable": usable, "total": admins.len() },
         "balance_included": want_balance,
+        // 有几个出口正在缺货。只数「比对出结论且真的缺」的，没比对成的不算。
+        "missing_endpoints": crate::manifest_check::missing_endpoint_count(),
     })))
 }
 
@@ -2032,9 +2098,17 @@ pub struct AvailableReq {
 /// 就在于「这家有没有我要的那几个模型」，先存再看等于先把一个不知道行不行的出口放进
 /// 候选池。
 ///
-/// 回的是**交集**：这家有的 ∩ 线路开放的。这家还有别的货不关我们的事 —— 出口只能在
-/// 线路开放的范围里做减法，多出来的那些没有价格、不在 IDE 列表里，列出来只会让人以为
-/// 勾上就能用。
+/// 回四组，不是交集。**这里曾经只回交集，后来推翻了**：出口的价值有一半就在于
+/// 「这家多了两款线路没有的货」，只回交集等于把那一半藏起来，运维在界面上永远勾不到。
+///
+///   · `here`           —— 线路开放 ∩ 这家有
+///   · `missing`        —— 线路开放，但这家没有（派过去只会撞 404）
+///   · `extra`          —— 这家有、线路没有，且**算得出价格** → 勾上就新增到 IDE 列表
+///   · `extra_no_price` —— 同上但算不出价格
+///
+/// `extra` 和 `extra_no_price` 分两堆，是因为算不出价的开放出去等于白送：用户一分不付，
+/// 上游照收你的钱（见 `priceable`）。分好之后界面把后者标红、勾不动，并在同一行给一个
+/// 填价框 —— 而不是等运维保存时才报一句错，或者更糟：让那个模型凭空消失。
 pub async fn admin_available(
     State(state): State<AppState>,
     claims: Claims,

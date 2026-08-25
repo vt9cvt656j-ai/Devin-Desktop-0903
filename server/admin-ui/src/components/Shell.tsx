@@ -45,6 +45,7 @@ export type NavKey =
   | "routing-groups"
   | "routing-endpoints"
   | "routing-icons"
+  | "routing-reconcile"
   | "employees"
   | "pricing"
   | "commission"
@@ -116,6 +117,8 @@ export const NAV: (Leaf | Group)[] = [
       // 后台认得出哪些厂商的一张对照表。放在这里是因为它回答的是线路那两屏上的问题：
       // 某条线路的图标是灰的，到底是没这家的图，还是判定没认出来。
       { key: "routing-icons", label: "模型图标" },
+      // 对账放最后：前面几屏回答「怎么配、能不能用」，这一屏回答「这么配下来赚没赚钱」。
+      { key: "routing-reconcile", label: "对账" },
     ],
   },
   // 智能员工紧跟在模型线路后面：它干的多数事情就是盯着线路，
