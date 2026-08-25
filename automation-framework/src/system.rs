@@ -416,11 +416,35 @@ impl SystemAutomation {
     }
 
     /// 输入文本
+    /// 输入文本。**换行按真的回车发出去**，不能原样丢给 text()。
+    ///
+    /// `enigo.text("a\nb")` 在 macOS 上走的是 Unicode 直接投递：`\n` 作为一个字符送出去，
+    /// 多数原生控件对它没有反应——于是"输入两行"变成输入一行，中间那次换行**静默消失**，
+    /// 而回执照样 ok。多行输入是最常见的用法之一（写提交信息、填地址、聊天发多段），
+    /// 这个坑一直在。中文没问题（Unicode 投递本来就对），只有回车会失效。
+    ///
+    /// `\r\n` 当成一次换行，别按两下。
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         debug!("输入文本: {} 字符", text.len());
-        self.enigo
-            .text(text)
-            .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)))?;
+        if !text.contains('\n') {
+            return self
+                .enigo
+                .text(text)
+                .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)));
+        }
+        let normalized = text.replace("\r\n", "\n");
+        let mut first = true;
+        for line in normalized.split('\n') {
+            if !first {
+                self.press_key(Key::Return)?;
+            }
+            first = false;
+            if !line.is_empty() {
+                self.enigo
+                    .text(line)
+                    .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)))?;
+            }
+        }
         Ok(())
     }
 

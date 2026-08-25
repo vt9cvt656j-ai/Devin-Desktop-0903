@@ -626,6 +626,35 @@ impl RpcServer {
             // 屏幕像素。这是整套系统里唯一能"看一眼真实桌面"的通路 —— 在它之前，
             // screenshot 工具只会用无头浏览器渲染一个网址，模型对任何原生应用都是全盲的，
             // 而工具描述还在教它"用 screenshot 验证结果"。
+            // 列出**全部**显示器及各自在全局坐标里的矩形。
+            //
+            // screen.info 只回主屏，于是副屏在模型眼里不存在：落在副屏上的窗口坐标
+            //（x 可能是负数，也可能大于主屏宽度）会被判成"屏幕外"，它要么不敢点，
+            // 要么把坐标夹回主屏点在错的地方。而 window.list 给的就是全局坐标，
+            // 本来就会包含副屏上的窗口——两边对不上，模型无从判断谁是对的。
+            //
+            // 区域截图那条链早就支持副屏（screencapture -R 收的是全局坐标），
+            // 缺的只是"告诉它副屏在哪"。
+            #[cfg(all(feature = "system", target_os = "macos"))]
+            "screen.displays" => {
+                drop(agent);
+                let list: Vec<serde_json::Value> = crate::platform::macos::list_displays()
+                    .into_iter()
+                    .map(|(id, x, y, w, h, is_main)| {
+                        serde_json::json!({
+                            "id": id, "x": x, "y": y, "width": w, "height": h, "is_main": is_main
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!({
+                    "displays": list,
+                    "count": list.len(),
+                    "coordinate_space": "screen_points_top_left",
+                    "note": "这些矩形是**全局坐标**，和 mouse.move / window.list / screen.capture 的 x,y 同一套。\
+                             要拍副屏就把那块的 x/y/width/height 传给 screen.capture。",
+                }))
+            }
+
             #[cfg(feature = "system")]
             "screen.capture" => {
                 let num = |k: &str| params.get(k).and_then(|v| v.as_f64()).map(|n| n as i32);
