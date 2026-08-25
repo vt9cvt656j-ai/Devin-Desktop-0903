@@ -42,3 +42,7 @@ yarn-error.log*
 # Python bytecode — build junk, never source
 __pycache__/
 *.pyc
+
+# IDE dogfood 时自己写的**本机**项目记忆（文件头也写着本地为空时会从它读回）。
+# 属于这台机器的状态，不是源码——进了库会让每台机器互相覆盖对方的记忆。
+.mrdayone/
