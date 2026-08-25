@@ -20517,7 +20517,17 @@ test("#53-3 只读继承 + scope 收敛：嵌套强制只读，scope 必须是�
   assert.match(sub, /嵌套 worker 的 scope（/, "越界必须有明确拒绝文案");
   // 拒绝必须发生在并发计数器与超时器启动之前——被拒的嵌套不得泄漏计数/定时器
   assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("_sess._subAgentsActive++"), "scope 拒绝在计数器之前");
-  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("const timeoutId = setTimeout"), "scope 拒绝在超时器之前");
+  assert.ok(sub.indexOf("嵌套 worker 的 scope（") < sub.indexOf("_armSubDeadline()"), "scope 拒绝在超时器之前");
+  // 墙钟预算必须在**抢到并发槽位之后**才起算，不能在排队之前。
+  // 排队是可以任意久的（上限 4 而 spawn_multiple_agents 的 maxItems 是 5，必然有人排队），
+  // 在排队前起算的话，排够 5 分钟的那个子体一进循环就超时退出、toolCount 是 0，
+  // 于是落进 0 步兜底——用户看到少了一个视角，而主体报告说都覆盖了。
+  assert.ok(
+    sub.indexOf("_sess._subAgentsActive++") < sub.indexOf("_armSubDeadline()"),
+    "墙钟预算在抢到槽位之前就起算了——排队时间会被算进它自己的预算",
+  );
+  assert.match(sub, /let _subDeadlineAt = Infinity;/,
+    "起算前的 deadline 必须是 Infinity，否则排队期间的边界判断会用到一个还没定义的时刻");
   // 行为复算：同一 within 谓词下的子集判定（含 CRLF 注入样本——归一后不得误判为子集）
   const within = (x, y) => x === y || x.startsWith(y + "/");
   const isSubset = (req, parent) => !req.some((s) => !parent.some((p) => within(s.replace(/\/+$/, ""), String(p).replace(/\/+$/, ""))));
@@ -23319,8 +23329,15 @@ test("spawn_multiple_agents wires a real per-child collaboration inbox into the 
   assert.match(sub, /_broadcastSubAgentCollaborationFinding\([\s\S]{0,260}collaboration\.peerJobIds/,
     "successful child tool evidence must flow into sibling inboxes during execution");
 
-  const spawnAt = RAW_SRC.indexOf("if (it.tc.name === \"spawn_multiple_agents\")");
-  const spawnBlock = SRC.slice(spawnAt, spawnAt + 6000);
+  // 切到这条分支结束，不要固定 6000 字符窗口——分支一变长（这次是给"先关旧会话"补了
+  // 说明）尾部就掉出窗口，断言以「没有开协同会话」的形式假红，而它其实好好的。
+  // 而且这里原来拿 RAW_SRC 的下标去切 SRC（剥过注释的那份），两个偏移根本对不上。
+  // 今天第四条同形状的了。
+  const spawnAt = SRC.indexOf('if (it.tc.name === "spawn_multiple_agents")');
+  assert.ok(spawnAt > 0, "spawn_multiple_agents 的分支找不到了");
+  const spawnEnd = SRC.indexOf("const _asyncSpawnNames", spawnAt);
+  const spawnBlock = SRC.slice(spawnAt, spawnEnd > spawnAt ? spawnEnd : spawnAt + 12000);
+  assert.ok(spawnBlock.length > 2000, `spawn 分支只切出 ${spawnBlock.length} 字符，切法坏了`);
   assert.match(spawnBlock, /collaboration:\s*_smShared\s*\?\s*\{/);
   // 传的是 storeId 而不是裸 jobId：黑板是全局的、jobId 是 run 内的编号，不带 run 前缀
   // 两个标签页的 job#1 会写进同一条记录（见「两个 run 的同号作业不串台」那组测试）。
@@ -26110,7 +26127,14 @@ test("两个 run 的同号作业不共用一个黑板键", () => {
 test("主作业键也要带 run 前缀——上一轮串台修复漏了这一半", () => {
   // `main_${_smLedgerLen}` 用的是账本长度，两个标签页在相同步数时会撞出同一个键，
   // 而 createJob 直接覆盖：A 的主作业记录被 B 顶掉，leadJobId 也指向别人的作业。
-  assert.match(SRC, /const _mainJobId = `main_\$\{_smRunToken\(run\)\}_\$\{_smLedgerLen\}`;/);
+  assert.match(SRC, /const _mainJobId = `main_\$\{_smRunToken\(run\)\}_\$\{_smLedgerLen\}_\$\{run\._subAgentJobSeq \|\| 0\}`;/);
+  // 同一批工具调用里的两次 spawn 会拿到相同的 _smLedgerLen，所以键里还要带派发序号，
+  // 否则 createJob 直接覆盖，两个会话的 leadJobId 指向同一条记录。
+  // 另一半：开新会话之前必须先关掉旧的——endSession 是释放 SharedStore 订阅的唯一出口，
+  // 而它只认 run._collabSession 当前那一个值。不关就永久留在 window 上那个引擎单例里，
+  // 订阅不解绑，而且后续每个新子体都会从 sharedKnowledge 里读到上一个任务的主体广播。
+  assert.match(SRC, /_endRunCollaborationSession\(run, "superseded"\);[\s\S]{0,200}startSession\(/,
+    "第二次 spawn_multiple_agents 直接覆盖了 _collabSession，旧协同会话永远关不掉");
   assert.doesNotMatch(SRC, /const _mainJobId = `main_\$\{_smLedgerLen\}`;/, "又漏掉前缀了");
 });
 

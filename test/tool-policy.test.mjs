@@ -62,6 +62,10 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     // 新增：git worktree。它在 <root>/.mrdayone/worktrees/ 下面建目录、建分支，remove
     // 还会连未提交的改动一起删。原来完全没登记，拿的是默认策略。
     "worktree",
+    // 新增（2026-08-25）：learndesign —— 它真的往工作区写两个文件
+    //（reference/<slug>-design-system.md 和 <slug>-tokens.css），却一直没登记，
+    // 于是只读三模式下照写不误、审批也不弹。
+    "learndesign",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
@@ -122,6 +126,10 @@ test("approval set matches the pre-refactor literal exactly", () => {
     "subagent",
       // 新增（2026-08-25）：gh —— 在 GitHub 上开 PR / 回评论，改的是外部世界且不可逆。
     "gh",
+    // 新增（2026-08-25）：learndesign —— 它真的往工作区写两个文件
+    //（reference/<slug>-design-system.md 和 <slug>-tokens.css），却一直没登记，
+    // 于是只读三模式下照写不误、审批也不弹。
+    "learndesign",
     // 新增（2026-08-25）：git —— 按 op 判，commit/push/stash/clone 要问，status/diff/log 不问。
     // 「会改工作区就必须能问」那条不变量只豁免 worktree 一个，所以 git 登记了
     // mutatesWorkspace 就必须同时登记 needsApproval。
@@ -190,6 +198,10 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // 它们此前完全没登记，于是这道门对整个 git/gh 族从来没生效过：走自定义模型时
     // 网关那份拒绝清单不参与，Explorer/Plan/Reviewer 下能真的开 PR。
     "git", "gh",
+    // 新增（2026-08-25）：learndesign —— 它真的往工作区写两个文件
+    //（reference/<slug>-design-system.md 和 <slug>-tokens.css），却一直没登记，
+    // 于是只读三模式下照写不误、审批也不弹。
+    "learndesign",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
