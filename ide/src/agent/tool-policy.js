@@ -268,6 +268,11 @@ function seed() {
     needsApproval: true,
     readOnlyModeBlocked: (call) => !GH_READ_OPS.has(String(call?.op || "")),
   });
+  // learn_design 一直没登记，于是三道门同时哑掉，它在 Plan / Explorer / Reviewer 里
+  // **真的往工作区写两个文件**（reference/<slug>-design-system.md 和 <slug>-tokens.css），
+  // 还会清掉「空工作区」标记。只读模式的注册表里也留着它（可见性判据是 `=== true`），
+  // search_tools 取得回；网关那份拒绝清单里同样没有它。
+  defineTool("learndesign", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });

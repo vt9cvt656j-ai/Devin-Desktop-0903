@@ -22164,6 +22164,16 @@ function _approvalLabel(call) {
       detail: (call.path || call.wikiDest || "PRODUCT_WIKI.md") + "\n\n这个路径由模型指定；写入是整份替换，不是追加。",
     };
     case "saveskill": return { title: "保存为技能？", detail: `${call.name || ""}\n${String(call.description || "").slice(0, 160)}\n→ ${call.path || ""}` };
+    // learn_design 会往工作区**真的写两个文件**（一份设计体系说明、一份 token CSS），
+    // 路径由被学的站点名派生。框上要把这两个落点摆出来——只写「执行该操作？」等于
+    // 让用户闭着眼同意两次写盘。
+    case "learndesign": {
+      const _slug = String(call.name || call.url || "").replace(/^https?:\/\//, "").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "site";
+      return {
+        title: "学习这个站点的设计体系？（会往工作区写两个文件）",
+        detail: `${call.url || ""}\n→ reference/${_slug}-design-system.md\n→ reference/${_slug}-tokens.css`,
+      };
+    }
     // 定时任务是一条**将来会在没人看着时被执行的常驻指令**。框上必须把两件事摆出来：
     // 什么时候跑、跑的时候会拿到哪句话。只写「新建定时任务？」等于让用户闭着眼点同意
     // 一件他事后才会看见后果的事。
@@ -38128,6 +38138,8 @@ const _STRICT_MUTATING_TOOL_NAMES = new Set([
   //   system        切前台、点菜单、开应用
   //   run_subagent  子智能体，能力上等于再开一整个会话
   "computer", "system", "run_subagent",
+  // learn_design：它真的往工作区写两个文件，2026-08-25 才登记进 tool-policy。
+  "learn_design",
 ]);
 
 function _mutatingToolArgIssue(name, rawArgs) {
@@ -50981,7 +50993,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // deadline 在父启动时挂上其 execRun._subDeadline，孙子体不能突破父预算，下限 1s 防负值/零窗口。
   const _parentRemainMs = (run && Number.isFinite(run._subDeadline)) ? (run._subDeadline - Date.now()) : SUBAGENT_TIMEOUT_MS;
   const _subTimeoutMs = Math.max(1000, Math.min(SUBAGENT_TIMEOUT_MS, _parentRemainMs));
-  const _subDeadlineAt = Date.now() + _subTimeoutMs;
+  // 旧的起算点在这里，已下移到抢到并发槽位之后（见 _armSubDeadline）。
   /**
    * 子智能体是否已经超时。**这是唯一的真值**——父侧不要再按经过时间去猜。
    *
@@ -50994,12 +51006,25 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
    * 告诉模型"内部 5 分钟超时会自行终止"。
    */
   let _subTimedOut = false;
-  const timeoutId = setTimeout(() => {
-    _subTimedOut = true;
-    res.className = "atc-result atc-result--timeout";
-    res.textContent = "⏱ [超时终止·已保留部分结果]";
-    if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
-  }, _subTimeoutMs);
+  // **计时器在抢到并发槽位之后才起，不在这里。**
+  //
+  // 排队是可以任意久的：并发上限 4，而 spawn_multiple_agents 的 schema 写着 maxItems 5，
+  // 一次五角色派发**必然**有一个排队；再叠上后台 run_subagent 和会诊归总子体抢同一批槽，
+  // 超员是常态。墙钟预算如果在排队之前起算，排够 5 分钟的那个子体一进循环第一句
+  // `if (_subTimedOut || Date.now() > _subDeadlineAt) break` 就退出，toolCount 是 0，
+  // 于是落进 0 步兜底——用户看到五个角色里少了一个视角、卡片写着「0 步·未执行」，
+  // 而主体的报告说五个视角都覆盖了。预算要衡量的是"它自己干了多久"，不是"它等了多久"。
+  let timeoutId = null;
+  let _subDeadlineAt = Infinity;
+  const _armSubDeadline = () => {
+    _subDeadlineAt = Date.now() + _subTimeoutMs;
+    timeoutId = setTimeout(() => {
+      _subTimedOut = true;
+      res.className = "atc-result atc-result--timeout";
+      res.textContent = "⏱ [超时终止·已保留部分结果]";
+      if (_vpObserver) { try { _vpObserver.disconnect(); } catch {} }
+    }, _subTimeoutMs);
+  };
   
   // === Concurrent subagent limit ===
   // This was a semaphore in name only: it incremented the counter, and when over the
@@ -51024,6 +51049,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     });
   }
   _sess._subAgentsActive++;
+  _armSubDeadline(); // 抢到槽位，从这一刻开始算它自己的墙钟预算
 
   /**
    * 归还一个并发槽位。
@@ -57364,7 +57390,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // === spawn_multiple_agents：一次并发派发 N 个只读子智能体（复用 run._subAgentJobs
         // 真实后台作业台账：同一套超时/代际/await_subagent 汇合机制，零新发明）。
         // shared_store 协同：每个作业落定时把报告摘要写进 SharedStore 并广播给其他作业记录，
-        // 控制台面板 (Cmd/Ctrl+Shift+A) 可实时看到每个作业的状态。
+        // （注：这条记录目前**只服务于子体之间的收件箱**，没有任何 UI 读它。以前这里写着「控制台面板 Cmd/Ctrl+Shift+A 可实时看到每个作业的状态」——那个面板和那个快捷键都不存在，全仓搜不到。留着假话的代价是：下一个来查「子智能体在干什么」的人会去找那个面板、找不到、以为是自己的问题，而真正该做的事因为注释说已经有了，永远不会被做。）。
         if (it.tc.name === "spawn_multiple_agents") {
           const specs = Array.isArray(it.call.agents) ? it.call.agents : [];
           if (!specs.length) {
@@ -57393,7 +57419,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             run._panelConfig = config;
             run._panelBody = body;
             run._subAgentJobs.set(jobId, job);
-            // 控制台可见性：同步登记到 SharedStore（面板/仪表盘读这里）
+            // 登记到 SharedStore。**注意：读它的只有子体之间的收件箱，没有面板也没有仪表盘。**
+            // 这条记录里的 tool/role/description/progress 目前是只写不读的，留着是因为做可见性入口时数据现成。
             try { _globalSharedStore.set(`jobs.sm_${storeId}`, { tool: "run_subagent", role: spec.role, description: desc, status: "running", progress: 0, findings: [], createdAt: Date.now() }); } catch {}
             job.promise = _runSubAgent({
               config,
@@ -57450,7 +57477,20 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             // 同一个键——而 createJob 会直接覆盖，于是 A 的主作业记录被 B 顶掉，
             // startSession 里 leadJobId 指向的也变成了别人的作业。
             // 修串台修到一半，比不修更难查。
-            const _mainJobId = `main_${_smRunToken(run)}_${_smLedgerLen}`;
+            // 主作业键还要带**这次派发自己的序号**。只用账本长度的话，同一批工具调用里
+            // 的两次 spawn 拿到相同的 _smLedgerLen → 相同的键 → createJob 直接覆盖，
+            // 两个会话的 leadJobId 指向同一条记录。
+            const _mainJobId = `main_${_smRunToken(run)}_${_smLedgerLen}_${run._subAgentJobSeq || 0}`;
+            // **先关掉上一个协同会话，再开新的。**
+            //
+            // 这里原来无条件覆盖 run._collabSession，而 endSession 是释放 SharedStore
+            // 订阅的唯一出口、且只认 run._collabSession 当前那一个值。于是一个 run 里派
+            // 两次 spawn_multiple_agents（中间没 await），第一个会话就永久留在
+            // engine.activeCollaborations 里——engine 是挂在 window 上的单例，活到刷新页面。
+            // 三个连带伤害：它的订阅永不解绑；enhanceContext 遍历**所有** activeCollaborations
+            // 取 sharedKnowledge，于是后续每个新子体都会拿到几轮之前甚至上一个任务的主体广播；
+            // 这些残留还会把 enhanced 撑过 maxContextSize，触发那条有损降级。
+            _endRunCollaborationSession(run, "superseded");
             try {
               _globalSharedStore.createJob({ tool: "main_agent", status: "running", findings: [] }, _mainJobId);
               window.collaborationEngine.startSession(_collabId,
@@ -57657,7 +57697,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             message = "✅ 产品 Wiki 已生成并存到 " + wikiPath + "（" + report.length + " 字）。以后做官网 / 理解产品直接 read_file 读它，别重复调研。\n\n" + report;
           } catch (error) { message = "[Wiki 存盘失败: " + String(error?.message || error).slice(0, 80) + "]\n\n" + report; }
         }
-        message = message.slice(0, 8000) + (isWorker ? "" : _subDropNote);
+        message = _clipPreservingErrors(message, 8000) + (isWorker ? "" : _subDropNote);
         it.rawResult = { type: isWorker ? "worker" : "subagent", path: it._wikiPath || it.call.description || "", content: message };
         return message;
       };
@@ -61077,11 +61117,24 @@ function _subAgentCmdAllowed(command, workspaceRoot) {
   // 重定向/反引号/子命令/多行 → 可能落盘或复合语义，拒绝
   if (/[><`\u000d\u000a]|\$\(/.test(raw)) return false;
   // 写盘/发布类词汇出现在任何位置都拒绝（比 _isPureExploreCommand 更严：多 git push/publish/deploy）
-  if (/\b(?:tee|rm|mv|cp|ln|chmod|chown|dd|install|touch|mkdir|xargs|push|publish|deploy|init|create|clone)\b/i.test(raw)) return false;
+  //
+  // **先摘掉「明确表示不安装」的那几个标记再扫词。** 否则 `install` 这个词会把
+  // `npx --no-install tsc --noEmit` 拒掉——而那恰恰是 _detectVerifyCmdRaw 给
+  // TypeScript 项目算出来的标准验证命令。后果是下面 verifyRe 里那条专门为它写的分支
+  // `npx\s+(?:--no-install\s+)?tsc\b[^;]*--noEmit` **结构上不可达**：它永远走不到。
+  // 于是主体派 test/security 角色去「确认改完还能编译」，子体手里那条命令必然被拒。
+  // 摘的是标记本身，不是放宽判据：`npm install` 照旧拒绝。
+  const scan = raw.replace(/--no-install\b/gi, "").replace(/--frozen-lockfile\b/gi, "");
+  if (/\b(?:tee|rm|mv|cp|ln|chmod|chown|dd|install|touch|mkdir|xargs|push|publish|deploy|init|create|clone)\b/i.test(scan)) return false;
   // 每个串联/管道段都必须是只读验证类命令，任何一段拿不准就拒绝（fail-closed）
   const segments = raw.split(/\s*(?:&&|\|\||;|\|)\s*/).map((segment) => segment.trim()).filter(Boolean);
   if (!segments.length) return false;
-  const verifyRe = /^(?:node\s+(?:--check|--test)\b|npx\s+(?:--no-install\s+)?tsc\b[^;]*--noEmit|tsc\b[^;]*--noEmit|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|typecheck|type-check|check)\b|cargo\s+(?:check|test)\b|go\s+(?:vet|test)\b|python3?\s+-m\s+(?:py_compile|pytest)\b|pytest\b|eslint\b|ruff\s+check\b)/;
+  // 这张表要盖住 _detectVerifyCmdRaw **实际会算出来**的那几条，否则主体派子体去验证时
+  // 子体手里的命令必然被拒。补的三条都是那个探测器的产出：
+  //   · `npx --no-install eslint .`（有 eslint 配置时）—— 原来 npx 后面只允许接 tsc
+  //   · `go build ./...`（go.mod）—— 原来只有 go vet / go test；build 不写工作区外的东西
+  //   · `cargo build`（Cargo.toml）—— 同上，且 cargo check/test 本来就在表内
+  const verifyRe = /^(?:node\s+(?:--check|--test)\b|npx\s+(?:--no-install\s+)?(?:tsc\b[^;]*--noEmit|eslint\b|prettier\s+--check\b|vitest\s+run\b|jest\b)|tsc\b[^;]*--noEmit|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|typecheck|type-check|check|build)\b|cargo\s+(?:check|test|build|clippy)\b|go\s+(?:vet|test|build)\b|python3?\s+-m\s+(?:py_compile|pytest|mypy|ruff)\b|pytest\b|mypy\b|eslint\b|ruff\s+check\b)/;
   return segments.every((segment) => verifyRe.test(segment));
 }
 function _emptyExploreSkipMessage(run, root, call) {
