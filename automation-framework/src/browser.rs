@@ -370,32 +370,45 @@ impl BrowserAutomation {
                 }
             }
             
-            if let Some(page) = &self.current_page {
-                match page.goto(url).await {
-                    Ok(_) => {
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("导航失败 (尝试 {}): {:?}", attempt + 1, e);
-                        last_error = Some(Error::Chromium(e));
-                    }
+            // **永远先拿到一个页面，再在它身上 goto。**
+            //
+            // 原来 current_page 为 None 时直接 `new_page(url)`，那条路有两个毛病：
+            //   · 它等的是「新标签页把这个 URL 加载完」，超时之后我们这头放弃了，
+            //     浏览器那头照样可能把标签页建出来并留在那儿——一个野标签页。
+            //     Chrome 会把新标签页置前，于是截图看到的是那个野页，而后续操作的是别的页，
+            //     症状是「截图和实际操作对不上」。三次重试就是三个野页。
+            //   · 它把「开标签页」和「导航」两件事绑成一次不可分的等待，失败时分不清是哪一步。
+            //
+            // 换成 about:blank 开页（几乎必然秒 load）再 goto：开页这一步不再挂在任意
+            // 站点的加载上，goto 失败也只是这一个页导航失败，页还在，重试落在同一个页上。
+            let page = match self.get_or_create_page().await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("拿不到页面 (尝试 {}): {:?}", attempt + 1, e);
+                    last_error = Some(e);
+                    continue;
                 }
-            } else {
-                match self.new_page_bounded(url).await {
-                    Ok(page) => {
-                        self.current_page = Some(Arc::new(page));
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        warn!("创建页面失败 (尝试 {}): {:?}", attempt + 1, e);
-                        last_error = Some(e);
-                    }
+            };
+            match tokio::time::timeout(Self::NEW_PAGE_TIMEOUT, page.goto(url)).await {
+                Ok(Ok(_)) => {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    warn!("导航失败 (尝试 {}): {:?}", attempt + 1, e);
+                    last_error = Some(Error::Chromium(e));
+                }
+                Err(_) => {
+                    warn!("导航超时 (尝试 {})", attempt + 1);
+                    last_error = Some(Error::Other(anyhow::anyhow!(
+                        "打开 {url} 超过 {} 秒还没加载完（页面的 load 事件一直没来，常见于挂住的\
+                         子资源、下载链接、重定向循环或弹出的登录框）。标签页还在，可以换个 URL 再试。",
+                        Self::NEW_PAGE_TIMEOUT.as_secs()
+                    )));
                 }
             }
         }
-        
+
         // 这里原来是 Err(Error::Chromium(last_error.unwrap()))，也就是把累积的错误
         // 硬当成 CdpError。加上超时之后失败不再只有一种来源（超时是本 crate 的 Error），
         // 再那么写会丢掉"为什么失败"——而"页面 load 一直没来"恰恰是最需要说清的一种。

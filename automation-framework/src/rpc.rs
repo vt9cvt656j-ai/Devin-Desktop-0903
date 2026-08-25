@@ -456,7 +456,10 @@ impl RpcServer {
                         "screen.act 需要 ref（screen.elements 结果里的序号）"
                     )));
                 }
-                crate::platform::macos_tree::act(r, action, value)
+                // pid 是调用方（read_screen 时记下的身份）传下来的，可选：不给就不校验，
+                // 给了就必须对得上。见 macos_tree::act 里那段说明。
+                let want_pid = params.get("pid").and_then(|v| v.as_i64()).map(|v| v as i32);
+                crate::platform::macos_tree::act(r, action, value, want_pid)
                     .map_err(|e| Error::Other(anyhow::anyhow!(e)))
             }
             _ => unreachable!("screen_method 只处理 needs_no_agent 里列出的方法"),

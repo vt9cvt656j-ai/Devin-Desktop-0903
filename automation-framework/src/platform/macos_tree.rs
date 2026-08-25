@@ -454,12 +454,31 @@ unsafe fn perform(el: AXUIElementRef, name: &str) -> bool {
 /// 支持的动作必须和 `ui_click` 放行的那一批**完全一致**。少一个的后果不是「那个动作用不了」，
 /// 而是它会退回 JXA 老路，而老路的 ref 是另一套编号（0 基、按控件类型分桶重排），
 /// 退回去必然点到别的元素上——比慢更糟。
-pub fn act(reference: u32, action: &str, value: Option<&str>) -> Result<serde_json::Value, String> {
+pub fn act(
+    reference: u32,
+    action: &str,
+    value: Option<&str>,
+    expect_pid: Option<i32>,
+) -> Result<serde_json::Value, String> {
     let g = HANDLES.lock().map_err(|_| "句柄表不可用".to_string())?;
     let map = g.as_ref().ok_or("还没有读过屏；先调 screen.elements")?;
     let held = map
         .get(&reference)
         .ok_or_else(|| format!("ref {reference} 不在最近一次读屏结果里；重新读一次"))?;
+
+    // 身份校验。`Held.pid` 一直存着却从没被读过，而 ui_click 的工具描述向模型明确保证
+    // 「目标不必在前台，身份由快照里记下的 pid 保证」。承诺落空的后果不是抽象的：
+    // 读屏读的是 A，中间句柄表被别的读屏换成了 B，动作就落到 B 的同序号元素上——
+    // 而签名校验拦不住（同名同位置的按钮在两个应用里长得一样），操作会静默打到别处。
+    if let Some(want) = expect_pid {
+        if want != held.pid {
+            return Err(format!(
+                "这个 ref 属于进程 {}，而这次动作要操作的是进程 {want}——中间有过一次\
+                 读屏把句柄表换掉了。重新 read_screen 再操作。",
+                held.pid
+            ));
+        }
+    }
 
     unsafe {
         // 先确认它还是原来那个东西。
@@ -766,17 +785,17 @@ mod act_tests {
         assert!(!nodes.is_empty(), "先得读到东西");
 
         // 不存在的 ref 要说清楚，而不是崩或者点到别的东西上。
-        let bad = super::act(999_999, "press", None).unwrap_err();
+        let bad = super::act(999_999, "press", None, None).unwrap_err();
         assert!(bad.contains("不在最近一次读屏结果里"), "越界 ref 的说法不对：{bad}");
 
         // 不支持的动作同样要点名可用的是哪几个。
-        let wrong = super::act(1, "click", None).unwrap_err();
+        let wrong = super::act(1, "click", None, None).unwrap_err();
         assert!(wrong.contains("press") && wrong.contains("focus"), "不支持的动作没列出可用的：{wrong}");
 
         // 真正要验的：ref 1 的句柄还活着，回读得到、签名对得上。
         // 走 set_value 到一个多半不可写的元素上——它会在**签名比对之后**才失败，
         // 所以只要报的不是「过期」就说明句柄和签名这一段是通的。
-        let r = super::act(1, "set_value", Some("__probe__"));
+        let r = super::act(1, "set_value", Some("__probe__"), None);
         match r {
             Ok(_) => println!("ref 1 可写，句柄链路通"),
             Err(e) => {

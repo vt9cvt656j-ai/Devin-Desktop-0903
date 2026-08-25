@@ -307,9 +307,21 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
     if let Some(p) = pid.filter(|p| *p > 0) {
         args["pid"] = serde_json::json!(p);
     }
-    let out = crate::automation::automation_call("screen.elements".into(), args)
-        .await
-        .ok()?;
+    // 快路也要自带上限，理由和动作那条一样：automation_call 的 HTTP 客户端给的是
+    // **120 秒**（为 browser.* 等页面准备的）。读一棵树是百毫秒级的事，真等到几十秒
+    // 只意味着 sidecar 排在别的调用后面——而 sidecar 是单线程串行的，一次 browser.goto
+    // 最坏能占住一分钟。没有这一层，一次读屏会把整个智能体循环挂住两分钟。
+    //
+    // 超时按「快路没跑成」处理，自动落回 JXA 老路——那条路自己有 6 秒预算，
+    // 而且它是独立的 osascript 子进程，不排 sidecar 这条队。
+    const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+    let out = tokio::time::timeout(
+        READ_BUDGET,
+        crate::automation::automation_call("screen.elements".into(), args),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let arr = out.get("elements")?.as_array()?;
     let pid = out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
     if pid <= 0 {
@@ -647,7 +659,7 @@ pub async fn ui_click(
     // 回一句「辅助功能操作超时或无权限」，一个和真实原因毫无关系的理由。
     // 老路只在快路没跑成（sidecar 没起来 / 没权限 / 读回空）时才用得上。
     if binding.native {
-        return native_ax_action(&binding, &action, value.as_deref()).await;
+        return native_ax_action(&binding, &action, value.as_deref(), &expected_target).await;
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
         perform_ax_action(&binding, &action, value.as_deref(), &expected_target)
@@ -666,8 +678,13 @@ async fn native_ax_action(
     binding: &AxRefBinding,
     action: &str,
     value: Option<&str>,
+    expected_target: &AccessibilityTarget,
 ) -> Result<serde_json::Value, String> {
-    let mut args = serde_json::json!({ "ref": binding.raw_ref, "action": action });
+    // pid 一起发下去。工具描述向模型保证「身份由快照里记下的 pid 保证，目标不必在前台」，
+    // 而 sidecar 那边的 Held.pid 此前只存不读——这句保证一直是空的。
+    let mut args = serde_json::json!({
+        "ref": binding.raw_ref, "action": action, "pid": expected_target.pid,
+    });
     if let Some(v) = value {
         args["value"] = serde_json::json!(v);
     }
