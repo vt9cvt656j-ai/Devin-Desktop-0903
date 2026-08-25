@@ -31309,7 +31309,11 @@ test("401 和 402 要真的把恢复路径摆到人面前，而不是只留一�
 
 test("状态码要结构化传下来，不能再从文案里反解析", () => {
   // 产生点：两处 HTTP 错误事件都要带 status。
-  const emits = SRC.match(/onEvent\(\{ kind: "error", message: _formatAiHttpError\([^)]*\)[^}]*\}\)/g) || [];
+  //
+  // 事件体不能假设它排在一行里。写死单行形状的话，产生点一换行就变成匹配到 0 个，
+  // 于是这条断言从「漏带状态码」静默滑成「没找到产生点」—— 门看着还在，实际不守了。
+  // 所以用 [\s\S] 跨行、并允许 kind/message 之间是任意空白。
+  const emits = SRC.match(/onEvent\(\{\s*kind: "error",\s*message: _formatAiHttpError\([\s\S]*?\}\)/g) || [];
   assert.ok(emits.length >= 2, "没找到 HTTP 错误事件的产生点");
   for (const e of emits) {
     assert.match(e, /status: resp\.status/, `错误事件漏带状态码：${e}`);

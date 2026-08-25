@@ -409,7 +409,20 @@ fn signature_drift(a: &AxNode, b: &AxNode) -> Option<String> {
     None
 }
 
-/// 对一个 ref 执行 AX 动作。press / focus / set_value 三种。
+/// 发一个 AX 动作；AXError 0 才算成功。
+///
+/// 不能只看「没抛错」：AXUIElementPerformAction 对不支持这个动作的元素会返回非 0 而不是
+/// 崩溃，把返回码丢掉就等于把「这个元素根本按不动」报成成功。
+unsafe fn perform(el: AXUIElementRef, name: &str) -> bool {
+    let a = CFString::new(name);
+    AXUIElementPerformAction(el, a.as_concrete_TypeRef()) == 0
+}
+
+/// 对一个 ref 执行 AX 动作。
+///
+/// 支持的动作必须和 `ui_click` 放行的那一批**完全一致**。少一个的后果不是「那个动作用不了」，
+/// 而是它会退回 JXA 老路，而老路的 ref 是另一套编号（0 基、按控件类型分桶重排），
+/// 退回去必然点到别的元素上——比慢更糟。
 pub fn act(reference: u32, action: &str, value: Option<&str>) -> Result<serde_json::Value, String> {
     let g = HANDLES.lock().map_err(|_| "句柄表不可用".to_string())?;
     let map = g.as_ref().ok_or("还没有读过屏；先调 screen.elements")?;
@@ -434,8 +447,7 @@ pub fn act(reference: u32, action: &str, value: Option<&str>) -> Result<serde_js
         match action {
             "press" => {
                 for name in ["AXPress", "AXOpen", "AXPick", "AXConfirm"] {
-                    let a = CFString::new(name);
-                    if AXUIElementPerformAction(held.el, a.as_concrete_TypeRef()) == 0 {
+                    if perform(held.el, name) {
                         return Ok(serde_json::json!({
                             "ok": true, "action": "press", "used": name,
                             "role": live.role, "text": live.text,
@@ -483,9 +495,50 @@ pub fn act(reference: u32, action: &str, value: Option<&str>) -> Result<serde_js
                 }
                 Ok(serde_json::json!({"ok": true, "action": "set_value", "value": back}))
             }
-            other => Err(format!(
-                "不支持的动作「{other}」；可用：press / focus / set_value"
-            )),
+            // 滚到可见。可访问性树只覆盖**可见的那一屏**，折叠以下的元素压根不在清单里，
+            // 没有这个动作，「滚下去再点」就只能盲滚坐标，而滚动量和目标位置之间没有任何
+            // 对应关系。滚完这一屏的几何全变，而 ref 的签名里含 x/y ——旧 ref 随之全部作废，
+            // 所以这句话必须跟着回执一起带回去，否则模型会拿着一批已失效的 ref 接着点。
+            "scroll_to" => {
+                if !perform(held.el, "AXScrollToVisible") {
+                    return Err(format!(
+                        "「{}」不支持 scroll_to（AXScrollToVisible）",
+                        live.text
+                    ));
+                }
+                let (x, y) = attr_point(held.el, "AXPosition").unwrap_or((live.x, live.y));
+                Ok(serde_json::json!({
+                    "ok": true, "action": "scroll_to",
+                    "role": live.role, "text": live.text, "x": x, "y": y,
+                    "note": "滚动后这一屏的元素位置全变了，之前那批 ref 已经作废——先重新 read_screen 再操作。",
+                }))
+            }
+            other => {
+                let ax = match other {
+                    "increment" => "AXIncrement",
+                    "decrement" => "AXDecrement",
+                    "show_menu" => "AXShowMenu",
+                    "confirm" => "AXConfirm",
+                    "cancel" => "AXCancel",
+                    "pick" => "AXPick",
+                    _ => {
+                        return Err(format!(
+                            "不支持的动作「{other}」；可用：press / focus / set_value / scroll_to / \
+                             increment / decrement / show_menu / confirm / cancel / pick"
+                        ))
+                    }
+                };
+                if !perform(held.el, ax) {
+                    return Err(format!(
+                        "「{}」不响应 {ax}（role={}）",
+                        live.text, live.role
+                    ));
+                }
+                Ok(serde_json::json!({
+                    "ok": true, "action": other,
+                    "role": live.role, "text": live.text, "value": node_value(held.el),
+                }))
+            }
         }
     }
 }

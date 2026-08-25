@@ -433,7 +433,11 @@ test("预测必须显式关思考，否则网关把它升级成 effort=high + ma
    * 于是一次「猜一句话」变成深思考大请求，然后被期限掐死。
    * 生产数据对得上：claude-fable-5 三天 70 组请求，预测行 0 条。
    */
-  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"), SRC_CODE.indexOf("async function _predictNextAsk") + 8000);
+  // 按 AST 抠整个函数，不切固定长度的窗口：函数一长（这段注释就长），窗口够不到
+  // 尾部的断言目标，而测试**仍然是绿的** —— 它守的东西已经不在它看的那段里了。
+  // code:true 取的是注释置空的那一份：下面有一条否定断言，而这个函数的注释里
+  // 正好引用了它禁的那个写法，拿原文断言会被自己的注释喂到。
+  const src = grab("_predictNextAsk", { code: true });
   assert.match(src, /reasoning_effort: "off"/, "没有显式关思考——网关会补成 high");
 
   // **只能**用 reasoning_effort:"off"。分叉前那道守卫判的是 `thinking` 键在不在
@@ -441,9 +445,15 @@ test("预测必须显式关思考，否则网关把它升级成 effort=high + ma
   assert.ok(!/thinking:\s*\{\s*type:\s*"disabled"\s*\}/.test(src),
     "发了 thinking:{type:disabled}——那会把 max_tokens 抬到 32000");
 
-  // 只对网关发：自定义端点的上游未知，塞一个不认的枚举会 400，把功能整个打死。
-  assert.match(src, /_predictCfg\.viaGateway \? \{ reasoning_effort: "off" \} : \{\}/,
-    "对自定义端点也发了这个枚举，可能 400");
+  // 只对**网关上的 Anthropic 一族**发。两条路都会 400：自定义端点上游未知；而网关是
+  // 按线路协议分叉的，非 anthropic 的线路原样透传 body。2026-08-25 线上实测，
+  // stealth/ox-alpha 当天 7 次 400，报文是
+  // `reasoning_effort: invalid option: expected one of "max"|…|"none"` —— off 不在枚举里。
+  assert.match(
+    src,
+    /_predictCfg\.viaGateway && _isAnthropicWireFamily\(_predictCfg\.model\) \? \{ reasoning_effort: "off" \} : \{\}/,
+    "这个枚举发到了 anthropic 桥以外的线路上，会被上游 400 打回，那些模型上预测一条都不出",
+  );
 
   // 网关那两条判据本身也钉一下，免得服务端改了这边毫不知情。
   const gw = fs.readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
@@ -451,6 +461,10 @@ test("预测必须显式关思考，否则网关把它升级成 effort=high + ma
     "网关的默认档变了——如果不再默认 high，这里的 off 就该重新评估");
   assert.match(gw, /is_some_and\(\|e\| !e\.is_empty\(\) && e != "off"\)/,
     "网关不再把 off 排除在 has_thinking 之外了——那 off 也会触发 32000 地板");
+  // 上面「按模型名判该不该发 off」之所以成立，前提是网关按**线路协议**分叉：
+  // 非 anthropic 的线路原样透传 body，客户端塞的枚举会直接落到上游手里。
+  assert.match(gw, /let anthropic = conn\.protocol == "anthropic"/,
+    "网关不再按线路协议分叉了——客户端按模型名判该不该发 off 的整套判据都要重新评估");
 });
 
 test("期限要和预算一起抬，只改一半是把顶满上限换成静默超时", () => {
@@ -498,4 +512,22 @@ test("默认底色是明写的，不是粘在别的规则行尾的碎片", () =>
     "无作用域的默认底色还粘在 --game_asset 行尾");
   assert.match(APP_CSS, /\.atc-type-icon \{[^}]*background: #ede7f6; color: #4527a0;[^}]*\}/s,
     "默认底色丢了——没有专属配色的 24 个工具图标会变成透明方块");
+});
+
+test("判断走不走 Anthropic 桥：Haiku 算，牛来/GPT 不算", () => {
+  const isAnthropicWire = new Function(`return ${grab("_isAnthropicWireFamily")}`)();
+
+  // Haiku 是最容易判漏的一族：它在档位表里的 kind 是 "none"（没有可调档位），
+  // 所以任何按 kind 判的写法都会把它整族漏掉，而它照样走 anthropic 桥。
+  for (const id of ["claude-haiku-4-5", "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "mythos-1"]) {
+    assert.equal(isAnthropicWire(id), true, `${id} 该被判成走 anthropic 桥`);
+  }
+
+  // 这几个走的是原样透传的线路，收到 "off" 会被上游 400 打回。
+  for (const id of ["stealth/ox-alpha", "gpt-5.6-sol", "grok-4.5", "deepseek-v4-pro", "gemini-3-pro"]) {
+    assert.equal(isAnthropicWire(id), false, `${id} 不走 anthropic 桥，不该收到 off`);
+  }
+
+  assert.equal(isAnthropicWire(""), false, "空模型名不该被判成 Anthropic");
+  assert.equal(isAnthropicWire(undefined), false, "缺模型名不该被判成 Anthropic");
 });

@@ -331,6 +331,28 @@ impl BrowserAutomation {
         )
     }
 
+    /// 新建标签页等页面 load 的上限。
+    ///
+    /// chromiumoxide 的 `Browser::new_page` 是**没有上限**的：它等的是这个 frame 收到过
+    /// 名为 "load" 的 Page.lifecycleEvent，而兑现它的那个 oneshot 在 `set_initiator` 之后
+    /// 就被搬出了 pending_commands，从此不再受 30 秒逐出管辖。也就是说只要页面永远不触发
+    /// load，这个 await 就**永远不返回**——挂着的子资源、下载型 URL、重定向循环、
+    /// basic-auth 弹窗都能做到。这是整条自动化链上唯一一处真正的无限期等待，
+    /// 而它还握着 rpc 那把 agent 锁，一挂就把读屏之类完全无关的调用一起堵死。
+    const NEW_PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// 新建标签页，带上限。超时按普通错误返回，让上层的重试和回执照常工作。
+    async fn new_page_bounded(&self, url: &str) -> Result<Page> {
+        match tokio::time::timeout(Self::NEW_PAGE_TIMEOUT, self.browser.new_page(url)).await {
+            Ok(r) => r.map_err(Error::Chromium),
+            Err(_) => Err(Error::Other(anyhow::anyhow!(
+                "打开 {url} 超过 {} 秒还没加载完（页面的 load 事件一直没来，常见于挂住的子资源、\
+                 下载链接、重定向循环或弹出的登录框）。换个 URL，或者先 browser.start 再单独 goto。",
+                Self::NEW_PAGE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
     /// 导航到指定 URL（带重试机制）
     pub async fn navigate(&mut self, url: &str) -> Result<()> {
         info!("导航到: {}", url);
@@ -356,11 +378,11 @@ impl BrowserAutomation {
                     }
                     Err(e) => {
                         warn!("导航失败 (尝试 {}): {:?}", attempt + 1, e);
-                        last_error = Some(e);
+                        last_error = Some(Error::Chromium(e));
                     }
                 }
             } else {
-                match self.browser.new_page(url).await {
+                match self.new_page_bounded(url).await {
                     Ok(page) => {
                         self.current_page = Some(Arc::new(page));
                         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -374,7 +396,12 @@ impl BrowserAutomation {
             }
         }
         
-        Err(Error::Chromium(last_error.unwrap()))
+        // 这里原来是 Err(Error::Chromium(last_error.unwrap()))，也就是把累积的错误
+        // 硬当成 CdpError。加上超时之后失败不再只有一种来源（超时是本 crate 的 Error），
+        // 再那么写会丢掉"为什么失败"——而"页面 load 一直没来"恰恰是最需要说清的一种。
+        Err(last_error.unwrap_or_else(|| {
+            Error::Other(anyhow::anyhow!("导航失败，且没有留下任何错误"))
+        }))
     }
 
     /// 获取当前页面（如果没有则创建新页面）
@@ -384,7 +411,9 @@ impl BrowserAutomation {
         }
 
         info!("创建新页面");
-        let page = self.browser.new_page("about:blank").await?;
+        // 同样要有上限：click / type / eval / screenshot / content 在没有当前页面时
+        // 都从这里过，一处无限等就把它们全拖下水。
+        let page = self.new_page_bounded("about:blank").await?;
         let page = Arc::new(page);
         self.current_page = Some(Arc::clone(&page));
         Ok(page)

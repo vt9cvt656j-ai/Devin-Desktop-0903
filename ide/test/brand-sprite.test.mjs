@@ -73,3 +73,32 @@ test("没有纯白填充的图标（白底上会隐形）", () => {
   const whites = [...sprite.matchAll(/fill=\\"(#fff|#ffffff|white)\\"/gi)];
   assert.equal(whites.length, 0, "有图标的主体是白色的，画在浅色底片上会看不见");
 });
+
+/**
+ * 网关说「还有没试过的出口」时，不能走 15 秒的限流退避。
+ *
+ * 那条长退避是为「所有上游都在限流」准备的。而多路由下常见的情况是：撞上的两个出口
+ * 刚被记了让位，**重发一次就会换一个出口、多半立刻成功** —— 这时等 15 秒是白等。
+ *
+ * 判据必须走响应头，不能从文案里认：网关的错误措辞改一次，认文案那套就静默失效。
+ */
+test("网关说还有别的出口时，走快速重发而不是限流长退避", () => {
+  const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
+  // 用子串比而不是正则：这段代码里有 `?.`、`("`、`"1"` 一堆要转义的东西，
+  // 正则写错的表现是**断言恒不成立**，看起来像功能坏了，其实是测试坏了。
+  assert.ok(
+    src.includes('retryElsewhere: resp.headers?.get?.("x-mide-retry-elsewhere") === "1"'),
+    "没有从响应头取这个信号 —— 从错误文案里反解析的话，网关改一次措辞就失效",
+  );
+  assert.ok(
+    src.includes("attemptRetryElsewhere = ev.retryElsewhere === true"),
+    "信号没有被重试循环接住",
+  );
+  // 限流判据里必须排掉它，否则信号收到了也不起作用。
+  const at = src.indexOf("const canWaitOutRateLimit");
+  assert.ok(at > 0, "限流判据不见了");
+  assert.ok(
+    src.slice(at, at + 600).includes("!attemptRetryElsewhere"),
+    "限流判据没有排掉「还有别的出口」这种情况 —— 会白等 15 秒",
+  );
+});
