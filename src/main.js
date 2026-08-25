@@ -295,15 +295,16 @@ if (!inTauri) {
 // existing SharedStore instead of advertising a disconnected realtime layer.
 window.collaborationEngine = getCollaborationEngine({
   store: _globalSharedStore,
-  mode: "shared_store",
-  readFile: (path) => backend.readTextFile(path),
+  // mode 这里给什么都不影响：唯一的 startSession 调用点写死 lead_follower，
+  // 而引擎现在也只剩这一种模式（shared_store 那条是 main.js 早就直接做了的第二套实现，
+  // 已删）。留着这个字段只是为了不改构造器签名。
+  mode: "lead_follower",
+  // readFile 注入删了：它唯一的消费方是 extractFileSnippets，而那条链的入口
+  // （enhanceContext 的 filesToInclude）在生产里恒为空数组，一次都没执行过。
   config: {
-    tokenBudget: 100000,
-    warningThreshold: 80,
-    criticalThreshold: 90,
-    broadcastThreshold: 5,
+    // tokenBudget / warningThreshold / criticalThreshold / broadcastThreshold 四个也删了：
+    // 读它们的那一族方法（trackTokenUsage 等五个）零调用点，已随之删除。
     maxContextSize: 8000,
-    fileSnippetsCount: 3,
   },
 });
 
