@@ -336,6 +336,53 @@ impl RpcServer {
     /// 之所以做成"有就用、没有就保持原样"，是因为 mouse.click 的老语义是"在当前位置点"，
     /// 有脚本依赖它；而两个工具 schema 又都对外声明可以带坐标。两边都认账。
     #[cfg(feature = "system")]
+    /// 这次点击要按住哪些修饰键。keys / modifiers / with 三种写法都收——
+    /// 模型是从工具目录里学写法的，认死一种等于逼它猜。
+    #[cfg(feature = "system")]
+    fn modifiers_of(params: &serde_json::Value) -> Vec<String> {
+        for k in ["keys", "modifiers", "with"] {
+            if let Some(v) = params.get(k) {
+                if let Some(arr) = v.as_array() {
+                    return arr.iter().filter_map(|x| x.as_str()).map(str::to_string).collect();
+                }
+                if let Some(s) = v.as_str() {
+                    // "cmd+shift" / "cmd shift" / "cmd,shift" 都当成两个键
+                    return s
+                        .split(|c: char| c == '+' || c == ',' || c.is_whitespace())
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// 连点 n 次，可带修饰键，可带落点。三个 click 方法共用。
+    #[cfg(feature = "system")]
+    fn click_n(
+        agent: &mut crate::agent::Agent,
+        params: &serde_json::Value,
+        times: u32,
+    ) -> Result<serde_json::Value> {
+        Self::click_at_if_given(agent, params)?;
+        let button = params.get("button").and_then(|v| v.as_str()).map(str::to_string);
+        let mods = Self::modifiers_of(params);
+        if mods.is_empty() {
+            agent.mouse_click_times(button.as_deref(), times)?;
+        } else {
+            agent.with_modifiers(&mods, |a| a.mouse_click_times(button.as_deref(), times))?;
+        }
+        let mut out = Self::acted_at(agent);
+        // 回执带上真的按了哪些修饰键：写错键名时静默降级成普通点击是最难查的一种。
+        if !mods.is_empty() {
+            out["modifiers"] = serde_json::json!(mods);
+        }
+        out["clicks"] = serde_json::json!(times);
+        Ok(out)
+    }
+
     fn click_at_if_given(
         agent: &mut crate::agent::Agent,
         params: &serde_json::Value,
@@ -624,17 +671,28 @@ impl RpcServer {
                 // 两个工具入口（automation / computer）都对外声明可以传 {x,y}，而这里以前只读
                 // button——多余的键被 serde 静默忽略，于是"带坐标的点击"实际点在光标上次停留的
                 // 位置上，还回一个 ok。不传坐标时保持原地点击的老行为。
+                Self::click_n(&mut agent, &params, 1)
+            }
+
+            #[cfg(feature = "system")]
+            "mouse.double_click" => Self::click_n(&mut agent, &params, 2),
+
+            // 三连击：整段选中一行/一段。文本编辑里的常用动作，此前完全不存在。
+            #[cfg(feature = "system")]
+            "mouse.triple_click" => Self::click_n(&mut agent, &params, 3),
+
+            // 按住 / 松开。拖滑块、框选、跨应用拖放靠这两条；底层早就有，一直没暴露。
+            #[cfg(feature = "system")]
+            "mouse.down" => {
                 Self::click_at_if_given(&mut agent, &params)?;
-                let button = params.get("button").and_then(|v| v.as_str());
-                agent.mouse_click(button)?;
+                agent.mouse_button_down(params.get("button").and_then(|v| v.as_str()))?;
                 Ok(Self::acted_at(&mut agent))
             }
-            
+
             #[cfg(feature = "system")]
-            "mouse.double_click" => {
+            "mouse.up" => {
                 Self::click_at_if_given(&mut agent, &params)?;
-                let button = params.get("button").and_then(|v| v.as_str());
-                agent.mouse_double_click(button)?;
+                agent.mouse_button_up(params.get("button").and_then(|v| v.as_str()))?;
                 Ok(Self::acted_at(&mut agent))
             }
             
@@ -665,13 +723,21 @@ impl RpcServer {
             
             #[cfg(feature = "system")]
             "mouse.scroll" => {
-                let delta_x = params.get("delta_x")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
+                // delta_x 原来用 as_i64 取：模型给 3.0（JSON 里是浮点）或 "3"（字符串）
+                // 都会拿到 None → **静默当成 0**，水平滚动就这么一声不响地没了。
+                // delta_y 早就用 coord 了，两边不一致本身就是信号。
+                let delta_x = Self::coord(&params, "delta_x").unwrap_or(0.0) as i32;
                 let delta_y = Self::coord(&params, "delta_y")
-                    .ok_or_else(|| Error::Other(anyhow::anyhow!("Missing 'delta_y' parameter")))? as i32;
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "mouse.scroll 需要 delta_y（正数向下、负数向上）；delta_x 可选")))? as i32;
+                // 滚动作用在**指针所在的那个区域**上，不是"当前窗口"。想滚某个面板就得先把
+                // 指针移进去——而这件事描述里从没说过，模型只能在整页上滚然后发现没动。
+                // 收下 x/y，语义和 click 一致：给了就先移过去。
+                Self::click_at_if_given(&mut agent, &params)?;
                 agent.mouse_scroll(delta_x, delta_y)?;
-                Ok(serde_json::json!({"status": "ok"}))
+                let mut out = Self::acted_at(&mut agent);
+                out["scrolled"] = serde_json::json!({"delta_x": delta_x, "delta_y": delta_y});
+                Ok(out)
             }
             
             #[cfg(feature = "system")]
@@ -682,6 +748,25 @@ impl RpcServer {
                 focus_bracketed(agent, |a| a.keyboard_type(text))
             }
             
+            // 长按。keyboard.down 之后没有任何合法的等待手段——computer 拿不到 sleep，
+            // 而两次 RPC 之间的间隔完全不可控。空格长按跳跃、方向键长按连续滚动、
+            // 长按呼出菜单，全卡在这一条上。
+            #[cfg(feature = "system")]
+            "keyboard.hold" => {
+                let key = params.get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::Other(anyhow::anyhow!(
+                        "keyboard.hold 需要 key（要按住的键）和可选的 ms（毫秒，默认 500，上限 10000）")))?;
+                let ms = Self::coord(&params, "ms")
+                    .or_else(|| Self::coord(&params, "duration_ms"))
+                    .or_else(|| Self::coord(&params, "millis"))
+                    .unwrap_or(500.0)
+                    .max(1.0) as u64;
+                let key = key.to_string();
+                focus_bracketed(agent, |a| a.keyboard_hold(&key, ms))?;
+                Ok(serde_json::json!({"status": "ok", "key": key, "held_ms": ms.min(10_000)}))
+            }
+
             #[cfg(feature = "system")]
             "keyboard.press" => {
                 let key = params.get("key")

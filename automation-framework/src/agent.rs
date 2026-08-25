@@ -232,35 +232,96 @@ impl Agent {
     }
 
     #[cfg(feature = "system")]
+    /// 按钮名解析。原来在 mouse_click / mouse_double_click 里各抄了一份，
+    /// 而 `_` 分支一律落回 Left —— 模型写 "secondary" 或 "Right" 就会**静默点成左键**，
+    /// 回执照样 ok。这里认全常见写法，且大小写无关。
+    fn button_of(name: Option<&str>) -> MouseButton {
+        match name.unwrap_or("left").trim().to_ascii_lowercase().as_str() {
+            "right" | "secondary" | "context" => MouseButton::Right,
+            "middle" | "wheel" | "center" => MouseButton::Middle,
+            _ => MouseButton::Left,
+        }
+    }
+
     pub fn mouse_click(&mut self, button: Option<&str>) -> Result<()> {
+        self.mouse_click_times(button, 1)
+    }
+
+    /// 连点 n 次。1=单击、2=双击、3=三连击（整段选中）。
+    #[cfg(feature = "system")]
+    pub fn mouse_click_times(&mut self, button: Option<&str>, times: u32) -> Result<()> {
         self.system_init()?;
         let mut sys = self.system.as_ref()
             .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
             .lock()
             .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
-        let btn = match button.unwrap_or("left") {
-            "left" => MouseButton::Left,
-            "right" => MouseButton::Right,
-            "middle" => MouseButton::Middle,
-            _ => MouseButton::Left,
-        };
-        sys.click(btn)
+        sys.click_times(Self::button_of(button), times)
+    }
+
+    /// 按住不放 / 松开。拖滑块、框选、拖放到另一个应用都靠这两条；
+    /// 底层 system.rs 里早就写好了，只是一直没有任何生产调用点，也没暴露给 RPC。
+    #[cfg(feature = "system")]
+    pub fn mouse_button_down(&mut self, button: Option<&str>) -> Result<()> {
+        self.system_init()?;
+        let mut sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.mouse_down(Self::button_of(button))
+    }
+
+    #[cfg(feature = "system")]
+    pub fn mouse_button_up(&mut self, button: Option<&str>) -> Result<()> {
+        self.system_init()?;
+        let mut sys = self.system.as_ref()
+            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
+            .lock()
+            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
+        sys.mouse_up(Self::button_of(button))
+    }
+
+    /// 按住一个键若干毫秒再松开。
+    ///
+    /// 没有它就做不了「长按」：keyboard.down 之后没有任何合法的等待手段——computer
+    /// 拿不到 sleep，而两次 RPC 之间的间隔完全不可控（这个 sidecar 还是串行的）。
+    /// 空格长按跳跃、方向键长按连续滚动、长按呼出菜单，全卡在这一条上。
+    #[cfg(feature = "system")]
+    pub fn keyboard_hold(&mut self, key: &str, millis: u64) -> Result<()> {
+        // 上限 10 秒：按住不放期间这条线程不干别的，写成 5 分钟等于把服务挂起。
+        let ms = millis.clamp(1, 10_000);
+        self.keyboard_down(key)?;
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        self.keyboard_up(key)
+    }
+
+    /// 按住若干修饰键，执行一个动作，再松开。
+    ///
+    /// Shift+点击（连选）、Cmd+点击（多选 / 新标签页打开）、Alt+拖拽（复制）这些在
+    /// 真实界面里是基本操作，而此前**做不到**：只能拆成 keyboard.down → mouse.click →
+    /// keyboard.up 三次 RPC，而这个 sidecar 单线程串行，三次之间隔着完整的往返，
+    /// 中途任何一次排队都会让修饰键在点击之前就松开——失败得毫无痕迹。
+    ///
+    /// 松开一定要执行：动作失败时若不松开，修饰键会**一直按着**，后面每一次输入都被污染。
+    #[cfg(feature = "system")]
+    pub fn with_modifiers<T>(
+        &mut self,
+        keys: &[String],
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        for k in keys {
+            self.keyboard_down(k)?;
+        }
+        let out = f(self);
+        // 逆序松开，且不因为前一个失败就跳过后面的。
+        for k in keys.iter().rev() {
+            let _ = self.keyboard_up(k);
+        }
+        out
     }
     
     #[cfg(feature = "system")]
     pub fn mouse_double_click(&mut self, button: Option<&str>) -> Result<()> {
-        self.system_init()?;
-        let mut sys = self.system.as_ref()
-            .ok_or_else(|| Error::System("系统自动化未初始化".to_string()))?
-            .lock()
-            .map_err(|e| Error::System(format!("Mutex 中毒: {}", e)))?;
-        let btn = match button.unwrap_or("left") {
-            "left" => MouseButton::Left,
-            "right" => MouseButton::Right,
-            "middle" => MouseButton::Middle,
-            _ => MouseButton::Left,
-        };
-        sys.double_click(btn)
+        self.mouse_click_times(button, 2)
     }
     
     #[cfg(feature = "system")]
@@ -765,6 +826,27 @@ fn parse_key(key: &str) -> Result<Key> {
         "f10" => Ok(Key::F10),
         "f11" => Ok(Key::F11),
         "f12" => Ok(Key::F12),
+        // **符号键的带名写法。** "+" / "-" / "=" 这些本身走下面单字符那一支就通了，
+        // 但模型也会写 "plus" / "minus"（DOM 键名和各家文档都这么教），认死一种等于逼它猜。
+        // 映射到 Character 是安全的：所有平台都走同一条 Unicode 路径。
+        "plus" | "add" => Ok(Key::Character('+')),
+        "minus" | "subtract" | "dash" => Ok(Key::Character('-')),
+        "equal" | "equals" => Ok(Key::Character('=')),
+        "comma" => Ok(Key::Character(',')),
+        "period" | "dot" => Ok(Key::Character('.')),
+        "slash" => Ok(Key::Character('/')),
+        "backslash" => Ok(Key::Character('\\')),
+        "semicolon" => Ok(Key::Character(';')),
+        "quote" | "apostrophe" => Ok(Key::Character('\'')),
+        "bracketleft" | "leftbracket" => Ok(Key::Character('[')),
+        "bracketright" | "rightbracket" => Ok(Key::Character(']')),
+        "backquote" | "backtick" | "grave" => Ok(Key::Character('`')),
+        // **Insert / CapsLock / Numlock / ScrollLock / Pause / Print 没有加。**
+        // 不是忘了：enigo 0.2 把它们全部 cfg 成 `windows` 或 `unix && !macos`，
+        // macOS 上那些变体根本不存在。要支持就得给本 crate 的 Key 加 cfg 变体、
+        // 再给 convert_key 加 cfg 分支，而这条路**在这台机器上编译不出来也验不了**
+        //（cfg 分支不参与本平台编译，mac 全绿说明不了 Windows 能编）。
+        // 等真要做 Windows 那一轮时连 `cargo xwin check` 一起做，别在这里凭印象加。
         s if s.len() == 1 => {
             let ch = s.chars().next().unwrap();
             Ok(Key::Character(ch))

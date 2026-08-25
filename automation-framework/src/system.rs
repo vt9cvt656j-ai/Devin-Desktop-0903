@@ -343,13 +343,25 @@ impl SystemAutomation {
         Ok(())
     }
 
+    /// 连点 n 次。双击、三连击共用这一条。
+    ///
+    /// 间隔 50ms 是有讲究的：系统判定「这是一次双击/三连击」靠的是**相邻两次点击的
+    /// 时间差和位置差**，不是我们说它是。太快某些工具包会丢事件，太慢就被判成两次单击。
+    /// 三连击（整段选中一行/一段）在文本编辑里是常用动作，而它此前完全不存在。
+    pub fn click_times(&mut self, button: MouseButton, times: u32) -> Result<()> {
+        debug!("连点 {} 次: {:?}", times, button);
+        for i in 0..times.max(1) {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            self.click(button)?;
+        }
+        Ok(())
+    }
+
     /// 鼠标双击
     pub fn double_click(&mut self, button: MouseButton) -> Result<()> {
-        debug!("双击: {:?}", button);
-        self.click(button)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        self.click(button)?;
-        Ok(())
+        self.click_times(button, 2)
     }
 
     /// 鼠标滚动
