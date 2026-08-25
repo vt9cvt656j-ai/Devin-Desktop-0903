@@ -9,11 +9,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { load, loadConst, fnSource, CODE } from "./helpers/source.mjs";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 
 const normalize = load("_previewNormalizeUrl");
 const isLocal = load("_previewIsLocalUrl");
@@ -175,41 +176,6 @@ test("终端读不到时不抛，已经拿到的候选照样交出去", () => {
   assert.deepEqual(detect().map((c) => c.url), ["http://localhost:8787"]);
 });
 
-test("轮询只在窗格可见且 CDP 引擎时开，其余情况一律停", () => {
-  const timers = new Map();
-  let seq = 0;
-  const state = { el: { hidden: false }, engine: "cdp", url: "http://x", dockOpen: false, frameTimer: 0, logTimer: 0 };
-  const sync = load("_previewSyncTimers", {
-    _preview: state,
-    activePath: "mrdayone:live-preview",
-    PREVIEW_TAB_PATH: "mrdayone:live-preview",
-    PREVIEW_CDP_FRAME_MS: 1200,
-    PREVIEW_LOG_POLL_MS: 2000,
-    _previewPumpFrame: () => {},
-    _previewPumpLogs: () => {},
-    setInterval: () => { const id = ++seq; timers.set(id, true); return id; },
-    clearInterval: (id) => { timers.delete(id); },
-  });
-
-  sync();
-  assert.ok(state.frameTimer, "CDP + 可见时没有开取帧轮询");
-  assert.equal(state.logTimer, 0, "控制台面板没打开却在拉日志");
-
-  state.dockOpen = true; sync();
-  assert.ok(state.logTimer, "控制台面板打开后没有开日志轮询");
-
-  // 切走 = 窗格不可见：两个轮询都必须停。这正是老卡片漏掉的那一步，
-  // 结果是画面没人看，浏览器和 IPC 还在被占着。
-  state.el.hidden = true; sync();
-  assert.equal(state.frameTimer, 0, "窗格隐藏后取帧轮询还在跑");
-  assert.equal(state.logTimer, 0, "窗格隐藏后日志轮询还在跑");
-  assert.equal(timers.size, 0, "有定时器没被 clearInterval 收掉");
-
-  // iframe 引擎本身就是活的，不需要任何轮询
-  state.el.hidden = false; state.engine = "live"; sync();
-  assert.equal(state.frameTimer, 0, "iframe 引擎下还开着取帧轮询");
-  assert.equal(state.logTimer, 0, "iframe 引擎下还开着日志轮询");
-});
 
 test("设备预设缩放：放得下就不缩，放不下按短边等比缩", () => {
   const DEVICES = loadConst("PREVIEW_DEVICES");
@@ -246,17 +212,6 @@ test("设备预设缩放：放得下就不缩，放不下按短边等比缩", ()
   assert.ok(!r.stage.classList.has("is-deviced"));
 });
 
-test("CDP 点击发的是完整指针事件序列，不是 element.click()", () => {
-  // 只发一个 click 的话，React 合成事件、Radix/shadcn 那类监听 pointerdown 的组件
-  // 全都没反应——表现是「点了没用」，而且没有任何报错。
-  const js = load("_PREVIEW_CLICK_JS")(120, 240);
-  assert.match(js, /elementFromPoint\(120, 240\)/);
-  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-    assert.ok(js.includes("'" + type + "'"), "点击序列里少了 " + type);
-  }
-  assert.match(js, /clientX: 120/);
-  assert.match(js, /clientY: 240/);
-});
 
 test("聊天里不再产出旧的内嵌预览卡", () => {
   // 预览搬进标签栏之后，消息体里只留一行指路条。旧的 .mi-live-preview 结构
@@ -275,20 +230,29 @@ test("agent 后台导航不把正在编辑的人拽走", () => {
   assert.match(src, /activePath === PREVIEW_TAB_PATH/);
 });
 
-test("内置 dev server 注入的调试桥是合法 JS，且只在被嵌时说话", () => {
-  // iframe 跨源读不到页面的 console，只有页面自己送出来这一条路。这段脚本躺在
-  // 一个 Python bytes 字面量里、又躺在 JS 模板串里，两层引号任何一层写错都只会
-  // 表现成「预览的控制台永远是空的」，不会有人报错。
-  const src = fnSource("_startDevServer", { code: true });
-  const m = src.match(/BRIDGE_JS = b'<script>([\s\S]*?)<\/script>'/);
-  assert.ok(m, "内置 dev server 没有注入调试桥");
-  const js = m[1];
-  assert.doesNotThrow(() => new Function(js), "注入的调试桥不是合法 JS");
-  assert.ok(js.includes("window.parent===window)return"), "没做「不在 iframe 里就一个字都不发」的判断");
-  assert.ok(js.includes("__mrdayone:\"preview-log\""), "消息没有带识别标记，接收端认不出来");
-  assert.ok(!js.includes("'"), "这段要嵌进 Python 的单引号字面量里，不能出现单引号");
-  // 注入点也要真的接上——常量定义了但没拼进响应，等于没写
-  assert.match(src, /RELOAD_JS \+ BRIDGE_JS/, "调试桥定义了却没被注入到页面里");
+test("调试桥由 dev server 单独提供，而且注入要覆盖根路径", () => {
+  // 桥从「压成一行塞进 Python 的 b'...' 字面量」改成 /__mrdayone_bridge.js 单独提供。
+  // 上一版那个写法只能用双引号、不能换行、不能写注释——加个「拾取元素」就没法写了。
+  const bridge = fnSource("_PREVIEW_BRIDGE_JS", { code: true });
+  const js = bridge.slice(bridge.indexOf("`") + 1, bridge.lastIndexOf("`"));
+  assert.doesNotThrow(() => new Function(js), "桥不是合法 JS");
+  assert.ok(js.includes("window.parent === window"), "没做「不在 iframe 里就只热重载」的判断");
+  assert.ok(js.includes('__mrdayone: "preview-log"'), "日志消息没带识别标记");
+  assert.ok(js.includes('__mrdayone: "preview-picked"'), "拾取结果没带识别标记");
+  assert.ok(js.includes('d.__mrdayone !== "preview-pick"'), "桥不接收父窗口的拾取指令");
+  // 模板字面量里出现 ${ 会被当成插值——这段是要原样送到页面里的
+  assert.ok(!/\$\{/.test(js), "桥里出现了 ${，会被外层模板字面量当成插值");
+
+  const dev = fnSource("_startDevServer", { code: true });
+  assert.match(dev, /BRIDGE_SRC = \$\{JSON\.stringify\(_PREVIEW_BRIDGE_JS\)\}/, "桥没被传进 dev server");
+  assert.match(dev, /__mrdayone_bridge\.js/, "dev server 没有提供桥的路由");
+  assert.match(dev, /BRIDGE_TAG \+ b'<\/body>'/, "桥没被注入页面");
+
+  // **注入必须覆盖 `/`。** translate_path('/') 返回的是目录，.endswith('.html') 不成立，
+  // 于是整个注入分支被跳过——而 `/` 恰恰是 IDE 自己打开的那个地址。实测过：
+  // 热重载和调试桥对根路径从来没生效过，显式敲 /index.html 才有。
+  assert.match(dev, /if os\.path\.isdir\(path\):/, "没有把目录解析成 index.html —— 根路径拿不到桥");
+  assert.match(dev, /for _idx in \('index\.html', 'index\.htm'\)/);
 });
 
 test("预览页签的伪路径不会被当成「当前文件」交出去", () => {
@@ -344,7 +308,6 @@ test("调试桥的 message 监听器只挂一次，不跟着窗格重建", () =>
   assert.ok(!down.includes("_preview.el = null"), "又开始销毁窗格了，监听器会重新开始叠加");
   assert.match(down, /stage\.textContent = "";/,
     "被预览的页面没卸掉——它的定时器/轮询/WebSocket 会在一个看不见的 iframe 里继续跑");
-  assert.match(down, /_previewStopTimers\(\);/);
 });
 
 test("只收当前预览源发来的桥消息", () => {
@@ -352,7 +315,8 @@ test("只收当前预览源发来的桥消息", () => {
   const src = CODE.slice(CODE.indexOf('window.addEventListener("message", (ev) => {'));
   assert.match(src.slice(0, 900), /new URL\(_preview\.url\)\.origin !== ev\.origin/,
     "没有校验消息来源，任何嵌套 iframe 都能往控制台面板里写东西");
-  assert.match(src.slice(0, 900), /d\.__mrdayone !== "preview-log"/);
+  assert.match(src.slice(0, 1200), /d\.__mrdayone === "preview-log"/);
+  assert.match(src.slice(0, 1600), /d\.__mrdayone === "preview-picked"/);
 });
 
 test("桌面壳的 CSP 必须放行实时预览真正要嵌的来源", () => {
@@ -407,12 +371,6 @@ test("桌面壳的 CSP 必须放行实时预览真正要嵌的来源", () => {
   }
 });
 
-test("实时引擎遇到外部地址要自己切走，而不是白屏", () => {
-  const src = fnSource("_previewNavigate", { code: true });
-  assert.match(src, /_preview\.engine === "live" && !_previewIsLocalUrl\(next\)/,
-    "没有判断「实时引擎 + 外部地址」——CSP 会把它拦成一片白，用户看不出原因");
-  assert.match(src, /_previewSetEngine\("cdp"\)/);
-});
 
 test("iframe 加载失败要说得出是哪一种失败", () => {
   // 三种原因在页面这侧长得一模一样（都是一片白）：服务没跑 / 被 CSP 拦（请求都没发出去）/
@@ -424,4 +382,117 @@ test("iframe 加载失败要说得出是哪一种失败", () => {
   assert.match(src, /X-Frame-Options/, "「不让被嵌」这一种没有单独的说法");
   // 两种结论必须真的分岔，不能都说同一句
   assert.match(src, /reachable\s*\?/);
+});
+
+test("工具栏绝不换行——排布不许随字体度量翻转", () => {
+  // 上一版用 flex-wrap: wrap 兜底「放不下」，结果在桌面端排成了两排，而同一份 CSS
+  // 在 Chrome 里是单排。原因是原生 <select> 的宽度取决于最长选项的**字体度量**，
+  // WKWebView 和 Chrome 的度量不一样。一个工具栏的排布随字体度量翻转，本身就是设计脆弱。
+  //
+  // 现在所有宽度都由我们自己定死；实在放不下就横向滚动——和文件页签条同一个做法：
+  // 不换行（排布不会翻转），也不裁掉（按钮还在、点不到，是最难查的一种「功能失踪」）。
+  const bar = APP_CSS.slice(APP_CSS.indexOf("\n.lp__bar {"), APP_CSS.indexOf(".lp__nav {"));
+  assert.ok(bar.length > 100, "抠不出 .lp__bar 的样式块，这条用例等于没跑");
+  assert.match(bar, /flex-wrap:\s*nowrap/, "工具栏又允许换行了");
+  assert.ok(!/flex-wrap:\s*wrap/.test(bar), "出现了 flex-wrap: wrap");
+  assert.match(bar, /overflow-x:\s*auto/, "放不下时没有横向滚动 —— 会被裁掉");
+});
+
+test("工具栏里不许出现原生 select——任何写法", () => {
+  // 仓库早有这条标准（wiring.test.mjs「设置面板的下拉必须是自绘组件」），理由是
+  // 原生控件的弹出菜单由系统画、**宽度按最长选项算**，CSS 一行都管不着。
+  // 但那条守卫钉的是 `createElement("select")`，而我上一版是用 innerHTML 写的 <select>，
+  // 于是**绕过了一条正对着我的规则**——而它预言的那个后果（宽度随字体度量变）当场发生了。
+  // 这里按「任何形式」再钉一遍。
+  const src = fnSource("_previewEnsurePane", { code: true });
+  assert.ok(!/<select/i.test(src), "工具栏里又出现了 <select>");
+  assert.ok(!/createElement\(["']select["']\)/.test(src));
+  // 设备档现在是四个图标按钮
+  assert.match(src, /data-lp-device="\$\{d\.id\}"/, "设备档不是自绘的按钮段");
+});
+
+test("设备档只出图标，尺寸放 tooltip", () => {
+  // 工具栏上出现「手机 390×844」这种字符串有两个坏处：占掉一大块横向空间（正是
+  // 换行的直接原因），而且尺寸是**选完之后**才需要知道的东西。
+  const devices = loadConst("PREVIEW_DEVICES");
+  assert.equal(devices.length, 4);
+  for (const d of devices) {
+    assert.ok(d.icon, `${d.id} 没有图标`);
+    assert.ok(d.label && d.hint, `${d.id} 缺 label/hint`);
+    assert.ok(!/\d{3,}/.test(d.label), `设备档的 label「${d.label}」里带了尺寸数字，那该放在 hint 里`);
+  }
+  const src = fnSource("_previewEnsurePane", { code: true });
+  assert.match(src, /title="\$\{_escAttr\(d\.label \+ " · " \+ d\.hint\)\}"/, "尺寸没有放进 tooltip");
+  assert.match(src, /_lpIcon\(d\.icon, 15\)/, "设备档没有用图标");
+});
+
+test("图标是 Lucide 的真路径，逐字一致", () => {
+  // 手绘那版实测在 15px 下手机和平板糊成两个一模一样的圆角方块。现在路径原样取自
+  // Lucide（已经是本仓库的依赖，shadcn/ui 用的就是这套）。
+  // 这条守的是**别被手改走样**：只要有人顺手调一下 d，就和上游对不上了。
+  const LP = loadConst("LP_ICON");
+  const MAP = {
+    back: "chevron-left", forward: "chevron-right", reload: "rotate-cw",
+    external: "external-link", auto: "scan", phone: "smartphone",
+    tablet: "tablet", desktop: "monitor", pick: "crosshair", console: "terminal",
+  };
+  const dir = join(HERE, "../node_modules/lucide-react/dist/esm/icons");
+  assert.ok(existsSync(dir), "lucide-react 不在 node_modules 里 —— 这条用例的参照物没了");
+  for (const [ours, lucide] of Object.entries(MAP)) {
+    const raw = readFileSync(join(dir, lucide + ".js"), "utf8");
+    const node = raw.match(/const __iconNode = (\[[\s\S]*?\]);/);
+    assert.ok(node, `抠不出 lucide 的 ${lucide}`);
+    // 把 lucide 的节点数组转成和 LP_ICON 一样的元素串
+    const want = [...node[1].matchAll(/\["(\w+)",\s*\{([^}]*)\}\]/g)].map(([, tag, attrs]) => {
+      const a = [...attrs.matchAll(/(\w+):\s*"([^"]*)"/g)]
+        .filter(([, k]) => k !== "key").map(([, k, v]) => `${k}="${v}"`).join(" ");
+      return `<${tag} ${a}/>`;
+    }).join("");
+    assert.equal(LP[ours], want, `LP_ICON.${ours} 和 Lucide 的 ${lucide} 对不上了`);
+  }
+});
+
+test("状态点是四档真状态，不是一个常亮的绿点", () => {
+  // 上一版无论加载成功、失败还是根本没连上都显示绿色并一直脉冲——那是仪表在说假话，
+  // 比没有指示器更坏：用户看着「已连接」，实际上是一片白。
+  const set = fnSource("_previewSetDot", { code: true });
+  for (const st of ["idle", "loading", "live", "error"]) {
+    assert.ok(set.includes(st), `状态点缺 ${st} 这一档`);
+    assert.match(APP_CSS, new RegExp("\\.lp__live--" + st + "\\s*\\{"), `CSS 里没有 .lp__live--${st}`);
+  }
+  // 失败那档**故意不给动画**：动画会显得「还在努力」，而它已经停了。
+  const err = APP_CSS.slice(APP_CSS.indexOf(".lp__live--error"), APP_CSS.indexOf(".lp__live--error") + 200);
+  assert.ok(!/animation:/.test(err.slice(0, err.indexOf("}"))), "失败态带了动画");
+  // 真状态要被真事件驱动，不能只在渲染时随便设一个
+  const watch = fnSource("_previewWatchLiveLoad", { code: true });
+  assert.match(watch, /_previewSetDot\("loading"\)/);
+  assert.match(watch, /_previewSetDot\("live"\)/);
+  assert.match(watch, /_previewSetDot\("error"\)/);
+});
+
+test("只剩一套引擎——CDP 那套连同它的轮询一起删干净", () => {
+  // 两套引擎是把复杂度推给用户：他得先搞懂两者各能干什么才知道该点哪个。
+  // 删掉之后必须**连根拔**，不能留下没人调的函数（仓库有「死函数只减不增」的棘轮）。
+  for (const gone of ["_previewSetEngine", "_previewCdpNavigate", "_previewPumpFrame",
+                      "_PREVIEW_CLICK_JS", "_previewCdpClick", "_previewPickAt",
+                      "_previewSyncTimers", "_previewStopTimers", "_previewPumpLogs",
+                      "PREVIEW_CDP_FRAME_MS", "PREVIEW_LOG_POLL_MS"]) {
+    assert.ok(!CODE.includes(gone), `${gone} 还在——CDP 引擎没删干净`);
+  }
+  assert.ok(!APP_CSS.includes("lp__engine"), "引擎切换的样式还在");
+  // 指元素改走调试桥，不再需要真实浏览器
+  const pick = fnSource("_previewTogglePick", { code: true });
+  assert.match(pick, /_preview\.bridgeSeen/, "没有先判断页面接没接桥");
+  assert.match(pick, /__mrdayone: "preview-pick"/, "拾取指令不是通过桥发的");
+});
+
+test("⌘L 聚焦地址栏", () => {
+  // 不只是顺手：地址栏在 Tab 顺序上排得很靠后（前面隔着侧栏、页签条、一堆按钮），
+  // 没有快捷键的话键盘用户实际上够不到它——实测过，要按二十几下 Tab。
+  const at = CODE.indexOf('if (e.key !== "l" && e.key !== "L") return;');
+  assert.ok(at > 0, "没有 ⌘L 的处理");
+  const block = CODE.slice(at - 400, at + 400);
+  assert.match(block, /activePath !== PREVIEW_TAB_PATH/, "没判断当前是不是在预览页签，会抢别处的 ⌘L");
+  assert.match(block, /\.lp__url/);
+  assert.match(block, /input\.select\(\)/, "聚焦后没选中全文，改地址还得先手动全选");
 });

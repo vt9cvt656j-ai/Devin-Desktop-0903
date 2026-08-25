@@ -16540,10 +16540,12 @@ test("browser runs keep ONE persistent live preview instead of per-turn screensh
   assert.match(ensure, /function _ensureLiveBrowserPreview\(step, url, run\)/);
   assert.match(ensure, /openLivePreview\(href, \{ focus: firstTime \|\| wasActive \}\);/,
     "浏览器工具没有把预览页签接管到当前地址");
-  // 引擎按目标在哪儿选：本地 dev server 用 iframe（真实时），外部站点用 CDP 回投
-  assert.match(ensure, /_previewSetEngine\(isLocal \? "live" : "cdp"\)/,
-    "外部站点走 iframe 会被 X-Frame-Options 挡掉，本地服务走轮询截图又白白慢一截");
+  // 只剩一套引擎（iframe 直嵌），所以 agent 跑到外部站点时**不接管**这个页签——
+  // 那个窗格只嵌本机地址，接过去只会显示一句「外部网站不能嵌进预览」，
+  // 反而把用户正在看的本地页面顶掉。
   assert.match(ensure, /const isLocal = _previewIsLocalUrl\(href\);/);
+  assert.match(ensure, /if \(!isLocal\) return null;/,
+    "外部地址还会接管预览页签——会把用户正在看的本地页面顶成一句错误提示");
   // 一个 run 只留一行指路条，原地复用，不随每次调用追加
   assert.match(ensure, /body\.querySelector\(":scope > \.mi-preview-jump"\)/,
     "指路条没有原地复用，agent 每调一次浏览器就会多出一行");
@@ -17495,18 +17497,14 @@ test("terminal and live-preview background work do not outlive their UI owners",
   assert.ok(resizeBlock.includes("if (layoutRaf) return;"));
   assert.ok(resizeBlock.includes("scheduleLayout();"));
 
-  // A slow remote browser screenshot must not stack another CDP/IPC request every
-  // poll tick; previews only need the latest completed frame.
-  // 实时预览从聊天卡片搬进了编辑器页签，这个不变量跟着搬到了窗格的状态对象上——
-  // 持有者换了，「绝不排队叠加」这条没变。
-  const pump = extractFn("_previewPumpFrame", { code: true });
-  assert.ok(pump.includes("if (_preview.frameInFlight) return;"), "取帧没有防重入，慢截图会排队堆叠");
-  assert.ok(pump.includes("_preview.frameInFlight = true;"));
-  assert.ok(pump.includes("finally { _preview.frameInFlight = false; }"), "异常路径没有把重入标志放掉，一次失败就永久卡死");
-  // 日志轮询是第二条会叠加的 IPC，同样要有
-  const logs = extractFn("_previewPumpLogs", { code: true });
-  assert.ok(logs.includes("if (_preview.logInFlight"), "日志轮询没有防重入");
-  assert.ok(logs.includes("finally { _preview.logInFlight = false; }"));
+  // 实时预览曾经有第二套「CDP 驱动真实浏览器 + 轮询取帧」的引擎，那条路需要防重入
+  // （慢截图会排队叠加）。整套引擎已经删掉，于是这个不变量的最好形态不是「防重入写对了」，
+  // 而是**根本没有需要防重入的东西**——窗格里只有一个 iframe，浏览器自己管加载。
+  // 反向钉住：任何一个轮询定时器回来，这条就红。
+  for (const gone of ["_previewPumpFrame", "_previewPumpLogs", "_previewSyncTimers", "_previewStopTimers"]) {
+    assert.ok(!SRC.includes(gone), `${gone} 回来了——预览又开始后台轮询了，那就得重新处理防重入和生命周期`);
+  }
+  assert.ok(!/_preview\.(frameTimer|logTimer)/.test(SRC), "预览里又出现了定时器");
 });
 
 test("closing a terminal before termOpen resolves reaps the late PTY without touching disposed xterm", async () => {
