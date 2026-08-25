@@ -4121,6 +4121,9 @@
             "enum": [
               "mouse.click",
               "mouse.double_click",
+              "mouse.triple_click",
+              "mouse.down",
+              "mouse.up",
               "mouse.move",
               "mouse.position",
               "mouse.drag",
@@ -4130,8 +4133,10 @@
               "keyboard.combo",
               "keyboard.down",
               "keyboard.up",
+              "keyboard.hold",
               "keyboard.paste",
               "screen.info",
+              "screen.displays",
               "screen.capture",
               "clipboard.get",
               "clipboard.set",
@@ -4144,7 +4149,7 @@
           },
           "params": {
             "type": "object",
-            "description": "Action parameters, e.g. {x,y}, {title}, {text}, {delta_y}"
+            "description": "Action parameters. Clicks take {x,y} (omit to click where the pointer already is), {button:\"left|right|middle\"} and {keys:[\"cmd\",\"shift\"]} to hold modifiers for the duration of the click — that is how you do shift-click to range-select, cmd-click to multi-select or open in a new tab, and alt-drag to copy. mouse.triple_click selects a whole line/paragraph. mouse.down/up are a held press you release yourself: use them for sliders, rubber-band selection and dragging between applications. mouse.scroll takes {delta_y} (positive scrolls down) plus optional {delta_x}, and optional {x,y} — scrolling applies to whatever is under the pointer, so pass the coordinates of the pane you mean. keyboard.hold takes {key, ms} (default 500, capped at 10000) for a real long-press. keyboard.combo takes {keys:[...]}. screen.displays lists every monitor with its rectangle in the same global coordinate space, which is how you reach a second screen — screen.info only ever describes the main one. Others: {title}, {text}."
           }
         },
         "required": [
