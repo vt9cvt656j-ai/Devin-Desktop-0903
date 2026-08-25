@@ -37,6 +37,33 @@ function strictNames() {
 }
 
 /**
+ * 「按调用判」的 type：策略里 readOnlyModeBlocked 写的是函数而不是 true/false。
+ *
+ * git / gh / browser / system / worktree 这些类型底下**读写混装**（git_diff 和
+ * git_commit 同为 type "git"）。对它们要求"每个工具名都进 strict 名单"是错的：
+ * 那会把 git_status / gh_pr_view 这些纯读取的也拖进严格校验，而 strict 名单的语义是
+ *「参数要严格校验的**改动类**工具」。服务端那条同源对账
+ *（server/src/prompts.rs 的 per_call_readonly_types）用的是同一条规矩。
+ *
+ * 抽成函数是因为下面两条测试都要用——各写一份就是这个仓库反复出问题的那个形状。
+ */
+function perCallTypes() {
+  const policySrc = readFileSync(join(ROOT, "src/agent/tool-policy.js"), "utf8");
+  const out = new Set();
+  const marks = [...policySrc.matchAll(/defineTool\(/g)].map((m) => m.index);
+  for (let i = 0; i < marks.length; i++) {
+    const seg = policySrc.slice(marks[i], marks[i + 1] ?? policySrc.length);
+    const nm = seg.match(/^defineTool\(\s*"([a-z0-9_]+)"/);
+    const f = seg.indexOf("readOnlyModeBlocked:");
+    if (!nm || f < 0) continue;
+    const val = seg.slice(f + "readOnlyModeBlocked:".length).trimStart();
+    if (!val.startsWith("true") && !val.startsWith("false")) out.add(nm[1]);
+  }
+  assert.ok(out.size >= 5, `按调用判的 type 只解析出 ${out.size} 个，解析判据坏了：${[...out]}`);
+  return out;
+}
+
+/**
  * 声明有副作用的 type，它底下的每个工具名都必须在 strict 名单里。
  *
  * 这两份清单键不一样：tool-policy.js 按 **type** 声明，main.js 的 strict 闸按**工具名**。
@@ -61,8 +88,11 @@ test("声明有副作用的 type，它的每个工具都要在 strict 闸的名�
   const risky = new Set([...workspaceMutatingTypes(), ...approvalTypes()]);
   assert.ok(risky.size >= 20, `声明有副作用的 type 只有 ${risky.size} 个，导入判据坏了`);
 
+  const perCall = perCallTypes();
+
   const missing = [];
   for (const [name, type] of n2t) {
+    if (perCall.has(type)) continue;
     if (risky.has(type) && !strict.has(name)) missing.push(`${name}(type=${type})`);
   }
   assert.deepEqual(
@@ -82,7 +112,9 @@ test("声明有副作用的 type，它的每个工具都要在 strict 闸的名�
 test("对账不是空转：拿掉一个已知有副作用的工具就会被发现", () => {
   const n2t = toolNameToType();
   const risky = new Set([...workspaceMutatingTypes(), ...approvalTypes()]);
-  const covered = [...n2t].filter(([, t]) => risky.has(t)).map(([n]) => n);
+  // 和上一条同一套豁免：按调用判的 type（git / gh / browser …）不参与这条对账。
+  const perCall = perCallTypes();
+  const covered = [...n2t].filter(([, t]) => risky.has(t) && !perCall.has(t)).map(([n]) => n);
   assert.ok(
     covered.length >= 10,
     `只有 ${covered.length} 个工具落在"声明有副作用"的 type 上，耦合太弱，这条对账基本不起作用`,

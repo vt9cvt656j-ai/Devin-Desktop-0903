@@ -823,9 +823,9 @@ function bodyOf(source, name) {
 //
 // The mirror image of a severed connection: a whole FILE nothing imports. It compiles, its
 // tests pass, and it is never loaded — so the tests are measuring code the product does not
-// run. `src/agent/job-queue.js` is 446 lines with a 218-line green test suite that main.js
-// has never imported; the live `spawn_multiple_agents` is implemented inline instead. Two
-// implementations, and the suite exercises the dead one.
+// run. 最典型的一例已经删掉了：`src/agent/job-queue.js` 445 行 + 218 行全绿测试，而
+// main.js 从来没有 import 过它，线上的 `spawn_multiple_agents` 是内联实现——两套实现，
+// 而测试套件测的是死的那一套。这正是这条基线要防的：测试全绿并不代表产品在跑这段代码。
 //
 // Baselined, like the write-only fields: the existing four may be deleted or wired up, but
 // the set must never grow.
@@ -886,8 +886,12 @@ test("no NEW unreachable module appears under src/", async () => {
       "桥不再注入所有帧了——那样它只对 IDE 自己那一帧生效，等于没用");
   }
   const KNOWN_DEAD = new Set([
-    "src/agent/job-queue.js",        // 446 lines; live spawn_multiple_agents is inline in main.js
-    "src/tools/spawn-multiple-agents.js", // 193 lines; imported by nothing at all
+    // job-queue.js 和 tools/spawn-multiple-agents.js 已于 2026-08-25 删除（连同
+    // agent-job-queue 那份 218 行全绿测试和根目录的 test-subagent.mjs 手跑脚本）。
+    // 删之前逐条确证过零生产调用点：从真实入口（index.html → boot.jsx → main.js）
+    // 走 import/require/new Worker(new URL()) 三类边只到达 90 个模块，两者都不在里面；
+    // 动态 import 全是字面量裸包名；两个文件都没有 window/globalThis 挂载和事件订阅，
+    // 即便被加载也不会向任何注册表登记；dist/ 产物里搜它们独有的字符串零命中。
     "src/search-enhanced.js",        // 377 lines; none of its exports appear in main.js
     "src/terminal.js",               // 335 lines; main.js carries its own terminal implementation
   ]);

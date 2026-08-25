@@ -51,98 +51,22 @@ class CollaborationEngine {
     this.store.set(`collab_sessions.${sessionId}`, sessionConfig);
     this.activeCollaborations.set(sessionId, sessionConfig);
 
-    switch (mode) {
-      case 'shared_store':
-        this.setupSharedStoreCollaboration(sessionId, jobIds);
-        break;
-
-      case 'eventbus':
-        this.setupEventBusCollaboration(sessionId, jobIds);
-        break;
-
-      case 'lead_follower':
-        this.setupLeadFollowerCollaboration(sessionId, jobIds, config);
-        break;
-    }
+    // **只有 lead_follower 一种模式。**
+    //
+    // 这里原来是个三分支 switch（shared_store / eventbus / lead_follower），而生产里唯一的
+    // 调用点写死 `{ mode: "lead_follower" }`——另外两条从来没被执行过一次。
+    // 更要紧的是 shared_store 那条是**第二套实现**：子体之间共享发现这件事，main.js 早就
+    // 直接做了（派发时给每个子体一个收件箱键、互为同伴，见 mainlink.js）。两套实现里
+    // 死的那套还带着一整套测试，测得全绿——那正是"测试在测产品不跑的代码"。
+    // 连同它的 token 预算那一族（trackTokenUsage / triggerTokenWarning / getTokenStats /
+    // autoOptimizeForTokenBudget / applyOptimization）一起删了，那五个也是零调用点。
+    this.setupLeadFollowerCollaboration(sessionId, jobIds, config);
 
     return sessionId;
   }
   
   /**
-   * ========== 模式 1: SharedStore (数据共享) ==========
-   */
-  setupSharedStoreCollaboration(sessionId, jobIds) {
-    const seenCounts = new Map(jobIds.map((jobId) => [
-      jobId,
-      Array.isArray(this.store.get(`jobs.${jobId}`)?.findings)
-        ? this.store.get(`jobs.${jobId}`).findings.length
-        : 0,
-    ]));
-    
-    jobIds.forEach(sourceJobId => {
-      // 监听每个 job 的 findings 更新
-      const unsubscribe = this.store.on(`jobs.${sourceJobId}.findings`, (findings) => {
-        if (!Array.isArray(findings) || findings.length === 0) return;
-
-        // SharedStore notifies with the complete findings array. Broadcast only
-        // newly appended local findings; rebroadcasting the external copies would
-        // bounce them between peers recursively until the stack overflowed.
-        const previousCount = Math.min(seenCounts.get(sourceJobId) || 0, findings.length);
-        seenCounts.set(sourceJobId, findings.length);
-        const latestFindings = findings
-          .slice(previousCount)
-          .filter((finding) => !finding?.isExternal)
-          .slice(-this.config.broadcastThreshold);
-        
-        if (!latestFindings.length) return;
-        
-        // 广播给其他所有 jobs
-        jobIds.forEach(targetJobId => {
-          if (targetJobId !== sourceJobId) {
-            this.store.appendFinding(targetJobId, {
-              source: sourceJobId,
-              channel: 'shared_store',
-              data: latestFindings.map(f => ({
-                type: f.type,
-                content: f.content?.slice(0, 200), // 限制内容长度
-                timestamp: f.timestamp
-              })),
-              isExternal: true,
-              sessionId
-            });
-          }
-        });
-        
-        // 跟踪 token 使用
-        this.trackTokenUsage(sessionId, latestFindings.length * 50);
-      });
-      this._trackSessionSubscription(sessionId, unsubscribe);
-    });
-  }
-  
-  /**
-   * ========== 模式 2: EventBus (事件驱动) ==========
-   */
-  setupEventBusCollaboration(sessionId, jobIds) {
-
-    // Publish directly to every peer inbox. The old implementation only put
-    // callbacks in a Map and never subscribed them to SharedStore, so no event
-    // could ever leave its source job.
-    this.activeCollaborations.get(sessionId).publish = (jobId, eventType, payload) => {
-      jobIds.forEach(otherJobId => {
-        if (otherJobId === jobId) return;
-        this.store.publish(`collab:${sessionId}:${otherJobId}`, {
-          type: eventType,
-          payload,
-          sourceJobId: jobId,
-          timestamp: Date.now(),
-        });
-      });
-    };
-  }
-  
-  /**
-   * ========== 模式 3: Lead-Follower (主从协调) ==========
+   * ========== Lead-Follower：唯一在生产里跑的协同模式 ==========
    */
   setupLeadFollowerCollaboration(sessionId, jobIds, config = {}) {
     if (!config.leadJobId) {
@@ -180,24 +104,23 @@ class CollaborationEngine {
     });
     this._trackSessionSubscription(sessionId, unsubscribe);
     
-    // Follower 可以向 Lead 请求指导
-    this.registerFollowerRequestHandler(sessionId, leadJobId, followerJobIds);
-  }
-  
-  registerFollowerRequestHandler(sessionId, leadJobId, followerJobIds) {
-    // 监听 follower 的请求
-    followerJobIds.forEach(followerId => {
-      const unsubscribe = this.store.on(`jobs.${followerId}.request_guidance`, (request) => {
-        // Lead job 接收请求并提供指导
-        this.store.appendFinding(leadJobId, {
-          type: 'guidance_request',
-          from: followerId,
-          data: request,
-          timestamp: Date.now()
-        });
-      });
-      this._trackSessionSubscription(sessionId, unsubscribe);
-    });
+    // 这里原来还挂着 registerFollowerRequestHandler —— 给每个 follower 订阅
+    // `jobs.<id>.request_guidance`，号称"follower 可以向 Lead 请求指导"。
+    //
+    // **删了，因为那条通道从来没有写入端。** 全仓 grep `request_guidance` 只有那一行订阅：
+    // 没有任何地方 set/publish 这个键，子体也没有任何工具或提示词知道有这个入口。
+    // 而 SharedStore 的通知只在 set/publish 时按精确键或 `<父>.*` 通配触发，follower 的
+    // 记录是整条对象写在 `jobs.<id>`，永远命中不到 `jobs.<id>.request_guidance`。
+    // 也就是说这不是"模型不会用"，是**根本没有入口**——而它还给每个 follower 挂一条
+    // 订阅，一直挂到 endSession。
+    //
+    // lead_follower 是唯一在生产里跑的模式，在它身上留一个假的一半，比没有更坏：
+    // 下一个人会以为双向已经通了，去查"为什么 follower 不求助"。
+    //
+    // 真要做的话缺的是三样，缺一不可：子体侧一个能写这个键的工具或约定、提示词里
+    // 告诉它有这条路、以及**主智能体能在自己那一轮之外响应**——最后这样现在不成立，
+    // 主循环没有可被打断的结构。所以不是补个订阅就能通的事。
+    // 反方向（主 → 子）是通的：见 src/agent/mainlink.js 的收件箱。
   }
   
   /**
@@ -214,12 +137,10 @@ class CollaborationEngine {
       _source: 'CollaborationEngine'
     };
     
-    // 添加相关文件的内容片段
-    if (filesToInclude.length > 0) {
-      const snippets = await this.extractFileSnippets(filesToInclude);
-      enhanced.fileSnippets = snippets;
-      enhanced.totalSnippetBytes = snippets.reduce((sum, s) => sum + s.content.length, 0);
-    }
+    // filesToInclude 这个参数在生产里**恒为空数组**（main.js 那个唯一调用点写死了 []），
+    // 所以配套的 extractFileSnippets / readFileSync / generateLineSummary 三个方法一次都
+    // 没被执行过，构造器里注入的 readFile 也一直没有消费方。三个方法连同注入一起删了。
+    // 哪天真要给子体喂文件片段，从这里重新长出来，别把死代码留着当"以后可能用得上"。
     
     // 添加相关 findings (来自其他协作的 jobs)
     const relatedFindings = await this.collectRelatedFindings(jobId);
@@ -273,52 +194,8 @@ class CollaborationEngine {
     return enhanced;
   }
   
-  /**
-   * 提取文件片段
-   */
-  async extractFileSnippets(filePaths) {
-    const snippets = [];
     
-    for (const filePath of filePaths) {
-      try {
-        // 读取文件内容 (实际应用中应该从 backend 获取)
-        const content = await this.readFileSync(filePath);
-        
-        if (!content) continue;
-        
-        const lines = content.split('\n');
-        
-        snippets.push({
-          path: filePath,
-          totalLines: lines.length,
-          linesRead: Math.min(lines.length, 100), // 最多读 100 行
-          content: content.slice(0, 2000), // 最多 2KB
-          summary: this.generateLineSummary(lines)
-        });
-        
-      } catch (error) {
-        console.error(`[CollaborationEngine] Failed to read ${filePath}:`, error);
-      }
-    }
-    
-    return snippets.slice(0, this.config.fileSnippetsCount);
-  }
-  
-  generateLineSummary(lines) {
-    if (!lines || lines.length === 0) return null;
-    
-    const firstFew = lines.slice(0, 5).join(' ');
-    const lastFew = lines.slice(-5).join(' ');
-    
-    return `First: ${firstFew}...\nLast: ...${lastFew}`;
-  }
-  
-  async readFileSync(path) {
-    if (!this.readFile) throw new Error('CollaborationEngine requires an injected workspace reader');
-    return this.readFile(path);
-  }
-  
-  /**
+/**
    * 收集相关的 findings (来自其他协作的 jobs)
    */
   async collectRelatedFindings(currentJobId) {
@@ -382,122 +259,12 @@ class CollaborationEngine {
   /**
    * 跟踪 token 使用
    */
-  trackTokenUsage(sessionId, count) {
-    if (!this.tokenTracking.has(sessionId)) {
-      this.tokenTracking.set(sessionId, { used: 0, sessions: [] });
-    }
-    
-    const tracking = this.tokenTracking.get(sessionId);
-    tracking.used += count;
-    
-    // 更新 store
-    this.store.set(`token_usage.${sessionId}`, {
-      total: tracking.used,
-      limit: this.config.tokenBudget,
-      percentage: (tracking.used / this.config.tokenBudget * 100).toFixed(2) + '%',
-      warningThreshold: this.config.warningThreshold + '%'
-    });
-    
-    // 检查是否超过阈值
-    const usagePercentage = tracking.used / this.config.tokenBudget * 100;
-    if (usagePercentage >= this.config.warningThreshold) {
-      this.triggerTokenWarning(sessionId, tracking.used, this.config.tokenBudget);
-    }
-  }
-  
-  /**
+/**
    * 触发 Token 警告
    */
-  triggerTokenWarning(sessionId, used, limit) {
-    console.warn(`[TokenWarning] Session ${sessionId} using ${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${((used/limit*100)).toFixed(1)}%)`);
-    
-    // 发布警告事件
-    this.store.publish('token_warning', {
-      sessionId,
-      used,
-      limit,
-      percentage: (used / limit * 100).toFixed(1)
-    });
-    
-    // 添加到 session 记录
-    const session = this.activeCollaborations.get(sessionId);
-    if (session) {
-      session.tokensUsed = used;
-      session.tokenWarning = true;
-      this.store.set(`collab_sessions.${sessionId}`, session);
-    }
-  }
-  
-  /**
+/**
    * 获取 Token 使用统计
    */
-  getTokenStats(sessionId) {
-    const usage = this.tokenTracking.get(sessionId);
-    const limit = this.config.tokenBudget;
-    
-    if (!usage) {
-      return { used: 0, limit, percentage: '0%', status: 'normal' };
-    }
-    
-    const percentage = (usage.used / limit * 100).toFixed(1);
-    let status = 'normal';
-    
-    if (percentage >= (this.config.criticalThreshold || 90)) status = 'critical';
-    else if (percentage >= this.config.warningThreshold) status = 'warning';
-    
-    return {
-      used: usage.used,
-      limit,
-      remaining: limit - usage.used,
-      percentage: percentage + '%',
-      status
-    };
-  }
-  
-  /**
-   * 自动优化 Token 使用
-   */
-  autoOptimizeForTokenBudget(sessionId, aggressive = false) {
-    const stats = this.getTokenStats(sessionId);
-    
-    if (stats.status === 'normal') return;
-    
-    
-    // 采取行动减少后续 token 消耗
-    const optimizations = [
-      { action: 'reduceBroadcastFrequency', threshold: 80 },
-      { action: 'limitContextSize', threshold: 90, aggressive },
-      { action: 'skipLowPriorityTasks', threshold: 95, aggressive }
-    ];
-    
-    const applicableOptimizations = optimizations.filter(
-      opt => stats.percentage.replace('%', '') >= opt.threshold
-    );
-    
-    applicableOptimizations.forEach(opt => {
-      this.applyOptimization(sessionId, opt.action, opt.aggressive);
-    });
-  }
-  
-  applyOptimization(sessionId, action, aggressive) {
-    switch (action) {
-      case 'reduceBroadcastFrequency':
-        this.config.broadcastThreshold = Math.max(1, Math.floor(this.config.broadcastThreshold / 2));
-        break;
-        
-      case 'limitContextSize':
-        this.config.maxContextSize = aggressive ? 4000 : 6000;
-        break;
-        
-      case 'skipLowPriorityTasks':
-        // Mark low priority tasks as skipped
-        const session = this.activeCollaborations.get(sessionId);
-        if (session) {
-          session.optimizationApplied = action;
-        }
-        break;
-    }
-  }
   
   /**
    * ========== 实用工具 ==========
@@ -531,11 +298,6 @@ class CollaborationEngine {
   /**
    * 获取所有活跃会话
    */
-  getActiveSessions() {
-    return Array.from(this.activeCollaborations.entries())
-      .filter(([, session]) => session.status === 'active')
-      .map(([sessionId, session]) => ({ sessionId, ...session }));
-  }
 
   _trackSessionSubscription(sessionId, unsubscribe) {
     if (typeof unsubscribe !== 'function') return;
@@ -546,11 +308,7 @@ class CollaborationEngine {
   /**
    * 广播消息给特定频道
    */
-  broadcast(channel, message) {
-    this.store.publish(channel, message);
-  }
-  
-  /**
+/**
    * 添加共享知识
    */
   addSharedKnowledge(sessionId, key, value) {
