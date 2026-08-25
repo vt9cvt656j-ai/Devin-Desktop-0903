@@ -339,7 +339,11 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
     Some(UiSnapshot {
         target: Some(AccessibilityTarget { pid, name }),
         elements,
-        page: None,
+        // 前台是浏览器时 sidecar 会顺路带回 AXWebArea 的加载状态。
+        // 这里原来硬写 None——于是「页面还在加载」那条提醒在快路上结构性失效，
+        // 而快路是 macOS 的默认路：模型读到半渲染的页面，却收不到任何提示，
+        // 于是把「还没渲染出来」当成「这页没有这个按钮」。
+        page: out.get("page").and_then(|v| serde_json::from_value(v.clone()).ok()),
         read_error: None,
     })
 }
@@ -1911,6 +1915,49 @@ return JSON.stringify({operated:operated,changed:changed});
         assert!(
             rs_body.contains("is_some_and(|s| !s.elements.is_empty())"),
             "快路判据和选快照的条件不再一致——读回空清单时会把 JXA 的 ref 标成快路来的"
+        );
+    }
+
+    /// 「页面还在加载」这条提醒，两条读屏路都必须给得出来。
+    ///
+    /// 它防的是一个很具体的错判：可访问性树只反映**此刻**渲染出来的东西，一个加载了
+    /// 一半的页面和一个加载完的短页面在结果里长得一模一样。没有这条提醒，模型会把
+    /// 「还没渲染出来」当成「这页没有这个按钮」，然后基于这句假话往下决策——而在浏览器上
+    /// 做自动化正是这条链最主要的用法。
+    ///
+    /// 曾经的实际状态：JXA 老路一直顺路读 AXWebArea 的 AXLoaded/AXLoadingProgress，
+    /// 而快路上线时把 page 硬写成了 None——于是这道防线在**默认路径**上静默失效，
+    /// 旁边的注释却还在描述它仍然生效。所以这里钉的是"快路没有把它写死成 None"。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn both_read_paths_can_report_page_loading() {
+        let src = prod_src();
+        let at = src
+            .find("async fn native_snapshot_via_sidecar(")
+            .expect("快路读屏不见了");
+        let end = src[at..]
+            .find("\n#[cfg(not(target_os = \"macos\"))]")
+            .map(|i| at + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("page: None"),
+            "快路又把 page 写死成 None 了——浏览器上读到半渲染页面时模型收不到任何提示"
+        );
+        assert!(
+            body.contains("get(\"page\")"),
+            "快路没有从 sidecar 的回执里取 page"
+        );
+
+        // 对端要真的发这个字段。只看本地这一半的话，sidecar 哪天不发了这边照样绿。
+        let rpc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../automation-framework/src/rpc.rs"),
+        )
+        .expect("读不到 sidecar 的 rpc.rs");
+        assert!(
+            rpc.contains("\"page\": page,"),
+            "sidecar 的 screen.elements 回执里没有 page 字段"
         );
     }
 

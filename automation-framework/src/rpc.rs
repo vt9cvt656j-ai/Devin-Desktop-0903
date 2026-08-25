@@ -416,7 +416,7 @@ impl RpcServer {
                     },
                 };
                 let t0 = std::time::Instant::now();
-                let nodes = if probe {
+                let (nodes, page) = if probe {
                     crate::platform::macos_tree::snapshot_probe(pid, cap)
                 } else {
                     crate::platform::macos_tree::snapshot(pid, cap)
@@ -438,6 +438,10 @@ impl RpcServer {
                     "app": app_name,
                     // 明说这次读有没有动过句柄表，调用方不用靠方法名去猜。
                     "refs_installed": !probe,
+                    // 前台是浏览器时才有。没有它，一个加载了一半的页面和一个加载完的
+                    // 短页面在调用方眼里长得一模一样，模型会把「还没渲染出来」当成
+                    // 「这页没有这个按钮」。JXA 老路一直在给，快路上线时漏了。
+                    "page": page,
                 }))
             }
             // 对上一次 screen.elements 里的某个 ref 执行 AX 动作。用的是**留下来的句柄**，

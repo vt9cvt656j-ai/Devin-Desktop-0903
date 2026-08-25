@@ -459,6 +459,7 @@ pub fn run() {
             accessibility::probe_screen,
             accessibility::ui_click,
             permissions::permission_status,
+            permissions::permission_advice,
             permissions::request_accessibility,
             automation::automation_call,
             knowledge::package_search,

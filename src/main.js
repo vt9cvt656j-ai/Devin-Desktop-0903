@@ -38064,6 +38064,27 @@ const _STRICT_MUTATING_TOOL_NAMES = new Set([
   "generate_image", "generate_3d", "generate_sound", "generate_music", "generate_voice",
   "auto_rig", "generate_motion", "generate_texture", "download_file", "download_asset",
   "automation", "ui_click", "db_query", "remote",
+  // 下面这十个的 type 在 src/agent/tool-policy.js 里**已经声明为有副作用**，却一直不在
+  // 这份名单里。两份清单键不一样（那边按 type，这边按工具名），所以谁也发现不了谁漏了。
+  //
+  // 漏掉的后果很具体：模型把工具调用写成文本（_parseTextToolCalls 那条兼容通道）且信封
+  // 被截断时，strict 那道闸只对名单里的工具生效。名单外的会被 _safeJsonLoose 松散修复
+  // 后照常执行——一个被截断的 browser eval / capture_replay（任意主机任意请求体）/
+  // docker_compose_up / create_project 就这么被"修好"成一次真实执行，而这条闸存在的
+  // 全部理由就是不让这种事发生。
+  //
+  // 反方向那批（git_commit / git_push / gh_pr_create / run_worker / remote）留着不动：
+  // 它们的 type 是 git / gh / worker / remote，而这些 type 底下**读写混装**
+  //（git_diff 和 git_commit 同为 type=git），type 级的声明表达不了这种粒度。
+  // 按工具名严格是对的，不是冗余。下面那个对账测试也照这个方向单向检查。
+  "browser", "capture_start", "capture_replay", "docker_compose_up", "create_project",
+  "schedule", "save_skill", "mcp_server", "research_project", "design_research",
+  // 这三个是补对账测试时才露出来的，而且是最重的三个——第一版解析器写成一条大正则，
+  // 恰好把它们的分支形状漏掉了，于是"没解析到"静默变成了"没有这个工具"，测试对它们恒绿。
+  //   computer      合成**真实鼠标键盘**，能开终端敲任意命令
+  //   system        切前台、点菜单、开应用
+  //   run_subagent  子智能体，能力上等于再开一整个会话
+  "computer", "system", "run_subagent",
 ]);
 
 function _mutatingToolArgIssue(name, rawArgs) {
@@ -40012,11 +40033,28 @@ async function _checkDesktopPermissionsOnStart() {
 // 显示的完全一致」——于是他去核对拼写，而真正的问题是系统根本没放行。更麻烦的是
 // 本地构建每次都换代码签名，授权会在系统设置的开关**仍然亮着**的情况下失效，
 // 不明说的话用户只会认为程序在撒谎。
-async function _desktopPermissionNote() {
+//
+// scope 决定问哪几项。**必须传**：全量那份只要三项缺一就出文案，而 read_screen /
+// ui_click 根本不需要屏幕录制——一次「ref 已过期」会被贴上一整段"去把屏幕录制移除
+// 再重加、然后完全退出重开"，用户照做一遍问题还在。那是一个权威、具体、可执行、
+// 而且完全错误的指示，比不给建议坏得多。
+//   "ax"      读屏 / 按 ref 操作 / system.*（辅助功能 + AppleEvents）
+//   "input"   合成鼠标键盘（只要辅助功能）
+//   "capture" 截屏录屏（只要屏幕录制）
+// automation/computer 的方法名 → 该问哪一域的权限。
+// 挑错域的后果不是"少提示"，是**提示一件和这次失败无关的事**：截屏失败去查辅助功能、
+// 读屏失败去查屏幕录制，两种都会把用户支去做一遍无用功。
+function _permScopeForMethod(method) {
+  const m = String(method || "");
+  if (m.startsWith("screen.capture") || m.startsWith("screen.record")) return "capture";
+  if (m.startsWith("mouse.") || m.startsWith("keyboard.") || m.startsWith("recorder.")) return "input";
+  return "ax";
+}
+
+async function _desktopPermissionNote(scope = "ax") {
   if (!inTauri) return "";
   try {
-    const st = await backend.invoke("permission_status");
-    const advice = String(st?.advice || "").trim();
+    const advice = String(await backend.invoke("permission_advice", { scope }) || "").trim();
     if (!advice) return "";
     return `\n\n⚠️ 系统权限诊断（请原样转述给用户，别改写成"请去打开开关"）：\n${advice}`;
   } catch { return ""; }
@@ -45025,6 +45063,12 @@ const _EXTERNAL_DATA_TYPES = new Set([
   // 于是链路是「网页/剪贴板里的一句指令 → 模型当成命令执行 → 键鼠 → 终端」，
   // 不是「多一条工具输出」。少这三个标记，模型没有任何依据把它们当材料而不是指令。
   "automation", "uiclick", "system",
+  // 又漏三条，都是**外部内容通道**，判据和上面完全一样：正文由项目之外的人写。
+  //   package_source        第三方依赖的源码与文档注释。npm/PyPI 上任何人都能发包，
+  //                         而"去读一下这个库怎么实现的"是最常见的用法之一。
+  //   qr                    二维码解出来的字符串——一张图片里藏一句指令，成本几乎为零。
+  //   search_game_assets    远端素材目录的标题和描述，同样是别人写的。
+  "package_source", "qr", "search_game_assets",
 ]);
 function _isExternalDataToolResult(type) {
   const t = String(type || "");
@@ -64246,12 +64290,12 @@ async function _executeToolStepInner(step, call, root, run) {
         res.className = "atc-result " + (ok ? "atc-result--ok" : "atc-result--err");
         res.textContent = ok ? `${call.action} 已执行` : "操作未执行";
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 4000))}</pre>`;
-        const _perm = ok ? "" : await _desktopPermissionNote();
+        const _perm = ok ? "" : await _desktopPermissionNote("ax");
         return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}${_perm}` };
       } catch (error) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "操作失败";
-        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}${await _desktopPermissionNote()}` };
+        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}${await _desktopPermissionNote("ax")}` };
       }
 
     } else if (call.type === "localdiscovery") {
@@ -66056,7 +66100,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         const _msg = String(e?.message || e);
         const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
-        const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote() : "";
+        const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote(_permScopeForMethod(_m)) : "";
         return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}${_perm}` };
       }
     } else if (call.type === "capture_start") {
@@ -67718,7 +67762,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch (e) {
         const m = String(e?.message || e);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        const _perm = await _desktopPermissionNote();
+        // system.* 走的是 AX + AppleEvents，和屏幕录制无关。
+        const _perm = await _desktopPermissionNote("ax");
         // 权限诊断在手时就别再说那句"去勾选 Mr. Day One 后重启"了——用户看到的就是它已经
         // 勾着，那句话只会把他引向死路。诊断为空（权限齐全）时才谈目标软件的 UI 暴露问题。
         const _tail = /仅支持/.test(m)
