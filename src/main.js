@@ -81477,6 +81477,8 @@ const palette = createCommandPalette({
     { id: "view.livePreview", title: PREVIEW_TAB_NAME, category: t("menu.view"), run: () => openLivePreview() },
     { id: "tools.cleanup", title: "清理旧版残留", category: t("menu.tools"), run: () => openCleanupDialog() },
     { id: "view.livePreviewReload", title: PREVIEW_TAB_NAME + "：重新加载", category: t("menu.view"), run: () => { openLivePreview(); _previewReload(); } },
+    // 指元素只有工具栏上那一个按钮，纯键盘够不到（Tab 要走过侧栏、页签条和半条工具栏）。
+    { id: "view.livePreviewPick", title: PREVIEW_TAB_NAME + "：指元素给 AI", category: t("menu.view"), run: () => { openLivePreview(); _previewTogglePick(); } },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
     { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
