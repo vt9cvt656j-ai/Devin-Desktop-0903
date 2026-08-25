@@ -50771,6 +50771,29 @@ const _ROLE_CAPABILITIES = {
 // view_image/probe_env/git 只读/gh 只读/各种检索），所以这里只补基础集**没有**的那几件。
 // 补不出东西的角色（architect / product / research / devops / docs）不列——
 // 它们的差异本来就在视角而不在工具，硬凑等于又造一份假清单。
+// **每个角色的轮数预算。** 参照 Claude Code：subagent 的 `maxTurns` / `model` / `effort`
+// 是**每个 agent 自己在 frontmatter 里声明**的，而不是全局一个常数。
+//
+// 这里只调轮数，不动模型和推理档——后两样会改变计费口径，得单独作为一次产品决定来做。
+// 轮数是纯预算：给得少了子体查不完就被截断（那份中间状态对父体几乎没用，钱照付），
+// 给得多了慢角色会占着并发槽。所以按**这个角色实际要走几步**给：
+//   · 调研/架构/安全这类要顺着线索一路读下去的，基准不够用；
+//   · 文档/产品这类目标明确、读几个文件就能下结论的，给基准就够。
+// 没列的角色走基准值。上限 40 是硬顶：再多说明任务该拆，不该靠加轮数硬扛。
+const _ROLE_TURN_BUDGET = {
+  research: 28,   // 顺线索一路读，最容易撞上限
+  architect: 26,  // 要把调用链走完才能谈结构
+  security: 26,   // 要顺着数据流一路查到边界
+  backend: 24,
+  frontend: 22,
+  database: 22,
+  test: 22,
+  devops: 20,
+  design: 20,
+  product: 16,    // 目标明确，读几个文件就该下结论
+  docs: 16,
+};
+
 const _ROLE_CAPABILITIES_READ = {
   // 看得见页面才谈得上前端/设计/测试视角。browser 只放行观察类动作（见下面派发闸）。
   frontend: { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] },
@@ -51438,7 +51461,11 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 真正做分析和写简报的余量没了——表现是简报越来越像"我查了这些"而不是"结论是什么"。
   // 放到 28 / 20。墙钟上限（_subDeadlineAt）没动，所以这不是把"跑更久"当成能力：
   // 它只是让子体在同样的时间预算里不至于被轮数先卡住。
-  const SUB_MAX = write ? 28 : 20;
+  // 轮数上限：write worker 固定 28（它的边界是 scope 不是轮数）；只读子体按角色给。
+  // 没有角色或角色不认识时回到 20 —— 和改这条之前完全一样，所以不是普涨。
+  const SUB_MAX = write
+    ? 28
+    : Math.min(40, _ROLE_TURN_BUDGET[String(role || "").trim().toLowerCase()] || 20);
   let _subFinished = false;
   try {
     for (let i = 0; i < SUB_MAX; i++) {
@@ -57643,7 +57670,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             else job.status = "failed";
             return job.result;
           });
-          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务；结果就绪后会自动送达，也可用 await_subagent 显式等待。⚠️ 不要立即 await——先推进计划里的其他步骤；若当前确实没有其他事可做，说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）。` + _subDropNote;
+          // 回执原来同时说了两句互相矛盾的话：「结果就绪后会自动送达」和「⚠️ 不要立即 await」。
+          // 模型照做——派完去干别的，干完就答复用户——而结果只在**下一次迭代开头**才投递，
+          // 这一轮结束就没有下一次了。于是子体几十轮调用的钱照付，报告一个字没进上下文。
+          // 现在把「收尾之前必须汇合」说清楚：这不是建议，是这条链的硬约束。
+          const message = `[子智能体已后台启动 job#${jobId}] ${desc}。它在后台工作，你继续推进当前任务。`
+            + `\n结果会在你**下一步开始时**自动送达。⚠️ 不要立即 await——先推进计划里的其他步骤。`
+            + `\n**但收尾之前必须汇合**：如果你在结果送达之前就答复用户、结束这一轮，还没跑完的作业会被取消，`
+            + `它那几十轮调用就白花了。所以要么在结束前用 await_subagent 等它，要么确认结果已经出现在上文里再收尾。`
+            + `\n若当前确实没有其他事可做，说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）。`
+            + _subDropNote;
           it.rawResult = { type: "subagent", path: it.call.description || "", content: message };
           return message;
         }
@@ -59270,6 +59306,30 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // _setStreaming(false) 遍历 session._cancelIds 取消；这里只做台账诚实记账，防幽灵作业。
     let _cancelledSubagents = false;
     if (run._subAgentJobs instanceof Map) {
+      // **先收割已经落定、但还没被消化的作业。**
+      //
+      // 后台作业的结果只有一条投递路：主循环**下一次迭代开头**的自动交付。模型静默收尾时
+      // 没有下一次迭代了，于是下面那几行把在途作业全标成 cancelled，而**已经跑完、报告
+      // 就摆在 job.result 里**的那些也跟着一起沉底——几十轮模型调用的钱照付，一个字都没进
+      // 上下文。派发回执还同时说着「结果就绪后会自动送达」和「不要立即 await」，
+      // 模型照做就必然落进这个形态。
+      //
+      // 这里只收割**已落定**的（钱已经付了，报告是现成的），不等在途的：等多久都是拍脑袋，
+      // 而且会让收尾延迟变得不可预测。在途的那些照旧取消，但下面会把它们数出来告诉用户。
+      const _unharvested = [...run._subAgentJobs.values()].filter(
+        (j) => !j.consumed && j.status !== "running" && String(j.result || "").trim(),
+      );
+      for (const j of _unharvested) {
+        j.consumed = true;
+        const _tag = j.status === "done" ? "完成"
+          : j.status === "timeout" ? "超时(部分结果)"
+          : j.status === "truncated" ? "未完成·轮次用尽" : "失败";
+        if (typeof run._pushRunFact === "function") {
+          run._pushRunFact(`[子智能体 job#${j.id} ${_tag}·${j.desc}·收尾时补收]
+`
+            + _clipPreservingErrors(String(j.result), 4000));
+        }
+      }
       for (const j of run._subAgentJobs.values()) {
         if (j.status === "running") { j.status = "cancelled"; j.consumed = true; _cancelledSubagents = true; }
       }

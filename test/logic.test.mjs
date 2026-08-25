@@ -19829,7 +19829,11 @@ test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记�
   assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
   // 启动后不 await：promise 挂进作业记录，工具结果立即返回
   assert.match(loopSrc, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
-  assert.match(loopSrc, /结果就绪后会自动送达，也可用 await_subagent 显式等待/);
+  // 回执改写过（2026-08-25）：原文同时说「结果就绪后会自动送达」和「不要立即 await」，
+  // 两句互相矛盾——结果只在**下一次迭代开头**投递，模型收尾就没有下一次了，
+  // 在途作业被取消、几十轮调用白花。现在钉的是新版里那条硬约束。
+  assert.match(loopSrc, /结果会在你\*\*下一步开始时\*\*自动送达/);
+  assert.match(loopSrc, /收尾之前必须汇合/, "收尾前不汇合就会丢结果，这条必须写在回执里");
   // promise.then 落四态：done/failed/timeout/cancelled（cancelled 同时标 consumed 防幽灵拦截）
   assert.match(loopSrc, /job\.status = "done"/);
   assert.match(loopSrc, /job\.status = "failed"/);
@@ -20008,7 +20012,8 @@ test("#49-2 启动文本强化：不要立即 await 提示 + 元数据反例，#
   const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
   assert.match(loopSrc, /⚠️ 不要立即 await——先推进计划里的其他步骤/);
   assert.match(loopSrc, /说明这个调研本该由你直接读文件完成（单个聚焦调查主智能体直接做更快更省）/);
-  assert.match(loopSrc, /结果就绪后会自动送达，也可用 await_subagent 显式等待/, "#45 既有文案不回退");
+  assert.match(loopSrc, /结果会在你\*\*下一步开始时\*\*自动送达/, "#45 既有文案不回退（已改写，见上一条说明）");
+  assert.match(loopSrc, /还没跑完的作业会被取消/, "必须说清不汇合的后果，否则模型照旧收尾");
   // 元数据反例：tool-guides 的 run_subagent use_cases 补单文件调查不要派
   const guides = readFileSync(join(HERE, "../src/tool-guides.js"), "utf8");
   assert.match(guides, /'单个聚焦文件调查不要派——主智能体直接读更快'/);
@@ -23379,7 +23384,12 @@ test("run collaboration cleanup is idempotent across await, normal completion, S
   const loop = extractFn("_runAgenticLoop");
   const finalizerStart = loop.indexOf("  finally {\n    planSteps = _settleRunPlan(run);");
   assert.ok(finalizerStart > 0, "the main run finalizer must remain structurally identifiable");
-  const finalizer = loop.slice(finalizerStart, finalizerStart + 2200);
+  // 切到 finally 里那次会话释放为止，不要固定 2200 字符窗口——这一段一变长
+  //（这次是补了"收尾前先收割已落定作业"）尾部就掉出窗口，断言以「finally 没释放监听」
+  // 的形式假红。今天第五条同形状的了。
+  const _relAt = loop.indexOf("_endRunCollaborationSession(run,", finalizerStart);
+  const finalizer = loop.slice(finalizerStart, _relAt > finalizerStart ? _relAt + 200 : finalizerStart + 6000);
+  assert.ok(finalizer.length > 500, `finally 段只切出 ${finalizer.length} 字符，切法坏了`);
   assert.match(finalizer, /_endRunCollaborationSession\(run, _cancelledSubagents \? "cancelled" : "completed"\)/,
     "the main finally must release listeners on normal, stopped, and exceptional exits");
 });
@@ -26634,7 +26644,23 @@ test("子智能体拿得到成套的只读调研工具，而不是二十来个",
 
 test("放权之后轮数上限跟着放开，但墙钟上限没动", () => {
   const sub = extractFn("_runSubAgent");
-  assert.match(sub, /const SUB_MAX = write \? 28 : 20;/);
+  // 轮数上限现在**按角色给**（2026-08-25，照 Claude Code 的 frontmatter：maxTurns 是每个
+  // agent 自己声明的，不是全局一个常数）。没角色 / 角色不认识时仍然回到 20——
+  // 所以这不是普涨，是把预算分配到真的需要的角色上。write worker 固定 28 不变
+  //（它的边界是 scope 不是轮数）。
+  assert.match(sub, /const SUB_MAX = write\s*\n?\s*\? 28\s*\n?\s*: Math\.min\(40, _ROLE_TURN_BUDGET\[/);
+  const budgets = new Function(`${/const _ROLE_TURN_BUDGET = \{[\s\S]*?\};/.exec(SRC)[0]}\n;return _ROLE_TURN_BUDGET;`)();
+  for (const [role, n] of Object.entries(budgets)) {
+    assert.ok(Number.isInteger(n) && n >= 8 && n <= 40, `${role} 的轮数预算 ${n} 不合理`);
+  }
+  // 角色枚举里的每个名字都要有预算，否则那个角色静默回落到基准值——
+  // 而工具 schema 把它们列成平等的可选项，静默回落等于又一份说谎的清单。
+  const roleEnum = SRC.slice(SRC.indexOf('name: "run_subagent"'), SRC.indexOf('name: "run_subagent"') + 4000)
+    .match(/enum: \[([^\]]*architect[^\]]*)\]/);
+  assert.ok(roleEnum, "run_subagent 的角色枚举取不到");
+  for (const r of [...roleEnum[1].matchAll(/"([a-z]+)"/g)].map((m) => m[1])) {
+    assert.ok(r in budgets, `角色 ${r} 在枚举里却没有轮数预算——它会静默回落到基准值`);
+  }
   // 墙钟才是真正的成本闸门；放开轮数不等于让它跑更久。
   assert.match(sub, /_subDeadlineAt/, "墙钟上限不能被顺手拿掉");
   assert.match(sub, /Date\.now\(\) > _subDeadlineAt/, "墙钟判断必须还在循环里");
