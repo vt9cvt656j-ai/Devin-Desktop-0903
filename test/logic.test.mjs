@@ -19817,7 +19817,7 @@ test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记�
   // 代际快照与 _subGenSnap 同语义：Stop/换轮后落定视为取消
   assert.match(loopSrc, /_jobSess\.streaming && \(_jobSess\._runGen \|\| 0\) === _jobGenSnap/);
   // #43 多任务并发提为 _spawnMulti 后同步/异步两路复用（既有钉死正则仍在本 slice 内）
-  assert.match(loopSrc, /const _spawnMulti = async \(\)/);
+  assert.match(loopSrc, /const _spawnMulti = async \(_collab = null\)/);
   assert.match(loopSrc, /const merged = \(await _spawnMulti\(\)\) \+ _subDropNote/,
     "合并报告也要带上被丢弃任务的提示");
 });

@@ -295,9 +295,16 @@ class SharedStore {
     const record = this._readRecord(key) || {};
     const findings = Array.isArray(record.findings) ? [...record.findings] : [];
     
-    // 添加 timestamp 和元数据
+    // 单调递增的序号。**消费端的游标必须挂在它上面，不能挂数组下标。**
+    //
+    // 下面那个 100 条上限用的是 shift()：数组长度就此钉死在 100，而已经读到 100 的
+    // 消费者游标也是 100，于是 `start >= findings.length` 恒成立——**收件箱从第 101 条
+    // 起永久哑掉**，主智能体和同伴此后说什么都收不到，而且没有任何报错。
+    // 序号跨 shift 不变，游标比的是序号，删多少条都不影响。
+    const seq = (Number(record.findingSeq) || 0) + 1;
     const enrichedFinding = {
       ...finding,
+      seq,
       source: finding.source === jobId ? jobId : (finding.isExternal ? String(finding.source || '') : jobId),
       timestamp: Date.now(),
       jobId // 反溯来源
@@ -310,7 +317,7 @@ class SharedStore {
       findings.shift();
     }
     
-    const next = { ...record, findings, updatedAt: Date.now() };
+    const next = { ...record, findings, findingSeq: seq, updatedAt: Date.now() };
     this.set(key, next);
     this._notifyListeners(`${key}.findings`, findings);
     
