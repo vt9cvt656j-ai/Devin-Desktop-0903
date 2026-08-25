@@ -1,3 +1,24 @@
+> **⚠️ 这份文档有多处已经过期成假话（2026-08-25 核对）。**
+>
+> 计划文档比没有文档更危险的地方在于：下一个人会照着它做决定，而它说的「已完成」
+> 可能从来没成立过。已核实的错处：
+>
+> - **阶段 2c 说「留下来是因为还有独立消费点」——那句话是错的。** 它点名保留的
+>   `_addedRuntimeObligations` / `_addedExternalObligations`，唯一的读取点是
+>   `_agentAllowsRuntimeKind` / `_agentAllowsExternalKind` 两个函数，而那两个函数
+>   **自己零调用点**。两个 Set 从头到尾只写不读，靠一层死函数假装有消费方，
+>   连「只写不读」那道守卫都被骗过去了。四样已于 2026-08-25 全部删除。
+> - **阶段 4 的前提已经反转。** 它假设"machinery gone"之后循环会收敛，而实测
+>   main.js 30 天从 52,537 行涨到 83,353 行（+59%）。在按这份计划推进之前，
+>   先看 `test/main-size-budget.test.mjs`——尺寸闸和「撞线先搬模块」的规矩在那里。
+> - 阶段 1 那份「静默轮只在这三种情况续跑」的清单与代码对不上；"Where main.js
+>   stands (measured)"表格最后一行引用的是已删函数；阶段 1 引用的 agent_core.txt
+>   里那句话 grep 不到。**这三处没有逐条更正**——只在这里标明不可信，
+>   要用之前请对着代码重新核。
+>
+> 同目录的 `WHY_SINGLE_DISPATCH_DIAGNOSIS.md` 和另一份编排诊断整篇在建议
+> **加回阶段 3 刚被所有者点名删掉的自动派发**。照着做等于把删掉的东西装回去。
+
 # Agent loop rebuild — toward the Claude Code / opencode shape
 
 Reference material studied: `~/Desktop/agent-reference/claude-code-analysis` and

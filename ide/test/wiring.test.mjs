@@ -1892,7 +1892,11 @@ const KNOWN_UNCALLED = new Set([
   "_ctxNativeCeiling", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
   "_evidenceGradingHint", "_refreshEmptyRootBeforeSkip", "_runApprovedVerification",
   "recommendToolsForIntent", "renderLspTool",
-  "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled", "_agentAllowsExternalKind", "_agentAllowsRuntimeKind",
+  "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled",
+  // _agentAllowsExternalKind / _agentAllowsRuntimeKind 已于 2026-08-25 删除。
+  // 它俩不只是"没人调"：它们还是 _addedRuntimeObligations / _addedExternalObligations
+  // 唯一的读取点，于是那两个 Set 靠这层死函数假装有消费方，把「只写不读」那道守卫
+  // 也骗过去了——那道守卫只看有没有人读，不看读它的人有没有人调。两层一起删。
   "_agentQuestionNeedsWorkspaceEvidence",
   "_agentSideEffectIntentIssue",
   "_agentToolNameAllowedByProfile", "_agentUserIntentText", "_appendToolPlanCard",
