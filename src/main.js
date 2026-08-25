@@ -5527,8 +5527,8 @@ window.addEventListener("message", (ev) => {
   if (d.__mrdayone === "preview-picked") {
     _preview.picking = false;
     _previewRender();
-    if (d.el && typeof d.el === "object") _previewShowPickPanel(d.el);
-    else showToast("没识别到元素，换个位置再点一次");
+    if (d.el && typeof d.el === "object") _previewSendElementToComposer(d.el);
+    else showToast("没选中元素（按 Esc 取消了，或者点到了空白处）");
   }
 });
 
@@ -5780,184 +5780,6 @@ function _previewApplyDevice() {
   target.style.marginBottom = Math.round(-dev.h * (1 - scale)) + "px";
 }
 
-/**
- * 注入到被预览页面里的调试桥。
- *
- * iframe 跨源，父窗口读不到里面的 console 和 DOM——只有页面自己送出来这一条路。
- * IDE 内置的 dev server 会把它作为 /__mrdayone_bridge.js 提供，并在每张 HTML 末尾
- * 插一行 <script src>。别人的 dev server 想要这几样能力，贴同一行即可。
- *
- * 三件事：① 热重载轮询；② 把 console.error/warn 和未捕获错误送给父窗口；
- * ③ 按父窗口的要求进入「拾取元素」模式。
- *
- * **写法约束**：这段会被 JSON.stringify 塞进 Python 源码，所以
- *   - 不用模板字符串（外层就是模板字符串，`${` 会被当成插值）
- *   - 不用反引号
- *   - 只用 ASCII（Python 那头是按 UTF-8 写文件，但没必要冒这个险）
- */
-const _PREVIEW_BRIDGE_JS = `(function () {
-  if (window.__mrdayoneBridge) return;
-  window.__mrdayoneBridge = 1;
-
-  // ---- 1. 热重载 ----
-  var last = 0;
-  setInterval(function () {
-    fetch("/__reload__").then(function (r) { return r.text(); }).then(function (s) {
-      var n = parseFloat(s);
-      if (last && n > last) location.reload();
-      last = n;
-    }).catch(function () {});
-  }, 800);
-
-  if (window.parent === window) return;   // 不在 iframe 里就只做热重载
-
-  var send = function (msg) {
-    try { parent.postMessage(msg, "*"); } catch (e) {}
-  };
-  var log = function (level, text, src) {
-    send({ __mrdayone: "preview-log", level: level, msg: String(text).slice(0, 600), src: src || "" });
-  };
-
-  // ---- 2. 控制台与未捕获错误 ----
-  ["error", "warn"].forEach(function (lv) {
-    var orig = console[lv];
-    console[lv] = function () {
-      try {
-        log(lv, Array.prototype.map.call(arguments, function (a) {
-          if (typeof a === "string") return a;
-          try { return JSON.stringify(a); } catch (e) { return String(a); }
-        }).join(" "));
-      } catch (e) {}
-      return orig.apply(console, arguments);
-    };
-  });
-  window.addEventListener("error", function (e) {
-    log("error", (e && e.message) || "script error",
-        e && e.filename ? e.filename + ":" + (e.lineno || 0) : "");
-  }, true);
-  window.addEventListener("unhandledrejection", function (e) {
-    var r = e && e.reason;
-    log("error", "unhandledrejection: " + ((r && r.message) || r));
-  });
-
-  // ---- 3. 拾取元素 ----
-  //
-  // 高亮层用 position:fixed + pointer-events:none 盖在页面上，不改动页面本身的任何
-  // 样式或结构——拾取模式退出后页面必须和进来之前一模一样。
-  var box = null, picking = false, hovered = null;
-  var ensureBox = function () {
-    if (box) return box;
-    box = document.createElement("div");
-    box.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #0a84ff;" +
-      "background:rgba(10,132,255,.12);border-radius:3px;transition:all .05s;display:none";
-    document.documentElement.appendChild(box);
-    return box;
-  };
-  var paint = function (el) {
-    if (!el) { if (box) box.style.display = "none"; return; }
-    var r = el.getBoundingClientRect();
-    var b = ensureBox();
-    b.style.display = "block";
-    b.style.left = r.left + "px"; b.style.top = r.top + "px";
-    b.style.width = r.width + "px"; b.style.height = r.height + "px";
-  };
-  var cssPath = function (el) {
-    // 短、稳、够用：优先 id，其次带一个类名的标签，再退到 nth-of-type。
-    if (el.id) return "#" + el.id;
-    var parts = [], node = el, depth = 0;
-    while (node && node.nodeType === 1 && depth < 4) {
-      var part = node.tagName.toLowerCase();
-      var cls = (typeof node.className === "string" ? node.className : "").trim().split(/\\s+/)[0];
-      if (cls) part += "." + cls;
-      else {
-        var p = node.parentElement;
-        if (p) {
-          var same = Array.prototype.filter.call(p.children, function (c) { return c.tagName === node.tagName; });
-          if (same.length > 1) part += ":nth-of-type(" + (same.indexOf(node) + 1) + ")";
-        }
-      }
-      parts.unshift(part);
-      if (node.id) { parts[0] = "#" + node.id; break; }
-      node = node.parentElement; depth++;
-    }
-    return parts.join(" > ");
-  };
-  var sourceOf = function (el) {
-    // 框架的 dev 模式会把源码位置留在 DOM 上。找得到就给准确的文件:行，
-    // 找不到就不编——**没有源码定位时必须说没有**，猜一个出来会让改文字那条路写错文件。
-    var n = el;
-    for (var i = 0; i < 6 && n; i++) {
-      var v = n.getAttribute && (n.getAttribute("data-source") || n.getAttribute("data-v-inspector") ||
-                                 n.getAttribute("data-inspector-file"));
-      if (v) {
-        var m = String(v).match(/^(.*?):(\\d+)(?::(\\d+))?$/);
-        if (m) return { file: m[1], line: Number(m[2]) };
-        return { file: String(v), line: 0 };
-      }
-      if (n.__reactFiber$ || n._debugSource) {
-        var ds = (n._debugSource) || (n.__reactFiber$ && n.__reactFiber$._debugSource);
-        if (ds && ds.fileName) return { file: ds.fileName, line: ds.lineNumber || 0 };
-      }
-      n = n.parentElement;
-    }
-    return null;
-  };
-  var describe = function (el) {
-    var cs = getComputedStyle(el);
-    var r = el.getBoundingClientRect();
-    return {
-      tag: el.tagName.toLowerCase(),
-      selector: cssPath(el),
-      text: (el.textContent || "").trim().slice(0, 200),
-      cls: typeof el.className === "string" ? el.className : "",
-      isLeaf: el.children.length === 0,
-      source: sourceOf(el),
-      color: cs.color, background: cs.backgroundColor,
-      fontSize: cs.fontSize, fontWeight: cs.fontWeight,
-      padding: cs.padding, margin: cs.margin, borderRadius: cs.borderRadius,
-      size: Math.round(r.width) + "x" + Math.round(r.height),
-      outerHTML: (el.outerHTML || "").slice(0, 400)
-    };
-  };
-  var onMove = function (e) {
-    if (!picking) return;
-    hovered = e.target;
-    paint(hovered);
-  };
-  var onClick = function (e) {
-    if (!picking) return;
-    e.preventDefault(); e.stopPropagation();
-    stop();
-    send({ __mrdayone: "preview-picked", el: describe(e.target) });
-  };
-  var onKey = function (e) { if (picking && e.key === "Escape") { stop(); send({ __mrdayone: "preview-picked", el: null }); } };
-  var start = function () {
-    if (picking) return;
-    picking = true;
-    document.documentElement.style.cursor = "crosshair";
-    window.addEventListener("mousemove", onMove, true);
-    window.addEventListener("click", onClick, true);
-    window.addEventListener("keydown", onKey, true);
-  };
-  var stop = function () {
-    picking = false;
-    document.documentElement.style.cursor = "";
-    paint(null);
-    window.removeEventListener("mousemove", onMove, true);
-    window.removeEventListener("click", onClick, true);
-    window.removeEventListener("keydown", onKey, true);
-  };
-  window.addEventListener("message", function (e) {
-    var d = e && e.data;
-    if (!d || typeof d !== "object" || d.__mrdayone !== "preview-pick") return;
-    if (d.on) start(); else stop();
-  });
-
-  // 桥装好了先报一声：父窗口据此知道这个页面有没有接桥，
-  // 从而决定「指元素」能不能用、控制台面板该显示日志还是显示怎么接。
-  log("info", "调试桥已接入");
-})();`;
-
 // ---- 指元素给 AI ----
 
 /**
@@ -5975,13 +5797,12 @@ const _PREVIEW_BRIDGE_JS = `(function () {
  */
 function _previewTogglePick() {
   if (!_preview.url) { showToast("先打开一个地址"); return; }
+  // 桌面端由 src-tauri 的 preview-bridge 插件把桥注入到**每一个帧**，所以任何本地
+  // dev server 的页面都自带，用户不用改自己的项目。到不了这里除非：页面还没加载完
+  // （桥在 document-start 注入，但它自报那条消息要等父窗口收到），或者跑在网页版里
+  // （浏览器没有 WKWebView，没有这条注入路径）。两种都不该弹一个教人贴 script 标签的框。
   if (!_preview.bridgeSeen) {
-    _confirmDialog("这个页面还没接调试桥",
-      "指元素需要页面自己把选中的元素送出来——iframe 跨源，从外面读不到它的结构。\n\n"
-      + "**按工具栏的运行按钮**起的预览会自动接上。别的 dev server 需要在页面里加一行：\n\n"
-      + "```html\n<script src=\"/__mrdayone_bridge.js\"></script>\n```\n\n"
-      + "（或者把 IDE 生成的那段桥脚本贴进去——控制台面板里有完整内容。）",
-      "知道了", false);
+    showToast(inTauri ? "页面还没加载完，等一下再点" : "网页版没有这个能力，用桌面版");
     return;
   }
   _preview.picking = !_preview.picking;
@@ -5999,24 +5820,59 @@ function _previewPostToPage(msg) {
   try { frame.contentWindow.postMessage(msg, origin); } catch { /* 页面还没加载完 */ }
 }
 
-/** 选中元素后的操作面板：复用聊天里那套（免费改文字/改样式，或发给 AI）。 */
-function _previewShowPickPanel(info) {
-  const dockBody = _preview.el?.querySelector('[data-lp="dock-body"]');
-  if (!dockBody) return;
-  _preview.dockOpen = true;
-  dockBody.hidden = false;
-  let host = dockBody.querySelector(".lp__pickhost");
-  if (!host) {
-    host = document.createElement("div");
-    host.className = "lp__pickhost";
-    dockBody.prepend(host);
+/**
+ * 选中的元素往哪儿去：**变成输入框里的一个胶囊**，像 Cursor 那样。
+ *
+ * 不是弹一个面板，也不是把一大段描述灌进输入框——那会把用户已经打的字和别的胶囊
+ * 全冲掉。做法和这个 IDE 已有的 @文件 / @mcp: 一致：
+ *   · 输入框里只留一个短 token `@element:<id>`（渲染成带十字准星图标的胶囊）
+ *   · 元素的详情存在下面这张 Map 里，**发送时**才展开进 _atContext
+ * 于是气泡和历史记录是干净的，用户可以接着打「把它改成圆角」然后发。
+ */
+const _previewPicked = new Map();
+/// 存多少个。选中是高频动作，不封顶的话一次会话能攒出几百份 outerHTML。
+const PREVIEW_PICK_CAP = 24;
+let _previewPickSeq = 0;
+
+/** 把选中的元素收进 Map 并在输入框光标处插一个胶囊。 */
+function _previewSendElementToComposer(info) {
+  const id = "e" + (++_previewPickSeq);
+  _previewPicked.set(id, info);
+  while (_previewPicked.size > PREVIEW_PICK_CAP) {
+    _previewPicked.delete(_previewPicked.keys().next().value);
   }
-  host.textContent = "";
-  const bar = document.createElement("div");
-  const hint = document.createElement("span");
-  host.appendChild(bar);
-  _renderPickPanel(host, bar, hint, info);
-  _previewRender();
+  // 胶囊上显示的名字：标签 + 第一个类名，够短又认得出是哪个。
+  const cls = String(info.cls || "").trim().split(/\s+/)[0];
+  const label = (info.tag || "元素") + (cls ? "." + cls : "");
+  _insertRefAtCursor(id, "element", label.slice(0, 28));
+  showToast("已放进输入框——接着说要改什么");
+}
+
+/** 发送时把胶囊展开成模型看得懂的一块上下文。 */
+function _previewElementContext(id) {
+  const e = _previewPicked.get(id);
+  if (!e) return "";
+  const rows = [
+    ["标签", (e.tag || "") + (e.cls ? "." + String(e.cls).trim().split(/\s+/).join(".") : "")],
+    ["选择器", e.selector],
+    ["文本", e.text ? JSON.stringify(String(e.text).slice(0, 160)) : ""],
+    ["源码", e.source && e.source.file ? e.source.file + (e.source.line ? ":" + e.source.line : "") : ""],
+    ["尺寸", e.size],
+    ["颜色", e.color ? e.color + (e.background ? "\u3000背景 " + e.background : "") : ""],
+    ["字号", e.fontSize ? e.fontSize + (e.fontWeight ? " / " + e.fontWeight : "") : ""],
+    ["间距", e.padding ? "padding " + e.padding + (e.margin ? "\u3000margin " + e.margin : "") : ""],
+    ["圆角", e.borderRadius],
+  ].filter(([, v]) => v);
+  let out = rows.map(([k, v]) => k + "\uff1a" + v).join("\n");
+  if (e.outerHTML) out += "\n\nHTML\uff1a\n" + String(e.outerHTML).slice(0, 400);
+  // 这两句是判据，不是客套：computed style 是浏览器**算完**的最终值，源码里写的多半
+  // 是别的东西（一个 Tailwind 类、一个 CSS 变量、一个 rem）。照着 computed 值去改
+  // 会写出一堆硬编码的魔数，而且下次主题一换就错。
+  out += e.source && e.source.file
+    ? "\n\n有源码定位，直接改那一处。"
+    : "\n\n没有源码定位（多为生产构建或没开 dev 模式）。用选择器和类名去仓库里搜出真正的定义处，"
+      + "别照着上面的 computed 值硬写——那是算完的结果，源码里写的可能是一个类名、一个变量或 rem。";
+  return out;
 }
 
 // ---- 控制台 / 网络面板 ----
@@ -29699,7 +29555,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
    *
    * 所以：远程仓库前缀从本地扫描里摘出去，另走一条发送期预取。
    */
-  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model):/i;
+  // element: 是预览里选中的那个 DOM 元素，详情存在 _previewPicked 里，不是磁盘上的路径。
+  // 不加进这张表的话，下面 _mentioned 会拿它去 readTextFile/readDir，两次都抛、被静默
+  // 吞掉，还白占一个 @ 名额。
+  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element):/i;
   const _mentionedAll = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
   const _mentioned = _mentionedAll.filter((v) => !_REMOTE_AT.test(v));
 
@@ -29784,6 +29643,18 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         _atContext += `\n\n（MCP 资源 ${server} · ${uri} 读取失败：${String(e?.message || e).slice(0, 120)}）`;
       }
     }
+  }
+
+  /*
+   * `@element:<id>` → 预览里选中的那个 DOM 元素。
+   *
+   * 和 @文件 同一个道理：用户已经指着它说话了，正确的工具调用数是 0。详情在
+   * _previewPicked 里，这里展开进上下文；输入框和历史里只留那个短 token。
+   */
+  for (const id of [...text.matchAll(/(?:^|\s)@element:([A-Za-z0-9]+)/g)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 4)) {
+    const block = _previewElementContext(id);
+    if (block) _atContext += `\n\n用户在实时预览里选中的元素:\n\`\`\`\n${block}\n\`\`\``;
   }
 
   if (_mentioned.length && _contextRoot) {
@@ -73475,17 +73346,10 @@ async function _startDevServer(dir, port, fileName = "") {
     "            file_hashes.update(cur)",
     "            last_change[0] = time.time()",
     "threading.Thread(target=watcher, daemon=True).start()",
-    // 调试桥改成**单独一个文件**提供：/__mrdayone_bridge.js。
-    //
-    // 上一版是把它压成一行塞进 Python 的 b'...' 字面量再内联进 HTML，于是整段只能用
-    // 双引号、不能换行、不能写注释——加个「拾取元素」就没法写了。现在它是 main.js 里
-    // 一个正常的 JS 常量（_PREVIEW_BRIDGE_JS），用 JSON.stringify 变成 Python 字符串
-    // 字面量传进来。顺带一个好处：别人的 dev server 想要同样的能力，只要在页面里加
-    // 一行 <script src="/__mrdayone_bridge.js">，而这行现在是真的成立的。
-    //
-    // 热重载轮询也并进桥里了，不再是两个脚本。
-    `BRIDGE_SRC = ${JSON.stringify(_PREVIEW_BRIDGE_JS)}`,
-    `BRIDGE_TAG = b'<script src="/__mrdayone_bridge.js"></script>'`,
+    // 只管热重载。**调试桥不在这里了**——它由 src-tauri 的 preview-bridge 插件
+    // 注入到应用的每一个帧（WKUserScript forMainFrameOnly:false），所以任何本地
+    // dev server 起的页面都自带，不再只有这一个服务的预览才有。
+    `RELOAD_JS = b'<script>(function(){var t=0;setInterval(function(){fetch("/__reload__").then(function(r){return r.text()}).then(function(s){var n=parseFloat(s);if(t&&n>t)location.reload();t=n})},800)})()</script>'`,
     "class RH(http.server.SimpleHTTPRequestHandler):",
     "    def do_GET(self):",
     "        if self.path == '/__reload__':",
@@ -73509,7 +73373,7 @@ async function _startDevServer(dir, port, fileName = "") {
     "                    break",
     "        if os.path.isfile(path) and (path.endswith('.html') or path.endswith('.htm')):",
     "            with open(path, 'rb') as f: data = f.read()",
-    "            data = data.replace(b'</body>', BRIDGE_TAG + b'</body>')",
+    "            data = data.replace(b'</body>', RELOAD_JS + b'</body>')",
     "            self.send_response(200)",
     "            self.send_header('Content-Type', 'text/html')",
     "            self.send_header('Content-Length', str(len(data)))",
@@ -76788,7 +76652,12 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name);
     icon = iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name));
   } else {
-    icon = kind === "model"
+    icon = kind === "element"
+      // 预览里选中的元素。用工具栏那个「指元素」的同一个图标（Lucide crosshair），
+      // 让用户一眼认出它是从哪儿来的。不能走下面那条 `i-brand-<kind>` 的拼名字路线——
+      // 没有 i-brand-element 这个符号，找不到会静默渲染成空白。
+      ? _lpIcon("pick", 13).replace("<svg ", '<svg class="ic" ')
+      : kind === "model"
       ? iconSvg(brandOf(rel).sym, brandOf(rel).cls)
       // MCP 不是"品牌"，没有 i-brand-mcp 这个符号；拼出来的名字找不到会静默渲染成空白。
       : kind === "mcp"
@@ -77101,10 +76970,10 @@ async function _dispatchComposerSubmission(draft) {
 // Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
 // contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
 // spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
-function _insertRefAtCursor(rel) {
+function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   if (!rel) return;
   promptEl.focus();
-  const chip = _makeComposerChip(rel);
+  const chip = _makeComposerChip(rel, kind, labelText);
   const sel = window.getSelection();
   // Insert at the caret if it's inside the composer; else append at the end. Supports MULTIPLE drags
   // (each adds another chip). NO surrounding space so caret navigation past the chip is a single press.

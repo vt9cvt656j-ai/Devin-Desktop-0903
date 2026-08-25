@@ -2,6 +2,7 @@
 // automation bridge; not every target currently wires each helper into a command.
 #[allow(dead_code)]
 mod accessibility;
+mod preview_bridge;
 mod permissions;
 mod archive;
 mod repos;
@@ -160,7 +161,10 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         // mrday:// —— 网页登录页靠它唤起本 App 完成登录交接。
-        .plugin(tauri_plugin_deep_link::init());
+        .plugin(tauri_plugin_deep_link::init())
+        // 实时预览的调试桥。注入到**所有帧**，所以任何本地 dev server 起的页面
+        // 一嵌进来就自带 console 转发和「指元素」，用户不用改自己的项目。
+        .plugin(preview_bridge::init());
 
     #[cfg(target_os = "macos")]
     {
