@@ -195,32 +195,32 @@
     {
       "name": "git_diff",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_show",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_log",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_blame",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_stash_list",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_conflicts",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "gh_pr_create",
@@ -490,27 +490,27 @@
     {
       "name": "git_commit",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_branch",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_push",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_clone",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_pull",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "create_dir",
@@ -545,12 +545,12 @@
     {
       "name": "git_stash",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_stash_pop",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "stop_terminal",
