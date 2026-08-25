@@ -351,6 +351,9 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "computer"
                 // save_skill 往磁盘写技能文件，只读模式不该能写。
                 | "save_skill"
+                // learn_design 会往工作区写 reference/<slug>-design-system.md 和
+                // <slug>-tokens.css 两个文件，还会清掉「空工作区」标记。
+                | "learn_design"
                 | "ui_click"
                 | "db_query"
                 | "remote"
