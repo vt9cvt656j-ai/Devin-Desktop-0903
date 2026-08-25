@@ -65,12 +65,25 @@ test("读屏和 ui_extract 的结果不吃 8000 那一档", () => {
 });
 
 /**
- * 紧凑序列化 + 30000 档，合起来必须真的把「到达模型的元素数」抬上去。
+ * 紧凑序列化 + 那一档合起来，必须真的把「到达模型的元素数」抬上去。
  *
- * 上面两条钉的是写法，这一条量的是效果——写法对而效果没变（比如哪天 marker 变长、
- * 或者元素字段暴涨）时，前两条是绿的，只有这条会红。
+ * 上一版这条测试**一个字节 main.js 都没读**：它自己造 payload、自己写死 8000 和 30000，
+ * 量的是我对算术的假设，不是代码。写法对而代码被改回去时它照样绿——那正是它声称要防的。
+ *
+ * 这一版把两个事实都**从源码里取**：档位的数字，和给模型那份到底带不带缩进。
+ * 谁把档位调回 8000、或者把 JSON.stringify 加回 null,2，这条就会红。
  */
-test("改完之后到达模型的元素数确实上去了", () => {
+test("改完之后到达模型的元素数确实上去了（两个事实都从源码取）", () => {
+  const tiers = SRC.slice(SRC.indexOf("const _cap ="), SRC.indexOf("const rawMessage"));
+  const capMatch = tiers.match(/_rt === "readscreen" \|\| _rt === "uiextract" \? (\d+)/);
+  assert.ok(capMatch, "读屏那一档不见了，取不到真实的字符预算");
+  const cap = Number(capMatch[1]);
+
+  const rs = SRC.slice(SRC.indexOf("const _rsPayload ="), SRC.indexOf("const _rsPayload =") + 1200);
+  const modelLine = rs.match(/const structured = JSON\.stringify\(_rsPayload([^)]*)\);/);
+  assert.ok(modelLine, "取不到给模型那份的序列化写法");
+  const indented = modelLine[1].includes("null");
+
   const element = (i) => ({
     ref: i + 1, role: "Button", text: "打开设置面板",
     x: 120 + i, y: 340 + i, w: 88, h: 24, value: "", enabled: true,
@@ -80,19 +93,22 @@ test("改完之后到达模型的元素数确实上去了", () => {
     elements: Array.from({ length: 500 }, (_, i) => element(i)),
     limitations: [],
   };
+  const text = indented ? JSON.stringify(payload, null, 2) : JSON.stringify(payload);
   // _headTailModelText 的实际形状：留一段头、一段尾，中间换成一个标记。
-  const reach = (text, cap) => {
-    const marker = 133;
-    const head = Math.ceil((cap - marker) * 0.45);
-    const tail = cap - marker - head;
-    return Math.floor((head + tail) / (text.length / 500));
-  };
-  const before = reach(JSON.stringify(payload, null, 2), 8000);
-  const after = reach(JSON.stringify(payload), 30000);
+  const marker = 133;
+  const head = Math.ceil((cap - marker) * 0.45);
+  const tail = cap - marker - head;
+  const reach = Math.floor((head + tail) / (text.length / 500));
 
+  // 基线：改动前是缩进 + 8000 档，实测约 43 个。
+  const before = Math.floor(
+    ((Math.ceil((8000 - marker) * 0.45)) + (8000 - marker - Math.ceil((8000 - marker) * 0.45)))
+      / (JSON.stringify(payload, null, 2).length / 500),
+  );
   assert.ok(before < 60, `基线不对：改动前应该只有几十个元素能进，实际 ${before}`);
   assert.ok(
-    after > 250,
-    `到达模型的元素数没上去（${before} → ${after}）——两处改动有一处没起作用`,
+    reach > 250,
+    `按源码里的真实写法算，只有 ${reach} 个元素到得了模型（基线 ${before}）。`
+      + `档位=${cap}，给模型那份${indented ? "带" : "不带"}缩进——两处至少有一处被改回去了。`,
   );
 });
