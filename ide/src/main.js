@@ -30307,6 +30307,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   sess._runIsLoop = false;
   _setStreaming(sess, true);
   const _pendingToolCalls = [];
+  // 已经渲染成 seg、但会被 acc 清空抹掉的正文段。收尾落盘时要把它们拼回去。
+  const _segTextsThisTurn = [];
   let _toolArgBuf = {};
   const _liveStats = _liveTurnStats(body, {
     startedAt: _taskStartedAt,
@@ -30478,6 +30480,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
                 seg.className = "agent-seg";
                 renderMarkdownInto(seg, acc.trim(), { streaming: false, highlighter: highlightCodeFinal });
                 body.appendChild(seg);
+                // 这段正文马上就要被 `acc = ""` 抹掉，而收尾只看 acc——留一份，
+                // 否则"先说一句再调工具"的那句话永远进不了历史。
+                _segTextsThisTurn.push(acc.trim());
                 acc = ""; _shown = 0; body._lastLen = 0;
               }
               const step = _createToolStep(call);
@@ -30545,6 +30550,25 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
         if (readResults.length) _agentFollowUp(readResults, body, sess);
       } else {
+        // **工具调用发生过就必须留痕。** chat 这条路一旦调过工具，上面那段会把已积累的
+        // 正文渲染成 seg 并 `acc = ""`，于是下面的 `if (_cc)` 恒为假——"先说一句『我查一下』
+        // 再调 web_search"这个最常见的形状下，正文和工具卡都画在屏幕上、sess.memory 里
+        // 一个字都没有；切走再回来整轮消失，全程无任何报错。而 30566 那条空回复兜底又被
+        // `!_pendingToolCalls.length` 挡掉，连提示都没有。
+        if (_pendingToolCalls.length) {
+          const _shown = _segTextsThisTurn.length ? _segTextsThisTurn.join("\n\n") : "";
+          const _toolLines = _pendingToolCalls
+            .map((c) => `· ${c.type}${c.path ? " " + String(c.path).slice(0, 80) : ""}`)
+            .join("\n");
+          const _results = _toolPromises
+            .filter((pr) => pr._result && pr._result.content)
+            .map((pr) => String(pr._result.content))
+            .join("\n\n");
+          const _body = [_shown, `〔本轮调用了工具〕\n${_toolLines}`, _results && `〔工具结果〕\n${_clipPreservingErrors(_results, 4000)}`]
+            .filter(Boolean).join("\n\n");
+          sess.memory.push({ role: "assistant", content: _body, model: config.model || "" });
+          saveChatHistory({ immediate: true });
+        }
         const _cc = _cleanAgentText(acc); // strip "..." filler / tool narration before render+persist
         if (_cc) {
           if (!body._chatStreamEl) {
@@ -50856,13 +50880,23 @@ function _drainSubAgentCollaborationInbox(store, jobId, cursor = 0, maxItems = 6
   let record = null;
   try { record = store.get(`jobs.sm_${jobId}`, null); } catch { return next; }
   const findings = Array.isArray(record?.findings) ? record.findings : [];
-  const start = Math.min(next.cursor, findings.length);
-  next.cursor = findings.length;
-  if (start >= findings.length) return next;
+  // 游标挂**序号**，不挂数组下标。
+  //
+  // 写入端为了控制体积在超过 100 条时 shift()，数组长度就此钉死在 100；而按下标走的
+  // 游标读到 100 之后也停在 100，`start >= findings.length` 恒成立——收件箱从第 101 条
+  // 起**永久哑掉**，主智能体和同伴此后说什么都收不到，一声不响。
+  // 序号跨 shift 不变。老记录里没有 seq，退回按下标算，行为和以前一致。
+  const hasSeq = findings.some((f) => Number.isFinite(f?.seq));
+  const maxSeq = hasSeq ? findings.reduce((m, f) => Math.max(m, Number(f?.seq) || 0), 0) : findings.length;
+  const fresh = hasSeq
+    ? findings.filter((f) => (Number(f?.seq) || 0) > next.cursor)
+    : findings.slice(Math.min(next.cursor, findings.length));
+  next.cursor = maxSeq;
+  if (!fresh.length) return next;
 
   const seen = new Set();
   const lines = [];
-  const candidates = findings.slice(start).filter((finding) => finding?.isExternal === true).slice(-Math.max(1, maxItems));
+  const candidates = fresh.filter((finding) => finding?.isExternal === true).slice(-Math.max(1, maxItems));
   for (const finding of candidates) {
     // `String(对象)` 是字面的 "[object Object]" —— 写入端只要漏给 content（
     // addSharedKnowledge 就漏过），模型上下文里就会多出一行毫无信息量的垃圾。
@@ -51697,6 +51731,28 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         if (_ok && write && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path) {
           _writesDone.push(_normRel(call.path, root) || String(call.path));
         }
+        // **命令写盘也算写盘。**
+        //
+        // 这本账是收尾那条「系统核对·非 worker 自述」唯一的依据，而它原来只认
+        // write/edit/multi_edit 三种工具。一个用 run_cmd 干活的 worker——跑脚手架、
+        // 跑 codegen、`cat > file`、`npm init`——文件是真的落了盘，账上却一条没有，
+        // 于是简报末尾被钉上一句「该 worker 全程未写盘任何文件——若简报声称已完成改动
+        // 即为虚报，不要采信」。**核对腿反过来指控它虚报**，主智能体照着这句话把一份
+        // 真实完成的工作重派一遍，或者自己再做一遍。
+        //
+        // 判据用主循环那条同一个权威 _commandWroteCode（它看的是真落盘的路径，不是从
+        // 命令字符串猜意图），别在这里另写一套。
+        if (_ok && write && (call.type === "cmd" || call.type === "termtask") && _commandWroteCode(call, result)) {
+          const _paths = Array.isArray(result?._fsPaths) ? result._fsPaths : [];
+          if (_paths.length) {
+            for (const wp of _paths) _writesDone.push(_normRel(wp, root) || String(wp));
+          } else {
+            // 拿不到具体路径时也要记一笔——记「有」比记「无」重要：
+            // 漏记会变成一句指控，多记最多让主体多抽查一次。
+            _writesDone.push(`（命令写盘：${String(call.command || "").slice(0, 60)}）`);
+          }
+          if (typeof onMutation === "function") onMutation(_paths[0] || String(call.command || "cmd"));
+        }
         if (run && run.ctx) {
           if (_ok && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path && run.ctx.modified) {
             run.ctx.modified.set(String(call.path).split("/").pop(), write ? "worker改" : "改");
@@ -51756,6 +51812,30 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     res.textContent = t("subagent.noSteps");
     card.classList.remove("is-open");
     _chatFollow();
+    // **先看 report，再说"没干活"。**
+    //
+    // 这块原来无条件返回下面那两句散文，而它排在底下三个前缀判定（[TIMEOUT] /
+    // [轮次用尽·未完成] / 正常简报）**之前**——于是四种完全不同的收场被抹平成同一句话：
+    //   ① 模型轮出错（子体没有主循环那套重试，一次 429/502/上下文超限就 break）；
+    //   ② 靠交接上下文直接作答、零工具调用——那是一份**合法简报**；
+    //   ③ 工具全被准入闸拒绝（拒绝分支 continue 在三个 toolCount++ 之前，不计数）；
+    //   ④ 墙钟超时且还没成功调过工具。
+    //
+    // 后果不止"看不清"：异步路的状态分类器用 /^\[ERROR\]/ 这类**锚在开头**的正则测
+    // job.result，散文三条全不中 → status 落成 "done"，await_subagent 和自动交付都打
+    // 「完成」标签。generate_wiki 那条更狠：它的落盘闸是「report 非空且不以 [ERROR] 开头」，
+    // 散文照样放行，于是这三十个字被当成 wiki 正文写进磁盘——dest 由模型给，
+    // 传 README.md 就把 README 覆盖掉。
+    //
+    // 而这句散文本身还是一条**指令**：「别再派子智能体，直接自己查」。一次上游抖动
+    // 就能教会模型放弃整个编排族。
+    if (_subTimedOut) return `[TIMEOUT] ${report || "子智能体在做出任何工具调用之前就超时了"}`;
+    if (report) {
+      // 有正文就按已有的前缀约定交出去：报错保持 [ERROR] 前缀（上游已经加好），
+      // 中途被截断的按轮次用尽处理，自然收尾的就是一份合法简报。
+      if (/^\[/.test(report) || _subFinished) return report;
+      return `[轮次用尽·未完成] 这个子智能体一次工具都没调成就被截断了，下面是它截止当时的状态，不是结论。\n\n${report}`;
+    }
     return write
       ? "（worker 未执行任何步骤=没干活。别再派 worker，直接自己 edit/write 改这块）"
       : "（子智能体未做任何调查=没干活。别再派子智能体，直接自己 read_file/search 查你要的）";
@@ -57481,20 +57561,66 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           ? `\n⚠ 你给的 tasks 里有 ${it.call.dropped.join("；")}——这些**没有**被派出去。别当成已经查过了。`
           : "";
         // 多任务并发派发+合并，提成局部函数供同步/异步两路复用（卡片渲染与 #42 节流不变）
-        const _spawnMulti = async () => {
+        const _spawnMulti = async (_collab = null) => {
           const results = await Promise.allSettled(_multiTasks.map((task, idx) => _runSubAgent({
             config,
             description: `${it.call.description || "调研"}[${idx + 1}/${_multiTasks.length}]`,
             prompt: typeof task === "string" ? task : String(task.task || ""),
             root, container: body, run, write: false, scope: [],
             role: (task && task.role) || it.call.role || "",
+            // 每个并发任务各自一个收件箱键，互为同伴：一份发现会广播给其余几份，
+            // 主智能体的广播也进得来。以前这条路完全没有 collaboration，几个子体
+            // 在同一个问题上各查各的，互相看不见。
+            collaboration: _collab ? {
+              shared: true,
+              store: _collab.store || _globalSharedStore,
+              jobId: `${_collab.jobId}_t${idx + 1}`,
+              peerJobIds: _multiTasks.map((_, i) => `${_collab.jobId}_t${i + 1}`).filter((_, i) => i !== idx),
+            } : null,
           }).then((report) => ({ idx, report }))));
-          const parts = ["=== 多子智能体并发报告 ==="];
+          const parts = [];
+          // 合并串的**开头**要能被状态分类器认出来。
+          //
+          // 原来第一段永远是 "=== 多子智能体并发报告 ==="，而异步路那三条判据
+          //（/^\[TIMEOUT\]/、/^\[ERROR\]/、/^\[轮次用尽·未完成\]/）是**锚在字符串开头**的，
+          // 于是合并串永远匹配不上任何一条 → status 一律落成 "done"：四条任务全部报错
+          // 也标「完成」，而 [ERROR] 埋在几千字正文里。这正是单任务路早就修过一次的
+          //「标签和正文互相打架」，多任务路一直没跟上。
+          //
+          // 取最差态：只要有一份挂了，整批就不能报完成——父体据此决定要不要重派。
+          const _rank = { "[ERROR]": 3, "[TIMEOUT]": 2, "[轮次用尽·未完成]": 1 };
+          let _worst = "";
+          const _mark = (text) => {
+            for (const k of Object.keys(_rank)) {
+              if (String(text || "").startsWith(k) && (!_worst || _rank[k] > _rank[_worst])) _worst = k;
+            }
+          };
+          const _lines = [];
           for (const [idx, r] of results.entries()) {
-            if (r.status === "fulfilled") parts.push(`【任务 ${r.value.idx + 1}/${_multiTasks.length}】\n${r.value.report}`);
-            else parts.push(`【任务 ${idx + 1}/${_multiTasks.length}】⚠️ 失败：${String(r.reason?.message || r.reason).slice(0, 200)}`);
+            if (r.status === "fulfilled") {
+              _mark(r.value.report);
+              _lines.push(`【任务 ${r.value.idx + 1}/${_multiTasks.length}】\n${r.value.report}`);
+            } else {
+              _worst = "[ERROR]";
+              _lines.push(`【任务 ${idx + 1}/${_multiTasks.length}】⚠️ 失败：${String(r.reason?.message || r.reason).slice(0, 200)}`);
+            }
           }
-          return parts.join("\n\n---\n\n").slice(0, 12000);
+          const _failed = _lines.filter((l) => /⚠️ 失败|【任务 \d+\/\d+】\n\[/.test(l)).length;
+          // 抬头要说清这批里有几份没成。它同时是模型看到的**摘要行**——自动交付取的是
+          // 第一段（split 空行后的第一块），原来那一段就是一句光秃秃的标题，
+          // 模型收到的摘要里一个字的实质内容都没有。
+          parts.push(
+            `${_worst ? _worst + " " : ""}=== 多子智能体并发报告：${_multiTasks.length} 份，`
+            + `${_multiTasks.length - _failed} 份有结论，${_failed} 份未完成 ===`
+          );
+          parts.push(..._lines);
+          const _joined = parts.join("\n\n---\n\n");
+          // 截断要说出来。原来直接 slice(0,12000)，靠后的整份子报告静默消失，
+          // 而抬头还宣称有 N 份——模型照着"都覆盖了"下结论。
+          if (_joined.length <= 12000) return _joined;
+          return _joined.slice(0, 12000)
+            + `\n\n【截断】合并报告超过 12000 字已被截断，靠后的任务正文没有全部带回。`
+            + `需要哪一份就把那条任务单独再派一次。`;
         };
         // === P2.1 异步作业模式：只读调研型子智能体默认后台派发，主流程不阻塞 ===
         // worker/wiki 因写盘记账（_workerMutated/_wikiMutated 在批次后被读取）依赖同步返回，
@@ -57511,9 +57637,24 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const _jobSess = run && run.session;
           const _jobGenSnap = _jobSess ? (_jobSess._runGen || 0) : 0; // 与 _subGenSnap 同一代际语义：Stop/换轮后落定视为取消
           const _jobLive = () => !_jobSess || (_jobSess.streaming && (_jobSess._runGen || 0) === _jobGenSnap);
+          // 主→子的实时通道以前只接在 spawn_multiple_agents 上，而**默认路径是这条**。
+          //
+          // _broadcastMainAgentFinding 会给 run._subAgentJobs 里**每一个**作业写黑板
+          //（键就是下面这个 storeId），主智能体改了哪个文件、哪条路走不通都会广播出去。
+          // 但 _runSubAgent 只在收到 collaboration.shared 时才去读收件箱——这条路一直没传，
+          // 于是消息写进去了、没人读：子体照着派发时的旧内容继续干，主体刚改过的文件它
+          // 一无所知。这是「派出去就断联」的真正来源，不是没实现，是没接线。
+          const _bgStoreId = `${_smRunToken(run)}_${jobId}`;
+          try {
+            _globalSharedStore.set(`jobs.sm_${_bgStoreId}`, {
+              tool: it.tc.name, role: it.call.role || "", description: desc,
+              status: "running", progress: 0, findings: [], createdAt: Date.now(),
+            });
+          } catch {}
+          const _bgCollab = { shared: true, store: _globalSharedStore, jobId: _bgStoreId, peerJobIds: [] };
           job.promise = (_multiTasks && _multiTasks.length > 1
-            ? _spawnMulti()
-            : _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: false, scope: [], role: it.call.role || "" })
+            ? _spawnMulti(_bgCollab)
+            : _runSubAgent({ config, description: it.call.description, prompt: it.call.prompt, root, container: body, run, write: false, scope: [], role: it.call.role || "", collaboration: _bgCollab })
           ).then((report) => {
             job.result = String(report || "").slice(0, 12000);
             if (!_jobLive()) { job.status = "cancelled"; job.consumed = true; }
@@ -58199,7 +58340,23 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if ((t === "cmd" || t === "termtask") && _commandWroteCode(it.call, it.rawResult)) {
             run._codeWrittenByCommand = true;
           }
-          if (mutationPath && t !== "cmd" && t !== "termtask") {
+          // worker 的真实写盘路径在 it._workerMutationPaths 里，**不在 it.call.path**。
+          //
+          // worker 的 call.path 是它的**任务描述**（映射层：path: args.description）。
+          // 原来这里一律走 mutationPath，于是 _mutatedFiles 收进去的是一句中文描述，
+          // 而 worker 真正改的那些文件一个都没进去。后果不是"多一条脏数据"：
+          // _mutatedFiles 是 _deliveryFacts 的输入，它算的是「这一轮改了哪些代码文件、
+          // 跑没跑验证」——于是一个由 worker 完成全部实现的 run，交付事实里写着
+          // **0 个代码文件改动**，验证义务整条不武装。_strayScratchFiles 同源失效。
+          if (t === "worker") {
+            for (const wp of (it._workerMutationPaths || [])) {
+              const rel = _normRel(wp, root);
+              if (rel) {
+                _mutatedFiles.add(rel);
+                _pad.modified.set(rel.split("/").pop(), "worker改");
+              }
+            }
+          } else if (mutationPath && t !== "cmd" && t !== "termtask") {
             const actualPath = _normRel(mutationPath, root);
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
@@ -64003,7 +64160,12 @@ async function _executeToolStepInner(step, call, root, run) {
           + `按这个答案继续做。它如果没有覆盖你现在真正卡住的那一点，说明你要问的是**另一件事**——`
           + `那就把问题重写成那件事本身，别把同一个问题换个说法再问一遍。` };
       }
-      const _auN = (run._askUserCount = (run._askUserCount || 0) + 1);
+      // run 在 chat 那条路上是 **undefined**（_executeToolStep(step, call, _agentRoot) 只传三个参），
+    // 而 ask_user 恰好是网关给 chat 注的 14 个工具之一。这里原来是裸解引用 → TypeError，
+    // 而 chat 侧那个 `p.then(...)` 没有 .catch，唯一的 allSettled 在另一条分支上：
+    // 表现是一次 unhandled rejection + 那张 ask_user 卡片**永远停在执行中**，
+    // 用户对着它干等，界面上没有任何提示。同一分支上面几行用的就是 `run?.session`。
+    const _auN = run ? (run._askUserCount = (run._askUserCount || 0) + 1) : 1;
       const _auBackToBack = run._lastToolWasAsk === true;
       run._lastToolWasAsk = true;
       if (_auN >= 3 || (_auN >= 2 && _auBackToBack)) {

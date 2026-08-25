@@ -123,3 +123,52 @@ test("两个 run 的同号作业不串台——黑板是全局的，jobId 不是
   assert.match(drain(store, a.key("1"), 0).message, /A 项目/);
   assert.equal(drain(store, b.key("1"), 0).message, "", "B 的子智能体读到了 A 的内容");
 });
+
+/**
+ * 收件箱不能在第 101 条之后哑掉。
+ *
+ * 写入端为了控制体积在超过 100 条时 `findings.shift()`——数组长度就此钉死在 100。
+ * 而消费端的游标原来是**数组下标**：读到 100 之后游标停在 100，`start >= findings.length`
+ * 从此恒成立，于是主智能体和同伴再说什么都收不到，**一声不响，没有任何报错**。
+ * 一个长会话里主体广播上百条发现是很正常的事。
+ *
+ * 判据必须跨过那个上限：只发 99 条的话，坏的实现照样绿。
+ */
+test("发过 100 条之后，收件箱还收得到新消息", () => {
+  const store = new SharedStore();
+  const run = mkRun(store, [[1, "running"]]);
+  const key = `sm_${run.key(1)}`;
+
+  let cursor = 0;
+  // 先灌满上限，并把游标一路推到最新——模拟一个长会话。
+  for (let i = 0; i < 120; i++) {
+    store.appendFinding(key, { content: `旧消息 ${i}`, source: "主智能体", isExternal: true });
+    cursor = drain(store, run.key(1), cursor).cursor;
+  }
+  assert.ok(cursor >= 120, `游标应该跟着序号走到 120 以上，实际 ${cursor}`);
+
+  // 现在再来一条新的：必须收得到。
+  store.appendFinding(key, { content: "第 121 条·这条必须收到", source: "主智能体", isExternal: true });
+  const got = drain(store, run.key(1), cursor);
+  assert.match(
+    got.message,
+    /第 121 条·这条必须收到/,
+    "过了 100 条上限之后收件箱哑了——游标挂在会被 shift 的数组下标上，主体此后说什么子体都收不到",
+  );
+  assert.ok(got.cursor > cursor, "游标没有前进");
+});
+
+/** 游标语义要跨 shift 稳定：删掉的旧条目不该让已读的重新冒出来。 */
+test("超出上限被删掉的旧消息，不会因为下标变化而重放", () => {
+  const store = new SharedStore();
+  const run = mkRun(store, [[1, "running"]]);
+  const key = `sm_${run.key(1)}`;
+
+  for (let i = 0; i < 105; i++) {
+    store.appendFinding(key, { content: `消息 ${i}`, source: "主智能体", isExternal: true });
+  }
+  const first = drain(store, run.key(1), 0);
+  assert.ok(first.message, "第一次读应该有内容");
+  const second = drain(store, run.key(1), first.cursor);
+  assert.equal(second.message, "", `没有新消息时不该再吐东西，实际吐了：${second.message.slice(0, 120)}`);
+});
