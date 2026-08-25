@@ -7,6 +7,7 @@
 //     看不出原因的崩溃或空白；
 //   · 轮询只在窗格可见时该跑——聊天里那张老卡片就是在这儿漏的。
 import { test } from "node:test";
+import { normalizeFsPath } from "../src/agent/paths.js";
 import assert from "node:assert/strict";
 import { load, loadConst, fnSource, CODE } from "./helpers/source.mjs";
 import { readFileSync, existsSync } from "node:fs";
@@ -86,7 +87,8 @@ test("页签的键在 _normalizeFsPath 下是不动点", () => {
   // 这条真踩过：`mrdayone://live-preview` 经过路径规范化会变成 `mrdayone:/live-preview`
   // （连续斜杠被折掉），于是 openFiles 的键和常量对不上，closeFile / activate 全部
   // 静默失配——页签关不掉、切过去是空白，而且哪里都不报错。
-  const norm = load("_normalizeFsPath", ["_normalizeFsPath", "_toPosix"]);
+  // 路径这一簇已搬进 src/agent/paths.js —— 直接 import 产品代码。
+  const norm = normalizeFsPath;
   const path = loadConst("PREVIEW_TAB_PATH");
   assert.equal(norm(path), path, path + " 经过路径规范化变成了 " + norm(path));
   assert.equal(norm("mrdayone://live-preview"), "mrdayone:/live-preview"); // 反面：这就是当初那个坑

@@ -10,6 +10,13 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
 // 不再从 main.js 源码里抠函数文本。
+import {
+  toPosix as _pathsToPosix,
+  normalizeFsPath as _pathsNormalize,
+  isAbsoluteFsPath as _pathsIsAbsolute,
+  pathIdentity as _pathsIdentity,
+  pathIsAtOrUnder as _pathsIsAtOrUnder,
+} from "../src/agent/paths.js";
 // 角色策略已搬进 src/agent/subagent-roles.js，直接 import 产品代码，不再抠源码。
 import {
   ROLE_TURN_BUDGET as _roleTurnBudget,
@@ -217,17 +224,17 @@ function collectIdentifiers(source, name) {
   return hits;
 }
 
-const TO_POSIX = load("_toPosix");
-const NORMALIZE_PATH = load("_normalizeFsPath", { _toPosix: TO_POSIX });
-const IS_ABSOLUTE_FS_PATH = load("_isAbsoluteFsPath", { _normalizeFsPath: NORMALIZE_PATH });
-const PATH_IDENTITY = load("_pathIdentity", {
-  _normalizeFsPath: NORMALIZE_PATH,
-  _remote: { active: false, platform: "" },
-  navigator: { platform: "Linux", userAgent: "" },
-});
+// 路径这一簇已搬进 src/agent/paths.js —— 直接 import 产品代码，不再抠源码。
+// 大小写敏感与否取决于文件系统在哪台机器上，所以 pathIdentity 收一个 remote 参数；
+// 这里固定按「本机 Linux、无远程」跑，和原来注入的桩语义一致。
+const TO_POSIX = _pathsToPosix;
+const NORMALIZE_PATH = _pathsNormalize;
+const IS_ABSOLUTE_FS_PATH = _pathsIsAbsolute;
+const LINUX = { active: false, platform: "" };
+const PATH_IDENTITY = (path) => _pathsIdentity(path, LINUX);
 const COHERENT_PATH = (path) => NORMALIZE_PATH(path);
 const NORM_REL = load("_normRel", { _normalizeFsPath: NORMALIZE_PATH, _pathIdentity: PATH_IDENTITY });
-const PATH_IS_AT_OR_UNDER = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+const PATH_IS_AT_OR_UNDER = (a, b) => _pathsIsAtOrUnder(a, b, LINUX);
 
 function makeRunEvidenceHelpers(openRoots = []) {
   const allRoots = (preferred = "") => {
@@ -1126,28 +1133,18 @@ test("filesystem paths collapse dot segments and use platform-correct identity",
   assert.equal(NORMALIZE_PATH("src/../../outside.js"), "../outside.js");
   assert.equal(NORMALIZE_PATH("/repo/name "), "/repo/name ", "real trailing whitespace in a filename must be preserved");
 
-  const windowsIdentity = load("_pathIdentity", {
-    _normalizeFsPath: NORMALIZE_PATH,
-    _remote: { active: false, platform: "" },
-    navigator: { platform: "Win32", userAgent: "Windows" },
-  });
+  // Windows 本机：原来靠注入假 navigator 模拟。模块化之后 navigator 是真全局注不进来，
+  // 改成走 remote 参数表达同一件事——判据（大小写不敏感）完全一样。
+  const windowsIdentity = (p) => _pathsIdentity(p, { active: true, platform: "Windows" });
   assert.equal(windowsIdentity("C:/Repo/A.js"), windowsIdentity("c:\\repo\\a.js"));
 
-  const remoteLinuxIdentity = load("_pathIdentity", {
-    _normalizeFsPath: NORMALIZE_PATH,
-    _remote: { active: true, platform: "Linux-6.8" },
-    navigator: { platform: "MacIntel", userAgent: "Mac OS" },
-  });
+  const remoteLinuxIdentity = (p) => _pathsIdentity(p, { active: true, platform: "Linux-6.8" });
   assert.notEqual(remoteLinuxIdentity("/srv/App.js"), remoteLinuxIdentity("/srv/app.js"));
 });
 
 test("directory containment follows platform path identity", () => {
-  const windowsIdentity = load("_pathIdentity", {
-    _normalizeFsPath: NORMALIZE_PATH,
-    _remote: { active: false, platform: "" },
-    navigator: { platform: "Win32", userAgent: "Windows" },
-  });
-  const isUnder = load("_pathIsAtOrUnder", { _pathIdentity: windowsIdentity });
+  const windowsIdentity = PATH_IDENTITY;
+  const isUnder = (a, b) => { const id = windowsIdentity; const c = id(a), pr = id(b); return !!c && !!pr && (c === pr || c.startsWith(pr.endsWith("/") ? pr : pr + "/")); };
   assert.equal(isUnder("C:\\Repo\\Src\\a.js", "c:/repo/src"), true);
   assert.equal(isUnder("C:/Repo/src-other/a.js", "c:/repo/src"), false);
   assert.equal(isUnder("/repo/src/a.js", "/repo/src/a.js"), true);
@@ -1163,7 +1160,7 @@ test("opening a different project closes tabs outside the new root, including pi
   const toasts = [];
   const closeOutside = load("_closeOpenFilesOutsideRoot", {
     _normalizeFsPath: NORMALIZE_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles,
     closeFile: async (path, options) => {
       closed.push([path, options]);
@@ -1420,13 +1417,13 @@ test("empty-workspace facts remain telemetry while every explicit probe reaches 
   const clearRunEmptyRoot = load("_clearRunEmptyRoot", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: PATH_IDENTITY,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
   });
   const emptyRootSkipMessage = load("_emptyRootSkipMessage", {
     _normalizeFsPath: NORMALIZE_PATH,
     _normalizeReadToolPath: normalizeReadToolPath,
     _pathIdentity: PATH_IDENTITY,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
   });
   const backendRef = { readDir: async () => [] };
   const refreshEmptyRootBeforeSkip = load("_refreshEmptyRootBeforeSkip", {
@@ -1492,7 +1489,7 @@ test("empty-workspace facts remain telemetry while every explicit probe reaches 
 });
 
 test("empty-root explore helpers classify telemetry without entering the executor", () => {
-  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const pathIsAtOrUnder = PATH_IS_AT_OR_UNDER;
   const isPureExploreCommand = load("_isPureExploreCommand", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIsAtOrUnder: pathIsAtOrUnder,
@@ -1631,7 +1628,7 @@ test("#54 timeout-wrapped dev server is stripped, recognized as a service, and s
 });
 
 test("probe-loop detection: blind guess-and-check probing triggers a root-cause checkpoint", () => {
-  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const pathIsAtOrUnder = PATH_IS_AT_OR_UNDER;
   const isPureExploreCommand = load("_isPureExploreCommand", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIsAtOrUnder: pathIsAtOrUnder,
@@ -3967,11 +3964,7 @@ test("explicit dark theme covers legacy light chat cards and popup surfaces", ()
 });
 
 test("coherent paths reuse the existing Windows editor key despite slash and case differences", () => {
-  const identity = load("_pathIdentity", {
-    _normalizeFsPath: NORMALIZE_PATH,
-    _remote: { active: false, platform: "" },
-    navigator: { platform: "Win32", userAgent: "Windows" },
-  });
+  const identity = PATH_IDENTITY;
   const coherent = load("_coherentFilePath", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: identity,
@@ -4125,7 +4118,7 @@ test("multi-root resolution never falls through to process cwd or guesses an amb
 });
 
 test("filesystem scan roots remove overlap while preserving the preferred root", () => {
-  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const pathIsAtOrUnder = PATH_IS_AT_OR_UNDER;
   const independent = load("_independentFsPaths", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: PATH_IDENTITY,
@@ -4139,7 +4132,7 @@ test("filesystem scan roots remove overlap while preserving the preferred root",
 });
 
 test("find_files requests cover ordinary, root-qualified, absolute, and missing-root patterns", () => {
-  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const pathIsAtOrUnder = PATH_IS_AT_OR_UNDER;
   const independent = load("_independentFsPaths", {
     _normalizeFsPath: NORMALIZE_PATH,
     _pathIdentity: PATH_IDENTITY,
@@ -15525,7 +15518,7 @@ test("directory watcher events update in-flight opens without overriding a newer
   const openingFiles = new Map([["/repo/src/a.js", opening]]);
   const sync = load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles: new Map(),
     _openingFiles: openingFiles,
     projectModels: new Set(),
@@ -15548,7 +15541,7 @@ test("directory watcher events update in-flight opens without overriding a newer
   const freshOpening = { hasDiskContent: false, diskContent: "", externalDeleted: false, diskVersion: 0 };
   const freshSync = load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles: new Map(),
     _openingFiles: new Map([["/repo/src/b.js", freshOpening]]),
     projectModels: new Set(),
@@ -15602,7 +15595,7 @@ test("external sync normalizes Windows paths and discards stale async reads", as
   const applied = [];
   const sync = load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles: new Map([["C:/repo/a.js", file]]),
     _openingFiles: new Map(),
     projectModels: new Set(),
@@ -15625,7 +15618,7 @@ test("the newest external sync wins even when older disk reads finish later", as
   const applied = [];
   const sync = load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles: new Map([["/repo/a.js", file]]),
     _openingFiles: new Map(),
     projectModels: new Set(),
@@ -15648,7 +15641,7 @@ test("external deletion closes clean tabs but preserves dirty buffers as explici
   const missing = load("_isMissingFileError");
   const makeSync = (file, openFiles, closed) => load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles,
     _openingFiles: new Map(),
     projectModels: new Set(),
@@ -16218,7 +16211,7 @@ test("a stale watcher read cannot roll back a newer preloaded Monaco model", asy
   const applied = [];
   const sync = load("_syncOpenFilesFromDisk", {
     _coherentFilePath: COHERENT_PATH,
-    _pathIsAtOrUnder: load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY }),
+    _pathIsAtOrUnder: PATH_IS_AT_OR_UNDER,
     openFiles: new Map(),
     _openingFiles: new Map(),
     projectModels: new Set(["/repo/src/a.js"]),
@@ -16715,7 +16708,7 @@ test("db tool cards preserve non-tabular MongoDB, Elasticsearch, and ClickHouse 
 });
 
 test("agent runtime helpers infer real project roots, terminals, and backend/DB clues", async () => {
-  const pathIsAtOrUnder = load("_pathIsAtOrUnder", { _pathIdentity: PATH_IDENTITY });
+  const pathIsAtOrUnder = PATH_IS_AT_OR_UNDER;
   const parentDir = (p) => { const s = String(p == null ? "" : p); return s.slice(0, s.lastIndexOf("/")) || "/"; };
   const outer = "/Users/michael/Desktop/中转站";
   const nested = `${outer}/github-community`;
@@ -22156,13 +22149,13 @@ test("靠后的顶层目录不能被前面的吃光预算——大项目里那�
 function treeSnapshot(tree) {
   // `_remote` 未启用 = 本地工作区，正是这些断言要覆盖的场景。路径归一化那一族都读它。
   const _remote = { active: false, url: "", token: "", root: "", host: "", platform: "" };
-  const _normalizeFsPath = load("_normalizeFsPath", { _toPosix: load("_toPosix"), _remote });
+  const _normalizeFsPath = NORMALIZE_PATH;
   return load("_workspaceTreeSnapshot", {
     backend: { readDir: async (p) => tree[p] || [] },
     _normalizeFsPath,
     _agentDirEntryName: load("_agentDirEntryName", { basename }),
     _agentDirEntryIsDir: load("_agentDirEntryIsDir"),
-    _normRel: load("_normRel", { _normalizeFsPath, _pathIdentity: load("_pathIdentity", { _normalizeFsPath, _remote }) }),
+    _normRel: load("_normRel", { _normalizeFsPath, _pathIdentity: PATH_IDENTITY }),
     _AGENT_CONTEXT_SKIP_DIRS: loadConst("_AGENT_CONTEXT_SKIP_DIRS"),
   });
 }
@@ -22454,7 +22447,19 @@ test("client modules have no undeclared identifiers", async () => {
     "__APP_VERSION__",
   ]);
 
-  const FILES = ["src/main.js","src/tool-guides.js","src/markdown.js","src/conversation-memory.js","src/growth.js","src/i18n.js"];
+  // **src/agent/ 下的模块也要扫，而且要自动发现。**
+  //
+  // 这份名单原来是手抄的，且不含 src/agent/——于是每从 main.js 抽出去一个模块，
+  // 它就逃出这道守卫一次。实测抓到过：paths.js 刚抽出来时 pathIdentity 还在读
+  // main.js 的 `_remote` 全局，在模块里那是 ReferenceError，而这条守卫看不见。
+  // 自动发现而不是往名单里再加一行——加一行的话下一个模块照样漏。
+  const { readdirSync } = await import("node:fs");
+  const FILES = [
+    "src/main.js", "src/tool-guides.js", "src/markdown.js",
+    "src/conversation-memory.js", "src/growth.js", "src/i18n.js",
+    ...readdirSync(join(HERE, "..", "src/agent")).filter((f) => f.endsWith(".js")).map((f) => `src/agent/${f}`),
+  ];
+  assert.ok(FILES.length > 8, `只发现 ${FILES.length} 个文件，自动发现坏了`);
   const offenders = [];
   for (const file of FILES) {
     const code = readFileSync(join(HERE, "..", file), "utf8");
@@ -32066,10 +32071,10 @@ test("以点开头的目录/文件，相对路径要解析到它自己", () => {
     _remote: { active: false, platform: "" },
     openFiles: new Map(),
     projectModels: new Map(),
-    _normalizeFsPath: load("_normalizeFsPath", { _toPosix: load("_toPosix") }),
+    _normalizeFsPath: NORMALIZE_PATH,
     _coherentFilePath: load("_coherentFilePath", {
-      _toPosix: load("_toPosix"),
-      _normalizeFsPath: load("_normalizeFsPath", { _toPosix: load("_toPosix") }),
+      _toPosix: TO_POSIX,
+      _normalizeFsPath: NORMALIZE_PATH,
       _pathIdentity: (p) => String(p),
       openFiles: new Map(),
       projectModels: new Map(),
@@ -32738,7 +32743,8 @@ test("项目约定要沿祖先链读到会话工作区根，不能只读当前�
   assert.ok(expr, "祖先链那段不见了，这条断言失去落点");
   const dirs = new Function("root", "boundaryRoot", "_pathIsAtOrUnder", "_workspaceAncestorRoots",
     `${expr[0]}\nreturn _guideDirs;`);
-  const atOrUnder = load("_pathIsAtOrUnder");
+  // main.js 里现在只剩一个薄壳（把 _remote 传给模块），抠它出来在沙箱里跑不了。
+  const atOrUnder = PATH_IS_AT_OR_UNDER;
   const ancestors = load("_workspaceAncestorRoots");
 
   // 主场景：光标在子目录，工作区根在上面两层——两层都要读，近的在前（预算优先给最具体的）。
@@ -34619,8 +34625,8 @@ test("Windows 绝对路径不许被当成相对路径二次拼接", () => {
   // 仓库里本来就有认盘符的 _isAbsoluteFsPath，这几处只是没用它。
   // 用仓库自己的加载器做依赖注入：_isAbsoluteFsPath → _normalizeFsPath → _toPosix
   // 是一条链，手工拼 new Function 只会把链上下一环漏掉。
-  const norm = load("_normalizeFsPath", { _toPosix: load("_toPosix", {}) });
-  const fn = load("_isAbsoluteFsPath", { _normalizeFsPath: norm });
+  const norm = NORMALIZE_PATH;
+  const fn = IS_ABSOLUTE_FS_PATH;
   for (const p of ["C:\\designs\\a.png", "C:/designs/a.png", "/tmp/a.png", "//server/share/a.png"]) {
     assert.equal(fn(p), true, `${p} 应该被认成绝对路径`);
   }

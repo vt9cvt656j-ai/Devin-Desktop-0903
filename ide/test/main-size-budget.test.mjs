@@ -50,8 +50,20 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  * 搬迁的附带收益（两次都一样，值得记）：原本靠「从 main.js 抠函数文本再 new Function」
  * 跑的测试可以改成直接 import 产品代码。抠源码验得到行为，验不到「这个函数在真实调用链上
  * 还在不在」——而本仓库真出过「实现写好了、零调用点」。这次改了三组、五处。
+ * · 83_400（2026-08-25 第三次，仍在往下）：实测 83,3xx。抽出 `src/agent/paths.js`
+ *   （路径规范化与比较，六个函数被引用近 250 次）。这一块比前两块难，两个教训值得记：
+ *
+ *   **判据要真的过一遍，不能看着像纯的就搬。** `pathIdentity` 读 `_remote` 全局、
+ *   `coherentFilePath` 读编辑器打开的文件表——第一次搬进去两个都带着自由变量。
+ *   前者改成从参数传（main.js 侧留薄壳），后者**退回 main.js**：模块里只放
+ *  「给它字符串就能算出答案」的东西。
+ *
+ *   **而那条"没有未声明标识符"的守卫当时没抓到**，因为它的文件名单是手抄的、
+ *   不含 src/agent/——每抽出去一个模块就逃出守卫一次。已改成自动发现该目录，
+ *   加一行名单救不了下一个模块。
+ *
  */
-const MAIN_JS_MAX_LINES = 83_500;
+const MAIN_JS_MAX_LINES = 83_400;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

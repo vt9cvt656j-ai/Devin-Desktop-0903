@@ -131,6 +131,18 @@ import {
 } from "./agent/capabilities.js";
 import getSharedStore from "./agent/shared-store.js";
 import {
+  toPosix as _toPosix,
+  normalizeFsPath as _normalizeFsPath,
+  isAbsoluteFsPath as _isAbsoluteFsPath,
+  pathIdentity as _pathIdentityRaw,
+  pathIsAtOrUnder as _pathIsAtOrUnderRaw,
+} from "./agent/paths.js";
+
+// 两个薄壳：把 main.js 这边的连接状态传进去，近 100 个调用点一个都不用改。
+// pathIdentity 的大小写敏感与否取决于文件系统在哪台机器上，而 `_remote` 是 main.js 的状态。
+const _pathIdentity = (path) => _pathIdentityRaw(path, _remote);
+const _pathIsAtOrUnder = (candidate, parent) => _pathIsAtOrUnderRaw(candidate, parent, _remote);
+import {
   ROLE_TURN_BUDGET as _ROLE_TURN_BUDGET,
   roleCapabilities as _rolePolicy,
 } from "./agent/subagent-roles.js";
@@ -10018,69 +10030,8 @@ function _treeReloadTargetForDir(dir) {
   return _treeVisibleAncestor(dir) || roots.find((root) => _pathIsAtOrUnder(dir, root)) || rootPath || "";
 }
 
-// Normalize a filesystem path to forward slashes. Windows dialogs / read_dir return
-// `C:\a\b`, but ALL path logic here joins & compares with "/" (rootPath + "/" + rel,
-// startsWith(rootPath + "/"), split("/")…). A backslash root then matches NOTHING →
-// relative paths don't resolve to the workspace ("不看当前工作目录"). Windows accepts
-// "/" in paths, so posix-normalizing at every boundary makes it all consistent.
-// No-op on macOS/Linux (they have no backslashes in paths).
-function _toPosix(p) { return typeof p === "string" ? p.replace(/\\/g, "/") : p; }
-
-function _normalizeFsPath(path) {
-  if (typeof path !== "string") return path;
-  // A filesystem name may legally end in whitespace on POSIX. Trimming the whole
-  // path turns `/repo/name ` into a different file (`/repo/name`) and defeats the
-  // invisible-whitespace recovery used by read_file. Call sites validate empty
-  // model arguments separately; path normalization itself must preserve identity.
-  let value = _toPosix(path);
-  if (!value) return value;
-  let prefix = "";
-  if (/^[A-Za-z]:\//.test(value)) {
-    prefix = value.slice(0, 2) + "/";
-    value = value.slice(3);
-  } else if (value.startsWith("//")) {
-    prefix = "//";
-    value = value.replace(/^\/+/, "");
-  } else if (value.startsWith("/")) {
-    prefix = "/";
-    value = value.replace(/^\/+/, "");
-  }
-  const parts = [];
-  for (const part of value.split("/")) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      if (parts.length && parts[parts.length - 1] !== "..") parts.pop();
-      else if (!prefix) parts.push(part);
-      continue;
-    }
-    parts.push(part);
-  }
-  return prefix + parts.join("/");
-}
-
-function _isAbsoluteFsPath(path) {
-  const normalized = _normalizeFsPath(String(path || ""));
-  return !!normalized && (normalized.startsWith("/") || normalized.startsWith("//") || /^[A-Za-z]:\//.test(normalized));
-}
-
-function _pathIdentity(path) {
-  const normalized = _normalizeFsPath(path);
-  const remoteCaseInsensitive = _remote.active && /windows|darwin|mac(?:os)?/i.test(_remote.platform || "");
-  const localCaseInsensitive = !_remote.active && typeof navigator !== "undefined"
-    && /Mac|Win/i.test((navigator.platform || "") + " " + (navigator.userAgent || ""));
-  return typeof normalized === "string" && (remoteCaseInsensitive || localCaseInsensitive || /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//"))
-    ? normalized.toLowerCase()
-    : normalized;
-}
-
-function _pathIsAtOrUnder(candidate, parent) {
-  const childIdentity = _pathIdentity(candidate);
-  const parentIdentity = _pathIdentity(parent);
-  if (!childIdentity || !parentIdentity) return false;
-  return childIdentity === parentIdentity
-    || childIdentity.startsWith(parentIdentity.endsWith("/") ? parentIdentity : parentIdentity + "/");
-}
-
+// 路径规范化与比较已搬到 src/agent/paths.js（见那边的文件头说明）。
+// 按原名 import，近 250 个调用点一个都不用改。
 function _coherentFilePath(path) {
   const normalized = _normalizeFsPath(path);
   if (typeof normalized !== "string") return normalized;
