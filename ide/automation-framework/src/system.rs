@@ -343,13 +343,25 @@ impl SystemAutomation {
         Ok(())
     }
 
+    /// 连点 n 次。双击、三连击共用这一条。
+    ///
+    /// 间隔 50ms 是有讲究的：系统判定「这是一次双击/三连击」靠的是**相邻两次点击的
+    /// 时间差和位置差**，不是我们说它是。太快某些工具包会丢事件，太慢就被判成两次单击。
+    /// 三连击（整段选中一行/一段）在文本编辑里是常用动作，而它此前完全不存在。
+    pub fn click_times(&mut self, button: MouseButton, times: u32) -> Result<()> {
+        debug!("连点 {} 次: {:?}", times, button);
+        for i in 0..times.max(1) {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            self.click(button)?;
+        }
+        Ok(())
+    }
+
     /// 鼠标双击
     pub fn double_click(&mut self, button: MouseButton) -> Result<()> {
-        debug!("双击: {:?}", button);
-        self.click(button)?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        self.click(button)?;
-        Ok(())
+        self.click_times(button, 2)
     }
 
     /// 鼠标滚动
@@ -404,11 +416,35 @@ impl SystemAutomation {
     }
 
     /// 输入文本
+    /// 输入文本。**换行按真的回车发出去**，不能原样丢给 text()。
+    ///
+    /// `enigo.text("a\nb")` 在 macOS 上走的是 Unicode 直接投递：`\n` 作为一个字符送出去，
+    /// 多数原生控件对它没有反应——于是"输入两行"变成输入一行，中间那次换行**静默消失**，
+    /// 而回执照样 ok。多行输入是最常见的用法之一（写提交信息、填地址、聊天发多段），
+    /// 这个坑一直在。中文没问题（Unicode 投递本来就对），只有回车会失效。
+    ///
+    /// `\r\n` 当成一次换行，别按两下。
     pub fn type_text(&mut self, text: &str) -> Result<()> {
         debug!("输入文本: {} 字符", text.len());
-        self.enigo
-            .text(text)
-            .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)))?;
+        if !text.contains('\n') {
+            return self
+                .enigo
+                .text(text)
+                .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)));
+        }
+        let normalized = text.replace("\r\n", "\n");
+        let mut first = true;
+        for line in normalized.split('\n') {
+            if !first {
+                self.press_key(Key::Return)?;
+            }
+            first = false;
+            if !line.is_empty() {
+                self.enigo
+                    .text(line)
+                    .map_err(|e| Error::System(format!("输入文本失败: {:?}", e)))?;
+            }
+        }
         Ok(())
     }
 

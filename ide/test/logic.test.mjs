@@ -29945,9 +29945,19 @@ test("computer 的合法动作只有一份，schema / 映射 / 报错文案不�
   const methods = new Function(`${/const _COMPUTER_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _COMPUTER_METHODS;`)();
   assert.ok(methods.includes("mouse.position"), "schema enum 里有、白名单里没有——模型照 schema 调就撞「不支持的动作」");
   // schema 的 enum 必须和它逐字一致
-  const at = RAW_SRC.indexOf('name: "computer"');
-  const seg = SRC.slice(at, at + 1600);
-  const enumNames = [...seg.matchAll(/"([a-z]+\.[a-z_]+)"/g)].map((m) => m[1]);
+  // 切到 enum 的**右方括号**为止，不要固定窗口。
+  //
+  // 原来是 `SRC.slice(at, at + 1600)`：computer 的描述本来就一千多字符，enum 紧随其后，
+  // 一旦描述或 enum 变长，尾部就被切在窗口外——断言随即报「schema enum 和白名单又分叉了」，
+  // 而两边其实是一致的。假红还算好的：反过来在窗口内恰好只剩前几项时，它会**假绿**。
+  // 另一个坑：这里原来用 RAW_SRC 的下标去切 SRC（剥过注释的那份），两者偏移根本对不上。
+  const at = SRC.indexOf('name: "computer"');
+  assert.ok(at > 0, "computer 的工具定义找不到了");
+  const eStart = SRC.indexOf("enum: [", at);
+  const eEnd = SRC.indexOf("]", eStart);
+  assert.ok(eStart > at && eEnd > eStart, "computer schema 里的 enum 形状变了");
+  const enumNames = [...SRC.slice(eStart, eEnd).matchAll(/"([a-z]+\.[a-z_]+)"/g)].map((m) => m[1]);
+  assert.ok(enumNames.length >= 20, `enum 只解析出 ${enumNames.length} 项，判据坏了`);
   assert.deepEqual(enumNames, methods, "schema enum 和白名单又分叉了");
   // 报错文案要拼这份常量，不许再手抄
   assert.match(SRC, /可用的是：\$\{_COMPUTER_METHODS\.join\(" \/ "\)\}/);

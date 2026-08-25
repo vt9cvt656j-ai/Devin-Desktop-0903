@@ -262,6 +262,37 @@ impl WindowControl for MacOSControl {
     }
 }
 
+/// 枚举**全部**在用的显示器，带各自在全局坐标里的矩形。
+///
+/// 为什么需要它：`get_screen_info` 只回 `CGDisplay::main()`，于是副屏在模型眼里
+/// 根本不存在——它看到一块 1728×1117 的屏，任何落在副屏上的窗口坐标（x 可能是负数，
+/// 也可能大于主屏宽度）都会被判成"在屏幕外"，于是它要么不敢点，要么把坐标夹回主屏
+/// 然后点在错误的地方。而 window.list 给的几何是全局坐标，本来就会包含副屏上的窗口。
+///
+/// 区域截图那条链其实早就支持副屏了（`screencapture -R` 收的就是全局坐标），
+/// 缺的只是"告诉模型副屏在哪"。所以这里只补枚举，不动截图。
+pub fn list_displays() -> Vec<(u32, i32, i32, u32, u32, bool)> {
+    let main_id = CGDisplay::main().id;
+    let ids = match CGDisplay::active_displays() {
+        Ok(v) => v,
+        Err(_) => vec![main_id],
+    };
+    ids.into_iter()
+        .map(|id| {
+            let d = CGDisplay::new(id);
+            let b = d.bounds();
+            (
+                id,
+                b.origin.x as i32,
+                b.origin.y as i32,
+                b.size.width as u32,
+                b.size.height as u32,
+                id == main_id,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod window_enumeration_tests {
     /// window.list 原来枚举的是 `NSWorkspace.runningApplications`——**应用**不是窗口：
