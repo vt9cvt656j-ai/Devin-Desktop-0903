@@ -60,9 +60,12 @@ test("声明的提示词真的进了子智能体的角色段", () => {
 
 test("声明的工具矩阵真的到了子智能体手里，而写错的工具名被挡掉", () => {
   const caps = new Function(
-    "_userRoleMap", "_ROLE_CAPABILITIES",
+    "_userRoleMap", "_ROLE_CAPABILITIES", "_ROLE_CAPABILITIES_READ",
     `${extractFn("_roleCapabilities")}\n;return _roleCapabilities;`,
-  )(() => roleMapWith(DECL), { frontend: { tools: ["browser"], types: ["browser"] } });
+  )((() => roleMapWith(DECL)), { frontend: { tools: ["browser"], types: ["browser"] } },
+    // 只读那半：这条用例验的是「用户声明的角色不能突破只读子体的工具边界」，
+    // 所以内置只读矩阵给一个不含 data 的真实子集就够。
+    { frontend: { tools: ["browser"], types: ["browser"] } });
 
   const got = caps("data", true);
   assert.deepEqual(got.tools, ["db_query", "http_request"],
@@ -77,7 +80,7 @@ test("声明的工具矩阵真的到了子智能体手里，而写错的工具�
 test("没有任何声明时，角色行为和以前完全一样", () => {
   const empty = normalizeCapabilities({}, "");
   const caps = new Function(
-    "_userRoleMap", "_ROLE_CAPABILITIES",
+    "_userRoleMap", "_ROLE_CAPABILITIES", "_ROLE_CAPABILITIES_READ",
     `${extractFn("_roleCapabilities")}\n;return _roleCapabilities;`,
   )(() => roleMapWith(empty), { frontend: { tools: ["browser"], types: ["browser"] } });
   assert.deepEqual(caps("frontend", true).tools, ["browser"]);

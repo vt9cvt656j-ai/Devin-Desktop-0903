@@ -24888,6 +24888,18 @@ test("shell mutations are captured into the run checkpoint, bounded, never gated
 // ---------------------------------------------------------------------------
 test("_roleCapabilities: write workers get role-matched tools, read-only get none", () => {
   const caps = load("_roleCapabilities", {
+    // 只读角色也有矩阵了（2026-08-25）：原来 11 个角色拿到的工具**逐字相同**，
+    // 角色的全部效力只是一段人格文字，而工具 schema 却把它们列成
+    // "read-only specialist perspective" —— 主智能体据此以为派 design 去看页面可行，
+    // 而只读子体连 browser 都没有。参照 Claude Code：角色 = 提示词 + 工具集。
+    _ROLE_CAPABILITIES_READ: {
+      frontend: { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] },
+      design:   { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] },
+      test:     { tools: ["browser"],                   types: ["browser"] },
+      backend:  { tools: ["db_query"],                  types: ["db"] },
+      database: { tools: ["db_query"],                  types: ["db"] },
+      security: { tools: ["capture_flows"],             types: ["capture_flows"] },
+    },
     _ROLE_CAPABILITIES: {
       frontend: { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
       design:   { tools: ["browser", "generate_image"], types: ["browser", "genimage"] },
@@ -24901,11 +24913,21 @@ test("_roleCapabilities: write workers get role-matched tools, read-only get non
   assert.deepEqual(caps("database", true), { tools: ["db_query"], types: ["db"] });
   assert.deepEqual(caps("design", true).tools, ["browser", "generate_image"]);
   assert.deepEqual(caps("backend", true).types, ["db", "http"]);
-  // Read-only child: no side-effect tools, whatever the role.
-  assert.deepEqual(caps("design", false), { tools: [], types: [] });
-  assert.deepEqual(caps("database", false), { tools: [], types: [] });
+  // 只读子体现在也按角色分工具，但给的是**只读语义下真的用得上**的那几件，
+  // 而且派发闸会按调用二次把关（browser 只放观察动作、db 只放不改数据的查询）。
+  assert.deepEqual(caps("design", false), { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] });
+  assert.deepEqual(caps("database", false), { tools: ["db_query"], types: ["db"] });
+  // 补不出东西的角色不列——它们的差异本来就在视角而不在工具，硬凑等于又造一份假清单。
+  assert.deepEqual(caps("architect", false), { tools: [], types: [] });
+  assert.deepEqual(caps("research", false), { tools: [], types: [] });
   // Unknown role → nothing extra (base set covers it).
   assert.deepEqual(caps("nonesuch", true), { tools: [], types: [] });
+  assert.deepEqual(caps("nonesuch", false), { tools: [], types: [] });
+  // 只读那份同样要名字和类型成对——名字进得去而类型没放行，等于给了一把打不开门的钥匙。
+  for (const role of ["frontend", "design", "test", "backend", "database", "security"]) {
+    const c = caps(role, false);
+    assert.equal(c.tools.length, c.types.length, `${role}(只读): tools and types must be paired`);
+  }
   // Every role's tool count equals its type count — a name with no admitted type would be
   // dead (dispatcher rejects it), so they must stay in lockstep.
   for (const role of ["frontend", "design", "backend", "database", "devops", "security", "test"]) {

@@ -118,6 +118,9 @@ function _toolScenarioFallback(name) {
 import exifr from "exifr";
 import appPackage from "../package.json";
 import {
+  // 观察类浏览器动作的**唯一**权威。只读子体的 browser 就按它放行——
+  // 在这里另写一份等于又造一张会漂的手抄名单。
+  BROWSER_OBSERVE_ACTIONS as _BROWSER_OBSERVE_ACTIONS,
   approvalTypes, blockedInReadOnlyMode, defineTool, fileEditTypes, hookedTypes, needsApprovalFor,
   isFileMutation, fileMutationTypes, workerScopeField, workerScopeTarget, workspaceMutatingTypes,
   toolPolicy,
@@ -50737,8 +50740,43 @@ const _ROLE_CAPABILITIES = {
   security: { tools: ["http_request"],              types: ["http"] },
   test:     { tools: ["browser"],                   types: ["browser"] },
 };
+// **只读子体的角色矩阵。**
+//
+// 上面那张 _ROLE_CAPABILITIES 只对 write worker 生效，而 run_subagent /
+// spawn_multiple_agents 派出去的**全部**子体 write=false —— 于是 architect / product /
+// research / frontend / backend / database / security / test / devops / design / docs
+// 这 11 个角色拿到的工具**逐字相同**，角色的全部效力就是一段人格文字。
+//
+// 真正咬人的是工具 schema 在替它撒谎：那 11 个名字被列成可选的
+// "read-only specialist perspective"，主智能体据此以为派一个 design 角色去看页面可行，
+// 而只读子体连 browser 都没有；backend 角色没有 db_query。
+//
+// 参照 Claude Code 的做法：每个 agent 类型有自己的 `tools:` 白名单，角色 = 提示词 + 工具集，
+// 不是只有提示词。这里给只读角色配上**只读语义下真的用得上**的那几件，并在派发闸上按
+// 调用二次把关（和 git / gh / MCP 那三条同一个形状：单 type 多行为，type 放行后逐次判）。
+//
+// 基础只读集已经很宽（read/search/lsp/diag/logs/screenshot/read_screen/ui_extract/
+// view_image/probe_env/git 只读/gh 只读/各种检索），所以这里只补基础集**没有**的那几件。
+// 补不出东西的角色（architect / product / research / devops / docs）不列——
+// 它们的差异本来就在视角而不在工具，硬凑等于又造一份假清单。
+const _ROLE_CAPABILITIES_READ = {
+  // 看得见页面才谈得上前端/设计/测试视角。browser 只放行观察类动作（见下面派发闸）。
+  frontend: { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] },
+  design:   { tools: ["browser", "visual_compare"], types: ["browser", "vizcompare"] },
+  test:     { tools: ["browser"],                   types: ["browser"] },
+  // 查得到数据才谈得上后端/数据库视角。只放行不改数据的查询（见下面派发闸）。
+  backend:  { tools: ["db_query"],                  types: ["db"] },
+  database: { tools: ["db_query"],                  types: ["db"] },
+  // 安全视角要看得到真实流量：capture_flows 读的是**已经抓到的**请求，纯读取。
+  security: { tools: ["capture_flows"],             types: ["capture_flows"] },
+};
+
 function _roleCapabilities(role, write) {
-  if (!write) return { tools: [], types: [] }; // read-only child: read+web only, no side-effect tools
+  if (!write) {
+    const key = String(role || "").trim().toLowerCase();
+    const caps = _ROLE_CAPABILITIES_READ[key];
+    return caps ? { tools: [...caps.tools], types: [...caps.types] } : { tools: [], types: [] };
+  }
   const key = String(role || "").trim().toLowerCase();
   // 用户声明优先：他为自己项目定义的 `data` 角色，比内置的同名角色更贴他的活。
   const mine = _userRoleMap().get(key);
@@ -51477,7 +51515,14 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         const _userWriteBlocked = !!call && call.type === "userhttp" && !call.userReadOnly;
         // gh 同理：pr_create / pr_reply 是不可逆的对外动作，子任务一律拒绝。
         const _ghWriteBlocked = !!call && call.type === "gh" && !_GH_READ_OPS.includes(call.op);
-        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked || _userWriteBlocked || _ghWriteBlocked) {
+        // browser 和 db 是给**只读角色**开的（frontend/design/test 要看页面，
+        // backend/database 要查数据），所以同样是单 type 多行为，必须逐次把关：
+        // browser 只放行观察类动作（eval 能跑任意 JS、upload 能传文件，都不行），
+        // db 只放行不改数据的查询。判据都用现成的权威，不在这里另写一套。
+        const _browserWriteBlocked = !!call && call.type === "browser" && !write
+          && !_BROWSER_OBSERVE_ACTIONS.has(String(call.action || ""));
+        const _dbWriteBlocked = !!call && call.type === "db" && !write && _dbCallMayMutate(call);
+        if (!call || !_execTypes.includes(call.type) || _gitOpBlocked || _mcpWriteBlocked || _userWriteBlocked || _ghWriteBlocked || _browserWriteBlocked || _dbWriteBlocked) {
           const rejectedCall = call || { type: "unknown", path: "" };
           rejectedCall._toolName = rejectedCall._toolName || tc.name || "unknown";
           const rejectedContent = call
@@ -51485,7 +51530,12 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
               ? `[BLOCKED] 子任务只允许 git 只读操作（${_GIT_READ_OPS.join("/")}），不能用 ${tc.name}。`
               : _ghWriteBlocked
               ? `[BLOCKED] 子任务只能读 GitHub（${_GH_READ_OPS.join("/")}），不能用 ${tc.name} —— 建 PR / 回复评论是不可逆的对外动作，交回主任务做。`
-              : _mcpWriteBlocked
+              : _browserWriteBlocked
+              ? `[BLOCKED] 只读子体的 browser 只能做观察类动作（${[..._BROWSER_OBSERVE_ACTIONS].slice(0, 10).join("/")} …），不能用 action=${String(call.action || "")}。`
+                + "eval 能在页面里跑任意 JS、upload 能传文件，都属于改动，交回主任务做。"
+            : _dbWriteBlocked
+              ? "[BLOCKED] 只读子体的 db_query 只能跑不改数据的查询，这条语句会写库。把它连同你查到的事实写进结论交回主任务。"
+            : _mcpWriteBlocked
               ? `[BLOCKED] 子任务只能用声明为只读的 MCP 工具，${tc.name} 没有这个声明。把这一步交回主任务处理。`
               // 这条兜底原来只说「不能用 X」，是四个分支里唯一不给去向的。
               // 前三条都写明了「还能用什么 / 交回主任务」，这条不写，子体就只能
