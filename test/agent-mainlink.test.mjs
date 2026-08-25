@@ -3,17 +3,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
 import { SharedStore } from "../src/agent/shared-store.js";
-// 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
-import { fnSource as grab } from "./helpers/source.mjs";
-// 黑板键带 run 前缀（_smRunToken）：jobId 是 run 内的编号，而 SharedStore 是全局的，
-// 不带前缀两个标签页的 job#1 会写进同一条记录。这里注入真实实现，不用桩——
-// 键怎么拼正是这组测试要守的东西。
-const { broadcast, drain, runToken } = new Function(
-  "_globalSharedStore",
-  "let _smRunTokenSeq = 0;\n" + grab("_smRunToken") + "\n" +
-  grab("_broadcastMainAgentFinding") + "\n" + grab("_drainSubAgentCollaborationInbox") +
-  "\nreturn { broadcast: _broadcastMainAgentFinding, drain: _drainSubAgentCollaborationInbox, runToken: _smRunToken };",
-)(null);
+// 这三个函数已经从 main.js 搬进 src/agent/mainlink.js，所以这里**直接 import 产品代码**。
+//
+// 原来是用 acorn 从 main.js 里把函数文本抠出来、再 new Function 起来跑。那样能验行为，
+// 但验不到「这个函数在真实调用链上还在不在」——而这个仓库真实出过「实现写好了、
+// 零调用点」。import 之后，函数被删或改名会直接编译期报错。
+import {
+  broadcastMainAgentFinding as broadcast,
+  drainSubAgentCollaborationInbox as drain,
+  smRunToken as runToken,
+} from "../src/agent/mainlink.js";
 
 // 造一个 run，并按**真实的键**把它的作业登记进黑板。run.key(id) 给测试用来读同一条。
 const mkRun = (store, jobs) => {
