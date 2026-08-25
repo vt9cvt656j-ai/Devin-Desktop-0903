@@ -484,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/admin/route-health", get(route_endpoints::admin_health))
         .route("/api/admin/reconciliation", get(reconcile::admin_reconciliation))
+        .route("/api/admin/endpoint-prices", post(reconcile::admin_save_price))
         // 发一封真的测试告警：「地址在列表里」和「这封信真能到」是两件事，
         // QQ 邮箱对陌生发件域尤其严，静默丢掉在服务端看也是「已发送」。
         .route(

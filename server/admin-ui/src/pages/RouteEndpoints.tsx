@@ -108,6 +108,8 @@ type Draft = {
   label: string;
   base_url: string;
   api_key: string;
+  /// 查余额用的控制台令牌。空 = 不改（和密钥同一规矩）。
+  balance_token: string;
   cost_ratio: string;
   note: string;
   /// 空 = 跟线路一样。
@@ -281,6 +283,7 @@ export function RouteEndpoints() {
           label: draft.label,
           base_url: draft.base_url,
           api_key: draft.api_key,
+          balance_token: draft.balance_token,
           cost_ratio: Number(draft.cost_ratio) || 1,
           note: draft.note,
           protocol: draft.protocol,
@@ -472,6 +475,7 @@ export function RouteEndpoints() {
                           label: "",
                           base_url: "",
                           api_key: "",
+                          balance_token: "",
                           cost_ratio: "1",
                           note: "",
                           protocol: "",
@@ -589,6 +593,7 @@ export function RouteEndpoints() {
                                         base_url: e.base_url,
                                         // 服务端不回密钥，所以这里必然是空的；空着保存 = 沿用。
                                         api_key: "",
+                                        balance_token: "",
                                         cost_ratio: String(e.cost_ratio),
                                         note: e.note,
                                         protocol: e.protocol,
@@ -666,6 +671,27 @@ export function RouteEndpoints() {
                 />
                 <p className="mt-1 text-xs text-muted-foreground">
                   留空就用线路自己的密钥。存进库时加密，之后任何页面都读不回来。
+                </p>
+              </div>
+              <div>
+                <Label htmlFor="e-btok">余额令牌</Label>
+                <Input
+                  id="e-btok"
+                  type="password"
+                  autoComplete="off"
+                  value={draft.balance_token}
+                  placeholder={draft.id ? "留空 = 不改" : "中转控制台的登录令牌"}
+                  onChange={(ev) => setDraft({ ...draft, balance_token: ev.target.value })}
+                />
+                {/*
+                  为什么要单独一个令牌：实测线上三家中转的余额接口
+                  （/api/v1/auth/me、/api/v1/subscriptions/summary）认的是**控制台登录令牌**，
+                  不是 sk- 开头的调用密钥 —— 拿调用密钥去问，7 个出口一个都查不到，
+                  对账页的余额那一列就永远空着。留空会先拿调用密钥试一次（有些中转两者通用）。
+                */}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  查余额用。多数中转的余额接口认的是控制台登录令牌，不是调用密钥——
+                  留空会先拿密钥试一次。同样加密存储。
                 </p>
               </div>
               <div className="grid gap-4 sm:grid-cols-3">

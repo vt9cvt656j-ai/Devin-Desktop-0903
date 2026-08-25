@@ -1590,6 +1590,12 @@ pub struct Model {
     pub api_key: String,
     pub price_cents: i64,
     pub rate: f64,
+    /// 查余额用的控制台令牌（加密存）。空 = 没配，退回去用 api_key 试。
+    ///
+    /// 和 api_key 分开是因为它们是两套凭据：余额接口要控制台登录令牌，
+    /// api_key 是 `sk-` 开头的调用密钥。实测线上三家中转都是这个情况。
+    #[sqlx(default)]
+    pub balance_token: String,
     /// USD per 1,000,000 INPUT tokens (real-API unit). 0 = not set → bill the flat `rate`.
     pub input_price: f64,
     /// USD per 1,000,000 OUTPUT tokens. 0 = not set → bill the flat `rate`.
@@ -1690,6 +1696,7 @@ impl Model {
     pub(crate) fn blank() -> Model {
         Model {
             id: uuid::Uuid::new_v4(),
+            balance_token: String::new(),
             label: String::new(),
             provider: String::new(),
             base_url: String::new(),
@@ -3051,6 +3058,8 @@ pub struct UpdateReq {
     pub provider: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>, // empty/missing = keep existing
+    /// 查余额用的控制台令牌。空/缺省 = 沿用原值（和 api_key 同一规矩）。
+    pub balance_token: Option<String>,
     pub rate: Option<f64>,
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
@@ -3109,6 +3118,18 @@ pub async fn admin_update(
     };
     // 新传的是明文 → 加密；沿用的旧值已是密文 → 原样透过。见 field_crypto::encrypt。
     let api_key = crate::field_crypto::encrypt(&api_key, MODEL_KEY_CTX);
+    let balance_token = match req.balance_token {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        _ => m.balance_token, // 没传就沿用原值
+    };
+    // 空串**不能**走 encrypt：没配 FIELD_ENC_KEY 时它是 passthrough，配了则会把空串
+    // 加密成一段密文 —— 那段密文解出来不是空，于是「没配令牌」会被判成「配了」，
+    // 然后每半小时拿一个空令牌去问一遍余额。
+    let balance_token = if balance_token.trim().is_empty() {
+        String::new()
+    } else {
+        crate::field_crypto::encrypt(&balance_token, MODEL_KEY_CTX)
+    };
     let rate = req.rate.unwrap_or(m.rate).max(0.0);
     let input_price = req.input_price.unwrap_or(m.input_price).max(0.0);
     let output_price = req.output_price.unwrap_or(m.output_price).max(0.0);
@@ -3197,7 +3218,7 @@ pub async fn admin_update(
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
-    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24, cache_disabled=$25 WHERE id=$19")
+    sqlx::query("UPDATE models SET label=$1, provider=$2, base_url=$3, api_key=$4, rate=$5, active=$6, sort=$7, enabled_models=$8, input_price=$9, output_price=$10, description=$11, billing_mode=$12, per_call_cents=$13, model_names=$14, cache_read_price=$15, cache_create_price=$16, model_prices=$17, protocol=$18, model_billing=$20, per_call_micro_usd=$21, effort_passthrough=$22, model_caps=$23, power_route=$24, cache_disabled=$25, balance_token=$26 WHERE id=$19")
         .bind(&label)
         .bind(&provider)
         .bind(&base_url)
@@ -3223,6 +3244,7 @@ pub async fn admin_update(
         .bind(req.model_caps.clone().unwrap_or_else(|| m.model_caps.clone()))
         .bind(req.power_route.unwrap_or(m.power_route))
         .bind(req.cache_disabled.unwrap_or(m.cache_disabled))
+        .bind(&balance_token)
         .execute(&state.db)
         .await?;
     Ok(Json(json!({ "ok": true })))
@@ -9809,7 +9831,7 @@ pub async fn chat_completions(
             // 出口用量：火后不管，丢几条无所谓。绝不放进结算事务——为了一个报表
             // 让钱的路径多一次写，不划算。
             crate::route_endpoints::note_endpoint_usage(
-                &st, hid, cid, cost, tokens.prompt, tokens.completion, tokens.cached,
+                &st, hid, cid, &req_model, cost, tokens.prompt, tokens.completion, tokens.cached,
             );
         });
         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {

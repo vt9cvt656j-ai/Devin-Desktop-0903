@@ -946,6 +946,8 @@ function ConnectionDialog({
   const [baseUrl, setBaseUrl] = useState(conn?.base_url || "");
   const [protocol, setProtocol] = useState(conn?.protocol || "anthropic");
   const [apiKey, setApiKey] = useState("");
+  // 查余额用的控制台令牌。和 API Key 一样：留空 = 不改。
+  const [balanceToken, setBalanceToken] = useState("");
   const [active, setActiveField] = useState(conn ? isOn(conn) : true);
   const [description, setDescription] = useState(conn?.description || "");
   const [mode, setMode] = useState(conn?.billing_mode === "per_call" ? "per_call" : "rate");
@@ -1053,7 +1055,11 @@ function ConnectionDialog({
     try {
       if (!conn) {
         // ModelReq (models.rs:1503-1519) — no protocol, no active, no enabled set on create.
-        await api.post("/api/admin/models", { ...base, api_key: apiKey.trim() });
+        await api.post("/api/admin/models", {
+          ...base,
+          api_key: apiKey.trim(),
+          balance_token: balanceToken.trim(),
+        });
       } else {
         const body: Record<string, unknown> = {
           ...base,
@@ -1096,6 +1102,8 @@ function ConnectionDialog({
           ),
         };
         if (apiKey.trim()) body.api_key = apiKey.trim();
+        // 空 = 沿用原值，和 api_key 同一规矩。一次「只改价格」的保存不该把令牌清掉。
+        if (balanceToken.trim()) body.balance_token = balanceToken.trim();
         await api.post(`/api/admin/models/${conn.id}`, body);
       }
       onSaved();
@@ -1157,6 +1165,26 @@ function ConnectionDialog({
               placeholder={editing ? conn?.api_key_masked || "sk-…" : "sk-…"}
               autoComplete="off"
             />
+          </div>
+          <div>
+            <Label htmlFor="cd-btok">余额令牌{editing && "（留空=不改）"}</Label>
+            <Input
+              id="cd-btok"
+              type="password"
+              value={balanceToken}
+              onChange={(e) => setBalanceToken(e.target.value)}
+              placeholder="中转控制台的登录令牌"
+              autoComplete="off"
+            />
+            {/*
+              实测（2026-08-25）：线上三家中转的余额接口 /api/v1/auth/me 和
+              /api/v1/subscriptions/summary 认的是**控制台登录令牌**，不是 sk- 调用密钥。
+              拿调用密钥去问，7 个出口一个都查不到 —— 对账页的余额那一列就永远空着。
+            */}
+            <p className="mt-1 text-xs text-muted-foreground">
+              查这个中转还剩多少钱用。多数中转的余额接口认的是控制台登录令牌，不是上面那个
+              调用密钥；留空会先拿密钥试一次。加密存储。
+            </p>
           </div>
           {editing && (
             <div>

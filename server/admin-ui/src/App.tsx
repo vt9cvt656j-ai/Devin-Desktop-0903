@@ -20,6 +20,19 @@ import { Mail, type MailView } from "@/pages/Mail";
 import { api, auth, endConsoleSession } from "@/lib/api";
 import { loadSettings } from "@/lib/settings";
 
+/**
+ * 「模型线路」下自带接口的那几屏。键就是 NavKey，值是渲染它的那一下。
+ *
+ * 一张表同时决定两件事：**渲染谁**，以及 Routing 要**排掉谁**。分成两处写过一次，
+ * 结果就是加了新屏但忘了排除，两屏叠着渲染（见下面 return 里的注释）。
+ */
+const ROUTING_OWN_SCREENS = {
+  "routing-health": () => <RouteHealth />,
+  "routing-endpoints": () => <RouteEndpoints />,
+  "routing-icons": () => <VendorIcons />,
+  "routing-reconcile": () => <Reconcile />,
+} as const;
+
 export default function App() {
   const [ready, setReady] = useState(false);
   const [authed, setAuthed] = useState(false);
@@ -84,16 +97,18 @@ export default function App() {
       {page === "billing" && <Billing />}
       {page === "settings" && <Settings />}
       {page.startsWith("mail") && <Mail view={page as MailView} />}
-      {/* 多路由自成一屏：它不依赖 Routing 的那份连接数据，自己有接口。
-          必须排在 startsWith("routing") 之前判掉，否则两个会一起渲染。 */}
-      {page === "routing-health" && <RouteHealth />}
-      {page === "routing-endpoints" && <RouteEndpoints />}
-      {page === "routing-icons" && <VendorIcons />}
-      {page === "routing-reconcile" && <Reconcile />}
-      {page.startsWith("routing") &&
-        !["routing-endpoints", "routing-icons", "routing-health"].includes(page) && (
-        <Routing view={page as RoutingView} />
-      )}
+      {/*
+        「模型线路」下面有几屏是**自成一屏**的：它们自己有接口，不依赖 Routing 那份
+        连接数据。这些必须从 Routing 的 `startsWith("routing")` 里排掉，否则两个会
+        一起渲染 —— 页面上就是一屏下面又接了一整屏。
+
+        名单**只写一份**。原来是「一行一个 page === 渲染」加「Routing 那行一个手写
+        的排除数组」，两处必须同时改；2026-08-25 加「对账」时只改了前一处，线上表现
+        是对账页下面又挂了整个线路页。原注释还说「排在前面判掉就行」—— 在同一个 JSX
+        片段里那是假的，这些不是 if/else，排除数组才是唯一的闸。
+      */}
+      {ROUTING_OWN_SCREENS[page as keyof typeof ROUTING_OWN_SCREENS]?.() ??
+        (page.startsWith("routing") ? <Routing view={page as RoutingView} /> : null)}
       {page === "employees" && <Employees />}
       {page === "pricing" && <Pricing />}
       {page.startsWith("commission") && <Commission view={page as CommissionView} />}

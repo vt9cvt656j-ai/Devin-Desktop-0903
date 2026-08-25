@@ -106,6 +106,12 @@ pub struct Endpoint {
     pub probe_at: Option<chrono::DateTime<chrono::Utc>>,
     pub probe_ms: Option<i32>,
     pub probe_note: String,
+    /// 查余额用的凭据（加密存）。空 = 没配，退回去用调用密钥试。
+    ///
+    /// 和 api_key 分开是因为它们是**两套凭据**：余额接口要的是控制台登录令牌，
+    /// 而 api_key 是 `sk-` 开头的调用密钥。实测线上三家中转都是这个情况。
+    #[sqlx(default)]
+    pub balance_token: String,
 }
 
 /// 出口在候选池里的排序键。小的先用。
@@ -433,6 +439,10 @@ pub fn note_endpoint_usage(
     state: &AppState,
     endpoint_id: uuid::Uuid,
     route_id: uuid::Uuid,
+    // 模型名（`claude-opus-5` 这种），**不是线路 id**。真实成本是 token × 该模型的
+    // 单价，而同一个出口上不同模型的单价能差两个量级 —— 没有这一维，混在一起的
+    // 总 token 乘任何一个单价都得不到真数。
+    model: &str,
     cost_cents: i64,
     // 直接收三个数，不收计费那边的内部类型 —— 观测不该有能力碰到计费的结构。
     prompt: i64,
@@ -442,6 +452,7 @@ pub fn note_endpoint_usage(
     let db = state.db.clone();
     // 分转微美元。看板要看得见「三分钱」这种量级，按分存会全是 0。
     let micro = cost_cents.max(0).saturating_mul(10_000);
+    let model = model.to_string();
     tokio::spawn(async move {
         let _ = sqlx::query(
             "INSERT INTO endpoint_usage \
@@ -464,6 +475,34 @@ pub fn note_endpoint_usage(
         .bind(cached)
         .execute(&db)
         .await;
+
+        // 同一批数字再按模型分开记一份。对账要按模型乘单价，健康面板要按出口求和 ——
+        // 两种问法，一个来源。分两张表而不是让健康面板改查这张：那块屏幕在正常工作，
+        // 而且旧表有历史，为一个新报表去动它不划算（这一段的代价只是一次 upsert）。
+        if !model.is_empty() {
+            let _ = sqlx::query(
+                "INSERT INTO endpoint_model_usage \
+                   (day, endpoint_id, route_id, model_id, calls, revenue_micro_usd, \
+                    prompt_tokens, completion_tokens, cached_tokens) \
+                 VALUES (current_date, $1, $2, $3, 1, $4, $5, $6, $7) \
+                 ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
+                   calls = endpoint_model_usage.calls + 1, \
+                   revenue_micro_usd = endpoint_model_usage.revenue_micro_usd + EXCLUDED.revenue_micro_usd, \
+                   prompt_tokens = endpoint_model_usage.prompt_tokens + EXCLUDED.prompt_tokens, \
+                   completion_tokens = endpoint_model_usage.completion_tokens + EXCLUDED.completion_tokens, \
+                   cached_tokens = endpoint_model_usage.cached_tokens + EXCLUDED.cached_tokens, \
+                   updated_at = now()",
+            )
+            .bind(endpoint_id)
+            .bind(route_id)
+            .bind(&model)
+            .bind(micro)
+            .bind(prompt)
+            .bind(completion)
+            .bind(cached)
+            .execute(&db)
+            .await;
+        }
     });
 }
 
@@ -494,22 +533,112 @@ pub struct BalanceReading {
     pub used_usd: Option<f64>,
 }
 
+/// 从一份不知道确切形状的 JSON 里把「还剩多少 / 已用多少」挑出来。
+///
+/// # 为什么是「找」不是「按字段读」
+///
+/// 各家中转没有统一的响应结构，同一个数可能在顶层、在 `data` 里、在 `user` 里。
+/// 写死一条路径的话，换一家就整个失效，而失效的样子是「查不到余额」——和「这家
+/// 没有余额接口」一模一样，没人分得出来。
+///
+/// # 只认这几个名字，而且**不猜单位**
+///
+/// 取到的数字原样带出来，不做任何除法。有些系统的 `quota` 是「点」（One API 那族
+/// 惯例 50 万点 = 1 美元），有些就是美元。猜错的代价是面板上显示一个差 50 万倍的
+/// 数字，而它看起来完全正常。原值 + 字段名一起显示，对不对一眼就能看出来。
+fn pick_balance(v: &serde_json::Value) -> Option<BalanceReading> {
+    // 顶层、data、user、result 各找一遍 —— 这四种嵌法覆盖了实测见过的全部形状。
+    let scopes: Vec<&serde_json::Value> = std::iter::once(v)
+        .chain(["data", "user", "result"].iter().filter_map(|k| v.get(*k)))
+        .collect();
+
+    let num = |o: &serde_json::Value, names: &[&str]| -> Option<(String, f64)> {
+        for n in names {
+            if let Some(x) = o.get(*n) {
+                // 有些家把金额当字符串发（避免浮点精度问题），两种都收。
+                let f = x.as_f64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok()));
+                if let Some(f) = f.filter(|f: &f64| f.is_finite()) {
+                    return Some(((*n).to_string(), f));
+                }
+            }
+        }
+        None
+    };
+
+    for o in scopes {
+        let left = num(o, &["balance", "remaining", "remain_quota", "credit", "credits", "quota"]);
+        let used = num(o, &["used", "used_quota", "total_used", "usage", "consumed"]);
+        if left.is_none() && used.is_none() {
+            continue;
+        }
+        let text = match (&left, &used) {
+            (Some((ln, lv)), Some((un, uv))) => format!("{ln} {lv:.4}（{un} {uv:.4}）"),
+            (Some((ln, lv)), None) => format!("{ln} {lv:.4}"),
+            (None, Some((un, uv))) => format!("已用 {un} {uv:.4}"),
+            (None, None) => unreachable!(),
+        };
+        return Some(BalanceReading {
+            text,
+            remaining_usd: left.map(|(_, v)| v),
+            used_usd: used.map(|(_, v)| v),
+        });
+    }
+    None
+}
+
 /// 给面板用的那层：只要展示串。
 pub(crate) async fn query_balance(
     http: &reqwest::Client,
     base_url: &str,
     key: &str,
+    balance_token: &str,
 ) -> Option<String> {
-    read_balance(http, base_url, key).await.map(|b| b.text)
+    read_balance(http, base_url, key, balance_token).await.map(|b| b.text)
 }
 
 pub(crate) async fn read_balance(
     http: &reqwest::Client,
     base_url: &str,
     key: &str,
+    // balance_token：控制台令牌。空就退回去用 key —— 有些中转两者通用，试一次不亏。
+    balance_token: &str,
 ) -> Option<BalanceReading> {
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
-    let bearer = format!("Bearer {key}");
+    // 有令牌就用令牌，没有就拿调用密钥试。两者都空时直接放弃 —— 不带 Authorization
+    // 打过去只会拿回一个 401，白费一个来回。
+    let cred = if balance_token.trim().is_empty() { key } else { balance_token.trim() };
+    if cred.trim().is_empty() {
+        return None;
+    }
+    let bearer = format!("Bearer {cred}");
+
+    // 形态零：自建中转那一族（线上三家 zyz / hanhegufei / polly 都是同一套）。
+    //
+    // 认出它的判据是错误结构：未鉴权时三家一字不差地回
+    // `{"code":"UNAUTHORIZED","message":"Authorization header is required"}`。
+    // 放在最前面试，是因为它是**线上实际在用的那一族** —— 后面三种是通用兜底。
+    for path in ["/api/v1/auth/me", "/api/v1/subscriptions/summary"] {
+        let Ok(r) = http.get(format!("{root}{path}")).header("authorization", &bearer).send().await
+        else {
+            continue;
+        };
+        if !r.status().is_success() {
+            continue;
+        }
+        let Ok(text) = r.text().await else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        if let Some(b) = pick_balance(&v) {
+            return Some(b);
+        }
+        // 请求成功、JSON 也解出来了，但认不出余额字段。**把原文带出来**：
+        // 这是「这家的字段名和我们猜的不一样」和「这家根本没有余额」之间唯一的区别，
+        // 静默返回 None 的话，两者在面板上长得一模一样，而修法完全不同。
+        return Some(BalanceReading {
+            text: format!("认不出余额字段：{}", text.chars().take(160).collect::<String>()),
+            remaining_usd: None,
+            used_usd: None,
+        });
+    }
 
     // 形态一：One API / New API
     if let Ok(r) = http
@@ -1485,7 +1614,8 @@ pub async fn admin_health(
     for r in &routes {
         let vendor = vendor_of(&r.provider, &crate::models::allowed_ids(r), &r.base_url);
         // 线路自带的地址也是一个出口，必须出现在面板里 —— 它往往是最常出问题的那个。
-        let mut entries: Vec<(uuid::Uuid, String, String, bool, f64, Option<f64>, bool, Option<bool>, Option<i32>, String, String)> =
+        // 最后两个 String 是「调用密钥」和「余额令牌」—— 两套凭据，见 read_balance。
+        let mut entries: Vec<(uuid::Uuid, String, String, bool, f64, Option<f64>, bool, Option<bool>, Option<i32>, String, String, String)> =
             vec![(
                 r.id,
                 "直连".into(),
@@ -1498,6 +1628,7 @@ pub async fn admin_health(
                 None,
                 String::new(),
                 r.api_key.clone(),
+                r.balance_token.clone(),
             )];
         for e in eps.iter().filter(|e| e.route_id == r.id) {
             let key = if e.api_key.trim().is_empty() { r.api_key.clone() } else { e.api_key.clone() };
@@ -1513,15 +1644,24 @@ pub async fn admin_health(
                 e.probe_ms,
                 e.probe_note.clone(),
                 key,
+                // 出口没配令牌就用线路的：同一个中转账号下挂几个入口地址是常见配置，
+                // 逼人把同一个令牌抄几遍只会抄错。
+                if e.balance_token.trim().is_empty() { r.balance_token.clone() } else { e.balance_token.clone() },
             ));
         }
 
-        for (id, label, base, is_own, cost, cap, active, pok, pms, pnote, key) in entries {
+        for (id, label, base, is_own, cost, cap, active, pok, pms, pnote, key, btok) in entries {
             let h = crate::route_health::snapshot(&state, id).await;
             let u = by_ep.get(&id);
             let mf = crate::manifest_check::report_for(id);
-            let balance = if want_balance && !key.trim().is_empty() {
-                query_balance(&http, &base, &crate::models::model_key(&key)).await
+            let balance = if want_balance && !(key.trim().is_empty() && btok.trim().is_empty()) {
+                query_balance(
+                    &http,
+                    &base,
+                    &crate::models::model_key(&key),
+                    &crate::models::model_key(&btok),
+                )
+                .await
             } else {
                 None
             };
@@ -1683,6 +1823,10 @@ pub struct SaveReq {
     /// 空串 = 跟线路一样。只收 anthropic / openai。
     #[serde(default, deserialize_with = "null_as_default")]
     pub protocol: String,
+    /// 查余额用的控制台令牌。空串 = **不改**（和 api_key 同一规矩：改地址时
+    /// 不用把令牌再抄一遍）。要清空得另外做一个动作，别让「没填」等于「清掉」。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub balance_token: String,
     /// 能扛多少（相对值）。None / 0 = 不填。
     #[serde(default)]
     pub capacity: Option<f64>,
@@ -1891,12 +2035,13 @@ pub async fn admin_save(
         Some(id) => {
             // 密钥空着 = 沿用原值。这一步必须在 UPDATE 之外先取出来，
             // 不然一次「只改地址」的保存会把密钥清成空。
-            let keep: Option<String> =
-                sqlx::query_scalar("SELECT api_key FROM route_endpoints WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&state.db)
-                    .await?;
-            let Some(keep) = keep else {
+            let keep: Option<(String, String)> = sqlx::query_as(
+                "SELECT api_key, balance_token FROM route_endpoints WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+            let Some((keep, keep_tok)) = keep else {
                 return Err(AppError::bad("这个出口不存在"));
             };
             let stored = if req.api_key.trim().is_empty() {
@@ -1904,10 +2049,17 @@ pub async fn admin_save(
             } else {
                 crate::field_crypto::encrypt(req.api_key.trim(), crate::models::MODEL_KEY_CTX)
             };
+            // 令牌和密钥同一条规矩：空 = 沿用。一次「只改地址」的保存不该把它清掉。
+            let stored_tok = if req.balance_token.trim().is_empty() {
+                keep_tok
+            } else {
+                crate::field_crypto::encrypt(req.balance_token.trim(), crate::models::MODEL_KEY_CTX)
+            };
             sqlx::query(
                 "UPDATE route_endpoints SET route_id = $2, label = $3, base_url = $4, \
                  api_key = $5, cost_ratio = $6, active = $7, note = $8, \
-                 enabled_models = $9, protocol = $10, capacity = $11, updated_at = now() \
+                 enabled_models = $9, protocol = $10, capacity = $11, \
+                 balance_token = $12, updated_at = now() \
                  WHERE id = $1",
             )
             .bind(id)
@@ -1921,6 +2073,7 @@ pub async fn admin_save(
             .bind(&enabled_models)
             .bind(&protocol)
             .bind(capacity)
+            .bind(&stored_tok)
             .execute(&state.db)
             .await
             .map_err(dup_url)?;
@@ -1929,10 +2082,18 @@ pub async fn admin_save(
         None => {
             let stored =
                 crate::field_crypto::encrypt(req.api_key.trim(), crate::models::MODEL_KEY_CTX);
+            // 新建时空令牌就存空串，**不能**走 encrypt —— 没配 FIELD_ENC_KEY 时它是
+            // passthrough，配了则会把空串加密成一段密文，那段密文解出来不是空，
+            // 于是「没配令牌」会被后面的 `trim().is_empty()` 判成「配了」。
+            let stored_tok = if req.balance_token.trim().is_empty() {
+                String::new()
+            } else {
+                crate::field_crypto::encrypt(req.balance_token.trim(), crate::models::MODEL_KEY_CTX)
+            };
             sqlx::query_scalar(
                 "INSERT INTO route_endpoints (route_id, label, base_url, api_key, cost_ratio, \
-                 active, note, enabled_models, protocol, capacity) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+                 active, note, enabled_models, protocol, capacity, balance_token) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id",
             )
             .bind(req.route_id)
             .bind(&label)
@@ -1944,6 +2105,7 @@ pub async fn admin_save(
             .bind(&enabled_models)
             .bind(&protocol)
             .bind(capacity)
+            .bind(&stored_tok)
             .fetch_one(&state.db)
             .await
             .map_err(dup_url)?
@@ -2231,6 +2393,7 @@ mod tests {
     fn ep(cost: f64, probe: Option<bool>, url: &str) -> Endpoint {
         Endpoint {
             id: uuid::Uuid::new_v4(),
+            balance_token: String::new(),
             route_id: uuid::Uuid::nil(),
             label: String::new(),
             base_url: url.into(),

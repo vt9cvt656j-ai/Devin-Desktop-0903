@@ -344,6 +344,13 @@ fn allowed_static_tool(mode: &str, name: &str) -> bool {
                 | "download_file"
                 | "download_asset"
                 | "automation"
+                // computer 和 automation 是**同一个执行器**（映射层 case "computer"
+                // 直接 return type "automation"）。automation 一直在这份清单里而
+                // computer 不在——于是 Plan/Explorer/Reviewer 禁掉了 automation，
+                // 却留着一条同样能合成真实鼠标键盘的旁路。
+                | "computer"
+                // save_skill 往磁盘写技能文件，只读模式不该能写。
+                | "save_skill"
                 | "ui_click"
                 | "db_query"
                 | "remote"
@@ -8464,29 +8471,40 @@ mod readonly_tool_injection_tests {
         let src = std::fs::read_to_string(repo_root().join("ide/src/agent/tool-policy.js"))
             .expect("读不到 tool-policy.js");
         let mut out = HashSet::new();
-        let mut at = 0usize;
-        while let Some(i) = src[at..].find("defineTool(") {
-            let start = at + i;
-            // defineTool("name", { ... })  —— 取名字，再取到这次调用结尾为止的那段
-            let Some(q1) = src[start..].find('"') else { break };
-            let name_start = start + q1 + 1;
-            let Some(q2) = src[name_start..].find('"') else { break };
-            let name = src[name_start..name_start + q2].to_string();
-            let body_end = src[name_start..]
-                .find(");")
-                .map(|e| name_start + e)
-                .unwrap_or(src.len());
-            let body = &src[name_start..body_end];
-            if let Some(f) = body.find("readOnlyModeBlocked:") {
-                let val = body[f + "readOnlyModeBlocked:".len()..].trim_start();
+        // 每条 defineTool 的作用域 = 从它自己到**下一条 defineTool** 之间。
+        //
+        // 上一版是从名字起找第一个 `");"` 当结尾，而策略里有 `(call) => ...` 这类
+        // 带括号的值，`");"` 会落在箭头函数体内部或者更靠后的地方，于是 `at` 一次
+        // 跳过好几条声明——**被跳过的那几条就静默不算 per-call 了**。实测它漏掉了
+        // subagent，还把 README.md 当成一个工具名收了进来（那说明它已经扫到注释里去了）。
+        // 漏判的后果是反的：按调用判的工具会被当成"必须整个拒掉"，只读模式里连描述
+        // 都拿不到——那正是 readonly_modes_never_drop_a_per_call_tool 要防的回退。
+        let marks: Vec<usize> = src.match_indices("defineTool(").map(|(i, _)| i).collect();
+        for (k, &start) in marks.iter().enumerate() {
+            let seg_end = marks.get(k + 1).copied().unwrap_or(src.len());
+            let seg = &src[start..seg_end];
+            let Some(q1) = seg.find('"') else { continue };
+            let Some(q2) = seg[q1 + 1..].find('"') else { continue };
+            let name = &seg[q1 + 1..q1 + 1 + q2];
+            if let Some(f) = seg.find("readOnlyModeBlocked:") {
+                let val = seg[f + "readOnlyModeBlocked:".len()..].trim_start();
                 // `true` / `false` 是一刀切；`(call) => …` 或一个函数名是按调用判。
-                let per_call = !val.starts_with("true") && !val.starts_with("false");
-                if per_call {
-                    out.insert(name);
+                if !val.starts_with("true") && !val.starts_with("false") {
+                    out.insert(name.to_string());
                 }
             }
-            at = body_end.max(start + 1);
         }
+        // 解析器一旦再坏掉，下游那些 `continue` 会静默失效而测试仍然绿。钉住它认得的东西。
+        for must in ["browser", "system", "worktree", "subagent"] {
+            assert!(
+                out.contains(must),
+                "tool-policy.js 里 {must} 是按调用判的，解析器没认出来——判据坏了：{out:?}"
+            );
+        }
+        assert!(
+            !out.iter().any(|n| n.contains('.') || n.contains('/')),
+            "解析出了不像工具名的东西，说明扫进注释或文件路径里去了：{out:?}"
+        );
         out
     }
 
@@ -8581,7 +8599,16 @@ mod readonly_tool_injection_tests {
             if !catalog.contains(&name) {
                 continue; // 客户端有、网关目录里没有的，不归这条管
             }
-            if per_call.contains(&name) {
+            // 豁免要按**声明的 type** 认，不能按工具名认。tool-policy.js 按 type 声明，
+            // 而客户端那份 strict 名单按**工具名**——大多数名字恰好等于自己的 type
+            //（browser / system / worktree / schedule），所以这个差别一直没露出来。
+            // 下面这四个不等，漏掉就会把「按调用判」的工具误判成「必须整个拒掉」。
+            let policy_type = match name.as_str() {
+                "mcp_server" => "mcpconfig",
+                "run_subagent" | "research_project" | "design_research" => "subagent",
+                other => other,
+            };
+            if per_call.contains(policy_type) {
                 continue; // 按调用判：能不能执行由客户端逐次决定，描述必须给到
             }
             for mode in ["plan", "explorer", "reviewer"] {
