@@ -23220,18 +23220,6 @@ function _agentAllowsWorkspaceMutation(run) {
   return !!(run?._steeredWorkspaceRequired || profile?.explicitWorkspaceMutation);
 }
 
-function _agentAllowsRuntimeKind(run, kind) {
-  if (!kind) return false;
-  const profile = run?.engineering || {};
-  const obligations = new Set([...(profile?.runtimeObligations || []), ...(run?._addedRuntimeObligations || [])]);
-  if (obligations.has(kind)) return true;
-  // Build/test/typecheck are normal evidence after an authorized code change or for
-  // diagnosis. Starting services, installing deps and packaging still need explicit words.
-  if ((kind === "build" || kind === "test") && (profile?.explicitWorkspaceMutation || profile?.bug || profile?.debugProject)) return true;
-  if (kind === "run" && profile?.ui && profile?.explicitWorkspaceMutation) return true;
-  return false;
-}
-
 function _simpleShellWords(segment) {
   const words = [];
   let cur = "", quote = "";
@@ -23304,12 +23292,6 @@ function _isDependencyRestoreCommand(command) {
     return false;
   }
   return sawRestore;
-}
-
-function _agentAllowsExternalKind(run, kind) {
-  const profile = run?.engineering || {};
-  const obligations = new Set([...(profile?.externalObligations || []), ...(run?._addedExternalObligations || [])]);
-  return !!(kind && obligations.has(kind));
 }
 
 function _agentSideEffectIntentIssue(call, run) {
@@ -54435,8 +54417,11 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
 // 是不是重活，模型自己已经在 run.engineering 里声明过一遍；harness 再按契约覆盖一次，等于拿
 // 猜的盖掉声明的。
 //
-// 留下的是有独立消费点的那部分：`_addedRuntimeObligations` / `_addedExternalObligations` 仍然
-// 喂提示词里的义务清单，`run._steeredWorkspaceRequired` 仍被写入义务判定读。只有
+// 阶段 2c 当时说「留下的是有独立消费点的那部分」——**那句话是错的**：
+// `_addedRuntimeObligations` / `_addedExternalObligations` 唯一的读取点是
+// `_agentAllowsRuntimeKind` / `_agentAllowsExternalKind` 两个函数，而那两个函数
+// 自己**零调用点**。也就是说这两个 Set 从头到尾只写不读，只是靠一层死函数
+// 假装有消费方，把「只写不读」那道守卫也骗过去了。2026-08-25 连同两个函数一起删。
 // `_cancelledEffectKinds` 随契约一起走 —— 它唯一的读者就是契约本身，留着就是纯写状态。
 
 function _callCanBypassPlanGate(call) {
@@ -54511,10 +54496,6 @@ function _applyLateIntentIfLanded(run, config, task, session, body, isLive, mess
   run.engineering = late;
   // Sticky: a late verdict may classify this turn more narrowly than the session already is.
   config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
-  run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
-  run._addedExternalObligations = run._addedExternalObligations instanceof Set ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
-  for (const kind of run.engineering.runtimeObligations || []) run._addedRuntimeObligations.add(kind);
-  for (const kind of run.engineering.externalObligations || []) run._addedExternalObligations.add(kind);
   run._syncAgentToolWindowToProfile?.();
   if (late.designKnowledgeRequired && !run._michaelDesignEvidence) {
     _startMichaelDesignPreflight({ run, body, isLive });
@@ -55820,10 +55801,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         for (const queued of session._steerQueue.splice(0)) {
           const steerText = typeof queued === "string" ? queued : String(queued?.text || "");
           const steerAttachments = typeof queued === "string" ? [] : (queued?.attachments || []);
-          run._addedRuntimeObligations = run._addedRuntimeObligations instanceof Set
-            ? run._addedRuntimeObligations : new Set(run._addedRuntimeObligations || []);
-          run._addedExternalObligations = run._addedExternalObligations instanceof Set
-            ? run._addedExternalObligations : new Set(run._addedExternalObligations || []);
           // Loop-body scope deliberately: this is read again AFTER the block below closes, by
           // the _routeAgentTools("steering", …) call at the end of the iteration. It used to be
           // declared inside that block, so the later read was a ReferenceError — the steering
@@ -55867,14 +55844,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             );
             if (_steerVerdict) _commitAiIntentState(session, _steerVerdict, _steerSemanticText, _steerIntentContext);
             config.ideSemanticProfile = _sessionStableSemanticProfile(session, _ideSemanticProfile(run.engineering));
-            run._addedRuntimeObligations.clear();
-            run._addedExternalObligations.clear();
-            for (const kind of run.engineering.runtimeObligations || []) {
-              run._addedRuntimeObligations.add(kind);
-            }
-            for (const kind of run.engineering.externalObligations || []) {
-              run._addedExternalObligations.add(kind);
-            }
             run._steeredWorkspaceRequired = !!run.engineering.explicitWorkspaceMutation;
             // 这里原本再算一次效果契约、和插话前对比，一旦多出 external 类效果就把任务改写成
             // 「需要计划的重活」。删了（阶段 2c）：上面几行刚用新裁决重跑过 `_mergeAiIntentProfile`，

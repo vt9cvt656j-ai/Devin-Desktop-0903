@@ -9763,11 +9763,25 @@ test("效果契约与它的上游全部删除，插话不再按预测改写任�
   assert.doesNotMatch(SRC, /run\._cancelledEffectKinds\s*=/,
     "契约是 _cancelledEffectKinds 唯一的读者，删了契约还留着它就是纯写状态");
 
-  // 有独立消费点的那部分必须留下：义务清单仍然喂提示词，写入义务判定仍然读插话标记。
-  assert.match(SRC, /\.\.\.\(run\?\._addedRuntimeObligations \|\| \[\]\)/, "运行义务清单不再喂提示词");
-  assert.match(SRC, /\.\.\.\(run\?\._addedExternalObligations \|\| \[\]\)/, "外部义务清单不再喂提示词");
+  // **这里原来断言「义务清单仍然喂提示词」——那句话是错的，2026-08-25 更正。**
+  //
+  // `_addedRuntimeObligations` / `_addedExternalObligations` 唯一的读取点是
+  // `_agentAllowsRuntimeKind` / `_agentAllowsExternalKind` 两个函数，而那两个函数
+  // **自己零调用点**。也就是说这两个 Set 从头到尾只写不读——它们靠一层死函数假装
+  // 有消费方，连「只写不读」那道守卫都被骗过去了（守卫只看有没有人读，不看读它的人
+  // 有没有人调）。阶段 2c 的文档和这条断言把同一个错误记了两遍。
+  // 两个函数连同两个字段一起删了，所以现在钉的是**它们不许长回来**。
+  assert.doesNotMatch(SRC, /_addedRuntimeObligations/,
+    "只写不读的运行义务清单又回来了——它唯一的读者是个零调用点的死函数");
+  assert.doesNotMatch(SRC, /_addedExternalObligations/,
+    "只写不读的外部义务清单又回来了");
+  assert.doesNotMatch(SRC, /function _agentAllowsRuntimeKind\(/, "死函数不许长回来");
+  assert.doesNotMatch(SRC, /function _agentAllowsExternalKind\(/, "死函数不许长回来");
+  // 这个字段不一样：它的读者 _agentAllowsWorkspaceMutation **确实被调用**
+  //（收尾那条「声称要改工作区却一个字没改」的判定），所以照旧留着。
   assert.match(SRC, /run\?\._steeredWorkspaceRequired \|\| profile\?\.explicitWorkspaceMutation/,
     "插话声明的写入义务没人读了");
+  assert.match(SRC, /_agentAllowsWorkspaceMutation\(run\)/, "它的读者本身也得有人调用");
 
   // 2a/2b 的反漂移守卫原样保留：关键词推导义务、预测型未完成标签，都不许长回来。
   assert.doesNotMatch(SRC, /function _runtimeObligationsForTask\(/);
@@ -9783,8 +9797,10 @@ test("效果契约与它的上游全部删除，插话不再按预测改写任�
 test("agent semantic profiles do not authorize or deny real tool execution", () => {
   const issue = load("_agentSideEffectIntentIssue");
   const allowsWorkspace = load("_agentAllowsWorkspaceMutation");
-  const allowsRuntime = load("_agentAllowsRuntimeKind");
-  const allowsExternal = load("_agentAllowsExternalKind");
+  // allowsRuntime / allowsExternal 已于 2026-08-25 删除：那两个函数**零调用点**，
+  // 而它们又是 _addedRuntimeObligations / _addedExternalObligations 唯一的读者——
+  // 两层一起构成一个「假装有消费方」的闭环，把「只写不读」那道守卫也骗过去了。
+  // 这条用例原来在验它们的返回值，也就是在验一段产品从来不执行的逻辑。
 
   const unknown = { mode: "agent", engineering: {} };
   for (const call of [
@@ -9816,10 +9832,8 @@ test("agent semantic profiles do not authorize or deny real tool execution", () 
     },
   };
   assert.equal(allowsWorkspace(structured), true);
-  assert.equal(allowsRuntime(structured, "build"), true);
-  assert.equal(allowsRuntime(structured, "run"), false);
-  assert.equal(allowsExternal(structured, "push"), true);
-  assert.equal(allowsExternal(structured, "deploy"), false);
+  // 这个留着：它的读者 _agentAllowsWorkspaceMutation 真的被调用（收尾那条
+  //「声称要改工作区却一个字没改」的判定），是三个里唯一活着的。
   assert.equal(issue({ type: "write", path: "src/auth.ts" }, structured), "");
   assert.equal(issue({ type: "cmd", command: "npm run build" }, structured), "");
   assert.equal(issue({ type: "cmd", command: "npm run dev" }, structured), "");
