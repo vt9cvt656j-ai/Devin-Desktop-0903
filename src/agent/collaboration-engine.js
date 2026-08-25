@@ -253,7 +253,11 @@ class CollaborationEngine {
         }));
       }
       if (Array.isArray(enhanced.relatedFindings)) {
-        enhanced.relatedFindings = enhanced.relatedFindings.slice(-5).map((finding) => ({
+        // 同样是降序数组，取末尾就是取**最旧**的 5 条。上面那处已经改成 slice(0,10)
+        // 并在注释里写明了原因，而这条裁剪分支一直没跟上——于是"上下文太大"时的降级
+        // 恰好把最新的发现全丢了，只留下最早的几条。降级本来就是有损的，
+        // 但不该反着损。
+        enhanced.relatedFindings = enhanced.relatedFindings.slice(0, 5).map((finding) => ({
           sourceJobId: finding.sourceJobId,
           type: finding.type,
           channel: finding.channel,
@@ -320,17 +324,55 @@ class CollaborationEngine {
   async collectRelatedFindings(currentJobId) {
     const allFindings = [];
     
-    // 查询 SharedStore 中与该 job 相关的发现
+    // **只收同一次派发里的同伴，不是黑板上所有人。**
+    //
+    // 这里原来无差别扫 `jobs.*`。而 SharedStore 是**全局**的、跨 run 也跨标签页：
+    // 上一轮任务的子体、另一个项目窗口里正在跑的子体，findings 全都躺在同一块黑板上。
+    // 于是新派的子智能体一开工就被喂进一段「其他角色已发现：…」，内容却来自一个
+    // 它从来没参与过的任务——它会把那些结论当成本次调查的既有证据接着往下推。
+    //
+    // 键的形状是 `sm_<runToken>_<jobId>`（见 main.js 的 _smRunToken：runToken 是 run 内
+    // 唯一的前缀，正是为了让两个标签页的 job#1 不串台）。同一次派发的同伴共享这个前缀。
+    const cur = String(currentJobId);
+    const runPrefix = /^(sm_[^_]+)_/.exec(cur)?.[1] || '';
+    // 会话里登记过的同伴优先——那是最准的一份名单。
+    const peers = new Set();
+    for (const session of this.activeCollaborations.values()) {
+      const ids = Array.isArray(session?.jobIds) ? session.jobIds.map(String) : [];
+      if (ids.includes(cur)) for (const id of ids) peers.add(id);
+    }
     const relatedJobs = this.store.query('jobs.*');
     
     for (const { key, value } of relatedJobs) {
       const match = /^jobs\.([^.]+)$/.exec(key);
-      if (!match || match[1] === String(currentJobId)) continue;
+      if (!match || match[1] === cur) continue;
+      const id = match[1];
+      if (peers.size) {
+        if (!peers.has(id)) continue;
+      } else if (runPrefix) {
+        // 没登记会话时退回按 run 前缀：仍然把别的 run / 别的标签页挡在外面。
+        if (!id.startsWith(runPrefix + '_')) continue;
+      } else {
+        // 连前缀都认不出来（老键或测试造的键）就不猜了——宁可不给上下文，
+        // 也不要把别人的结论当成同伴发现喂进去。
+        continue;
+      }
       const findings = Array.isArray(value?.findings) ? value.findings : [];
-      allFindings.push(...findings.map(f => ({ ...f, sourceJobId: match[1] })));
+      allFindings.push(...findings.map(f => ({ ...f, sourceJobId: id })));
     }
     
-    return allFindings.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    // 排序按 **seq 优先**，timestamp 兜底。
+    //
+    // 只按 timestamp 排是不可靠的：Date.now() 的分辨率是毫秒，而子体在一轮里连着写
+    // 十几条发现是常态——它们的 timestamp 完全相同，sort 稳定于是保持**插入顺序**，
+    // 也就是升序。下游按"这是降序"去取前 N 条，拿到的正好是**最旧**的 N 条，
+    // 而注释和变量名都在说"最新"。这个坑在 enhanceContext 里已经以两种形态各出现过一次。
+    // seq 是写入端的单调计数（见 shared-store.appendFinding），同一毫秒也能定序。
+    return allFindings.sort((a, b) => {
+      const sa = Number(a?.seq), sb = Number(b?.seq);
+      if (Number.isFinite(sa) && Number.isFinite(sb) && sa !== sb) return sb - sa;
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    });
   }
   
   /**
