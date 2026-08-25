@@ -77,6 +77,12 @@ impl From<&UiElement> for AxElementSignature {
 struct AxRefBinding {
     raw_ref: u32,
     signature: AxElementSignature,
+    /// 这个 ref 是**哪条读屏路**发的。两条路的编号语义根本不同，动作必须走回同一条：
+    ///   · 快路（sidecar screen.elements）：raw_ref 是句柄表的编号，1 起步，深度优先序。
+    ///   · 老路（JXA）：raw_ref 是重排后数组的下标，0 起步，按控件类型分四桶重排。
+    /// 拿快路的号去老路取，差的不止一位——两份清单的顺序压根不是一回事，取回来的
+    /// 几乎必然是另一个元素，然后被签名校验拒掉，回一句「界面变了，重新读」的假话。
+    native: bool,
 }
 
 #[derive(Default)]
@@ -97,7 +103,7 @@ fn clear_latest_ax_refs() -> Result<(), String> {
     Ok(())
 }
 
-fn install_ax_snapshot(snapshot: &mut UiSnapshot) -> Result<(), String> {
+fn install_ax_snapshot(snapshot: &mut UiSnapshot, native: bool) -> Result<(), String> {
     let mut latest = LATEST_AX_REFS
         .lock()
         .map_err(|_| "accessibility target state is unavailable".to_string())?;
@@ -109,6 +115,7 @@ fn install_ax_snapshot(snapshot: &mut UiSnapshot) -> Result<(), String> {
         let binding = AxRefBinding {
             raw_ref: element.ref_,
             signature: AxElementSignature::from(&*element),
+            native,
         };
         let opaque_ref = loop {
             let candidate = NEXT_AX_REF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -379,6 +386,10 @@ pub async fn read_screen(
     // 拼限制说明。绝不能在这里提前 return——ui_click 靠 install_ax_snapshot 记下的
     // pid 和元素签名来定位，跳过它等于把「按 ref 操作」整条功能弄坏。
     let fast = if use_ocr { None } else { native_snapshot_via_sidecar(target_pid).await };
+    // 走没走成快路，决定了这批 ref 的编号语义，也决定了 ui_click 该往哪条路发动作。
+    // 判据必须和下面那个 match 的条件**逐字一致**：读回空清单时会落回老路，
+    // 那种情况下 ref 是 JXA 的下标，按快路发就点错元素了。
+    let native_refs = fast.as_ref().is_some_and(|s| !s.elements.is_empty());
     let mut snapshot = match fast {
         Some(s) if !s.elements.is_empty() => s,
         _ => tauri::async_runtime::spawn_blocking(move || {
@@ -419,7 +430,7 @@ pub async fn read_screen(
             None => {}
         }
     }
-    install_ax_snapshot(&mut snapshot)?;
+    install_ax_snapshot(&mut snapshot, native_refs)?;
     let elements = snapshot.elements;
 
     let mut limitations = Vec::new();
@@ -623,12 +634,56 @@ pub async fn ui_click(
     // 签名八个字段全是零值。也就是说 Windows 上"这个 ref 还指着刚才那个元素吗"
     // 从来没有被检查过——而它恰恰是按 ref 操作能不能信的全部依据。
     let (binding, expected_target) = resolve_ax_ref(reference)?;
+    // 快路读来的 ref 就走快路的动作：sidecar 在读屏时按 ref 把元素句柄 CFRetain 留下了，
+    // 动作直接对着那个句柄发，**不重跑枚举**，成本是常数级的几次 C 调用。
+    //
+    // 底下那条 JXA 老路每执行一次动作都要把整棵树重新枚举一遍（最多 5 个窗口
+    // entireContents + 逐元素读 role/位置/尺寸/标题/值/可用性），实测轻应用约 1 秒、
+    // Chrome 5.3 秒、日历 20.8 秒——而它的预算只有 6 秒，重界面上必然被掐断，
+    // 回一句「辅助功能操作超时或无权限」，一个和真实原因毫无关系的理由。
+    // 老路只在快路没跑成（sidecar 没起来 / 没权限 / 读回空）时才用得上。
+    if binding.native {
+        return native_ax_action(&binding, &action, value.as_deref()).await;
+    }
     let result = tauri::async_runtime::spawn_blocking(move || {
         perform_ax_action(&binding, &action, value.as_deref(), &expected_target)
     })
     .await
     .map_err(|error| format!("accessibility action task failed: {error}"))??;
     parse_action_result(&result)
+}
+
+/// 按 ref 走 sidecar 的句柄表执行动作（快路）。
+///
+/// 身份校验在 sidecar 那边做：句柄表是**上一次 screen.elements 留下的**，读别的应用会
+/// 整张换掉，所以句柄天然属于最近读过的那个应用；元素本身还是不是原来那个，由 act()
+/// 里的签名比对负责。这里不再重复校验 pid/应用名——那是老路因为要按下标回查才需要的。
+async fn native_ax_action(
+    binding: &AxRefBinding,
+    action: &str,
+    value: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut args = serde_json::json!({ "ref": binding.raw_ref, "action": action });
+    if let Some(v) = value {
+        args["value"] = serde_json::json!(v);
+    }
+    // 必须自己带上限。automation_call 的 HTTP 客户端给的是 **120 秒**——那是为
+    // browser.* 那种真的要等页面的调用准备的。按句柄发一个 AX 动作只有几毫秒，
+    // 真等到几十秒只意味着对面卡住了，而不是这一步还有希望。
+    // 没有这一层的话，换到快路反而会把老路原有的 6 秒上限放大成两分钟的假死。
+    const ACT_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+    match tokio::time::timeout(
+        ACT_BUDGET,
+        crate::automation::automation_call("screen.act".into(), args),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "按 ref 操作超过 {} 秒没有回应——自动化服务卡住了。重新 read_screen 再试一次。",
+            ACT_BUDGET.as_secs()
+        )),
+    }
 }
 
 fn parse_action_result(result: &str) -> Result<serde_json::Value, String> {
@@ -1661,10 +1716,11 @@ return JSON.stringify({operated:operated,changed:changed});
             page: None,
             read_error: None,
         };
-        install_ax_snapshot(&mut first).expect("first snapshot should install");
+        install_ax_snapshot(&mut first, true).expect("first snapshot should install");
         let first_ref = first.elements[0].ref_;
         let (binding, target) = resolve_ax_ref(first_ref).expect("first ref should resolve");
         assert_eq!(binding.raw_ref, 7);
+        assert!(binding.native, "快路装进去的 binding 必须记着自己是快路来的");
         assert_eq!(
             binding.signature,
             AxElementSignature::from(&first.elements[0])
@@ -1680,9 +1736,15 @@ return JSON.stringify({operated:operated,changed:changed});
             page: None,
             read_error: None,
         };
-        install_ax_snapshot(&mut second).expect("second snapshot should install");
+        install_ax_snapshot(&mut second, false).expect("second snapshot should install");
         assert_ne!(first_ref, second.elements[0].ref_);
         assert!(resolve_ax_ref(first_ref).is_err());
+        let (second_binding, _) =
+            resolve_ax_ref(second.elements[0].ref_).expect("second ref should resolve");
+        assert!(
+            !second_binding.native,
+            "老路装进去的 binding 不能被当成快路——那会拿 JXA 的下标去查句柄表"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1767,6 +1829,120 @@ return JSON.stringify({operated:operated,changed:changed});
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 快路读来的 ref，动作也必须走快路。
+    ///
+    /// 这两条路的 ref 编号语义不同（快路是句柄表编号、1 起步、深度优先；老路是重排后
+    /// 数组的下标、0 起步、按控件类型分四桶），互相拿错就是点到别的元素上。而且症状
+    /// 极具误导性：签名校验会把它拒成「界面变了，重新 read_screen」，模型于是重读重试，
+    /// 陷进一个理由是假的死循环里。
+    ///
+    /// 曾经的实际状态是**动作侧压根没有分流**：读屏已经换成原生 AX，ui_click 却仍然
+    /// 无条件走 JXA，于是每点一次都要把整棵树重新枚举一遍（实测 Chrome 5.3 秒、
+    /// 日历 20.8 秒，而预算只有 6 秒），慢和点错同时发生。
+    #[test]
+    fn native_refs_act_through_the_native_path() {
+        let src = prod_src();
+        let start = src
+            .find("pub async fn ui_click(")
+            .expect("ui_click 不见了");
+        let end = src[start..]
+            .find("\nfn parse_action_result")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        let dispatch = body
+            .find("if binding.native")
+            .expect("ui_click 没有按 ref 的来路分流——快路的 ref 会被送进 JXA 老路");
+        let jxa = body
+            .find("spawn_blocking")
+            .expect("JXA 兜底那条不见了；快路跑不成时就没有退路了");
+        assert!(
+            dispatch < jxa,
+            "分流判断排在 JXA 调用后面，等于没分流"
+        );
+        assert!(
+            body.contains("native_ax_action"),
+            "分流之后没有走原生动作"
+        );
+
+        // 快路动作必须真的发 screen.act。写成别的方法名（比如复用 screen.elements）
+        // 会把句柄表整张换掉，正在操作的那批 ref 当场全废。
+        let act_start = src
+            .find("async fn native_ax_action(")
+            .expect("native_ax_action 不见了");
+        let act_end = src[act_start..]
+            .find("\nfn ")
+            .map(|i| act_start + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[act_start..act_end].contains("\"screen.act\""),
+            "原生动作没走 screen.act"
+        );
+
+        // read_screen 判「这次算不算快路」的条件，必须和它选快照的条件一致。
+        // 不一致的表现是静默的：读回空清单时会落回老路，而 ref 仍被标成快路来的。
+        let rs = src
+            .find("pub async fn read_screen(")
+            .expect("read_screen 不见了");
+        let rs_end = src[rs..]
+            .find("\nfn ")
+            .map(|i| rs + i)
+            .unwrap_or(src.len());
+        let rs_body = &src[rs..rs_end];
+        assert!(
+            rs_body.contains("is_some_and(|s| !s.elements.is_empty())"),
+            "快路判据和选快照的条件不再一致——读回空清单时会把 JXA 的 ref 标成快路来的"
+        );
+    }
+
+    /// 快路必须认得 `ui_click` 放行的**每一个**动作。
+    ///
+    /// 这两份清单在两个 crate 里各写一份（本文件的 `matches!` 和 automation-framework 的
+    /// `macos_tree::act`），中间没有任何类型把它们绑在一起——正是最容易悄悄漂开的形状。
+    /// 漂开的后果不是"那个动作报不支持"：快路认不得就退回 JXA 老路，而老路的 ref 是另一套
+    /// 编号（0 起步、按控件类型分四桶重排），退回去会**点到别的元素上**，还慢几秒。
+    /// 加这个动作的人多半只改一边，所以判据放在这里，红了就知道另一边也要补。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fast_path_knows_every_action_ui_click_allows() {
+        let src = prod_src();
+        let at = src.find("pub async fn ui_click(").expect("ui_click 不见了");
+        let list_start = src[at..].find("matches!(").expect("放行清单不见了") + at;
+        // 收尾必须钉 `matches!` 那个括号本身。钉 ")\n" 会一路吃到底下那句错误文案里，
+        // 于是整句提示被当成一个"动作名"，测试红得莫名其妙（实测踩过一次）。
+        let list_end = src[list_start..]
+            .find("\n    ) {")
+            .expect("放行清单没有收尾")
+            + list_start;
+        let allowed: Vec<String> = src[list_start..list_end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            allowed.len() >= 10,
+            "只解析出 {} 个动作，清单的写法大概变了：{allowed:?}",
+            allowed.len()
+        );
+
+        let act_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../automation-framework/src/platform/macos_tree.rs");
+        let act_src = std::fs::read_to_string(&act_path)
+            .unwrap_or_else(|e| panic!("读不到 {}：{e}", act_path.display()));
+        let at = act_src.find("pub fn act(").expect("act() 不见了");
+        let body = &act_src[at..];
+
+        for action in &allowed {
+            assert!(
+                body.contains(&format!("\"{action}\"")),
+                "快路的 act() 不认得「{action}」——这个动作会退回 JXA 老路，\
+                 而老路的 ref 是另一套编号，退回去会点到别的元素上"
+            );
+        }
     }
 
     /// 探查读法**不许**碰 ref 表。
@@ -1982,6 +2158,8 @@ return JSON.stringify({operated:operated,changed:changed});
         let binding = AxRefBinding {
             raw_ref: 9,
             signature: AxElementSignature::from(&source),
+            // 这条测的是 JXA 脚本生成器，也就是**老路**：老路的 ref 才是下标语义。
+            native: false,
         };
         let script = build_ax_action_script(
             &binding,
@@ -2020,6 +2198,7 @@ return JSON.stringify({operated:operated,changed:changed});
         let binding = AxRefBinding {
             raw_ref: 3,
             signature: AxElementSignature::from(&element(3)),
+            native: false,
         };
         // Every extended action must be accepted by the builder and map to a real AX verb.
         for (action, ax_verb) in [
