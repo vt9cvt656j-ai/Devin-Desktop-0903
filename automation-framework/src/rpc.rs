@@ -379,14 +379,14 @@ impl RpcServer {
     /// 排队发生在比锁早一层的地方：内核的 accept 队列——第二个请求连从 socket 读出来
     /// 都还没有，谈不上等锁。所以「先分流再拿锁」对那个症状是个空动作。
     ///
-    /// 那为什么还留着分流？它买到的是另一件事，小但真实：`self.agent.lock().unwrap()`
-    /// 在 mutex 中毒时会 panic，而中毒会连环 panic 掉整个 sidecar。分流之后 screen.*
-    /// 不受中毒牵连。仅此而已——**不要再把它当成"浏览器不再堵读屏"的修复**。
+    /// **队头阻塞已经在 accept 那一层修掉了**（见 serve_http_blocking）：/health 和
+    /// screen.* 读完鉴权完就被丢到另一条线程上跑，accept 循环立刻回去接下一个连接。
+    /// 所以浏览器再慢也不会再堵住读屏和按 ref 操作。
     ///
-    /// 真正的队头阻塞还在，而且不限于浏览器：任何慢方法（recorder.replay、
-    /// 长文本 keyboard.type、模型自己给毫秒数的 sleep{ms}）都会把后面全部堵住。
-    /// 要修得让这个服务能并发处理连接，而那受限于 Agent 的 !Send —— screen.* 不碰
-    /// Agent，是唯一可以先拆出去的一族。
+    /// 那这里的分流为什么还留着？因为 screen.* **还有第二条进来的路**：
+    /// `recorder.replay` 会把录制里的每一步 re-dispatch 回 `execute_method`。走那条路时
+    /// 请求本来就在持锁线程上，分流让它至少不必再等一次锁，也躲开 mutex 中毒
+    /// （`lock().unwrap()` 在中毒时 panic，而中毒会连环杀掉整个 sidecar）。
     #[cfg(all(feature = "system", target_os = "macos"))]
     fn screen_method(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         match method {
@@ -467,8 +467,8 @@ impl RpcServer {
     }
 
     fn execute_method(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        // 分流放在拿锁之前。注意这**不是**为了躲开锁争用（这个服务单线程，锁从不被争用），
-        // 而是为了让 screen.* 不受 agent mutex 中毒的牵连。详见 screen_method 上面那段。
+        // 分流放在拿锁之前。走到这里的 screen.* 只可能来自 recorder.replay 的
+        // re-dispatch（正常路径在 accept 那一层就被挪走了）。详见 screen_method 上面那段。
         #[cfg(all(feature = "system", target_os = "macos"))]
         if matches!(method, "screen.elements" | "screen.probe" | "screen.act") {
             return Self::screen_method(method, params);
@@ -933,8 +933,17 @@ impl RpcServer {
 
     /// 启动 HTTP-RPC 服务器（axum）——把这一个**有状态**的 RpcServer 通过 `POST /rpc` 暴露出去。
     /// 浏览器会话 + 录制状态在整个进程生命周期常驻；任何自动化引擎都能 POST /rpc 调它。
-    /// 极简**单线程阻塞式** HTTP-RPC 服务（std only）。Agent 含 macOS !Send 句柄，必须全程钉在
-    /// 一条线程上；自动化本就串行，单线程正合适。`POST /rpc` body=JSON-RPC → JSON-RPC 响应；`GET /health`→ok。
+    /// 极简阻塞式 HTTP-RPC 服务（std only）。`POST /rpc` body=JSON-RPC → JSON-RPC 响应；`GET /health`→ok。
+    ///
+    /// **碰 Agent 的活串行，不碰的并发。** Agent 含 macOS !Send 句柄，必须全程钉在这条线程上，
+    /// 所以 browser.* / mouse.* / keyboard.* / recorder.* 一律 inline 跑。
+    ///
+    /// 但「整个服务单线程」曾经是个真问题：读请求本身在 accept 队列里排队，于是一次
+    /// browser.goto（最坏一分钟）期间，read_screen / ui_click / 甚至 /health 的连接连从
+    /// socket 读出来都还没有。症状是「整个自动化都卡住了」，而且它还会把父进程的健康探测
+    /// 拖超时——那边的看门狗一度会据此 SIGKILL 掉整个进程组，连浏览器一起。
+    ///
+    /// 现在读+鉴权仍在这条线程（很快，且有 15 秒 IO 上限），**执行**按碰不碰 Agent 分流。
     pub fn serve_http_blocking(&self) -> Result<()> {
         let addr = format!("127.0.0.1:{}", self.port);
         let listener = std::net::TcpListener::bind(&addr)
@@ -942,18 +951,50 @@ impl RpcServer {
         eprintln!("🚀 automation server on http://{}/rpc", addr);
         for stream in listener.incoming() {
             match stream {
-                Ok(mut s) => { let _ = self.handle_conn(&mut s); }
+                Ok(mut s) => {
+                    // 读请求 + 鉴权仍然在这条线程上做：它们很快，而且有 15 秒 IO 上限。
+                    // **执行**才分流。
+                    match self.read_and_auth(&mut s) {
+                        Ok(Some(job)) => {
+                            if job.offloadable() {
+                                // 不碰 Agent 的活（/health 和 screen.*）另开线程跑，
+                                // accept 循环立刻回去接下一个连接。
+                                //
+                                // 这才是「浏览器不再堵读屏」的**真正**修法。之前那次把
+                                // screen.* 挪到 agent 锁前面是无效的：这个服务从来只有
+                                // 一条线程，锁根本没被争用过，排队发生在比锁早一层的
+                                // accept 队列里——第二个请求连从 socket 读出来都还没有。
+                                //
+                                // 只有这两族能这样搬：它们不碰 Agent（含 macOS !Send 句柄，
+                                // 必须钉在一条线程上）。screen.* 的共享状态只有 HANDLES，
+                                // 而它自带 Mutex，act 整个动作期间都握着那把锁，
+                                // 和并发的读屏之间不会撕裂。
+                                let token = self.token.clone();
+                                std::thread::spawn(move || {
+                                    let _ = Self::finish_offloaded(&mut s, job, token.as_deref());
+                                });
+                            } else {
+                                let _ = self.finish_inline(&mut s, job);
+                            }
+                        }
+                        // 鉴权失败/格式错的响应已经在 read_and_auth 里写回去了。
+                        Ok(None) | Err(_) => {}
+                    }
+                }
                 Err(_) => continue,
             }
         }
         Ok(())
     }
 
-    fn handle_conn(&self, stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+    /// 读请求 + 鉴权。**不执行**。
+    ///
+    /// 拆出来是为了让 accept 循环能尽快回去接下一个连接：读和鉴权都很快（而且有 15 秒
+    /// IO 上限），真正会花时间的是执行。返回 None 表示已经把 401/413 写回去了。
+    fn read_and_auth(&self, stream: &mut std::net::TcpStream) -> std::io::Result<Option<Job>> {
         use std::io::{Read, Write, BufRead, BufReader};
-        // 读写都要超时：这个服务在**一条线程上串行**处理连接（自动化本就串行），
-        // 一个连上来却不发数据的连接会把它整个堵死——后面所有自动化调用只能干等到
-        // IDE 侧那 120 秒超时。本机任意进程都能连上 127.0.0.1，成本极低。
+        // 读写都要超时：一个连上来却不发数据的连接会把读这一步堵死。
+        // 本机任意进程都能连上 127.0.0.1，成本极低。
         let io_timeout = std::time::Duration::from_secs(15);
         let _ = stream.set_read_timeout(Some(io_timeout));
         let _ = stream.set_write_timeout(Some(io_timeout));
@@ -1043,12 +1084,11 @@ impl RpcServer {
             stream.write_all(header.as_bytes())?;
             stream.write_all(body)?;
             stream.flush()?;
-            return Ok(());
+            return Ok(None);
         }
 
         // 鉴权之后才读 body。原来读在鉴权**之前**：一个未鉴权的连接报一个撒谎的
-        // Content-Length，就能让我们在验明身份前先按它说的大小申请内存；而这个服务是
-        // 单线程串行处理的，一个不发数据的连接还能把后面所有自动化调用一起堵死。
+        // Content-Length，就能让我们在验明身份前先按它说的大小申请内存。
         const MAX_BODY: usize = 8 * 1024 * 1024;
         if content_len > MAX_BODY {
             let body = b"{\"error\":\"payload too large\"}";
@@ -1059,7 +1099,7 @@ impl RpcServer {
             stream.write_all(header.as_bytes())?;
             stream.write_all(body)?;
             stream.flush()?;
-            return Ok(());
+            return Ok(None);
         }
         let body = if content_len > 0 {
             let mut buf = vec![0u8; content_len];
@@ -1067,32 +1107,120 @@ impl RpcServer {
             buf
         } else { Vec::new() };
 
-        let resp_body: Vec<u8> = if health_probe {
-            // 持有 token 才算得出这个值；没配 token（本地开发）时维持旧的 "ok"。
-            match (&self.token, &nonce) {
-                (Some(tok), Some(n)) => health_challenge_response(tok, n).into_bytes(),
-                _ => b"ok".to_vec(),
-            }
-        } else if http_method == "POST" && path == "/rpc" {
-            match serde_json::from_slice::<RpcRequest>(&body) {
-                Ok(req) => serde_json::to_vec(&self.handle_request(req)).unwrap_or_default(),
-                Err(e) => serde_json::to_vec(&serde_json::json!({
-                    "jsonrpc": "2.0", "id": serde_json::Value::Null,
-                    "error": { "code": -32700, "message": format!("parse error: {}", e) }
-                })).unwrap_or_default(),
-            }
+        // 方法名要在这里就取出来：分流判据靠它，而分流发生在执行之前。
+        let rpc_method = if http_method == "POST" && path == "/rpc" {
+            serde_json::from_slice::<RpcRequest>(&body).ok().map(|r| r.method)
         } else {
-            b"{\"error\":\"not found\"}".to_vec()
+            None
         };
 
+        Ok(Some(Job { health_probe, nonce, http_method, path, body, rpc_method }))
+    }
+
+    /// 把响应写回去。
+    fn write_ok(stream: &mut std::net::TcpStream, resp_body: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             resp_body.len()
         );
         stream.write_all(header.as_bytes())?;
-        stream.write_all(&resp_body)?;
-        stream.flush()?;
-        Ok(())
+        stream.write_all(resp_body)?;
+        stream.flush()
+    }
+
+    fn parse_error_body(e: impl std::fmt::Display) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": serde_json::Value::Null,
+            "error": { "code": -32700, "message": format!("parse error: {}", e) }
+        })).unwrap_or_default()
+    }
+
+    /// 不碰 Agent 的活：/health 和 screen.*。在另一条线程上跑。
+    fn finish_offloaded(
+        stream: &mut std::net::TcpStream,
+        job: Job,
+        token: Option<&str>,
+    ) -> std::io::Result<()> {
+        let resp_body: Vec<u8> = if job.health_probe {
+            // 持有 token 才算得出这个值；没配 token（本地开发）时维持旧的 "ok"。
+            match (token, &job.nonce) {
+                (Some(tok), Some(n)) => health_challenge_response(tok, n).into_bytes(),
+                _ => b"ok".to_vec(),
+            }
+        } else {
+            match serde_json::from_slice::<RpcRequest>(&job.body) {
+                Ok(req) => {
+                    #[cfg(all(feature = "system", target_os = "macos"))]
+                    let result = Self::screen_method(&req.method, req.params);
+                    #[cfg(not(all(feature = "system", target_os = "macos")))]
+                    let result: Result<serde_json::Value> = Err(Error::Other(anyhow::anyhow!(
+                        "screen.* 只在 macOS 上可用"
+                    )));
+                    let resp = match result {
+                        Ok(value) => RpcResponse {
+                            jsonrpc: "2.0".to_string(), result: Some(value), error: None, id: req.id,
+                        },
+                        Err(e) => RpcResponse {
+                            jsonrpc: "2.0".to_string(), result: None,
+                            error: Some(RpcError { code: -32603, message: e.to_string() }), id: req.id,
+                        },
+                    };
+                    serde_json::to_vec(&resp).unwrap_or_default()
+                }
+                Err(e) => Self::parse_error_body(e),
+            }
+        };
+        Self::write_ok(stream, &resp_body)
+    }
+
+    /// 要用 Agent 的活。必须留在 accept 那条线程上：Agent 含 macOS !Send 句柄。
+    fn finish_inline(&self, stream: &mut std::net::TcpStream, job: Job) -> std::io::Result<()> {
+        let resp_body: Vec<u8> = if job.http_method == "POST" && job.path == "/rpc" {
+            match serde_json::from_slice::<RpcRequest>(&job.body) {
+                Ok(req) => serde_json::to_vec(&self.handle_request(req)).unwrap_or_default(),
+                Err(e) => Self::parse_error_body(e),
+            }
+        } else {
+            b"{\"error\":\"not found\"}".to_vec()
+        };
+        Self::write_ok(stream, &resp_body)
+    }
+}
+
+/// 一次已经读完并通过鉴权、但**还没执行**的请求。
+struct Job {
+    health_probe: bool,
+    nonce: Option<String>,
+    http_method: String,
+    path: String,
+    body: Vec<u8>,
+    /// POST /rpc 时解析出来的方法名。分流判据靠它。
+    rpc_method: Option<String>,
+}
+
+impl Job {
+    /// 这次活碰不碰 Agent。不碰的才能挪到别的线程上跑。
+    ///
+    /// 判据必须**保守**：多算一个进来就等于把 Agent 从"永远单线程"变成"可能并发"，
+    /// 而它带的是 macOS !Send 句柄。只有这两族确定不碰：
+    ///   · /health —— 只做一次 SHA-256；
+    ///   · screen.elements / screen.probe / screen.act —— 走 macos_tree，
+    ///     共享状态只有自带 Mutex 的 HANDLES。
+    fn offloadable(&self) -> bool {
+        if self.health_probe {
+            return true;
+        }
+        #[cfg(all(feature = "system", target_os = "macos"))]
+        {
+            if matches!(
+                self.rpc_method.as_deref(),
+                Some("screen.elements") | Some("screen.probe") | Some("screen.act")
+            ) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1125,6 +1253,63 @@ mod tests {
         let req: RpcRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.method, "browser.goto");
         assert_eq!(req.params["url"], "https://example.com");
+    }
+
+    fn job(method: Option<&str>, health: bool) -> Job {
+        Job {
+            health_probe: health,
+            nonce: None,
+            http_method: "POST".into(),
+            path: if health { "/health".into() } else { "/rpc".into() },
+            body: Vec::new(),
+            rpc_method: method.map(str::to_string),
+        }
+    }
+
+    /// 分流判据必须**保守**。
+    ///
+    /// 多算一族进来，就等于把 Agent 从「永远只有一条线程碰它」变成「可能并发」——
+    /// 而它带的是 macOS !Send 句柄，那不是数据竞争的风险，是未定义行为。
+    /// 所以这条测试钉的是白名单本身：只有 /health 和三个 screen.* 能挪走。
+    #[test]
+    fn only_agent_free_work_leaves_the_accept_thread() {
+        assert!(job(None, true).offloadable(), "/health 必须能挪走——它只做一次 SHA-256");
+
+        for m in ["browser.goto", "browser.click", "mouse.click", "keyboard.type",
+                  "recorder.replay", "window.list", "sleep", "system.open"] {
+            assert!(
+                !job(Some(m), false).offloadable(),
+                "{m} 被判成可以挪走——它会碰 Agent，而 Agent 必须钉在一条线程上"
+            );
+        }
+
+        #[cfg(all(feature = "system", target_os = "macos"))]
+        for m in ["screen.elements", "screen.probe", "screen.act"] {
+            assert!(
+                job(Some(m), false).offloadable(),
+                "{m} 没能挪走——浏览器一忙就会把读屏和按 ref 操作重新堵死"
+            );
+        }
+    }
+
+    /// accept 循环真的把可挪的活丢出去了，而不是只定义了一个没人用的判据。
+    ///
+    /// 判据是源码文本：这条链要跑起来得有真实的 TCP 服务和 macOS 授权，单元测试里
+    /// 验不了行为，但「判据存在却没接线」恰恰是这个仓库反复出过的事（screen.act 当初
+    /// 写好了零调用点）。所以至少钉住接线本身。
+    #[test]
+    fn the_accept_loop_actually_offloads() {
+        let src = include_str!("rpc.rs");
+        let at = src.find("pub fn serve_http_blocking").expect("服务入口不见了");
+        // 按字符取，不按字节切：这份源码全是中文注释，按字节加偏移会切在多字节字符
+        // 中间直接 panic（踩了一次）。
+        let end = src[at..].find("\n    fn read_and_auth").unwrap_or(4000);
+        let body: String = src[at..at + end].chars().collect();
+        let body = body.as_str();
+        assert!(body.contains("read_and_auth"), "accept 循环没有先读+鉴权再分流");
+        assert!(body.contains("offloadable()"), "accept 循环没有用分流判据");
+        assert!(body.contains("std::thread::spawn"), "可挪的活没有真的挪出这条线程");
+        assert!(body.contains("finish_inline"), "碰 Agent 的活没有留在这条线程上");
     }
 }
 
