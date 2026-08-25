@@ -61884,7 +61884,9 @@ function _previewSimulateTool(call, res, vp, root) {
       rows([["inv_00041", "£76.00 · paid"], ["inv_00042", "£19.00 · open"], ["inv_00043", "£240.00 · void"]]);
       return { type: t, path: call.driver || "postgres", content: "(simulated) query returned 3 rows." };
     case "memory": case "askuser": case "current_time": case "designboard": case "preview":
-    case "genimage": case "vizcompare": case "explain": case "worktree": case "computer":
+    // 这里原来还有一个 `case "computer"`，永远走不到：这个 switch 判的是 `call.type`，
+    // 而映射层从不产出 type "computer"（`case "computer"` 返回的是 type "automation"）。
+    case "genimage": case "vizcompare": case "explain": case "worktree":
     case "system": case "automation": case "readscreen": case "uiclick": case "remote":
     case "qr": case "capture_start": case "capture_flows": case "capture_stop": case "capture_replay":
     case "demostart": case "demostop": case "background_monitor": case "localdiscovery":
