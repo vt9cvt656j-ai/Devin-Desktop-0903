@@ -52,6 +52,8 @@ function buildCatalog() {
 function buildMapToolCall(catalog) {
   const prelude = [
     extractConst("_COMPUTER_METHODS"),
+    // automation 入口也校验方法名了，用的是这份超集。
+    extractConst("_AUTOMATION_METHODS"),
     // save_skill 的归一化要拼出技能落点（<工作区>/<产品目录>/skills/…）。产品目录名在
     // main.js 里只有一份（_STATE_DIR），沙箱按需注入它，别在测试里另写一个字面量。
     extractConst("_STATE_DIR"),

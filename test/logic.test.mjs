@@ -318,6 +318,9 @@ AUTO_LOAD_DEPS = {
   // computer 的合法动作表：schema enum、映射白名单、报错文案三处以前各抄一份，
   // 漏了 mouse.position。现在是同一份常量，抠映射层的测试要跟着注进来。
   _COMPUTER_METHODS: new Function(`${/const _COMPUTER_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _COMPUTER_METHODS;`)(),
+  // automation 入口现在也校验方法名（此前零校验直通 sidecar），用的是这份超集。
+  // 少注一个常量的表现是 ReferenceError —— 看起来像"映射崩了"，实际是沙箱没给。
+  _AUTOMATION_METHODS: new Function(`${/const _AUTOMATION_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _AUTOMATION_METHODS;`)(),
   // 容器自愈：_coerceSchemaTypes 现在会调它（headers 被塞成 JSON 字符串 / 键值对数组
   // 这类包装错误，以前一律拒绝执行）。抠 _coerceSchemaTypes 的测试不止一处，少了它是
   // ReferenceError，表现成"这个测试挂了"而不是"参数没被扶正"。
@@ -22214,9 +22217,18 @@ test("#95: 在册工具的 catch 块返回内容可被失败记忆框架检测",
   assert.match(SRC, /call\.type === "system"[\s\S]{0,3000}\[系统控制失败\]/,
     "system catch 块返回 [系统控制失败]");
   // readscreen / uiclick / automation / tor 返回 [失败]
+  //
+  // 判据不能写成「分支起点后 3000 字符内出现 [失败]」：分支一变长（automation 那条这次
+  // 就因为补了方法校验和更细的报错文案而超了），断言会以「catch 块不返回 [失败]」的
+  // 形式**假红**——而它其实好好的。反过来更糟：窗口内恰好扫到隔壁分支的 [失败] 会假绿。
+  // 改成切到**下一个 else if (call.type ===** 为止，也就是这条分支自己的范围。
   for (const tool of ["readscreen", "uiclick", "automation", "tor"]) {
-    assert.match(SRC, new RegExp(`call\\.type === "${tool}"[\\s\\S]{0,3000}\\[失败\\]`),
-      `${tool} catch 块返回 [失败]`);
+    const at = SRC.indexOf(`call.type === "${tool}"`);
+    assert.ok(at > 0, `工具 ${tool} 的执行分支找不到了`);
+    const next = SRC.indexOf('} else if (call.type === "', at + 10);
+    const branch = SRC.slice(at, next > at ? next : SRC.length);
+    assert.ok(branch.length > 200, `${tool} 的分支只切出 ${branch.length} 字符，切法坏了`);
+    assert.ok(branch.includes("[失败]"), `${tool} catch 块返回 [失败]`);
   }
   // localdiscovery / learndesign 返回 [失败]（handler 较长，给更多距离）
   assert.match(SRC, /call\.type === "localdiscovery"[\s\S]{0,10000}\[失败\] local_discovery/,
@@ -29960,7 +29972,17 @@ test("computer 的合法动作只有一份，schema / 映射 / 报错文案不�
   assert.ok(enumNames.length >= 20, `enum 只解析出 ${enumNames.length} 项，判据坏了`);
   assert.deepEqual(enumNames, methods, "schema enum 和白名单又分叉了");
   // 报错文案要拼这份常量，不许再手抄
-  assert.match(SRC, /可用的是：\$\{_COMPUTER_METHODS\.join\(" \/ "\)\}/);
+  // 报错文案要拼常量，不许手抄；而且要按**入口**给对应那份——automation 是超集
+  // （含 browser.* / recorder.* / sleep），给错清单会把模型引向它这条路上不存在的方法。
+  assert.match(SRC, /_AUTOMATION_METHODS : _COMPUTER_METHODS\)\.join\(" \/ "\)/);
+  // automation 入口也必须校验。它此前零校验直通，写错的方法名要打到 sidecar 才失败，
+  // 模型拿不到可用清单，只能猜下一个再来一轮。
+  assert.match(SRC, /_AUTOMATION_METHODS\.includes\(_m\)/, "automation 入口没有方法校验");
+  const autoMethods = new Function(`${/const _AUTOMATION_METHODS = \[[\s\S]*?\];/.exec(SRC)[0]}\n;return _AUTOMATION_METHODS;`)();
+  for (const m of methods) {
+    assert.ok(autoMethods.includes(m), `${m} 在 computer 白名单里却不在 automation 全集里——computer 必须是子集`);
+  }
+  assert.ok(autoMethods.length > methods.length, "automation 应该是严格超集");
 });
 
 test("网页版不提供跑不了的工具", () => {
