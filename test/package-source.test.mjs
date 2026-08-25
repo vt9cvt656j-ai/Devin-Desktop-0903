@@ -8,6 +8,7 @@
 // （scoped、桶文件、几百个打包产物、269KB 的类型声明）才是会把实现坑掉的东西，
 // 手写的夹具全都碰不到。
 import test from "node:test";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -219,9 +220,13 @@ test("已有的公共代码搜索要说清它是干什么的", () => {
    * 它治的是 package_source 治不了的那一层：**签名对了，但用法不对**——参数顺序、
    * 必需的初始化步骤、真实的调用惯例。文档常常不写，一千个仓库的实际用法里全都有。
    */
-  const at = RAW_SRC.indexOf('name: "developer_community_search"');
-  assert.ok(at > 0, "找不到这个工具");
-  const block = SRC.slice(at, at + 5000);
+  // 目录搬进模块之后从**数据结构**取，别再 indexOf 切窗口：main.js 里还有一处
+  // 同名的意图提示（`{ name: "developer_community_search", args: ... }`），
+  // indexOf 先撞上它，5000 字窗口就完全落空——判据会静默失效。
+  const tool = [...baseTools(), ...readonlyExternalTools(), ...writeTools()]
+    .find((t) => t?.function?.name === "developer_community_search");
+  assert.ok(tool, "找不到这个工具");
+  const block = JSON.stringify(tool);
   assert.match(block, /`sourcegraph` is public CODE search across many repositories/,
     "描述里没说清 sourcegraph 是代码搜索");
   assert.match(SRC, /签名对了但不确定怎么用→developer_community_search/,

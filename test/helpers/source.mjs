@@ -13,7 +13,7 @@
 // literals and regex literals are untouched, so prompt text living inside a template
 // literal still matches. Positive assertions ("this contract must exist") belong on CODE.
 // `SRC` stays available for the handful of assertions that deliberately inspect comments.
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as acorn from "acorn";
@@ -22,7 +22,48 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const MAIN_PATH = join(HERE, "../../src/main.js");
 
 /** Raw main.js text, comments included. Only for assertions that target comments. */
-export const SRC = readFileSync(MAIN_PATH, "utf8");
+/**
+ * 「客户端源码」现在**跨多个文件**：main.js 加上从它抽出去的那些模块。
+ *
+ * 这里必须把它们拼起来，否则每抽出去一块，一大批按源文本断言的测试就会以
+ *「这段代码不见了」的形式集体假红——实测抽工具目录那一次直接红了 161 条。
+ * 它们断言的是「产品里有没有这段代码」，而代码搬到隔壁文件并不改变这个事实。
+ *
+ * 拼接顺序：main.js 在前（大量断言依赖它内部的前后顺序），模块按文件名排在后面，
+ * 每块之间插一行分隔注释，免得两个文件的收尾和开头在正则里粘成一句。
+ *
+ * **注意**：这只让「这段代码在不在」这类断言继续成立。要验行为，请直接
+ * `import` 那个模块——抠源码验得到行为，验不到「它在真实调用链上还在不在」。
+ */
+const AGENT_DIR = join(dirname(MAIN_PATH), "agent");
+export const SRC = [
+  readFileSync(MAIN_PATH, "utf8"),
+  ...readdirSync(AGENT_DIR)
+    .filter((f) => f.endsWith(".js"))
+    .sort()
+    .map((f) => {
+      // 拼进来之前把 `import …` 整行和 `export ` 前缀去掉。
+      //
+      // 不去的话 acorn 解析这份拼接文本会撞上重复声明——main.js `import { X }` 而模块里
+      // `export const X`，同一份文本里就是两个 X（实测 USER_TOOL_PREFIX 直接把 155 个
+      // 测试文件打成解析失败）。这份拼接的用途只有一个：让「产品里有没有这段代码」
+      // 这类**文本**断言在代码搬家之后继续成立，所以去掉模块语法不影响它要回答的问题。
+      const body = readFileSync(join(AGENT_DIR, f), "utf8")
+        .split("\n")
+        // 整行去掉：`import …` 和纯再导出的 `export { … }`（后者去掉 export 之后
+        // 会剩一个裸的块语句，形状变了；直接丢更干净）。
+        .filter((line) => !/^\s*import\s/.test(line) && !/^\s*export\s*\{/.test(line))
+        // 前缀去掉：`export default X` / `export const|let|function|class|async …`。
+        .map((line) => line
+          .replace(/^(\s*)export\s+default\s+/, "$1")
+          .replace(/^(\s*)export\s+/, "$1"))
+        .join("\n");
+      // 再包一层块作用域：只去模块语法还不够——main.js 那边 `import { X }` 的绑定
+      // 和模块里的 `const X` 仍然在同一份顶层文本里撞名。包进 `{}` 之后 const/let/class
+      // 都成了块级声明，谁也不撞谁，而**文本一个字没变**，正则该匹配的照样匹配。
+      return `\n// ==== src/agent/${f} ====\n{\n` + body + "\n}\n";
+    }),
+].join("\n");
 
 /**
  * Blank out every comment in `source`, preserving length and line breaks so offsets and
@@ -48,6 +89,22 @@ export function stripComments(source) {
 }
 
 /** main.js with all comments blanked out. Use this for positive source assertions. */
+/**
+ * 工具目录的**源码文本**（src/agent/tool-catalog.js）。
+ *
+ * 141 条 schema 的字面量已经从 `_buildAgentToolSchemas` 搬进那个模块，所以
+ * `extractFn("_buildAgentToolSchemas")` 现在只拿得到组装逻辑，捞不到任何一条 schema。
+ * 按源文本断言 schema 的地方改用这个。
+ *
+ * **不过更好的做法是直接 import 那个模块**：`baseTools()` 等三个 getter 返回的是
+ * 数据结构，`.find(t => t.function.name === "x")` 比正则可靠得多。这个导出只是给
+ * 存量断言用的过渡。
+ */
+export const TOOL_CATALOG_SRC = readFileSync(join(dirname(MAIN_PATH), "agent", "tool-catalog.js"), "utf8")
+  // 去掉 `export ` 前缀：这份文本会被塞进 `new Function` 跑，而那里面不允许模块语法。
+  // 文本内容不变，正则该匹配的照样匹配。
+  .replace(/^(\s*)export\s+/gm, "$1");
+
 export const CODE = stripComments(SRC);
 
 // ---------------------------------------------------------------------------

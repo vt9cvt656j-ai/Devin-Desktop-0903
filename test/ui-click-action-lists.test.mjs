@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+// 工具目录已搬进 src/agent/tool-catalog.js。schema 那一半从**数据结构**读
+// （`.find(t => t.function.name === "ui_click")`），比正则可靠；执行分支那一半
+// 仍在 main.js 里，所以两份都要。
 const MAIN = readFileSync(join(ROOT, "src/main.js"), "utf8");
+const CATALOG = readFileSync(join(ROOT, "src/agent/tool-catalog.js"), "utf8");
 const ACC = readFileSync(join(ROOT, "src-tauri/src/accessibility.rs"), "utf8");
 const TREE = readFileSync(join(ROOT, "automation-framework/src/platform/macos_tree.rs"), "utf8");
 
@@ -29,9 +33,9 @@ const TREE = readFileSync(join(ROOT, "automation-framework/src/platform/macos_tr
  */
 
 function schemaEnum() {
-  const at = MAIN.indexOf('name: "ui_click"');
+  const at = CATALOG.indexOf('name: "ui_click"');
   assert.ok(at > 0, "ui_click 的工具定义不见了");
-  const m = MAIN.slice(at, at + 4000).match(/enum: \[([^\]]+)\]/);
+  const m = CATALOG.slice(at, at + 4000).match(/enum: \[([^\]]+)\]/);
   assert.ok(m, "ui_click schema 里的 action enum 取不到");
   return new Set([...m[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]));
 }
@@ -105,8 +109,8 @@ test("ui_click 的动作清单，五个地方必须完全一致", () => {
  * pid，name 从来没参与过校验。承诺落空比不承诺更糟：模型会据此认为 ref 绝无可能落错窗口。
  */
 test("ui_click 的描述不承诺它没做的校验", () => {
-  const at = MAIN.indexOf('name: "ui_click"');
-  const desc = MAIN.slice(at, at + 4000);
+  const at = CATALOG.indexOf('name: "ui_click"');
+  const desc = CATALOG.slice(at, at + 4000);
   assert.doesNotMatch(
     desc,
     /pid \+ name are both checked/,

@@ -8,6 +8,7 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
 // 不再从 main.js 源码里抠函数文本。
 import {
@@ -66,7 +67,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
 const DAP_CLIENT = readFileSync(join(HERE, "../src/dap-client.js"), "utf8");
 const LSP_CLIENT = readFileSync(join(HERE, "../src/lsp-client.js"), "utf8");
 const TAURI_DEBUG = readFileSync(join(HERE, "../src-tauri/src/debug.rs"), "utf8");
@@ -199,6 +200,11 @@ function buildRegisteredToolSchemas() {
     "_userCapabilities",
     "compileToolSchema",
     "_withoutDisabledTools",
+    // 目录字面量已搬进 src/agent/tool-catalog.js —— 三个 getter 从模块**注入**，
+    // 组装逻辑仍从 main.js 抠。这样拿到的就是产品真正会构建出来的那份目录。
+    "baseTools",
+    "readonlyExternalTools",
+    "writeTools",
     `${extractFn("_applyUserRoleEnums")}\n${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
   )(
     true,
@@ -206,6 +212,9 @@ function buildRegisteredToolSchemas() {
     () => ({ tools: [], commands: [], disabled: [], errors: [] }),
     compileToolSchema,
     (tools) => tools,
+    baseTools,
+    readonlyExternalTools,
+    writeTools,
   )(true, []);
 }
 function collectIdentifiers(source, name) {
@@ -20222,7 +20231,7 @@ test("#47-5 恢复懒渲染：同步只渲最近 30 条，其余 idle 补渲，�
 });
 
 test("#51-1 九个专用工具 description 含「何时用」引导段", () => {
-  const schemas = extractFn("_buildAgentToolSchemas");
+  const schemas = TOOL_CATALOG_SRC;
   for (const tool of ["find_symbol", "lsp_references", "lsp_definition", "semantic_search", "git_blame", "git_log", "db_query", "developer_community_search", "performance_profile"]) {
     const m = schemas.match(new RegExp(`name: "${tool}", description: "((?:[^"\\\\]|\\\\.)+)"`));
     assert.ok(m, `${tool} 的 schema 定义必须存在`);
@@ -31299,17 +31308,10 @@ test("save_skill 不再依赖工作区，落点是家目录技能库", () => {
 // 返回的却是「内置工具里没有专用的，注册表是起手包不是能力边界」——在只读模式下这是假话。
 // 判据取 _READ_TOOLS 的交集（本仓库给只读子体的名单），不另手抄一份。
 test("只读模式够得着的检索工具，不许被关进 includeWrite 块", () => {
-  const fn = extractFn("_buildAgentToolSchemas");
-  const at = fn.indexOf("  if (includeWrite) {");
-  assert.ok(at > 0, "includeWrite 块找不到了，这条断言失去落点");
-  // 括号配平取块范围，别用行数猜。
-  let depth = 0, end = at;
-  for (; end < fn.length; end++) {
-    const c = fn[end];
-    if (c === "{") depth++;
-    else if (c === "}") { depth--; if (!depth) break; }
-  }
-  const inBlock = new Set([...fn.slice(at, end).matchAll(/name: "([a-z_0-9]+)"/g)].map((m) => m[1]));
+  // 目录搬进模块之后，这条判据从「在不在 includeWrite 这个代码块里」变成
+  // 「在不在 writeTools() 这个数组里」——**直接读数据结构**，不再括号配平切源码。
+  // 这正是把目录抽出去图的东西：判据从"位置"变成"事实"。
+  const inBlock = new Set(writeTools().map((t) => t?.function?.name).filter(Boolean));
   const readTools = new Set([...(/const _READ_TOOLS = \[[^\]]*\]/.exec(SRC)[0].matchAll(/"([a-z_0-9]+)"/g))].map((m) => m[1]));
   const trapped = [...inBlock].filter((n) => readTools.has(n)).sort();
   assert.deepEqual(trapped, [],
