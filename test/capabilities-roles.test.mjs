@@ -9,6 +9,7 @@
 //   2. 声明的工具矩阵真的到了子智能体手里（否则 design 角色打不开浏览器）
 //   3. 模型**知道**这个角色存在（枚举里没有的角色，它永远不会选）
 import { readFileSync } from "node:fs";
+import { roleCapabilities } from "../src/agent/subagent-roles.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -59,13 +60,10 @@ test("声明的提示词真的进了子智能体的角色段", () => {
 });
 
 test("声明的工具矩阵真的到了子智能体手里，而写错的工具名被挡掉", () => {
-  const caps = new Function(
-    "_userRoleMap", "_ROLE_CAPABILITIES", "_ROLE_CAPABILITIES_READ",
-    `${extractFn("_roleCapabilities")}\n;return _roleCapabilities;`,
-  )((() => roleMapWith(DECL)), { frontend: { tools: ["browser"], types: ["browser"] } },
-    // 只读那半：这条用例验的是「用户声明的角色不能突破只读子体的工具边界」，
-    // 所以内置只读矩阵给一个不含 data 的真实子集就够。
-    { frontend: { tools: ["browser"], types: ["browser"] } });
+  // 角色策略已搬进 src/agent/subagent-roles.js —— 直接用产品代码。
+  // 用户自声明的角色表现在是**参数**（它要读工具注册表，留在 main.js 那边），
+  // 所以这里传进去就行，不用再往沙箱里注三张矩阵。
+  const caps = (role, write) => roleCapabilities(role, write, roleMapWith(DECL));
 
   const got = caps("data", true);
   assert.deepEqual(got.tools, ["db_query", "http_request"],
@@ -74,16 +72,16 @@ test("声明的工具矩阵真的到了子智能体手里，而写错的工具�
   // 只读子智能体照旧什么副作用工具都不给，用户声明也不能突破这条。
   assert.deepEqual(caps("data", false), { tools: [], types: [] });
   // 内置角色不受影响。
-  assert.deepEqual(caps("frontend", true).tools, ["browser"]);
+  // 内置角色不受影响（真表里 frontend 是 browser + generate_image）。
+  assert.deepEqual(caps("frontend", true).tools, ["browser", "generate_image"]);
 });
 
 test("没有任何声明时，角色行为和以前完全一样", () => {
   const empty = normalizeCapabilities({}, "");
-  const caps = new Function(
-    "_userRoleMap", "_ROLE_CAPABILITIES", "_ROLE_CAPABILITIES_READ",
-    `${extractFn("_roleCapabilities")}\n;return _roleCapabilities;`,
-  )(() => roleMapWith(empty), { frontend: { tools: ["browser"], types: ["browser"] } });
-  assert.deepEqual(caps("frontend", true).tools, ["browser"]);
+  // 这条验的是「一条声明都没有时」——所以传的是**空**角色表，不是 DECL。
+  const caps = (role, write) => roleCapabilities(role, write, roleMapWith(empty));
+  // 内置角色不受影响（真表里 frontend 是 browser + generate_image）。
+  assert.deepEqual(caps("frontend", true).tools, ["browser", "generate_image"]);
   assert.deepEqual(caps("data", true), { tools: [], types: [] });
 });
 
