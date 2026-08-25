@@ -14,6 +14,7 @@
 //
 // 这份文件按链条逐环钉：落点 → 发现 → 权限登记 → 面板 → 文案 → 当轮可见 → 常驻迁移。
 import { readFileSync } from "node:fs";
+import { normalizeFsPath, pathIdentity, pathIsAtOrUnder } from "../src/agent/paths.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -238,8 +239,13 @@ test("升级时按目录名把常驻 id 迁到技能库，只迁一次", () => {
 // ── ⑦ 面板与文案：说的落点要和真落点一致 ────────────────────────────────────
 
 test("面板按技能库判「已安装」，不再按当前工作区", () => {
-  const isInstalled = load("_skillIsLibraryInstalled",
-    ["_remote", "_toPosix", "_normalizeFsPath", "_pathIdentity", "_pathIsAtOrUnder", "_skillIsLibraryInstalled"]);
+  // 路径这一簇已搬进 src/agent/paths.js —— 从模块注入，不再从 main.js 抠。
+  // pathIdentity 收 remote 参数；这里按「本机、无远程」跑，和原来的语义一致。
+  const _local = { active: false, platform: "" };
+  const isInstalled = new Function(
+    "_normalizeFsPath", "_pathIdentity", "_pathIsAtOrUnder",
+    `${fnSource("_skillIsLibraryInstalled")}\n;return _skillIsLibraryInstalled;`,
+  )(normalizeFsPath, (x) => pathIdentity(x, _local), (a, b) => pathIsAtOrUnder(a, b, _local));
   const root = "/home/me/.mrdayone/skills";
   assert.equal(isInstalled({ baseDir: "/home/me/.mrdayone/skills/docx" }, root), true);
   assert.equal(isInstalled({ baseDir: "/repo/.mrdayone/skills/docx" }, root), false);
