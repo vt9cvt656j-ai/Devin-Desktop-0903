@@ -140,21 +140,34 @@ test("透明窗口所需的构建开关是开的", () => {
 test("桌面控制失败时会把真实的权限诊断带给模型", () => {
   // 光在 Rust 里算出诊断没用，得送到模型手上——否则用户听到的还是那句
   // 「去系统设置勾选 Mr. Day One」，而他看到的就是它已经勾着。
-  assert.match(SRC, /async function _desktopPermissionNote\(\)/, "必须有统一的诊断取用点");
-  assert.match(SRC, /backend\.invoke\("permission_status"\)/, "诊断要问系统 API，不能猜");
+  assert.match(SRC, /async function _desktopPermissionNote\(scope = "ax"\)/,
+    "必须有统一的诊断取用点，而且要**按能力分域**");
   const note = extractFn("_desktopPermissionNote");
+  assert.match(note, /backend\.invoke\("permission_advice", \{ scope \}\)/,
+    "诊断要问系统 API，而且要把 scope 带过去");
+  assert.doesNotMatch(note, /invoke\("permission_status"\)/,
+    "全量那份不能用在失败回执上：它只要三项缺一就出文案，而读屏/点击根本不需要屏幕录制——"
+    + "一次「ref 已过期」会被贴上一整段「去把屏幕录制移除再重加」，用户照做一遍问题还在");
   assert.match(note, /原样转述/, "要明确要求模型别把诊断改写成「请去打开开关」");
 
-  for (const [what, marker] of [
-    ["automation", 'return { type: "automation", path: _m, content: `[失败]'],
-    ["system", "[系统控制失败]"],
-    ["uiclick", '[失败] ui_click: ${message}'],
+  // 每一条失败路都要附诊断，而且**要传对域**。传错域不是"少提示"，是提示一件和这次
+  // 失败无关的事：截屏失败去查辅助功能、读屏失败去查屏幕录制，两种都支使用户做无用功。
+  for (const [what, marker, wantScope] of [
+    ["automation", 'return { type: "automation", path: _m, content: `[失败]', /_desktopPermissionNote\(_permScopeForMethod\(_m\)\)/],
+    ["system", "[系统控制失败]", /_desktopPermissionNote\("ax"\)/],
+    ["uiclick", '[失败] ui_click: ${message}', /_desktopPermissionNote\("ax"\)/],
   ]) {
     const at = RAW_SRC.indexOf(marker);
     assert.ok(at > 0, `找不到 ${what} 的失败返回`);
-    assert.match(SRC.slice(at - 400, at + 300), /_desktopPermissionNote\(\)/,
-      `${what} 失败时必须附上权限诊断`);
+    assert.match(SRC.slice(at - 400, at + 300), wantScope,
+      `${what} 失败时必须附上**这一域**的权限诊断`);
   }
+
+  // 分域函数本身要认得那三类，映射反了和不分域一样坏。
+  const scope = extractFn("_permScopeForMethod");
+  assert.match(scope, /screen\.capture[\s\S]*?return "capture"/, "截屏要归到屏幕录制那一域");
+  assert.match(scope, /mouse\.[\s\S]*?return "input"/, "合成键鼠要归到辅助功能那一域");
+  assert.match(scope, /return "ax"/, "其余（读屏 / 按 ref 操作 / system）归 AX 域");
 });
 
 // 解释某段代码为什么被删的注释，往往会把被删的原文照抄一遍——那会让
@@ -218,7 +231,8 @@ test("system 失败不再无条件叫用户去勾一个已经勾着的开关", (
   const region = stripJsComments(SRC.slice(at - 900, at + 400));
   assert.doesNotMatch(region, /勾选 Mr\. Day One 后重启/,
     "这句话在授权已失效时是错的：开关本来就勾着，重勾无效，只会把用户引向死路");
-  assert.match(region, /_desktopPermissionNote\(\)/, "取而代之的必须是真实诊断");
+  assert.match(region, /_desktopPermissionNote\("ax"\)/,
+    "取而代之的必须是真实诊断，而且是 AX 那一域——system.* 和屏幕录制无关");
 });
 
 test("启动后有一个能点的授权入口", () => {

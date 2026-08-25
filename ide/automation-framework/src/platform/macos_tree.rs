@@ -20,6 +20,7 @@
 use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
+use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use std::ptr;
 
@@ -65,6 +66,24 @@ pub struct AxNode {
     pub w: i32,
     pub h: i32,
     pub enabled: bool,
+}
+
+/// 网页加载状态。**只有前台是浏览器（树里有 WebArea）时才有。**
+///
+/// 可访问性树只反映**此刻**渲染出来的东西。页面还在加载时读到的就是半个页面，而
+/// 一个加载了一半的页面和一个加载完的短页面在结果里长得一模一样——模型会把
+/// 「还没渲染出来」当成「这页没有这个按钮」，然后基于这句假话往下决策。
+/// JXA 那条老路一直在顺路读它；快路上线时漏了，而快路现在是 macOS 的默认路。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PageState {
+    pub title: String,
+    pub loaded: bool,
+    pub progress: f64,
+}
+
+unsafe fn attr_f64(el: AXUIElementRef, name: &str) -> Option<f64> {
+    let v = copy_attr(el, name)?;
+    v.downcast::<CFNumber>().and_then(|n| n.to_f64())
 }
 
 unsafe fn copy_attr(el: AXUIElementRef, name: &str) -> Option<CFType> {
@@ -154,11 +173,22 @@ unsafe fn walk(
     cap: usize,
     out: &mut Vec<AxNode>,
     handles: &mut Vec<(u32, AXUIElementRef, AxNode)>,
+    page: &mut Option<PageState>,
 ) {
     if out.len() >= cap || depth > 24 {
         return;
     }
     let role = attr_string(el, "AXRole").unwrap_or_default();
+    // 加载状态挂在 AXWebArea 上，顺路读掉——只读第一个，不为它额外遍历一遍树。
+    // 放在尺寸过滤**之前**：WebArea 本身可能被判成尺寸退化而不进清单，但它的
+    // 加载状态照样有效，漏在过滤后面会让整条提醒在部分页面上静默消失。
+    if page.is_none() && role == "AXWebArea" {
+        *page = Some(PageState {
+            title: attr_string(el, "AXTitle").unwrap_or_default().chars().take(120).collect(),
+            loaded: attr_bool(el, "AXLoaded").unwrap_or(false),
+            progress: attr_f64(el, "AXLoadingProgress").unwrap_or(0.0),
+        });
+    }
     let (x, y) = attr_point(el, "AXPosition").unwrap_or((0, 0));
     let (w, h) = attr_size(el, "AXSize").unwrap_or((0, 0));
     // 尺寸退化的元素点不到，收进来只会挤掉真能点的（末尾有 cap 截断）。
@@ -193,7 +223,7 @@ unsafe fn walk(
         for i in 0..n {
             let c = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
             if !c.is_null() {
-                walk(c, depth + 1, cap, out, handles);
+                walk(c, depth + 1, cap, out, handles, page);
             }
             if out.len() >= cap {
                 break;
@@ -223,7 +253,7 @@ pub fn frontmost_pid() -> Option<i32> {
 ///
 /// 只走用户真看得见、真点得到的窗口：跳过最小化的和尺寸退化的（浏览器会挂 1x1 的
 /// 隐藏工具窗），主窗口排最前——被 cap 截断时先留它。
-pub fn snapshot(pid: i32, cap: usize) -> Vec<AxNode> {
+pub fn snapshot(pid: i32, cap: usize) -> (Vec<AxNode>, Option<PageState>) {
     snapshot_inner(pid, cap, true)
 }
 
@@ -236,17 +266,18 @@ pub fn snapshot(pid: i32, cap: usize) -> Vec<AxNode> {
 ///
 /// 这条路走同一套遍历，末尾把 walk 里 retain 过的句柄逐个放掉（不放就是泄漏），
 /// 只交出可读文本。**它不产生 ref，也不销毁 ref。**
-pub fn snapshot_probe(pid: i32, cap: usize) -> Vec<AxNode> {
+pub fn snapshot_probe(pid: i32, cap: usize) -> (Vec<AxNode>, Option<PageState>) {
     snapshot_inner(pid, cap, false)
 }
 
-fn snapshot_inner(pid: i32, cap: usize, keep_handles: bool) -> Vec<AxNode> {
+fn snapshot_inner(pid: i32, cap: usize, keep_handles: bool) -> (Vec<AxNode>, Option<PageState>) {
     let mut out = Vec::new();
+    let mut page: Option<PageState> = None;
     let mut handles: Vec<(u32, AXUIElementRef, AxNode)> = Vec::new();
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return out;
+            return (out, page);
         }
         // 卡死的应用不能把整次读取拖死。
         AXUIElementSetMessagingTimeout(app, 2.0);
@@ -302,7 +333,7 @@ fn snapshot_inner(pid: i32, cap: usize, keep_handles: bool) -> Vec<AxNode> {
             for i in order.into_iter().take(5) {
                 let w = CFArrayGetValueAtIndex(arr, i) as AXUIElementRef;
                 if !w.is_null() {
-                    walk(w, 0, cap, &mut out, &mut handles);
+                    walk(w, 0, cap, &mut out, &mut handles, &mut page);
                 }
                 if out.len() >= cap {
                     break;
@@ -321,7 +352,7 @@ fn snapshot_inner(pid: i32, cap: usize, keep_handles: bool) -> Vec<AxNode> {
             unsafe { CFRelease(el as CFTypeRef) };
         }
     }
-    out
+    (out, page)
 }
 
 #[cfg(test)]
@@ -335,7 +366,7 @@ mod tests {
         let pid: i32 = std::env::var("AX_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         assert!(pid > 0, "用 AX_PID=<进程号> 指定目标");
         let t = std::time::Instant::now();
-        let nodes = super::snapshot(pid, 500);
+        let (nodes, _page) = super::snapshot(pid, 500);
         let ms = t.elapsed().as_millis();
         println!("原生 AX：{} 个元素，{} 毫秒", nodes.len(), ms);
         let mut roles: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -423,12 +454,31 @@ unsafe fn perform(el: AXUIElementRef, name: &str) -> bool {
 /// 支持的动作必须和 `ui_click` 放行的那一批**完全一致**。少一个的后果不是「那个动作用不了」，
 /// 而是它会退回 JXA 老路，而老路的 ref 是另一套编号（0 基、按控件类型分桶重排），
 /// 退回去必然点到别的元素上——比慢更糟。
-pub fn act(reference: u32, action: &str, value: Option<&str>) -> Result<serde_json::Value, String> {
+pub fn act(
+    reference: u32,
+    action: &str,
+    value: Option<&str>,
+    expect_pid: Option<i32>,
+) -> Result<serde_json::Value, String> {
     let g = HANDLES.lock().map_err(|_| "句柄表不可用".to_string())?;
     let map = g.as_ref().ok_or("还没有读过屏；先调 screen.elements")?;
     let held = map
         .get(&reference)
         .ok_or_else(|| format!("ref {reference} 不在最近一次读屏结果里；重新读一次"))?;
+
+    // 身份校验。`Held.pid` 一直存着却从没被读过，而 ui_click 的工具描述向模型明确保证
+    // 「目标不必在前台，身份由快照里记下的 pid 保证」。承诺落空的后果不是抽象的：
+    // 读屏读的是 A，中间句柄表被别的读屏换成了 B，动作就落到 B 的同序号元素上——
+    // 而签名校验拦不住（同名同位置的按钮在两个应用里长得一样），操作会静默打到别处。
+    if let Some(want) = expect_pid {
+        if want != held.pid {
+            return Err(format!(
+                "这个 ref 属于进程 {}，而这次动作要操作的是进程 {want}——中间有过一次\
+                 读屏把句柄表换掉了。重新 read_screen 再操作。",
+                held.pid
+            ));
+        }
+    }
 
     unsafe {
         // 先确认它还是原来那个东西。
@@ -731,21 +781,21 @@ mod act_tests {
     fn act_ref_resolves_and_detects_staleness() {
         let pid: i32 = std::env::var("AX_PID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         assert!(pid > 0, "用 AX_PID=<进程号> 指定目标");
-        let nodes = super::snapshot(pid, 200);
+        let (nodes, _page) = super::snapshot(pid, 200);
         assert!(!nodes.is_empty(), "先得读到东西");
 
         // 不存在的 ref 要说清楚，而不是崩或者点到别的东西上。
-        let bad = super::act(999_999, "press", None).unwrap_err();
+        let bad = super::act(999_999, "press", None, None).unwrap_err();
         assert!(bad.contains("不在最近一次读屏结果里"), "越界 ref 的说法不对：{bad}");
 
         // 不支持的动作同样要点名可用的是哪几个。
-        let wrong = super::act(1, "click", None).unwrap_err();
+        let wrong = super::act(1, "click", None, None).unwrap_err();
         assert!(wrong.contains("press") && wrong.contains("focus"), "不支持的动作没列出可用的：{wrong}");
 
         // 真正要验的：ref 1 的句柄还活着，回读得到、签名对得上。
         // 走 set_value 到一个多半不可写的元素上——它会在**签名比对之后**才失败，
         // 所以只要报的不是「过期」就说明句柄和签名这一段是通的。
-        let r = super::act(1, "set_value", Some("__probe__"));
+        let r = super::act(1, "set_value", Some("__probe__"), None);
         match r {
             Ok(_) => println!("ref 1 可写，句柄链路通"),
             Err(e) => {

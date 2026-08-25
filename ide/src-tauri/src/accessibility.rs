@@ -307,9 +307,21 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
     if let Some(p) = pid.filter(|p| *p > 0) {
         args["pid"] = serde_json::json!(p);
     }
-    let out = crate::automation::automation_call("screen.elements".into(), args)
-        .await
-        .ok()?;
+    // 快路也要自带上限，理由和动作那条一样：automation_call 的 HTTP 客户端给的是
+    // **120 秒**（为 browser.* 等页面准备的）。读一棵树是百毫秒级的事，真等到几十秒
+    // 只意味着 sidecar 排在别的调用后面——而 sidecar 是单线程串行的，一次 browser.goto
+    // 最坏能占住一分钟。没有这一层，一次读屏会把整个智能体循环挂住两分钟。
+    //
+    // 超时按「快路没跑成」处理，自动落回 JXA 老路——那条路自己有 6 秒预算，
+    // 而且它是独立的 osascript 子进程，不排 sidecar 这条队。
+    const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+    let out = tokio::time::timeout(
+        READ_BUDGET,
+        crate::automation::automation_call("screen.elements".into(), args),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let arr = out.get("elements")?.as_array()?;
     let pid = out.get("pid").and_then(|v| v.as_i64()).unwrap_or(0);
     if pid <= 0 {
@@ -339,7 +351,11 @@ async fn native_snapshot_via_sidecar(pid: Option<i64>) -> Option<UiSnapshot> {
     Some(UiSnapshot {
         target: Some(AccessibilityTarget { pid, name }),
         elements,
-        page: None,
+        // 前台是浏览器时 sidecar 会顺路带回 AXWebArea 的加载状态。
+        // 这里原来硬写 None——于是「页面还在加载」那条提醒在快路上结构性失效，
+        // 而快路是 macOS 的默认路：模型读到半渲染的页面，却收不到任何提示，
+        // 于是把「还没渲染出来」当成「这页没有这个按钮」。
+        page: out.get("page").and_then(|v| serde_json::from_value(v.clone()).ok()),
         read_error: None,
     })
 }
@@ -643,7 +659,7 @@ pub async fn ui_click(
     // 回一句「辅助功能操作超时或无权限」，一个和真实原因毫无关系的理由。
     // 老路只在快路没跑成（sidecar 没起来 / 没权限 / 读回空）时才用得上。
     if binding.native {
-        return native_ax_action(&binding, &action, value.as_deref()).await;
+        return native_ax_action(&binding, &action, value.as_deref(), &expected_target).await;
     }
     let result = tauri::async_runtime::spawn_blocking(move || {
         perform_ax_action(&binding, &action, value.as_deref(), &expected_target)
@@ -662,8 +678,13 @@ async fn native_ax_action(
     binding: &AxRefBinding,
     action: &str,
     value: Option<&str>,
+    expected_target: &AccessibilityTarget,
 ) -> Result<serde_json::Value, String> {
-    let mut args = serde_json::json!({ "ref": binding.raw_ref, "action": action });
+    // pid 一起发下去。工具描述向模型保证「身份由快照里记下的 pid 保证，目标不必在前台」，
+    // 而 sidecar 那边的 Held.pid 此前只存不读——这句保证一直是空的。
+    let mut args = serde_json::json!({
+        "ref": binding.raw_ref, "action": action, "pid": expected_target.pid,
+    });
     if let Some(v) = value {
         args["value"] = serde_json::json!(v);
     }
@@ -1911,6 +1932,49 @@ return JSON.stringify({operated:operated,changed:changed});
         assert!(
             rs_body.contains("is_some_and(|s| !s.elements.is_empty())"),
             "快路判据和选快照的条件不再一致——读回空清单时会把 JXA 的 ref 标成快路来的"
+        );
+    }
+
+    /// 「页面还在加载」这条提醒，两条读屏路都必须给得出来。
+    ///
+    /// 它防的是一个很具体的错判：可访问性树只反映**此刻**渲染出来的东西，一个加载了
+    /// 一半的页面和一个加载完的短页面在结果里长得一模一样。没有这条提醒，模型会把
+    /// 「还没渲染出来」当成「这页没有这个按钮」，然后基于这句假话往下决策——而在浏览器上
+    /// 做自动化正是这条链最主要的用法。
+    ///
+    /// 曾经的实际状态：JXA 老路一直顺路读 AXWebArea 的 AXLoaded/AXLoadingProgress，
+    /// 而快路上线时把 page 硬写成了 None——于是这道防线在**默认路径**上静默失效，
+    /// 旁边的注释却还在描述它仍然生效。所以这里钉的是"快路没有把它写死成 None"。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn both_read_paths_can_report_page_loading() {
+        let src = prod_src();
+        let at = src
+            .find("async fn native_snapshot_via_sidecar(")
+            .expect("快路读屏不见了");
+        let end = src[at..]
+            .find("\n#[cfg(not(target_os = \"macos\"))]")
+            .map(|i| at + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("page: None"),
+            "快路又把 page 写死成 None 了——浏览器上读到半渲染页面时模型收不到任何提示"
+        );
+        assert!(
+            body.contains("get(\"page\")"),
+            "快路没有从 sidecar 的回执里取 page"
+        );
+
+        // 对端要真的发这个字段。只看本地这一半的话，sidecar 哪天不发了这边照样绿。
+        let rpc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../automation-framework/src/rpc.rs"),
+        )
+        .expect("读不到 sidecar 的 rpc.rs");
+        assert!(
+            rpc.contains("\"page\": page,"),
+            "sidecar 的 screen.elements 回执里没有 page 字段"
         );
     }
 

@@ -284,6 +284,38 @@ pub fn permission_status() -> PermissionStatus {
     }
 }
 
+/// 只针对**这次失败的操作真正需要的那几项**给建议。
+///
+/// 为什么不能直接用 permission_status().advice：那份是全量的，只要三项里缺任何一项就出文案。
+/// 而 read_screen / ui_click 根本不需要屏幕录制。于是一个「ref 已过期（位置从 100,200
+/// 移到 300,400）」这种完全正常的界面变动，会被贴上一整段「缺少『屏幕录制』权限，去系统
+/// 设置里移除再重加、然后完全退出重开」。用户照着做一遍，问题当然还在——真因是要重读一次屏。
+/// 这是这个仓库最忌讳的形态：一个**权威、具体、可执行、而且完全错误**的指示。
+///
+/// 做法是把不相关的那几项当成"已授权"喂进去，让 advice_text 自己判空。
+#[tauri::command]
+pub fn permission_advice(scope: String) -> String {
+    let accessibility = accessibility_granted();
+    let screen_recording = screen_recording_granted();
+    let apple_events = apple_events_granted();
+    let pinned = identity_pinned_to_build();
+    // 每一项列出**谁真的会卡在它上面**，改的时候照着这个改，别凭印象。
+    let (need_ax, need_capture, need_events) = match scope.as_str() {
+        // 截屏、录屏：只卡屏幕录制。
+        "capture" => (false, true, false),
+        // 合成鼠标键盘：只卡辅助功能。没有 AppleEvents 也照样能注入事件。
+        "input" => (true, false, false),
+        // 读屏 / 按 ref 操作 / system.*：卡辅助功能（AX 树）；JXA 那条兜底路还要 AppleEvents。
+        _ => (true, false, true),
+    };
+    advice_text(
+        accessibility || !need_ax,
+        screen_recording || !need_capture,
+        apple_events || !need_events,
+        pinned,
+    )
+}
+
 /// 弹出系统的辅助功能授权框，并返回弹框之后的状态。
 ///
 /// 这是"授权因重新构建而失效"的最省事出路：带 prompt 的检查会让 macOS 自己把本 App

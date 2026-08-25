@@ -36743,7 +36743,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
     { type: "function", function: { name: "performance_profile", description: "Analyse a front-end page's performance metrics and produce a report. It drives the browser to inject the Performance API for timing data and pairs that with screenshots to confirm the page's state. Good for tracking down slow loads and render jank. 【When to use】When a page stutters or loads slowly, run this first to get real timing data and locate the bottleneck — do not read the code and guess \"it is probably rendering\".", parameters: { type: "object", properties: { url: { type: "string", description: "Target page URL (must start with http://localhost or http://127.0.0.1)" }, metrics: { type: "string", enum: ["cpu", "memory", "both"], description: "What to monitor: cpu = CPU usage, memory = memory usage, both = both", default: "both" }, timeoutSeconds: { type: "number", description: "Timeout in seconds, default 30", default: 30 } }, required: ["url"] } } },
     { type: "function", function: { name: "openapi_parser", description: "Extract the list of usable endpoints from a Swagger/OpenAPI JSON specification. Accepts a local file path (starting with ./) or a public URL, and can output the endpoint list, the schema, JSON, or curl examples.", parameters: { type: "object", properties: { url: { type: "string", description: "File path or URL of the OpenAPI JSON specification (local paths start with ./, public ones with https/http)" }, outputFormat: { type: "string", enum: ["list", "schema", "client"], description: "Output format: list = one endpoint per line, schema = the full JSON as escaped text, client = a curl example template", default: "list" } }, required: ["url"] } } },
     { type: "function", function: { name: "read_screen", description: "Read the accessibility elements the frontmost application actually exposes (role, name, value, whether it is enabled, and screen coordinates). **A browser is one of those applications, and its tree includes the rendered page** — links, buttons, form fields and text, each with real screen coordinates. That is how you operate the user's own already-running browser, the one CDP cannot attach to: bring it to the front, read it here, then act by ref with ui_click — page links, buttons, text fields and dropdowns all expose real AX actions, so the reliable path involves no coordinates at all. Fall back to coordinate clicking only for what exposes no action. When the result is empty, do not guess why — the tool names the cause (missing permission / the read did not complete / every window minimized / the app genuinely exposes nothing). Only the last one means a retry is pointless; the rest are fixable, usually by bringing the window to the front and reading again. ocr=true is a macOS on-screen text-recognition fallback; an OCR ref is not an actionable AX node. **By default this reads the frontmost app — pass `app` (or `pid`) to read one that is NOT in front**, which is what you want whenever the front window is Mr. Day One itself, or when you must not steal focus from what the user is doing. ui_click then acts on that same app without bringing it forward.", parameters: { type: "object", properties: { ocr: { type: "boolean", description: "Set true only when the frontmost application has no accessibility tree; may require Screen Recording permission. Cannot be combined with app/pid — OCR photographs the screen, so it only ever covers the frontmost window." }, app: { type: "string", description: "Read THIS application instead of whichever one is in front. Match is exact-name-first, then case-insensitive substring (\"Chrome\" finds \"Google Chrome\"). If nothing matches you get an error naming the problem — it never silently falls back to the frontmost app. Use system window.list to see exact names." }, pid: { type: "integer", description: "Read the app with this process id. Wins over app when both are given." } }, required: [] } } },
-    { type: "function", function: { name: "ui_click", description: "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. Refs from one app are refused on another (pid + name are both checked), so a ref never lands on the wrong window. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "The element ref returned by read_screen" }, action: { description: "press = click, set_value = set the value, focus = focus it, scroll_to = scroll the element into view (the AX tree only covers the visible screen, so anything below the fold must be scrolled in before it can be read or pressed; note that scrolling invalidates every ref from the previous read — read_screen again after it)", type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick", "scroll_to"] }, value: { type: "string", description: "For set_value: the text to enter" } }, required: ["ref"] } } },
+    { type: "function", function: { name: "ui_click", description: "Perform press, set_value or focus on a real accessibility ref returned by read_screen. **This works on web page elements too** — a browser exposes its links, buttons, text fields and dropdowns as AX nodes that support a real press, so this is how you operate the user's own already-running browser (the one CDP cannot attach to) without touching a single coordinate. **The ref carries its own target**: if read_screen was pointed at a specific app, ui_click acts on that same app — it does NOT need to be in front, and pressing does not bring it forward. A ref carries the pid it was read from and is refused if the action would land on a different process, so it never operates the wrong app's window. Only direct manipulation of macOS AX nodes is supported; re-run read_screen after the interface changes, and OCR refs may not be passed in.", parameters: { type: "object", properties: { ref: { type: "integer", minimum: 0, description: "The element ref returned by read_screen" }, action: { description: "press = click, set_value = set the value, focus = focus it, scroll_to = scroll the element into view (the AX tree only covers the visible screen, so anything below the fold must be scrolled in before it can be read or pressed; note that scrolling invalidates every ref from the previous read — read_screen again after it)", type: "string", enum: ["press", "set_value", "focus", "increment", "decrement", "show_menu", "confirm", "cancel", "pick", "scroll_to"] }, value: { type: "string", description: "For set_value: the text to enter" } }, required: ["ref"] } } },
     {
       type: "function",
       function: {
@@ -36999,6 +36999,11 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
   // 占掉配额。和上面那段注释写下的意图正好相反——"don't even offer them there"。
   // 这份名单和执行器的 !inTauri 分支是两处手抄，下面那条测试逐个对账，防止再漏。,
+  // git 一族。它们的执行器此前**没有** !inTauri 开头，所以既没进这份名单，
+  // 也没被下面那条对账测试发现——网页版一直把 14 个 git 工具照常发给模型。
+  "git_status", "git_diff", "git_log", "git_show", "git_blame", "git_branch",
+  "git_commit", "git_push", "git_pull", "git_clone", "git_stash", "git_stash_list",
+  "git_stash_pop", "git_conflicts",
   "gh_pr_create",
   "gh_pr_view",
   "gh_pr_checks",
@@ -38064,6 +38069,27 @@ const _STRICT_MUTATING_TOOL_NAMES = new Set([
   "generate_image", "generate_3d", "generate_sound", "generate_music", "generate_voice",
   "auto_rig", "generate_motion", "generate_texture", "download_file", "download_asset",
   "automation", "ui_click", "db_query", "remote",
+  // 下面这十个的 type 在 src/agent/tool-policy.js 里**已经声明为有副作用**，却一直不在
+  // 这份名单里。两份清单键不一样（那边按 type，这边按工具名），所以谁也发现不了谁漏了。
+  //
+  // 漏掉的后果很具体：模型把工具调用写成文本（_parseTextToolCalls 那条兼容通道）且信封
+  // 被截断时，strict 那道闸只对名单里的工具生效。名单外的会被 _safeJsonLoose 松散修复
+  // 后照常执行——一个被截断的 browser eval / capture_replay（任意主机任意请求体）/
+  // docker_compose_up / create_project 就这么被"修好"成一次真实执行，而这条闸存在的
+  // 全部理由就是不让这种事发生。
+  //
+  // 反方向那批（git_commit / git_push / gh_pr_create / run_worker / remote）留着不动：
+  // 它们的 type 是 git / gh / worker / remote，而这些 type 底下**读写混装**
+  //（git_diff 和 git_commit 同为 type=git），type 级的声明表达不了这种粒度。
+  // 按工具名严格是对的，不是冗余。下面那个对账测试也照这个方向单向检查。
+  "browser", "capture_start", "capture_replay", "docker_compose_up", "create_project",
+  "schedule", "save_skill", "mcp_server", "research_project", "design_research",
+  // 这三个是补对账测试时才露出来的，而且是最重的三个——第一版解析器写成一条大正则，
+  // 恰好把它们的分支形状漏掉了，于是"没解析到"静默变成了"没有这个工具"，测试对它们恒绿。
+  //   computer      合成**真实鼠标键盘**，能开终端敲任意命令
+  //   system        切前台、点菜单、开应用
+  //   run_subagent  子智能体，能力上等于再开一整个会话
+  "computer", "system", "run_subagent",
 ]);
 
 function _mutatingToolArgIssue(name, rawArgs) {
@@ -40012,11 +40038,28 @@ async function _checkDesktopPermissionsOnStart() {
 // 显示的完全一致」——于是他去核对拼写，而真正的问题是系统根本没放行。更麻烦的是
 // 本地构建每次都换代码签名，授权会在系统设置的开关**仍然亮着**的情况下失效，
 // 不明说的话用户只会认为程序在撒谎。
-async function _desktopPermissionNote() {
+//
+// scope 决定问哪几项。**必须传**：全量那份只要三项缺一就出文案，而 read_screen /
+// ui_click 根本不需要屏幕录制——一次「ref 已过期」会被贴上一整段"去把屏幕录制移除
+// 再重加、然后完全退出重开"，用户照做一遍问题还在。那是一个权威、具体、可执行、
+// 而且完全错误的指示，比不给建议坏得多。
+//   "ax"      读屏 / 按 ref 操作 / system.*（辅助功能 + AppleEvents）
+//   "input"   合成鼠标键盘（只要辅助功能）
+//   "capture" 截屏录屏（只要屏幕录制）
+// automation/computer 的方法名 → 该问哪一域的权限。
+// 挑错域的后果不是"少提示"，是**提示一件和这次失败无关的事**：截屏失败去查辅助功能、
+// 读屏失败去查屏幕录制，两种都会把用户支去做一遍无用功。
+function _permScopeForMethod(method) {
+  const m = String(method || "");
+  if (m.startsWith("screen.capture") || m.startsWith("screen.record")) return "capture";
+  if (m.startsWith("mouse.") || m.startsWith("keyboard.") || m.startsWith("recorder.")) return "input";
+  return "ax";
+}
+
+async function _desktopPermissionNote(scope = "ax") {
   if (!inTauri) return "";
   try {
-    const st = await backend.invoke("permission_status");
-    const advice = String(st?.advice || "").trim();
+    const advice = String(await backend.invoke("permission_advice", { scope }) || "").trim();
     if (!advice) return "";
     return `\n\n⚠️ 系统权限诊断（请原样转述给用户，别改写成"请去打开开关"）：\n${advice}`;
   } catch { return ""; }
@@ -45025,6 +45068,12 @@ const _EXTERNAL_DATA_TYPES = new Set([
   // 于是链路是「网页/剪贴板里的一句指令 → 模型当成命令执行 → 键鼠 → 终端」，
   // 不是「多一条工具输出」。少这三个标记，模型没有任何依据把它们当材料而不是指令。
   "automation", "uiclick", "system",
+  // 又漏三条，都是**外部内容通道**，判据和上面完全一样：正文由项目之外的人写。
+  //   package_source        第三方依赖的源码与文档注释。npm/PyPI 上任何人都能发包，
+  //                         而"去读一下这个库怎么实现的"是最常见的用法之一。
+  //   qr                    二维码解出来的字符串——一张图片里藏一句指令，成本几乎为零。
+  //   search_game_assets    远端素材目录的标题和描述，同样是别人写的。
+  "package_source", "qr", "search_game_assets",
 ]);
 function _isExternalDataToolResult(type) {
   const t = String(type || "");
@@ -64246,12 +64295,12 @@ async function _executeToolStepInner(step, call, root, run) {
         res.className = "atc-result " + (ok ? "atc-result--ok" : "atc-result--err");
         res.textContent = ok ? `${call.action} 已执行` : "操作未执行";
         if (vp) vp.innerHTML = `<pre style="white-space:pre-wrap">${_escHtml(structured.slice(0, 4000))}</pre>`;
-        const _perm = ok ? "" : await _desktopPermissionNote();
+        const _perm = ok ? "" : await _desktopPermissionNote("ax");
         return { type: "uiclick", path: String(call.ref), materialEffect: ok, content: `${ok ? "ui_click 已执行" : "[失败] ui_click 未执行"}：\n${structured}${_perm}` };
       } catch (error) {
         const message = String(error?.message || error).slice(0, 360);
         res.className = "atc-result atc-result--err"; res.textContent = "操作失败";
-        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}${await _desktopPermissionNote()}` };
+        return { type: "uiclick", path: String(call.ref), content: `[失败] ui_click: ${message}${await _desktopPermissionNote("ax")}` };
       }
 
     } else if (call.type === "localdiscovery") {
@@ -65061,6 +65110,22 @@ async function _executeToolStepInner(step, call, root, run) {
       }
 
     } else if (call.type === "git") {
+      // 网页版没有 git 后端。**必须在这里就说清楚**，否则往下走会撞出一句假话：
+      // 模拟后端的通用 invoke 是 `async () => ({})`，于是 git_status 回一个空对象，
+      // is_repo 是 undefined，_gitResolveRepoContext 判成"不是仓库"，工具回执写
+      // 「当前工作区不是 Git 仓库（没有 .git）」——而同一份模拟后端里 gitStatus /
+      // gitCommit / gitBranches 都实现得好好的，左侧 git 面板照常显示分支和改动清单。
+      // 用户看着一个有分支有改动的面板，智能体却坚持这不是仓库，然后劝他 git init。
+      //
+      // 也不能反过来把 git 接到那批模拟实现上：网页版的文件系统是内存里的假的，
+      // 让智能体对着一个假仓库提交，比说"用不了"坏得多。
+      if (!inTauri) {
+        res.className = "atc-result atc-result--err"; res.textContent = "桌面专用";
+        return { type: "git", path: call.op || "", content:
+          "[不可用] git 需要 Mr. Day One 桌面版。网页版的工作区是内存里的模拟环境，没有真实仓库，"
+          + "所以 git 一族在这里全部不可用（左侧那个 git 面板显示的是演示数据）。"
+          + "\n需要真的动仓库就到桌面版；在这里可以继续读代码、改文件、讨论方案。" };
+      }
       const isClone = call.op === "clone";
       const gitRoot = root || rootPath || workspaceRoots[0] || "";
       if (!gitRoot && !isClone) { res.className = "atc-result atc-result--err"; res.textContent = "未打开工作区"; return { type: "git", path: call.op, content: "[ERROR] 未打开工作区，无法执行 git。" }; }
@@ -66056,7 +66121,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
         const _msg = String(e?.message || e);
         const _hint = /找不到 automation-server|未就绪/.test(_msg) ? "\n（首次用需在 ~/Desktop/自动化工具框架 里 `cargo build --release --features 'system browser' --bin automation-server`；正常我会自动拉起它。）" : "";
-        const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote() : "";
+        const _perm = _callDrivesDesktop(call) ? await _desktopPermissionNote(_permScopeForMethod(_m)) : "";
         return { type: "automation", path: _m, content: `[失败] ${_m}: ${_msg.slice(0, 300)}${_hint}${_perm}` };
       }
     } else if (call.type === "capture_start") {
@@ -67718,7 +67783,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       } catch (e) {
         const m = String(e?.message || e);
         res.className = "atc-result atc-result--err"; res.textContent = "失败";
-        const _perm = await _desktopPermissionNote();
+        // system.* 走的是 AX + AppleEvents，和屏幕录制无关。
+        const _perm = await _desktopPermissionNote("ax");
         // 权限诊断在手时就别再说那句"去勾选 Mr. Day One 后重启"了——用户看到的就是它已经
         // 勾着，那句话只会把他引向死路。诊断为空（权限齐全）时才谈目标软件的 UI 暴露问题。
         const _tail = /仅支持/.test(m)
