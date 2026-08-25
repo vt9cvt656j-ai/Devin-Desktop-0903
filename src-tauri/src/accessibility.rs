@@ -679,8 +679,18 @@ async fn native_ax_action(
     .await
     {
         Ok(r) => r,
+        // 超时只取消**我们这一头**。请求早就发出去了，sidecar 收到之后照样会执行——
+        // 所以不能说「没执行」，更不能建议直接重试：那会把同一个动作做第二遍
+        // （点两次、写两次值）。措辞必须把这件事说出来，模型才能决定是先去看结果还是重来。
+        //
+        // 超时的原因几乎总是**队头阻塞**而不是崩溃：sidecar 的 HTTP 服务单线程串行，
+        // 一次慢调用（browser.goto 最坏 60 秒、模型自己给毫秒数的 sleep、长回放）期间
+        // 后面全部排队。说成「服务卡住了」会把模型引向重启/重读，而正确的动作是等或者查。
         Err(_) => Err(format!(
-            "按 ref 操作超过 {} 秒没有回应——自动化服务卡住了。重新 read_screen 再试一次。",
+            "按 ref 操作等了 {} 秒还没轮到——自动化服务是单线程的，多半正在处理另一个\
+             自动化调用（浏览器导航、回放、sleep 都会占住它）。\
+             **这个动作可能已经执行了**：请求已经发出去，超时只是我们这头不等了。\
+             先 read_screen 看一眼界面现在是什么样，再决定要不要重发——直接重发会做第二遍。",
             ACT_BUDGET.as_secs()
         )),
     }
@@ -1209,9 +1219,15 @@ fn build_ax_action_script(
     value: Option<&str>,
     expected_target: &AccessibilityTarget,
 ) -> Result<String, String> {
+    // 这份白名单必须覆盖 ui_click 放行的**全部**动作，否则脚本里写好的实现根本走不到。
+    // scroll_to 就漏在这里过：AX_ACTION_JS 里那段 AXScrollToVisible 实现完整写着，
+    // 但请求先被这里拦成 "unsupported accessibility action" —— 读起来是「这个动作不存在」，
+    // 而模型刚被工具描述告知 scroll_to 是把折叠以下的元素滚进视区的唯一手段。
+    // 于是它断定这个界面滚不动，转去盲滚坐标。走到这条兜底路的四种情形
+    //（sidecar 没起来 / 没编出来 / 没权限 / 快路读回空）恰恰是最需要它能用的时候。
     let act = match action {
         "set_value" | "focus" | "press" | "increment" | "decrement" | "show_menu" | "confirm"
-        | "cancel" | "pick" => action,
+        | "cancel" | "pick" | "scroll_to" => action,
         _ => return Err("unsupported accessibility action".to_string()),
     };
     let context = serde_json::json!({
@@ -1934,11 +1950,42 @@ return JSON.stringify({operated:operated,changed:changed});
         let act_src = std::fs::read_to_string(&act_path)
             .unwrap_or_else(|e| panic!("读不到 {}：{e}", act_path.display()));
         let at = act_src.find("pub fn act(").expect("act() 不见了");
-        let body = &act_src[at..];
+        // 必须**切到 act() 结束**，不能一路取到文件尾。取到文件尾的话，同一文件里
+        // `#[cfg(test)] mod tests` 中的 `super::act(999_999, "press", None)` 之类会把
+        // 断言喂绿：删掉 act() 里的 "press" 分支，测试代码里那个字符串仍在，门照样过。
+        // 实测过——show_menu 只在实现里出现，删了会红；press/focus/set_value 在测试里
+        // 也出现，删了不红。同一个测试对最常用的三个动作是瞎的，那才是最坏的一种。
+        let body_end = act_src[at..]
+            .find("\n#[cfg(test)]")
+            .or_else(|| act_src[at..].find("\n/// 只读**这一个**元素的签名"))
+            .map(|i| at + i)
+            .expect("找不到 act() 的结尾；切片判据要跟着代码结构改");
+        let body = &act_src[at..body_end];
 
+        // 老路（JXA）那份白名单也要覆盖全部动作。漏一个的后果和快路漏一个不同但一样坏：
+        // 请求在 build_ax_action_script 里就被拦成 "unsupported accessibility action"，
+        // 而脚本里的实现明明写着——模型收到的是「这个动作不存在」这句假话。
+        // scroll_to 就这么漏了一段时间。
+        let wl_start = src
+            .find("let act = match action {")
+            .expect("JXA 那份动作白名单不见了");
+        let wl_end = src[wl_start..].find("};").expect("白名单没有收尾") + wl_start;
+        let whitelist = &src[wl_start..wl_end];
         for action in &allowed {
             assert!(
-                body.contains(&format!("\"{action}\"")),
+                whitelist.contains(&format!("\"{action}\"")),
+                "JXA 兜底路的白名单漏了「{action}」——脚本里有实现也走不到，\
+                 模型会收到一句「这个动作不存在」的假话"
+            );
+        }
+
+        for action in &allowed {
+            // 钉的是**match 分支的形状**（`"press" =>`），不是"这个字符串在 act() 里出现过"。
+            // 后者是空门：每个分支的回执 JSON 里都写着 `"action": "press"`，把分支删掉
+            // 那个字符串照样在，断言照样绿。实测过——只删 `"press" => {` 这一行，
+            // 旧判据一声不吭。直接分支和映射表（`"increment" => "AXIncrement"`）都是这个形状。
+            assert!(
+                body.contains(&format!("\"{action}\" =>")),
                 "快路的 act() 不认得「{action}」——这个动作会退回 JXA 老路，\
                  而老路的 ref 是另一套编号，退回去会点到别的元素上"
             );

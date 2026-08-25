@@ -67,30 +67,64 @@ fn server_bin() -> Option<std::path::PathBuf> {
 ///
 /// 现在改成挑战应答：我们发一个随机 nonce（明文，不是凭据），sidecar 回
 /// SHA-256("<token>:<nonce>")。只有真持有 token 的一方算得出来，而 token 从不出本进程。
+/// 探测结果必须分三态，不能只有真假。
+///
+/// sidecar 的 HTTP 服务是**单线程串行**的（`for stream in listener.incoming()`），一条慢调用
+/// 期间 `/health` 的连接只是躺在内核 accept 队列里，永远等不到应答。二态探测会把这种
+/// 「正忙」判成「没起来」，然后走到下面那条看门狗——**SIGKILL 掉整个进程组**，
+/// 连它拉起的浏览器一起。用户那边看到的是「automation-server 启动后未就绪」和
+/// 「调用自动化服务失败」，两条理由都是假的：真凶是自己的看门狗杀了一个健康的服务。
+///
+/// 判据是 TCP 连得上连不上：连接被拒 = 真没起来；连上了但不答 = 活着，在忙。
+#[derive(PartialEq, Debug)]
+enum Health {
+    /// 答对了挑战。
+    Ok,
+    /// 连得上但没在预算内答话——单线程服务正在处理别的调用。**活着，别杀。**
+    Busy,
+    /// 连不上，或答错了挑战。
+    Down,
+}
+
 async fn health_ok() -> bool {
+    health_probe().await == Health::Ok
+}
+
+async fn health_probe() -> Health {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_millis(600))
         .build()
     {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return Health::Down,
     };
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let expected = health_challenge_response(AUTOMATION_TOKEN.as_str(), &nonce);
-    let Ok(resp) = client
+    let resp = match client
         .get(format!("http://127.0.0.1:{PORT}/health"))
         .header("x-automation-nonce", &nonce)
         .send()
         .await
-    else {
-        return false;
+    {
+        Ok(r) => r,
+        // 超时 = 连上了但没答话 = 服务活着、正忙。连接类错误才是真的没起来。
+        Err(e) if e.is_timeout() => return Health::Busy,
+        Err(_) => return Health::Down,
     };
     if !resp.status().is_success() {
-        return false;
+        return Health::Down;
     }
-    let Ok(body) = resp.text().await else { return false };
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) if e.is_timeout() => return Health::Busy,
+        Err(_) => return Health::Down,
+    };
     // 常量时间比较：这条路每次失败都会重试，时序差异是可观测的。
-    constant_time_eq(body.trim().as_bytes(), expected.as_bytes())
+    if constant_time_eq(body.trim().as_bytes(), expected.as_bytes()) {
+        Health::Ok
+    } else {
+        Health::Down
+    }
 }
 
 /// 和 sidecar 侧 `health_challenge_response` 必须逐字节一致（automation-framework/src/rpc.rs）。
@@ -131,8 +165,14 @@ static AUTOMATION_TOKEN: std::sync::LazyLock<String> =
 
 /// 确保服务在跑：健康就直接用；否则 spawn 一个、等它就绪（最多 ~4s）。
 async fn ensure_server() -> Result<(), String> {
-    if health_ok().await {
-        return Ok(());
+    match health_probe().await {
+        Health::Ok => return Ok(()),
+        // 正忙就直接放行。**不能等，更不能杀**：这条调用自己会在服务空出来时被处理，
+        // 而调用方各自带着预算（screen.act 6 秒、HTTP 客户端 120 秒）。
+        // 原来这里把「忙」和「没起来」混成一个 false，于是后台每两秒一次的读屏轮询
+        // 撞上一个几十秒的 browser.goto 时，会把 sidecar 连同前台正在用的浏览器一起 SIGKILL。
+        Health::Busy => return Ok(()),
+        Health::Down => {}
     }
     {
         // spawn 是同步且很快的；MutexGuard 不 Send，必须在任何 await 之前 drop。
@@ -188,8 +228,11 @@ async fn ensure_server() -> Result<(), String> {
         }
     }
     for _ in 0..40 {
-        if health_ok().await {
-            return Ok(());
+        match health_probe().await {
+            Health::Ok => return Ok(()),
+            // 起来了、已经在干活了。同样不能杀。
+            Health::Busy => return Ok(()),
+            Health::Down => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

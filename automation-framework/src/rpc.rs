@@ -366,13 +366,27 @@ impl RpcServer {
         }
     }
 
-    /// 屏幕相关的三个方法：**不碰 agent，所以在拿锁之前就地处理掉。**
+    /// 屏幕相关的三个方法：不碰 agent，所以在拿锁之前就地处理掉。
     ///
-    /// 原来它们是普通的 match 分支，各自开头 `drop(agent)`。但 `execute_method` 一进来就
-    /// 无条件 `self.agent.lock()`，于是"进门先排队"这件事已经发生了——一次挂住的
-    /// browser.* 调用（它整场都握着这把锁）会把 screen.elements / screen.act 一起堵在
-    /// 门外。而这两条恰恰是读屏和按 ref 操作的快路：用户看到的症状是"整个自动化都卡住了"，
-    /// 而不是"那一个浏览器操作慢"。分流放在锁前面，这两条就不再受浏览器影响。
+    /// **先把上一版注释的错更正掉。** 那一版写着「一次挂住的 browser.* 整场握着这把锁，
+    /// 把 screen.* 堵在门外，分流之后这两条就不再受浏览器影响」——**这句话是假的**，
+    /// 而且它假得很危险：下一个人会照它把浏览器排除掉，去别处找卡死的原因。
+    ///
+    /// 真相是这个服务**根本没有并发**：`serve_http_blocking` 是
+    /// `for stream in listener.incoming() { handle_conn(&s) }`，单线程、一次一条连接，
+    /// 整个 crate 一个 `thread::spawn` 都没有（Agent 带 macOS !Send 句柄，本来就必须
+    /// 钉在一条线程上）。于是这把 Mutex 从来只有一个线程去 lock，**从来没有被争用过**。
+    /// 排队发生在比锁早一层的地方：内核的 accept 队列——第二个请求连从 socket 读出来
+    /// 都还没有，谈不上等锁。所以「先分流再拿锁」对那个症状是个空动作。
+    ///
+    /// 那为什么还留着分流？它买到的是另一件事，小但真实：`self.agent.lock().unwrap()`
+    /// 在 mutex 中毒时会 panic，而中毒会连环 panic 掉整个 sidecar。分流之后 screen.*
+    /// 不受中毒牵连。仅此而已——**不要再把它当成"浏览器不再堵读屏"的修复**。
+    ///
+    /// 真正的队头阻塞还在，而且不限于浏览器：任何慢方法（recorder.replay、
+    /// 长文本 keyboard.type、模型自己给毫秒数的 sleep{ms}）都会把后面全部堵住。
+    /// 要修得让这个服务能并发处理连接，而那受限于 Agent 的 !Send —— screen.* 不碰
+    /// Agent，是唯一可以先拆出去的一族。
     #[cfg(all(feature = "system", target_os = "macos"))]
     fn screen_method(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         match method {
@@ -446,7 +460,8 @@ impl RpcServer {
     }
 
     fn execute_method(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        // 先分流，再拿锁。顺序不能反：lock() 本身就要排队，反过来写等于没分流。
+        // 分流放在拿锁之前。注意这**不是**为了躲开锁争用（这个服务单线程，锁从不被争用），
+        // 而是为了让 screen.* 不受 agent mutex 中毒的牵连。详见 screen_method 上面那段。
         #[cfg(all(feature = "system", target_os = "macos"))]
         if matches!(method, "screen.elements" | "screen.probe" | "screen.act") {
             return Self::screen_method(method, params);
