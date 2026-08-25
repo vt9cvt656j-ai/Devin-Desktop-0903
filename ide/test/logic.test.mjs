@@ -8,6 +8,13 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+// 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
+// 不再从 main.js 源码里抠函数文本。
+import {
+  smRunToken as _mlRunToken,
+  drainSubAgentCollaborationInbox as _mlDrain,
+  broadcastMainAgentFinding as _mlBroadcast,
+} from "../src/agent/mainlink.js";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { basename, dirname, join } from "node:path";
@@ -23255,7 +23262,7 @@ test("shared_store collaboration delivers bounded unseen sibling findings to a c
     ] }],
   ]);
   const store = { get: (key, fallback) => records.get(key) ?? fallback };
-  const drain = load("_drainSubAgentCollaborationInbox");
+  const drain = _mlDrain;
   const first = drain(store, 2, 0, 6, 1600);
   assert.equal(first.cursor, 3, "the cursor must advance over local and external records exactly once");
   assert.match(first.message, /sm_1: first concrete finding/);
@@ -23357,8 +23364,12 @@ test("_runSubAgent builds enhanced context via CollaborationEngine for collabora
 });
 
 test("_broadcastMainAgentFinding propagates to shared knowledge for active collaboration sessions", () => {
-  const broadcast = extractFn("_broadcastMainAgentFinding");
-  assert.match(broadcast, /collaborationEngine\.addSharedKnowledge\(run\._collabSession/,
+  // 函数已搬进 src/agent/mainlink.js。import 保证它存在且名字没变（改名会编译期报错），
+  // 这里再钉它确实把主体的发现同步进协同会话的共享知识——只 import 不钉的话，
+  // 函数还在、这条链断了也发现不了。
+  const ml = readFileSync(new URL("../src/agent/mainlink.js", import.meta.url), "utf8");
+  assert.equal(typeof _mlBroadcast, "function", "mainlink 没有导出 broadcastMainAgentFinding");
+  assert.match(ml, /addSharedKnowledge\(run\._collabSession/,
     "main agent findings must be propagated to shared knowledge for running sub-agents");
 });
 
@@ -26054,7 +26065,7 @@ test("退出 App 时浏览器也要收——这张单子上原来只差它一个
 // 标签页各自派并行子智能体，双方都产出 sm_1 / sm_2。
 
 test("两个 run 的同号作业不共用一个黑板键", () => {
-  const token = load("_smRunToken", { _smRunTokenSeq: 0 });
+  const token = _mlRunToken;
   const a = {}, b = {};
   assert.notEqual(token(a), token(b), "两个 run 拿到了同一个前缀");
   assert.equal(token(a), token(a), "同一个 run 每次要拿到同一个前缀，否则前后写的键对不上");
@@ -26078,7 +26089,7 @@ test("派发、状态回写、同伴广播、主体广播——四处用的是�
   assert.match(SRC, /jobId: storeId,/, "collaboration.jobId 就是黑板键，必须传带前缀的那个");
   assert.match(SRC, /_smJobs\.push\(storeId\);/, "同伴名单里也得是带前缀的键");
   // 主体→子体那条广播遍历的是 run 内的 Map，键得自己拼前缀。
-  assert.match(SRC, /store\.appendFinding\(`sm_\$\{_token\}_\$\{jobId\}`/);
+  assert.match(readFileSync(new URL("../src/agent/mainlink.js", import.meta.url), "utf8"), /store\.appendFinding\(`sm_\$\{_token\}_\$\{jobId\}`/);
   // 裸键一个都不该再有。
   assert.doesNotMatch(SRC, /_globalSharedStore\.(?:set|updateJobStatus)\(`(?:jobs\.)?sm_\$\{jobId\}`/,
     "还有地方在用不带 run 前缀的裸键");
@@ -26319,7 +26330,7 @@ test("共享知识广播要给人看得懂的正文，不是丢个对象过去",
   // 写入端补上 content
   assert.match(ce, /content: `\$\{key\}：\$\{typeof value === 'string' \? value : JSON\.stringify\(value\)\}`/);
   // 读取端兜底：任何情况下都不该吐出 [object Object]
-  const drain = load("_drainSubAgentCollaborationInbox");
+  const drain = _mlDrain;
   const store = {
     get: () => ({
       findings: [
@@ -26336,11 +26347,18 @@ test("共享知识广播要给人看得懂的正文，不是丢个对象过去",
 
 test("新派的子智能体拿到的是同伴**最新**的发现，不是最旧的", () => {
   const ce = readFileSync(new URL("../src/agent/collaboration-engine.js", import.meta.url), "utf8");
-  // collectRelatedFindings 末尾按 timestamp 降序排（新的在前）
-  assert.match(ce, /return allFindings\.sort\(\(a, b\) => \(b\.timestamp \|\| 0\) - \(a\.timestamp \|\| 0\)\);/);
-  // 对降序数组取 slice(-10) 拿到的是**最旧**的 10 条——注释还写着"最新 10 条"，正好相反
+  // collectRelatedFindings 末尾按 **seq 优先、timestamp 兜底** 降序排（新的在前）。
+  // 只按 timestamp 排定不了序：Date.now() 是毫秒分辨率，而子体一轮里连写十几条发现是
+  // 常态，它们 timestamp 完全相同 → sort 稳定 → 保持插入顺序（升序）→ 下游按"降序"
+  // 取前 N 条拿到的正好是最旧的。seq 是写入端的单调计数，同一毫秒也能定序。
+  assert.match(ce, /if \(Number\.isFinite\(sa\) && Number\.isFinite\(sb\) && sa !== sb\) return sb - sa;/,
+    "排序没有按 seq 定序——同一毫秒写入的发现会退回插入顺序，'最新 N 条'又变成最旧的");
+  assert.match(ce, /return \(b\.timestamp \|\| 0\) - \(a\.timestamp \|\| 0\);/, "timestamp 兜底不见了");
+  // 取前 N 条 = 最新 N 条。**两处**都要：正常那条和上下文超预算的裁剪分支。
   assert.match(ce, /enhanced\.relatedFindings = relatedFindings\.slice\(0, 10\);/);
-  assert.doesNotMatch(ce, /relatedFindings\.slice\(-10\)/, "又取回最旧的那批了");
+  assert.match(ce, /enhanced\.relatedFindings\.slice\(0, 5\)\.map/,
+    "裁剪分支又取回最旧的那批了——降级本来就有损，但不该反着损");
+  assert.doesNotMatch(ce, /relatedFindings\.slice\(-\d/, "又取回最旧的那批了");
 });
 
 // ══ 子智能体：看得见的工具必须真的能调 ═════════════════════════════════════
