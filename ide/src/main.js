@@ -21976,6 +21976,29 @@ const _GIT_MUTATING_OPS = new Set(["clone", "commit", "push", "pull", "stash", "
 // computer 工具的合法动作。**唯一一份**：schema 的 enum、映射层的白名单、以及报错时
 // 那句「可用的是：…」以前是三处手抄，漏了 mouse.position——模型照 schema 调，撞一句
 // 「不支持的动作」，还附一份同样漏掉它的清单，于是认定读不到指针位置。
+// sidecar（automation-framework/src/rpc.rs）**真正实现**的方法全集。
+//
+// automation 此前零校验直通后端：方法名写错会一路打到 sidecar 才失败，而那边回的是
+// 一句底层错误，模型拿不到"可用的是这些"这份清单，只能猜下一个名字再来一轮。
+// computer 走 _COMPUTER_METHODS 校验、不认识就报 invalidMethod（全文件唯一产地），
+// 于是同一个笔误在两个入口上的代价差着好几轮往返。
+//
+// 这份是**超集**：computer 是它里面挑出来的、不含 browser.* / recorder.* / sleep 的
+// 那一档（那几族有自己的专用工具，或者会让模型拿它当 sleep 用）。
+const _AUTOMATION_METHODS = [
+  "mouse.click", "mouse.double_click", "mouse.triple_click", "mouse.down", "mouse.up",
+  "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
+  "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up",
+  "keyboard.hold", "keyboard.paste",
+  "screen.info", "screen.displays", "screen.capture", "screen.elements", "screen.probe", "screen.act",
+  "clipboard.get", "clipboard.set",
+  "window.list", "window.activate", "window.minimize", "window.restore",
+  "recorder.save", "recorder.list", "recorder.replay",
+  "browser.start", "browser.goto", "browser.click", "browser.type", "browser.wait",
+  "browser.eval", "browser.content", "browser.screenshot", "browser.close",
+  "system.init", "system.open", "sleep",
+];
+
 const _COMPUTER_METHODS = [
   "mouse.click", "mouse.double_click", "mouse.triple_click", "mouse.down", "mouse.up", "mouse.move", "mouse.position", "mouse.drag", "mouse.scroll",
   "keyboard.type", "keyboard.press", "keyboard.combo", "keyboard.down", "keyboard.up", "keyboard.hold", "keyboard.paste",
@@ -38914,7 +38937,15 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
       captureMode: String(args.mode || args.capture_mode || "auto"),
       systemProxy: Object.prototype.hasOwnProperty.call(args, "system_proxy") ? !!args.system_proxy : undefined,
     };
-    case "automation": return { type: "automation", method: String(args.method || ""), params: (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {} };
+    case "automation": {
+      // 和 computer 走同一道校验。原来这里零校验直通：方法名写错会打到 sidecar 才失败，
+      // 模型收到的是一句底层错误、拿不到可用清单，只能猜下一个名字再来一轮。
+      const _m = String(args.method || "").trim();
+      const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {};
+      if (!_m) return { type: "automation", via: "automation", method: "", invalidMethod: "(空)" };
+      if (!_AUTOMATION_METHODS.includes(_m)) return { type: "automation", via: "automation", method: "", invalidMethod: _m };
+      return { type: "automation", via: "automation", method: _m, params: _p };
+    }
     case "capture_flows": return { type: "capture_flows", filter: String(args.filter || "").toLowerCase(), limit: Number.isFinite(+args.limit) ? +args.limit : 30, includeBody: args.include_body !== false };
     case "capture_stop": return { type: "capture_stop" };
     case "background_monitor": {
@@ -39022,7 +39053,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
         uploadPaths: Array.isArray(args.paths) ? args.paths : (args.path ? [args.path] : (args.file ? [args.file] : (args.files ? (Array.isArray(args.files) ? args.files : [args.files]) : []))),
       };
     }
-    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = _COMPUTER_METHODS; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
+    case "computer": { const _m = String(args.method || args.action || "").trim(); if (!_m) return { type: "automation", method: "screen.info", params: {} }; const _validMethods = _COMPUTER_METHODS; const _method = _validMethods.includes(_m) ? _m : null; if (!_method) return { type: "automation", via: "computer", method: "", invalidMethod: _m }; const _p = (args.params && typeof args.params === "object" && !Array.isArray(args.params)) ? args.params : {}; return { type: "automation", method: _method, params: _p }; }
     case "preview_choices": return { type: "preview", title: args.title || "选择方案", target: args.target || "", variants: Array.isArray(args.variants) ? args.variants : [] };
     case "visual_explain": return { type: "explain", title: args.title || "概念解释", prompt: args.prompt || "", summary: args.summary || "" };
     case "system": {
@@ -66094,8 +66125,13 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         res.className = "atc-result atc-result--err"; res.textContent = "不支持的动作";
         return { type: "automation", path: "", content:
           `[ERROR] 不支持的 method「${String(call.invalidMethod).slice(0, 60)}」——**这次什么都没做**（以前会静默降级成截图并报成功）。`
-          + `\n可用的是：${_COMPUTER_METHODS.join(" / ")}。`
-          + `\n组合键用 keyboard.combo，右键用 uiclick 或 browser 的 rightclick。` };
+          // 报**这个入口自己**的合法集合。两个入口的集合不一样（automation 是超集，
+          // 含 browser.* / recorder.* / sleep），报错时给错清单会把模型引向一个在
+          // 它这条路上根本不存在的方法，再白烧一轮。
+          + `\n可用的是：${(call.via === "automation" ? _AUTOMATION_METHODS : _COMPUTER_METHODS).join(" / ")}。`
+          // 右键早就支持了：mouse.click{button:"right"}。原来这句让人去换工具，
+          // 是在这条路本来就能做的事情上把模型支走。
+          + `\n组合键用 keyboard.combo；右键用 mouse.click{button:"right"}；按住修饰键点击用 {keys:["cmd"]}。` };
       }
       if (!_m) return { type: "automation", path: "", content: "[ERROR] automation 需要 method（如 browser.goto / mouse.click / recorder.replay）。" };
       try {
