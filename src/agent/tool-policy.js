@@ -232,6 +232,42 @@ function seed() {
     mutatesWorkspace: true,
     readOnlyModeBlocked: (call) => String(call?.action || "list") !== "list",
   });
+  /**
+   * git / gh 一直**没有登记**，于是这道门对它们从来没生效过。
+   *
+   * 两个类型底下都是读写混装的（git_diff 和 git_commit 同为 type "git"，
+   * gh_pr_view 和 gh_pr_create 同为 type "gh"），所以必须按调用判 op。
+   *
+   * git 的写操作**碰巧**够不着：它们躲在 `if (includeWrite)` 里，只读模式的注册表
+   * 里压根没有。但 **gh_pr_create / gh_pr_reply 在 includeWrite 之外**，是只读模式
+   * 87 条注册表里的正式成员，search_tools 装得进来。于是两种坏结局二选一：
+   *   · 走网关（默认）：网关的只读拒绝清单里有它们，于是它们从请求里**彻底消失**，
+   *     而模型上一轮刚被 search_tools 告知「已加载 gh_pr_create」——白烧一轮，
+   *     且模型无从得知发生了什么；
+   *   · 不走网关（自定义模型 / 自带 key）：客户端自己把 schema 塞进 body.tools，
+   *     网关那份清单完全不参与，而客户端这道门又不认 gh —— Explorer/Plan/Reviewer 下
+   *     模型可以**真的在 GitHub 上开 PR、回评论**，不可逆。
+   *
+   * 只读 op 照常放行：只读模式的价值就在于取证能力完整。
+   */
+  const GIT_READ_OPS = new Set(["status", "diff", "show", "log", "blame", "stash_list", "conflicts"]);
+  const gitWrites = (call) => !GIT_READ_OPS.has(String(call?.op || "status"));
+  defineTool("git", {
+    // **不登记 mutatesWorkspace。** 那个字段是 type 级的布尔，而 git 这个 type 底下
+    // 一多半是纯读取——把整个类型标成"会改工作区"，`git_status` 也会被算成一次改动，
+    // 于是 _toolMutatesWorkspace 对 `{op:"branch"}`（列分支）返回 true，
+    // 并行只读判定和验证义务全都跟着错。已有测试正面钉着这一点，试过一次，它是对的。
+    // "git branch 带名字才算动工作树" 这种粒度只能按调用判，_toolMutatesWorkspace
+    // 里本来就有那条规则。
+    needsApproval: gitWrites,
+    readOnlyModeBlocked: gitWrites,
+  });
+  const GH_READ_OPS = new Set(["pr_view", "pr_checks", "actions_log", "pr_review_comments"]);
+  defineTool("gh", {
+    // 不是改工作区，是改**外部世界**（GitHub 上的 PR 和评论），而且不可逆。
+    needsApproval: true,
+    readOnlyModeBlocked: (call) => !GH_READ_OPS.has(String(call?.op || "")),
+  });
   defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });

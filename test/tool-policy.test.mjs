@@ -76,6 +76,8 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
   assert.equal(mutatesWorkspace("saveskill"), false);
 });
 
+// gh 新增（2026-08-25）：它改的不是工作区，是**外部世界**——在 GitHub 上开 PR、回评论，
+// 不可逆。所以进审批集合而不是 workspaceMutating 集合。
 test("approval set matches the pre-refactor literal exactly", () => {
   assert.deepEqual(sorted(approvalTypes()), sorted(new Set([
     "write", "edit", "multiedit", "delete", "move", "mkdir", "copy", "format",
@@ -118,6 +120,12 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // research_project / design_research 照常放行（只读模式本来就靠它们干活），只有带
     // _wiki 的那次落盘被挡；出现在这个集合里只表示「至少有一种调用会被挡」。
     "subagent",
+      // 新增（2026-08-25）：gh —— 在 GitHub 上开 PR / 回评论，改的是外部世界且不可逆。
+    "gh",
+    // 新增（2026-08-25）：git —— 按 op 判，commit/push/stash/clone 要问，status/diff/log 不问。
+    // 「会改工作区就必须能问」那条不变量只豁免 worktree 一个，所以 git 登记了
+    // mutatesWorkspace 就必须同时登记 needsApproval。
+    "git",
   ])));
   // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
@@ -177,6 +185,11 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // research_project / design_research 照常放行（只读模式本来就靠它们干活），只有带
     // _wiki 的那次落盘被挡；出现在这个集合里只表示「至少有一种调用会被挡」。
     "subagent",
+      // 新增（2026-08-25）：git / gh 按调用判 op —— 两个类型底下读写混装
+    //（git_diff 和 git_commit 同为 type "git"，gh_pr_view 和 gh_pr_create 同为 type "gh"）。
+    // 它们此前完全没登记，于是这道门对整个 git/gh 族从来没生效过：走自定义模型时
+    // 网关那份拒绝清单不参与，Explorer/Plan/Reviewer 下能真的开 PR。
+    "git", "gh",
   ])));
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd

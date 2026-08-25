@@ -62059,7 +62059,7 @@ async function _executeToolStepInner(step, call, root, run) {
     const _roExit = _roMode === "explorer"
       ? "\n出路：Explorer 只调查不动手。把该改的地方写成带 path:line 的最小修复建议交回去，由用户切到 Agent 模式执行。"
       : "";  // plan / reviewer 每轮都从 _modeRuntimeGuidanceBlock 收到同样口径的指引，不重复说
-    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。\n只读模式下**读取与取证类工具全部可用**：read_file / list_dir / search / find_files / find_symbol / lsp_definition / lsp_references / get_diagnostics / read_terminal / read_logs / git 的 status·diff·log·blame·show / 声明为只读的 MCP / 声明为只读（GET·HEAD 或 readOnly）的用户能力与知识库检索。git 只有 commit·push·pull·stash·clone·新建分支被挡。\n这是**模式限制不是能力缺失**——不要换 run_cmd 或别的工具去做同一件事。${_roExit}` };
+    return { type: call.type, path: call.path, content: `[BLOCKED] ${modeName} 是只读模式，不能${what}。\n只读模式下**读取与取证类工具全部可用**：read_file / list_dir / search / find_files / find_symbol / lsp_definition / lsp_references / get_diagnostics / read_terminal / read_logs / git 的 status·diff·log·blame·show / 声明为只读的 MCP / 声明为只读（GET·HEAD 或 readOnly）的用户能力与知识库检索。git 只有 commit·push·pull·stash·clone·新建分支被挡；gh 只有 pr_create·pr_reply 被挡，pr_view·pr_checks·actions_log·pr_review_comments 照常可用。\n这是**模式限制不是能力缺失**——不要换 run_cmd 或别的工具去做同一件事。${_roExit}` };
   }
 
   // Worker scope guard: a parallel worker sub-agent may read anywhere and may run
