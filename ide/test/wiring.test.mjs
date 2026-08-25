@@ -131,6 +131,19 @@ const NAME_DISPATCHED = {
   debate: "debate",
 };
 
+
+/**
+ * 剥掉 Rust 源码里的行注释再断言。
+ *
+ * 这不是洁癖：preview_bridge.rs 的文档注释里**写着** `js_init_script_on_all_frames`
+ * 用来解释为什么要全帧注入。于是「把调用改成只注入主帧」这个变异照样能让
+ * /js_init_script_on_all_frames/ 匹配到注释——断言全绿，而功能已经死了。
+ * 实测就是这么漏的。
+ */
+function rustCode(src) {
+  return src.split("\n").map((l) => l.replace(/^\s*\/\/.*$/, "")).join("\n");
+}
+
 test("every tool the model can call is reachable end to end", () => {
   // Link 1: schema → mapper. No case means `{type:"unknown"}` — a tool that silently no-ops.
   const unmapped = schemaNames.filter((n) => !mapperCases.includes(n));
@@ -858,7 +871,20 @@ test("no NEW unreachable module appears under src/", async () => {
   }
 
   // `_serve.mjs` is a standalone dev script, launched by hand rather than imported.
-  const INTENTIONALLY_STANDALONE = new Set(["src/_serve.mjs"]);
+  //
+  // `preview-bridge.js` 不被任何 JS 模块 import，但它**不是死代码**：它是注入到被预览
+  // 页面里的那段脚本，由 src-tauri/src/preview_bridge.rs 用 include_str! 在编译期读进去，
+  // 再经 js_init_script_on_all_frames 注入到应用的每一个帧。它的"调用方"在 Rust 那边，
+  // 这个只扫 JS import 图的检查看不到——所以要在这里注明，而不是把它删掉。
+  // 下面那条断言会核对这个引用真的还在，防止 Rust 侧删掉之后这里变成一句空话。
+  const INTENTIONALLY_STANDALONE = new Set(["src/_serve.mjs", "src/preview-bridge.js"]);
+  {
+    const rs = rustCode(readFileSync(join(HERE, "../src-tauri/src/preview_bridge.rs"), "utf8"));
+    assert.match(rs, /include_str!\("\.\.\/\.\.\/src\/preview-bridge\.js"\)/,
+      "preview-bridge.js 被登记成「Rust 那边在用」，但 preview_bridge.rs 里已经不引用它了");
+    assert.match(rs, /\.js_init_script_on_all_frames\(/,
+      "桥不再注入所有帧了——那样它只对 IDE 自己那一帧生效，等于没用");
+  }
   const KNOWN_DEAD = new Set([
     "src/agent/job-queue.js",        // 446 lines; live spawn_multiple_agents is inline in main.js
     "src/tools/spawn-multiple-agents.js", // 193 lines; imported by nothing at all

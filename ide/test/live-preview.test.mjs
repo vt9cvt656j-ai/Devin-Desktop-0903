@@ -16,6 +16,19 @@ import { dirname, join } from "node:path";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP_CSS = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
 
+/**
+ * 剥掉 Rust 源码里的行注释再断言。
+ *
+ * 这不是洁癖：preview_bridge.rs 的文档注释里**写着** `js_init_script_on_all_frames`
+ * 用来解释为什么要全帧注入。于是「把调用改成只注入主帧」这个变异照样能让
+ * /js_init_script_on_all_frames/ 匹配到注释——断言全绿，而功能已经死了。
+ * 实测就是这么漏的。
+ */
+function rustCode(src) {
+  return src.split("\n").map((l) => l.replace(/^\s*\/\/.*$/, "")).join("\n");
+}
+
+
 const normalize = load("_previewNormalizeUrl");
 const isLocal = load("_previewIsLocalUrl");
 
@@ -230,29 +243,89 @@ test("agent 后台导航不把正在编辑的人拽走", () => {
   assert.match(src, /activePath === PREVIEW_TAB_PATH/);
 });
 
-test("调试桥由 dev server 单独提供，而且注入要覆盖根路径", () => {
-  // 桥从「压成一行塞进 Python 的 b'...' 字面量」改成 /__mrdayone_bridge.js 单独提供。
-  // 上一版那个写法只能用双引号、不能换行、不能写注释——加个「拾取元素」就没法写了。
-  const bridge = fnSource("_PREVIEW_BRIDGE_JS", { code: true });
-  const js = bridge.slice(bridge.indexOf("`") + 1, bridge.lastIndexOf("`"));
+test("调试桥注入到每一个帧，且只有一份源码", () => {
+  // 上一版是让 IDE 自带的 Python 预览服务把 <script src> 插进它服务的 HTML，
+  // 于是**只有那一个服务**起的预览才有桥——用户拿 vite / next / django 起的服务
+  // 一律没有，「指元素」永远弹一个「这个页面还没接调试桥」。那不叫能用。
+  //
+  // 现在走 WebView 的原生能力：Tauri 插件 js_init_script_on_all_frames 一路落到
+  // WKUserScript(forMainFrameOnly: false)，任何被嵌的页面在文档解析前就拿到它。
+  const rs = rustCode(readFileSync(join(HERE, "../src-tauri/src/preview_bridge.rs"), "utf8"));
+  assert.match(rs, /\.js_init_script_on_all_frames\(/,
+    "只注入主帧的话，被预览的 iframe 一个字都收不到——等于没做");
+  assert.match(rs, /include_str!\("\.\.\/\.\.\/src\/preview-bridge\.js"\)/,
+    "桥的正文没有从共用文件读——另抄一份必然漂移");
+  assert.match(readFileSync(join(HERE, "../src-tauri/src/lib.rs"), "utf8"),
+    /\.plugin\(preview_bridge::init\(\)\)/, "插件没挂上，注入根本不会发生");
+
+  const js = readFileSync(join(HERE, "../src/preview-bridge.js"), "utf8");
   assert.doesNotThrow(() => new Function(js), "桥不是合法 JS");
-  assert.ok(js.includes("window.parent === window"), "没做「不在 iframe 里就只热重载」的判断");
+
+  // **位置守卫**。它被注入到应用的每一个帧，包括 IDE 自己那一帧和 PDF 预览的 iframe。
+  // 没有这道守卫的话，console 钩子会把 IDE 自身的日志也劫走。
+  assert.match(js, /location\.protocol !== "http:" && location\.protocol !== "https:"/,
+    "没有按 location 自守——会在 IDE 自己那一帧和 asset: 的 iframe 里也装上");
+  assert.match(js, /window\.parent === window/, "没有「只在子帧里装」的判断");
+
+  // 消息协议两个方向都要在
   assert.ok(js.includes('__mrdayone: "preview-log"'), "日志消息没带识别标记");
   assert.ok(js.includes('__mrdayone: "preview-picked"'), "拾取结果没带识别标记");
   assert.ok(js.includes('d.__mrdayone !== "preview-pick"'), "桥不接收父窗口的拾取指令");
-  // 模板字面量里出现 ${ 会被当成插值——这段是要原样送到页面里的
-  assert.ok(!/\$\{/.test(js), "桥里出现了 ${，会被外层模板字面量当成插值");
 
+  // main.js 里**不许**再有第二份桥
+  assert.ok(!CODE.includes("_PREVIEW_BRIDGE_JS"), "main.js 里又有一份桥的副本了");
+
+  // dev server 只管热重载，注入仍要覆盖根路径（translate_path('/') 返回的是目录）
   const dev = fnSource("_startDevServer", { code: true });
-  assert.match(dev, /BRIDGE_SRC = \$\{JSON\.stringify\(_PREVIEW_BRIDGE_JS\)\}/, "桥没被传进 dev server");
-  assert.match(dev, /__mrdayone_bridge\.js/, "dev server 没有提供桥的路由");
-  assert.match(dev, /BRIDGE_TAG \+ b'<\/body>'/, "桥没被注入页面");
+  assert.ok(!dev.includes("BRIDGE_SRC"), "dev server 又开始自己发桥了——那条路只覆盖它自己起的预览");
+  assert.match(dev, /if os\.path\.isdir\(path\):/, "没有把目录解析成 index.html —— 根路径拿不到热重载");
+});
 
-  // **注入必须覆盖 `/`。** translate_path('/') 返回的是目录，.endswith('.html') 不成立，
-  // 于是整个注入分支被跳过——而 `/` 恰恰是 IDE 自己打开的那个地址。实测过：
-  // 热重载和调试桥对根路径从来没生效过，显式敲 /index.html 才有。
-  assert.match(dev, /if os\.path\.isdir\(path\):/, "没有把目录解析成 index.html —— 根路径拿不到桥");
-  assert.match(dev, /for _idx in \('index\.html', 'index\.htm'\)/);
+test("选中的元素进输入框，而不是弹面板或冲掉已打的字", () => {
+  // 参考 Cursor：选中之后应该变成输入框里的一个胶囊，用户接着打「把它改成圆角」再发。
+  // 上一版那条「发给 AI」是 promptEl.value = 整段文字——会把用户已经打的字和别的胶囊全抹掉。
+  const send = fnSource("_previewSendElementToComposer", { code: true });
+  assert.match(send, /_insertRefAtCursor\(id, "element"/, "没有插胶囊");
+  assert.ok(!/promptEl\.value\s*=/.test(send), "又在整段覆盖输入框了，会冲掉用户已经打的字");
+  assert.ok(!CODE.includes("_previewShowPickPanel"), "旧的弹面板路径还在");
+
+  // @element: 不能被当成本地路径去读盘
+  assert.match(CODE, /_REMOTE_AT = \/\^\(github\|gitlab\|gitee\|codeberg\|model\|element\)/,
+    "@element: 会被拿去 readTextFile/readDir，两次都抛、还白占一个 @ 名额");
+
+  // 胶囊序列化成 " @element:<id> "，发送时按这个形状展开
+  const chipText = load("_chipText");
+  assert.equal(chipText({ dataset: { kind: "element", rel: "e1" } }), " @element:e1 ");
+  assert.match(CODE, /@element:\(\[A-Za-z0-9\]\+\)/, "发送路径没有展开 @element:");
+
+  // 胶囊得有图标——不能走 `i-brand-<kind>` 那条拼名字的路（没有 i-brand-element，会渲染成空白）
+  const chip = fnSource("_makeComposerChip", { code: true });
+  assert.match(chip, /kind === "element"/, "胶囊不认 element，图标会是空白");
+});
+
+test("送给模型的元素上下文带源码定位，且说清 computed 值不能照抄", () => {
+  const mk = (over) => ({
+    tag: "button", cls: "btn btn-primary", selector: "#app > button.btn", text: "去结算",
+    size: "120x40", color: "rgb(255,255,255)", background: "rgb(91,109,250)",
+    fontSize: "16px", fontWeight: "600", padding: "14px 0px", margin: "0px",
+    borderRadius: "12px", outerHTML: "<button>去结算</button>", ...over,
+  });
+  const run = (info) => load("_previewElementContext", { _previewPicked: new Map([["e1", info]]) })("e1");
+
+  const withSrc = run(mk({ source: { file: "src/Cart.tsx", line: 42 } }));
+  assert.match(withSrc, /源码：src\/Cart\.tsx:42/, "有源码定位却没写出来——那是模型最需要的一行");
+  assert.match(withSrc, /有源码定位，直接改那一处/);
+  assert.match(withSrc, /选择器：#app > button\.btn/);
+
+  const noSrc = run(mk({ source: null }));
+  assert.ok(!/源码：/.test(noSrc), "没有源码定位却编了一个出来");
+  // 这一句是判据不是客套：computed style 是浏览器算完的最终值，源码里写的多半是
+  // 一个 Tailwind 类、一个 CSS 变量或 rem。照抄会写出一堆魔数。
+  assert.match(noSrc, /别照着上面的 computed 值硬写/,
+    "没告诉模型 computed 值不能照抄——它会把 16px 这种算完的结果硬写回源码");
+
+  assert.equal(load("_previewElementContext", { _previewPicked: new Map() })("nope"), "",
+    "不存在的 id 该返回空串，而不是一段没有内容的壳");
 });
 
 test("预览页签的伪路径不会被当成「当前文件」交出去", () => {
