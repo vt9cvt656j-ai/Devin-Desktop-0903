@@ -26697,9 +26697,16 @@ test("命令不存在时指向 probe_env，不再推它一条条 run_cmd 试", (
 // 但只有劝导没有下限。
 
 test("ask_user 有分级下限：第一次原样放行，第三次不再弹卡片", () => {
-  const branch = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "askuser") {'));
-  const seg = branch.slice(0, 3000);
-  assert.match(seg, /const _auN = \(run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1\);/);
+  // 切到**这条分支结束**，不要固定 3000 字符窗口：分支一变长（这次是给 run 的裸解引用
+  // 补了一句说明——chat 那条路 run 是 undefined，原写法会 TypeError）尾部就掉出窗口，
+  // 断言以「这段文案不见了」的形式假红，而它其实好好的。反过来窗口扫到隔壁分支会假绿。
+  // 另外这里原来拿 RAW_SRC 的下标去切 SRC（剥过注释的那份），两个偏移根本对不上。
+  const at = SRC.indexOf('} else if (call.type === "askuser") {');
+  assert.ok(at > 0, "askuser 分支找不到了");
+  const next = SRC.indexOf('} else if (call.type === "', at + 10);
+  const seg = SRC.slice(at, next > at ? next : SRC.length);
+  assert.ok(seg.length > 800, `askuser 分支只切出 ${seg.length} 字符，切法坏了`);
+  assert.match(seg, /const _auN = run \? \(run\._askUserCount = \(run\._askUserCount \|\| 0\) \+ 1\) : 1;/);
   // 第 3 次起不弹卡片——这不是惩罚，是替用户挡住那 120 秒干等
   assert.match(seg, /if \(_auN >= 3 \|\| \(_auN >= 2 && _auBackToBack\)\)/);
   assert.match(seg, /没有再弹卡片，因为每次提问都让用户对着界面干等最多两分钟/);

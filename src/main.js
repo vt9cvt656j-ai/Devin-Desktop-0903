@@ -30307,6 +30307,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   sess._runIsLoop = false;
   _setStreaming(sess, true);
   const _pendingToolCalls = [];
+  // 已经渲染成 seg、但会被 acc 清空抹掉的正文段。收尾落盘时要把它们拼回去。
+  const _segTextsThisTurn = [];
   let _toolArgBuf = {};
   const _liveStats = _liveTurnStats(body, {
     startedAt: _taskStartedAt,
@@ -30478,6 +30480,9 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
                 seg.className = "agent-seg";
                 renderMarkdownInto(seg, acc.trim(), { streaming: false, highlighter: highlightCodeFinal });
                 body.appendChild(seg);
+                // 这段正文马上就要被 `acc = ""` 抹掉，而收尾只看 acc——留一份，
+                // 否则"先说一句再调工具"的那句话永远进不了历史。
+                _segTextsThisTurn.push(acc.trim());
                 acc = ""; _shown = 0; body._lastLen = 0;
               }
               const step = _createToolStep(call);
@@ -30545,6 +30550,25 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         const readResults = _toolPromises.filter(p => p._result).map(p => p._result);
         if (readResults.length) _agentFollowUp(readResults, body, sess);
       } else {
+        // **工具调用发生过就必须留痕。** chat 这条路一旦调过工具，上面那段会把已积累的
+        // 正文渲染成 seg 并 `acc = ""`，于是下面的 `if (_cc)` 恒为假——"先说一句『我查一下』
+        // 再调 web_search"这个最常见的形状下，正文和工具卡都画在屏幕上、sess.memory 里
+        // 一个字都没有；切走再回来整轮消失，全程无任何报错。而 30566 那条空回复兜底又被
+        // `!_pendingToolCalls.length` 挡掉，连提示都没有。
+        if (_pendingToolCalls.length) {
+          const _shown = _segTextsThisTurn.length ? _segTextsThisTurn.join("\n\n") : "";
+          const _toolLines = _pendingToolCalls
+            .map((c) => `· ${c.type}${c.path ? " " + String(c.path).slice(0, 80) : ""}`)
+            .join("\n");
+          const _results = _toolPromises
+            .filter((pr) => pr._result && pr._result.content)
+            .map((pr) => String(pr._result.content))
+            .join("\n\n");
+          const _body = [_shown, `〔本轮调用了工具〕\n${_toolLines}`, _results && `〔工具结果〕\n${_clipPreservingErrors(_results, 4000)}`]
+            .filter(Boolean).join("\n\n");
+          sess.memory.push({ role: "assistant", content: _body, model: config.model || "" });
+          saveChatHistory({ immediate: true });
+        }
         const _cc = _cleanAgentText(acc); // strip "..." filler / tool narration before render+persist
         if (_cc) {
           if (!body._chatStreamEl) {
@@ -64136,7 +64160,12 @@ async function _executeToolStepInner(step, call, root, run) {
           + `按这个答案继续做。它如果没有覆盖你现在真正卡住的那一点，说明你要问的是**另一件事**——`
           + `那就把问题重写成那件事本身，别把同一个问题换个说法再问一遍。` };
       }
-      const _auN = (run._askUserCount = (run._askUserCount || 0) + 1);
+      // run 在 chat 那条路上是 **undefined**（_executeToolStep(step, call, _agentRoot) 只传三个参），
+    // 而 ask_user 恰好是网关给 chat 注的 14 个工具之一。这里原来是裸解引用 → TypeError，
+    // 而 chat 侧那个 `p.then(...)` 没有 .catch，唯一的 allSettled 在另一条分支上：
+    // 表现是一次 unhandled rejection + 那张 ask_user 卡片**永远停在执行中**，
+    // 用户对着它干等，界面上没有任何提示。同一分支上面几行用的就是 `run?.session`。
+    const _auN = run ? (run._askUserCount = (run._askUserCount || 0) + 1) : 1;
       const _auBackToBack = run._lastToolWasAsk === true;
       run._lastToolWasAsk = true;
       if (_auN >= 3 || (_auN >= 2 && _auBackToBack)) {
