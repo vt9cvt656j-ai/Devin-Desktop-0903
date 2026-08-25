@@ -5148,19 +5148,54 @@ function hidePdfPreview() {
 }
 
 // ============================================================================
-// 实时预览页签：编辑器标签栏里的一个真浏览器窗格
+// 实时预览页签：编辑器标签栏里的一个内嵌浏览器
 // ============================================================================
 //
-// 以前实时预览是聊天流里的一张卡片，跟着消息往上滚、宽度只有助手面板那么点，而且
-// 每开一轮新会话就要重新找它。它本质上不是"某条消息的产物"，是一个和编辑器平级的
-// 视图，所以搬到标签栏来：和 daily.yaml / scene.py 并排，可以拖、可以固定、随会话恢复。
+// 以前实时预览是聊天流里的一张卡片，跟着消息往上滚、宽度只有助手面板那么点。它其实是
+// 一个和编辑器平级的视图，所以搬到标签栏来：和 daily.yaml / scene.py 并排，可以拖、
+// 可以固定、随会话恢复。
 //
-// 两套引擎，工具栏上可切，因为它们能做的事不一样，谁也替代不了谁：
-//   · 实时（iframe 直嵌）——默认。改代码 HMR 即时反映，鼠标键盘直接作用在真页面上，
-//     没有第二个窗口。代价：iframe 跨源，读不到它的 DOM 和 console。
-//   · 浏览器（CDP 驱动真实 Chrome，取帧回投）——任意页面都能拿到控制台、网络请求、
-//     元素定位。代价：靠轮询截图，不如 iframe 跟手。
-// 判据写在工具栏的提示里，不指望用户自己猜。
+// **只有一套引擎：iframe 直嵌。** 上一版做了「实时 / 浏览器」两套引擎可切，第二套用
+// CDP 驱动真实浏览器再把画面轮询回投。删掉了——那是把复杂度推给用户：他得先搞懂两套
+// 引擎各自能干什么，才知道该点哪个。Claude Code、Codex 那类预览都只是一个内嵌实时视图，
+// 没有引擎这个概念。删掉的代价只有一处（指元素要读 DOM，而 iframe 跨源读不到），
+// 改走调试桥补回来了——对本地 dev server 反而更快，也不用弹第二个浏览器窗口。
+//
+// 因此这个窗格**只嵌本机地址**：桌面壳的 CSP 里 frame-src 故意只放行 localhost 一族，
+// 而且外部站点大多带 X-Frame-Options 本来也嵌不进来。敲外部地址时明说，并给一键
+// 用系统浏览器打开，不留白屏。
+
+/**
+ * 实时预览工具栏的图标。
+ *
+ * 路径**原样取自 Lucide**（ISC，node_modules/lucide-react@0.548.0/dist/esm/icons/*.js），
+ * 不是手绘的——手绘那版实测在 15px 下手机和平板糊成两个一模一样的圆角方块。
+ * 和 brand-sprite.js 同一个做法：一次性抽出来内联，没有运行时依赖（lucide-react 是
+ * React 包，main.js 不是 React，直接 import 会把整个 React 拖进来）。
+ *
+ * 用 Lucide 原生的 stroke-width 2，而不是本仓库别处那个 1.7：这套图形是按 2 设计的，
+ * 调细了在 16px 下发虚。工具栏内部整条都是这一套，自洽。
+ *
+ * 对应关系：back=chevron-left、forward=chevron-right、reload=rotate-cw、external=external-link、auto=scan、phone=smartphone、tablet=tablet、desktop=monitor、pick=crosshair、console=terminal
+ */
+const LP_ICON = {
+  back: '<path d="m15 18-6-6 6-6"/>',
+  forward: '<path d="m9 18 6-6-6-6"/>',
+  reload: '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+  external: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  auto: '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>',
+  phone: '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
+  tablet: '<rect width="16" height="20" x="4" y="2" rx="2" ry="2"/><line x1="12" x2="12.01" y1="18" y2="18"/>',
+  desktop: '<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>',
+  pick: '<circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>',
+  console: '<path d="M12 19h8"/><path d="m4 17 6-6-6-6"/>',
+};
+/** 包一层 <svg>。viewBox 固定 24，和 Lucide 一致。 */
+function _lpIcon(name, size = 16) {
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" `
+    + `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LP_ICON[name] || ""}</svg>`;
+}
+
 // 不带 `//`。这个字符串会经过 _coherentFilePath → _normalizeFsPath，而那条路会把
 // 连续斜杠折掉：`mrdayone://live-preview` 出来是 `mrdayone:/live-preview`，于是
 // openFiles 的键和这里的常量对不上，closeFile / activate 全部静默失配。
@@ -5168,43 +5203,38 @@ function hidePdfPreview() {
 const PREVIEW_TAB_PATH = "mrdayone:live-preview";
 const PREVIEW_TAB_NAME = "实时预览";
 const PREVIEW_URL_STORE_KEY = "michael-ide.live-preview-url";
-/// CDP 引擎的取帧间隔。和聊天里那张老卡片保持一致：再快也追不上人眼，更快只会把
-/// WebContent 占满，让真正的点击/输入排在截图后面。
-const PREVIEW_CDP_FRAME_MS = 1200;
-/// 控制台/网络面板的拉取间隔。它读的是页面里累积的队列，不需要跟帧一样勤。
-const PREVIEW_LOG_POLL_MS = 2000;
 
 const _preview = {
   el: null,
   url: "",
-  engine: "live",      // live | cdp
   device: "auto",
-  history: [],         // 自己维护：跨源 iframe 的 history 读不到，浏览器前进后退只能自己记
+  history: [],         // 自己维护：跨源 iframe 的 history 读不到，前进后退只能自己记
   hpos: -1,
-  frameTimer: 0,
-  frameInFlight: false,
-  logTimer: 0,
-  logInFlight: false,
+  dot: "idle",         // idle | loading | live | error —— 见 _previewSetDot
+  loadSeq: 0,          // 每次导航 +1；异步的失败判定回来时对不上就丢弃
   picking: false,
   dockOpen: false,
-  bridgeSeen: false,   // 页面是否接过调试桥（决定控制台面板显示日志还是显示怎么接）
-  loadSeq: 0,          // 每次导航 +1；异步的失败判定回来时对不上就丢弃
+  bridgeSeen: false,   // 页面接过调试桥没有（决定控制台面板显示日志还是显示怎么接）
 };
 
-/// 设备预设。宽高是 CSS 像素，auto 表示铺满窗格（不缩放）。
+/**
+ * 设备档。
+ *
+ * 工具栏上**只出图标,不出 390×844 这种数字**——尺寸是选完之后才需要知道的东西，
+ * 放在 tooltip 里。四个图标紧挨着，手机/平板/桌面的宽度递进本身就说明了顺序。
+ */
 const PREVIEW_DEVICES = [
-  { id: "auto", label: "自适应", w: 0, h: 0 },
-  { id: "phone", label: "手机 390×844", w: 390, h: 844 },
-  { id: "phone-l", label: "手机横屏 844×390", w: 844, h: 390 },
-  { id: "tablet", label: "平板 820×1180", w: 820, h: 1180 },
-  { id: "desktop", label: "桌面 1280×800", w: 1280, h: 800 },
+  { id: "auto",    icon: "auto",    label: "自适应", hint: "跟着窗格宽度走", w: 0,    h: 0 },
+  { id: "phone",   icon: "phone",   label: "手机",   hint: "390 × 844",     w: 390,  h: 844 },
+  { id: "tablet",  icon: "tablet",  label: "平板",   hint: "820 × 1180",    w: 820,  h: 1180 },
+  { id: "desktop", icon: "desktop", label: "桌面",   hint: "1280 × 800",    w: 1280, h: 800 },
 ];
 
 /**
  * 把用户在地址栏里敲的东西变成一个能打开的 URL。
  *
- * 支持几种真实会敲的写法：光一个端口号（3000）、光一条路径（/about，接在当前站点上）、
- * 省略协议的主机（localhost:5173 / example.com）。
+ * 支持几种真实会敲的写法：光一个端口号（3000）、端口号带路径（3000/about）、
+ * 光一条路径（/about，接在当前站点上）、省略协议的主机（localhost:5173 / example.com）。
  *
  * 返回 "" 表示这不是一个可以打开的地址——**包括协议不被允许的情况**。只放行 http/https：
  * `javascript:` 塞进 iframe 的 src 会在 iframe 那个文档里执行，而新建的 iframe 文档是
@@ -5332,51 +5362,65 @@ function showLivePreviewPane() {
   _previewEnsurePane();
   _preview.el.hidden = false;
   _previewRender();
-  _previewSyncTimers();
 }
 
 function hideLivePreviewPane() {
   if (!_preview.el) return;
   _preview.el.hidden = true;
-  // 隐藏就停轮询。留着的话切到别的文件后，CDP 取帧仍在占用浏览器和 IPC，
-  // 而画面根本没人看——聊天里那张老卡片就踩过这个坑（卡片滚出视口仍在刷）。
-  _previewStopTimers();
+  // 只是切走，页面留着继续跑：dev server 的热更、页面里的状态都不该因为看了一眼
+  // 别的文件就丢掉。真正要卸掉页面的是关页签，见 _previewTeardown。
 }
+
+/**
+ * 关掉预览页签：把正在预览的页面卸掉，但**保留窗格这个壳**。
+ *
+ * 早先这里是把整个窗格 remove 掉、_preview.el 置空，下次打开重建。问题是调试桥的
+ * message 监听器挂在 window 上（它必须挂在那儿——消息是从 iframe post 上来的），
+ * 不会跟着窗格一起消失：关一次再开一次就多一个监听器，控制台里每条日志翻一倍，
+ * 开三次就是三倍。壳留着、监听器只挂一次，这条路根本不存在。
+ *
+ * 但被预览的**页面**必须真的卸掉：留着的话它的定时器、轮询、WebSocket 会在
+ * 一个谁也看不见的 iframe 里继续跑。
+ */
+function _previewTeardown() {
+  _preview.picking = false;
+  _preview.bridgeSeen = false;
+  _preview.dot = "idle";
+  _previewClearLogs();
+  const stage = _preview.el?.querySelector('[data-lp="stage"]');
+  if (stage) stage.textContent = "";
+  if (_preview.el) _preview.el.hidden = true;
+}
+
+// ---- 工具栏 ----
 
 function _previewEnsurePane() {
   if (_preview.el) return _preview.el;
   const pane = document.createElement("div");
   pane.className = "lp";
   pane.id = "livePreviewPane";
+  const navBtn = (act, name, title) =>
+    `<button type="button" class="lp__btn" data-lp="${act}" title="${_escAttr(title)}" aria-label="${_escAttr(title)}">${_lpIcon(name)}</button>`;
+  const devSeg = PREVIEW_DEVICES.map((d) =>
+    `<button type="button" class="lp__seg" data-lp-device="${d.id}" title="${_escAttr(d.label + " · " + d.hint)}"`
+    + ` aria-label="${_escAttr(d.label + " " + d.hint)}" aria-pressed="false">${_lpIcon(d.icon, 15)}</button>`).join("");
   pane.innerHTML = `
     <div class="lp__bar">
       <div class="lp__nav">
-        <button type="button" class="lp__btn" data-lp="back" title="后退">
-          <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m14.5 6-6 6 6 6"/></svg>
-        </button>
-        <button type="button" class="lp__btn" data-lp="forward" title="前进">
-          <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9.5 6 6 6-6 6"/></svg>
-        </button>
-        <button type="button" class="lp__btn" data-lp="reload" title="重新加载">
-          <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M19 12a7 7 0 1 1-2.1-5M19 4v4h-4"/></svg>
-        </button>
+        ${navBtn("back", "back", "后退")}
+        ${navBtn("forward", "forward", "前进")}
+        ${navBtn("reload", "reload", "重新加载")}
       </div>
       <div class="lp__omni">
-        <span class="lp__live" data-lp="livedot" title="实时连接中"></span>
-        <input class="lp__url" type="text" spellcheck="false" autocomplete="off"
-               placeholder="地址、端口号（3000）或路径（/about）—— 回车打开" />
-        <button type="button" class="lp__btn lp__btn--in" data-lp="external" title="在系统浏览器里打开">
-          <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M13 5h6v6M19 5l-8 8M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>
-        </button>
+        <span class="lp__live" data-lp="dot" aria-hidden="true"></span>
+        <input class="lp__url" type="text" spellcheck="false" autocomplete="off" aria-label="预览地址"
+               placeholder="地址、端口号（3000）或路径（/about）" />
+        <button type="button" class="lp__btn lp__btn--in" data-lp="external" title="在系统浏览器里打开" aria-label="在系统浏览器里打开">${_lpIcon("external", 14)}</button>
       </div>
-      <select class="lp__device" data-lp="device" title="视口尺寸"></select>
-      <div class="lp__engine" data-lp="engine"></div>
-      <button type="button" class="lp__btn" data-lp="pick" title="指元素给 AI（需要「浏览器」引擎）">
-        <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M12 3v3m0 12v3M3 12h3m12 0h3"/><circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.9"/></svg>
-      </button>
-      <button type="button" class="lp__btn" data-lp="dock" title="控制台 / 网络">
-        <svg class="ic" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m5 8 4 4-4 4M12 16h7"/></svg>
-      </button>
+      <span class="lp__sep" aria-hidden="true"></span>
+      <div class="lp__device" role="group" aria-label="视口尺寸">${devSeg}</div>
+      ${navBtn("pick", "pick", "指元素给 AI")}
+      ${navBtn("dock", "console", "控制台 / 网络")}
     </div>
     <div class="lp__body">
       <div class="lp__stage" data-lp="stage"></div>
@@ -5393,6 +5437,7 @@ function _previewWirePane(pane) {
   const stage = pane.querySelector('[data-lp="stage"]');
 
   urlInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { urlInput.value = _preview.url || ""; urlInput.blur(); return; }
     if (e.key !== "Enter") return;
     e.preventDefault();
     const next = _previewNormalizeUrl(urlInput.value, _preview.url);
@@ -5408,14 +5453,9 @@ function _previewWirePane(pane) {
   });
   urlInput.addEventListener("focus", () => urlInput.select());
 
-  const deviceSel = pane.querySelector('[data-lp="device"]');
-  deviceSel.innerHTML = PREVIEW_DEVICES.map((d) => `<option value="${d.id}">${_escHtml(d.label)}</option>`).join("");
-  deviceSel.addEventListener("change", () => {
-    _preview.device = deviceSel.value;
-    _previewApplyDevice();
-  });
-
   pane.addEventListener("click", (e) => {
+    const dev = e.target.closest("[data-lp-device]");
+    if (dev) { _preview.device = dev.dataset.lpDevice; _previewRender(); return; }
     const btn = e.target.closest("[data-lp]");
     if (!btn) return;
     const act = btn.dataset.lp;
@@ -5428,55 +5468,68 @@ function _previewWirePane(pane) {
   });
 
   // 窗格尺寸变了要重算设备预设的缩放比例，否则选了「手机」再拖动分栏，
-  // 画面要么溢出要么留一大片空白。
+  // 画面要么溢出要么留一大片空白。顺带按宽度收紧工具栏间距。
   try {
-    const ro = new ResizeObserver(() => { if (!pane.hidden) _previewApplyDevice(); });
-    ro.observe(stage);
+    const ro = new ResizeObserver(() => {
+      if (pane.hidden) return;
+      _previewApplyDevice();
+      pane.querySelector(".lp__bar")?.classList.toggle("is-tight", pane.clientWidth < 460);
+    });
+    ro.observe(pane);
   } catch { /* 老 WebView 没有 ResizeObserver：退化成不跟随，功能不受影响 */ }
-
 }
 
 /**
- * 关掉预览页签：停轮询、把正在预览的页面卸掉，但**保留窗格这个壳**。
+ * ⌘L / Ctrl+L 聚焦地址栏——浏览器的通用习惯。
  *
- * 早先这里是把整个窗格 remove 掉、_preview.el 置空，下次打开重建。问题是调试桥的
- * message 监听器挂在 window 上（它必须挂在那儿——消息是从 iframe post 上来的），
- * 不会跟着窗格一起消失：关一次再开一次就多一个监听器，控制台里每条日志翻一倍，
- * 开三次就是三倍。壳留着、监听器只挂一次，这条路根本不存在。
- *
- * 但被预览的**页面**必须真的卸掉：留着的话它的定时器、轮询、WebSocket 会在
- * 一个谁也看不见的 iframe 里继续跑。
+ * 这不只是顺手：预览窗格里的地址栏在 Tab 顺序上排得很靠后（前面隔着侧栏、页签条、
+ * 工具栏一堆按钮），没有快捷键的话键盘用户实际上够不到它。
  */
-function _previewTeardown() {
-  _previewStopTimers();
-  _preview.picking = false;
-  _preview.bridgeSeen = false;
-  _previewClearLogs();
-  const stage = _preview.el?.querySelector('[data-lp="stage"]');
-  if (stage) stage.textContent = "";
-  if (_preview.el) _preview.el.hidden = true;
-}
+document.addEventListener("keydown", (e) => {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+  if (e.key !== "l" && e.key !== "L") return;
+  if (activePath !== PREVIEW_TAB_PATH || !_preview.el || _preview.el.hidden) return;
+  const input = _preview.el.querySelector(".lp__url");
+  if (!input) return;
+  e.preventDefault();
+  input.focus();
+  input.select();
+});
 
-// 调试桥：页面主动 postMessage 过来的控制台/错误。iframe 跨源读不到 console，
-// 但页面自己可以把它送出来——IDE 自带的预览服务已经默认接了这条桥。
-//
-// 挂在模块级、只挂一次。挂在「建窗格」里的话，每次关掉预览页签再打开都会再挂一个，
-// 而它们读的是同一份 _preview 状态，于是每条日志按打开次数翻倍。
+/**
+ * 调试桥：页面主动 postMessage 过来的控制台日志和被选中的元素。
+ *
+ * iframe 跨源读不到里面的 console 和 DOM，只有页面自己送出来这一条路。
+ * IDE 内置的预览服务已经默认把这段桥注入到它服务的 HTML 里。
+ *
+ * 挂在模块级、只挂一次。挂在「建窗格」里的话，每次关掉预览页签再打开都会再挂一个，
+ * 而它们读的是同一份 _preview 状态，于是每条日志按打开次数翻倍。
+ */
 window.addEventListener("message", (ev) => {
   const d = ev && ev.data;
-  if (!d || typeof d !== "object" || d.__mrdayone !== "preview-log") return;
+  if (!d || typeof d !== "object") return;
   // 不看窗格是否可见：切到别的文件时预览页面还活着，那段时间里报的错也该收下来，
   // 切回去就能看到（条数有上限，不会无限涨）。浏览器的控制台也是这个行为。
   if (!_preview.url) return;
   // 只收当前正在预览的那个源发来的消息。页面里可能还嵌着别的第三方 iframe，
   // 它们也能 postMessage 到这里。
   try { if (new URL(_preview.url).origin !== ev.origin) return; } catch { return; }
-  _preview.bridgeSeen = true;
-  _previewPushLog({
-    level: String(d.level || "log").slice(0, 8),
-    msg: String(d.msg == null ? "" : d.msg).slice(0, 600),
-    src: String(d.src || "").slice(0, 200),
-  });
+
+  if (d.__mrdayone === "preview-log") {
+    _preview.bridgeSeen = true;
+    _previewPushLog({
+      level: String(d.level || "log").slice(0, 8),
+      msg: String(d.msg == null ? "" : d.msg).slice(0, 600),
+      src: String(d.src || "").slice(0, 200),
+    });
+    return;
+  }
+  if (d.__mrdayone === "preview-picked") {
+    _preview.picking = false;
+    _previewRender();
+    if (d.el && typeof d.el === "object") _previewShowPickPanel(d.el);
+    else showToast("没识别到元素，换个位置再点一次");
+  }
 });
 
 // ---- 导航 ----
@@ -5492,21 +5545,12 @@ function _previewNavigate(url, { push = true } = {}) {
       _preview.hpos = _preview.history.length - 1;
     }
   }
-  // 实时（iframe）引擎只嵌得了本机地址。桌面壳的 CSP 里 frame-src **故意**只放行
-  // localhost/127.0.0.1，没有放行整个 https:——给一个桌面应用开放"任意站点都能嵌"
-  // 是实打实的攻击面，而外部站点本来也大多带 X-Frame-Options 嵌不进来。
-  // 外部地址改走「浏览器」引擎，那条路本来就是为它们准备的。
-  if (_preview.engine === "live" && !_previewIsLocalUrl(next)) {
-    showToast("外部站点要用「浏览器」引擎打开——iframe 嵌不了它们。已为你切换。");
-    _previewSetEngine("cdp");
-  }
   _preview.url = next;
   _preview.bridgeSeen = false;
+  _preview.picking = false;
   _previewPersistUrl(next);
   _previewClearLogs();
   _previewRender();
-  _previewSyncTimers();
-  if (_preview.engine === "cdp") _previewCdpNavigate(next);
 }
 
 function _previewGo(delta) {
@@ -5528,13 +5572,12 @@ function _previewGo(delta) {
  * 看起来像是页面自己挂了。新建元素挂上去就一定会加载，没有任何时序依赖。
  */
 function _previewReload() {
-  if (_preview.engine === "cdp") { _previewCdpNavigate(_preview.url); return; }
   const stage = _preview.el?.querySelector('[data-lp="stage"]');
   if (!stage || !_preview.url) { _previewRender(); return; }
   _preview.bridgeSeen = false;
   _previewClearLogs();
   stage.querySelector("iframe")?.remove();
-  _previewRenderStage(); // 新建一个 iframe 并设好 src
+  _previewRenderStage();
 }
 
 // ---- 渲染 ----
@@ -5547,96 +5590,92 @@ function _previewRender() {
   pane.querySelector('[data-lp="back"]').disabled = _preview.hpos <= 0;
   pane.querySelector('[data-lp="forward"]').disabled = _preview.hpos >= _preview.history.length - 1;
   pane.querySelector('[data-lp="external"]').disabled = !_preview.url;
-  pane.querySelector('[data-lp="pick"]').classList.toggle("is-on", _preview.picking);
-  pane.querySelector('[data-lp="dock"]').classList.toggle("is-on", _preview.dockOpen);
-  const deviceSel = pane.querySelector('[data-lp="device"]');
-  if (deviceSel && deviceSel.value !== _preview.device) deviceSel.value = _preview.device;
-  _previewRenderEngineSwitch();
+  const pick = pane.querySelector('[data-lp="pick"]');
+  pick.classList.toggle("is-on", _preview.picking);
+  pick.setAttribute("aria-pressed", String(_preview.picking));
+  const dock = pane.querySelector('[data-lp="dock"]');
+  dock.classList.toggle("is-on", _preview.dockOpen);
+  dock.setAttribute("aria-pressed", String(_preview.dockOpen));
+  for (const b of pane.querySelectorAll("[data-lp-device]")) {
+    const on = b.dataset.lpDevice === _preview.device;
+    b.classList.toggle("is-on", on);
+    b.setAttribute("aria-pressed", String(on));
+  }
   _previewRenderStage();
   _previewRenderDock();
 }
 
-function _previewRenderEngineSwitch() {
-  const host = _preview.el?.querySelector('[data-lp="engine"]');
-  if (!host) return;
-  const modes = [
-    { id: "live", label: "实时", tip: "iframe 直嵌：改代码即时热更、鼠标键盘直接作用在页面上。跨源读不到控制台。" },
-    { id: "cdp", label: "浏览器", tip: "驱动真实浏览器并回投画面：任意页面都能拿到控制台、网络请求和元素定位。靠轮询取帧，不如实时跟手。" },
-  ];
-  host.innerHTML = modes.map((m) =>
-    `<button type="button" class="lp__seg${_preview.engine === m.id ? " is-on" : ""}" data-lp-engine="${m.id}" title="${_escAttr(m.tip)}">${_escHtml(m.label)}</button>`
-  ).join("");
-  for (const b of host.querySelectorAll("[data-lp-engine]")) {
-    b.addEventListener("click", () => _previewSetEngine(b.dataset.lpEngine));
-  }
-}
-
-function _previewSetEngine(mode) {
-  if (mode !== "live" && mode !== "cdp") return;
-  if (_preview.engine === mode) return;
-  _preview.engine = mode;
-  _preview.picking = false;
-  _previewStopTimers();
-  _previewClearLogs();
-  const stage = _preview.el?.querySelector('[data-lp="stage"]');
-  if (stage) stage.textContent = ""; // 换引擎 = 换承载元素，iframe 和 img 不复用
-  _previewRender();
-  _previewSyncTimers();
-  if (mode === "cdp" && _preview.url) _previewCdpNavigate(_preview.url);
+/**
+ * 地址栏左边那个状态点。
+ *
+ * 四档各有各的颜色和动画，**不是一个常亮的绿点**。上一版无论加载成功、失败还是根本
+ * 没连上都显示绿色并且一直在脉冲——那是仪表在说假话，比没有指示器更坏：用户看着
+ * 「已连接」，实际上是一片白。
+ *
+ *   idle    没有地址        灰、不动
+ *   loading 正在取          灰环旋转
+ *   live    已加载          绿、呼吸
+ *   error   连不上/不让嵌   红、静止（静止是刻意的：动画会显得"还在努力"）
+ */
+function _previewSetDot(state) {
+  _preview.dot = state;
+  const el = _preview.el?.querySelector('[data-lp="dot"]');
+  if (!el) return;
+  el.className = "lp__live lp__live--" + state;
+  el.title = { idle: "还没打开地址", loading: "正在加载…", live: "已连接 · 改代码即时刷新", error: "打不开" }[state] || "";
 }
 
 function _previewRenderStage() {
   const stage = _preview.el?.querySelector('[data-lp="stage"]');
   if (!stage) return;
-  if (!_preview.url) { _previewRenderEmpty(stage); return; }
+  if (!_preview.url) { _previewSetDot("idle"); _previewRenderEmpty(stage); return; }
+
+  // 外部站点嵌不进来：桌面壳的 CSP 里 frame-src 只放行本机地址（给桌面应用开放
+  // "任意站点都能嵌"是实打实的攻击面），而且外部站点大多自己带 X-Frame-Options。
+  // 与其给一片白，不如把话说明白，并给一键用系统浏览器打开。
+  if (!_previewIsLocalUrl(_preview.url)) {
+    stage.textContent = "";
+    _previewSetDot("error");
+    _previewShowStageNote({
+      title: "外部网站不能嵌进预览",
+      body: "这个窗格只嵌本机的 dev server。外部站点大多自己就禁止被嵌，桌面版也不放行。",
+      action: { label: "用系统浏览器打开", run: () => openExternal(_preview.url) },
+    });
+    return;
+  }
+
   const empty = stage.querySelector(".lp__empty");
   if (empty) empty.remove();
-
-  if (_preview.engine === "live") {
-    let frame = stage.querySelector("iframe");
-    if (!frame) {
-      stage.textContent = "";
-      frame = document.createElement("iframe");
-      frame.className = "lp__frame";
-      // allow-top-navigation 故意不给：预览页面一句 top.location=… 就能把整个 IDE
-      // 导航走（在桌面壳里等于把应用窗口变成那个网站，回不来）。其余能力照给，
-      // 否则任何真实应用都跑不起来。
-      frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads allow-pointer-lock");
-      frame.setAttribute("allow", "clipboard-read; clipboard-write");
-      stage.appendChild(frame);
-    }
-    if (frame.getAttribute("src") !== _preview.url) {
-      frame.setAttribute("src", _preview.url);
-      _previewWatchLiveLoad(frame, _preview.url);
-    }
-  } else {
-    let img = stage.querySelector("img");
-    if (!img) {
-      stage.textContent = "";
-      img = document.createElement("img");
-      img.className = "lp__shot";
-      img.alt = "预览画面";
-      img.addEventListener("click", (e) => _previewCdpClick(e, img));
-      stage.appendChild(img);
-      const wait = document.createElement("div");
-      wait.className = "lp__wait";
-      wait.textContent = "正在连接浏览器…";
-      stage.appendChild(wait);
-    }
+  let frame = stage.querySelector("iframe");
+  if (!frame) {
+    stage.textContent = "";
+    frame = document.createElement("iframe");
+    frame.className = "lp__frame";
+    // allow-top-navigation 故意不给：预览页面一句 top.location=… 就能把整个 IDE
+    // 导航走（在桌面壳里等于把应用窗口变成那个网站，回不来）。其余能力照给，
+    // 否则任何真实应用都跑不起来。
+    frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads allow-pointer-lock");
+    frame.setAttribute("allow", "clipboard-read; clipboard-write");
+    frame.setAttribute("title", "实时预览");
+    stage.appendChild(frame);
+  }
+  if (frame.getAttribute("src") !== _preview.url) {
+    frame.setAttribute("src", _preview.url);
+    _previewWatchLiveLoad(frame, _preview.url);
   }
   _previewApplyDevice();
 }
 
 /**
- * 实时引擎的失败信号。
+ * 加载结果的取证。
  *
  * iframe 加载失败在页面这一侧是**完全静默**的，而且三种原因长得一模一样——都是一片白：
  *   · 服务没在跑           → 请求发出去了，连不上
  *   · 被应用自己的 CSP 拦住 → 请求**根本没发出去**，dev server 一条日志都没有
- *   · 页面自己不让被嵌      → 请求成功了，但拿到的是个空文档（X-Frame-Options / frame-ancestors）
+ *   · 页面自己不让被嵌      → 请求成功了，但拿到的是个空文档
  *
  * 实测踩过第二种：桌面壳的 frame-src 少了 localhost，预览白屏、终端零请求，
- * 从界面上完全看不出是谁拦的。所以这里分两路取证再合起来说一句人话：
+ * 从界面上完全看不出是谁拦的。所以分两路取证再合起来说一句人话：
  * ① 从应用这一层 fetch 一下，回答"服务在不在"（connect-src 已放行本机地址）；
  * ② 等 iframe 的 load 事件，回答"它让不让被嵌"。
  */
@@ -5644,9 +5683,12 @@ function _previewWatchLiveLoad(frame, url) {
   const seq = ++_preview.loadSeq;
   let loaded = false;
   _previewClearStageNote();
+  _previewSetDot("loading");
   frame.addEventListener("load", () => {
     loaded = true;
-    if (seq === _preview.loadSeq) _previewClearStageNote();
+    if (seq !== _preview.loadSeq) return;
+    _previewClearStageNote();
+    _previewSetDot("live");
   }, { once: true });
 
   void (async () => {
@@ -5659,11 +5701,14 @@ function _previewWatchLiveLoad(frame, url) {
     // 给 iframe 一点时间把 load 事件发出来，再下结论
     await new Promise((r) => setTimeout(r, 2500));
     if (seq !== _preview.loadSeq || loaded) return;  // 已经换地址了，或者其实加载成功了
+    _previewSetDot("error");
     _previewShowStageNote(reachable
       ? { title: "服务在，但这个页面不让被嵌",
-          body: "它带了 X-Frame-Options 或 frame-ancestors。切到「浏览器」引擎能打开它——那条路不走 iframe。" }
+          body: "它带了 X-Frame-Options 或 frame-ancestors。用系统浏览器可以打开它。",
+          action: { label: "用系统浏览器打开", run: () => openExternal(_preview.url) } }
       : { title: "连不上这个地址",
-          body: "服务没在跑，或者端口不对。看一眼终端里那个 dev server 还活着吗，再按重新加载。" });
+          body: "服务没在跑，或者端口不对。看一眼终端里那个 dev server 还活着吗，再按重新加载。",
+          action: { label: "重新加载", run: () => _previewReload() } });
   })();
 }
 
@@ -5676,6 +5721,12 @@ function _previewShowStageNote(note) {
   const h = document.createElement("h4"); h.textContent = note.title;
   const p = document.createElement("p"); p.textContent = note.body;
   box.appendChild(h); box.appendChild(p);
+  if (note.action) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "lp__notebtn"; b.textContent = note.action.label;
+    b.addEventListener("click", note.action.run);
+    box.appendChild(b);
+  }
   stage.appendChild(box);
 }
 
@@ -5695,7 +5746,7 @@ function _previewRenderEmpty(stage) {
       ).join("")}</div>`
     : `<p class="lp__hint">没有检测到在跑的本地服务。在终端里启动 dev server（或按工具栏的运行按钮），它打印出来的地址会自动出现在这里。</p>`;
   box.innerHTML = `<h3>实时预览</h3>
-    <p class="lp__sub">在这里打开本地 dev server 或任意网页：能点、能填表、能改尺寸，改了代码即时刷新。</p>
+    <p class="lp__sub">打开本地 dev server：能点、能填表、能换尺寸，改了代码即时刷新。</p>
     ${list}
     <button type="button" class="lp__rescan">重新检测</button>`;
   stage.appendChild(box);
@@ -5705,11 +5756,11 @@ function _previewRenderEmpty(stage) {
   box.querySelector(".lp__rescan").addEventListener("click", () => _previewRenderStage());
 }
 
-/** 设备预设：给 iframe 定死宽高，再整体缩放到窗格里放得下。 */
+/** 设备档：给 iframe 定死宽高，再整体缩放到窗格里放得下。 */
 function _previewApplyDevice() {
   const stage = _preview.el?.querySelector('[data-lp="stage"]');
   if (!stage) return;
-  const target = stage.querySelector("iframe") || stage.querySelector("img");
+  const target = stage.querySelector("iframe");
   if (!target) return;
   const dev = PREVIEW_DEVICES.find((d) => d.id === _preview.device) || PREVIEW_DEVICES[0];
   if (!dev.w) {
@@ -5729,103 +5780,226 @@ function _previewApplyDevice() {
   target.style.marginBottom = Math.round(-dev.h * (1 - scale)) + "px";
 }
 
-// ---- CDP 引擎：驱动真实浏览器并回投画面 ----
+/**
+ * 注入到被预览页面里的调试桥。
+ *
+ * iframe 跨源，父窗口读不到里面的 console 和 DOM——只有页面自己送出来这一条路。
+ * IDE 内置的 dev server 会把它作为 /__mrdayone_bridge.js 提供，并在每张 HTML 末尾
+ * 插一行 <script src>。别人的 dev server 想要这几样能力，贴同一行即可。
+ *
+ * 三件事：① 热重载轮询；② 把 console.error/warn 和未捕获错误送给父窗口；
+ * ③ 按父窗口的要求进入「拾取元素」模式。
+ *
+ * **写法约束**：这段会被 JSON.stringify 塞进 Python 源码，所以
+ *   - 不用模板字符串（外层就是模板字符串，`${` 会被当成插值）
+ *   - 不用反引号
+ *   - 只用 ASCII（Python 那头是按 UTF-8 写文件，但没必要冒这个险）
+ */
+const _PREVIEW_BRIDGE_JS = `(function () {
+  if (window.__mrdayoneBridge) return;
+  window.__mrdayoneBridge = 1;
 
-async function _previewCdpNavigate(url) {
-  if (!url || !inTauri) return;
-  try {
-    await backend.invoke("browser_navigate", { url });
-  } catch (e) {
-    _previewPushLog({ level: "error", msg: "打不开浏览器：" + String(e?.message || e) });
-  }
-}
+  // ---- 1. 热重载 ----
+  var last = 0;
+  setInterval(function () {
+    fetch("/__reload__").then(function (r) { return r.text(); }).then(function (s) {
+      var n = parseFloat(s);
+      if (last && n > last) location.reload();
+      last = n;
+    }).catch(function () {});
+  }, 800);
 
-async function _previewPumpFrame() {
-  if (_preview.frameInFlight) return; // 截图可能比取帧间隔慢，绝不排队叠加
-  _preview.frameInFlight = true;
-  try {
-    const st = await backend.invoke("browser_screenshot");
-    const img = _preview.el?.querySelector(".lp__shot");
-    if (st && st.screenshot && img) {
-      img.src = st.screenshot;
-      const wait = _preview.el?.querySelector(".lp__wait");
-      if (wait) wait.remove();
+  if (window.parent === window) return;   // 不在 iframe 里就只做热重载
+
+  var send = function (msg) {
+    try { parent.postMessage(msg, "*"); } catch (e) {}
+  };
+  var log = function (level, text, src) {
+    send({ __mrdayone: "preview-log", level: level, msg: String(text).slice(0, 600), src: src || "" });
+  };
+
+  // ---- 2. 控制台与未捕获错误 ----
+  ["error", "warn"].forEach(function (lv) {
+    var orig = console[lv];
+    console[lv] = function () {
+      try {
+        log(lv, Array.prototype.map.call(arguments, function (a) {
+          if (typeof a === "string") return a;
+          try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }).join(" "));
+      } catch (e) {}
+      return orig.apply(console, arguments);
+    };
+  });
+  window.addEventListener("error", function (e) {
+    log("error", (e && e.message) || "script error",
+        e && e.filename ? e.filename + ":" + (e.lineno || 0) : "");
+  }, true);
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e && e.reason;
+    log("error", "unhandledrejection: " + ((r && r.message) || r));
+  });
+
+  // ---- 3. 拾取元素 ----
+  //
+  // 高亮层用 position:fixed + pointer-events:none 盖在页面上，不改动页面本身的任何
+  // 样式或结构——拾取模式退出后页面必须和进来之前一模一样。
+  var box = null, picking = false, hovered = null;
+  var ensureBox = function () {
+    if (box) return box;
+    box = document.createElement("div");
+    box.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #0a84ff;" +
+      "background:rgba(10,132,255,.12);border-radius:3px;transition:all .05s;display:none";
+    document.documentElement.appendChild(box);
+    return box;
+  };
+  var paint = function (el) {
+    if (!el) { if (box) box.style.display = "none"; return; }
+    var r = el.getBoundingClientRect();
+    var b = ensureBox();
+    b.style.display = "block";
+    b.style.left = r.left + "px"; b.style.top = r.top + "px";
+    b.style.width = r.width + "px"; b.style.height = r.height + "px";
+  };
+  var cssPath = function (el) {
+    // 短、稳、够用：优先 id，其次带一个类名的标签，再退到 nth-of-type。
+    if (el.id) return "#" + el.id;
+    var parts = [], node = el, depth = 0;
+    while (node && node.nodeType === 1 && depth < 4) {
+      var part = node.tagName.toLowerCase();
+      var cls = (typeof node.className === "string" ? node.className : "").trim().split(/\\s+/)[0];
+      if (cls) part += "." + cls;
+      else {
+        var p = node.parentElement;
+        if (p) {
+          var same = Array.prototype.filter.call(p.children, function (c) { return c.tagName === node.tagName; });
+          if (same.length > 1) part += ":nth-of-type(" + (same.indexOf(node) + 1) + ")";
+        }
+      }
+      parts.unshift(part);
+      if (node.id) { parts[0] = "#" + node.id; break; }
+      node = node.parentElement; depth++;
     }
-    // 页面自己跳转过（重定向、点了链接）时，地址栏要跟着走
-    if (st && st.url && st.url !== _preview.url) {
-      _preview.url = st.url;
-      _previewPersistUrl(st.url);
-      const input = _preview.el?.querySelector(".lp__url");
-      if (input && document.activeElement !== input) input.value = st.url;
+    return parts.join(" > ");
+  };
+  var sourceOf = function (el) {
+    // 框架的 dev 模式会把源码位置留在 DOM 上。找得到就给准确的文件:行，
+    // 找不到就不编——**没有源码定位时必须说没有**，猜一个出来会让改文字那条路写错文件。
+    var n = el;
+    for (var i = 0; i < 6 && n; i++) {
+      var v = n.getAttribute && (n.getAttribute("data-source") || n.getAttribute("data-v-inspector") ||
+                                 n.getAttribute("data-inspector-file"));
+      if (v) {
+        var m = String(v).match(/^(.*?):(\\d+)(?::(\\d+))?$/);
+        if (m) return { file: m[1], line: Number(m[2]) };
+        return { file: String(v), line: 0 };
+      }
+      if (n.__reactFiber$ || n._debugSource) {
+        var ds = (n._debugSource) || (n.__reactFiber$ && n.__reactFiber$._debugSource);
+        if (ds && ds.fileName) return { file: ds.fileName, line: ds.lineNumber || 0 };
+      }
+      n = n.parentElement;
     }
-  } catch { /* 浏览器忙/已关：跳过这一帧，下一轮再来 */ }
-  finally { _preview.frameInFlight = false; }
-}
+    return null;
+  };
+  var describe = function (el) {
+    var cs = getComputedStyle(el);
+    var r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName.toLowerCase(),
+      selector: cssPath(el),
+      text: (el.textContent || "").trim().slice(0, 200),
+      cls: typeof el.className === "string" ? el.className : "",
+      isLeaf: el.children.length === 0,
+      source: sourceOf(el),
+      color: cs.color, background: cs.backgroundColor,
+      fontSize: cs.fontSize, fontWeight: cs.fontWeight,
+      padding: cs.padding, margin: cs.margin, borderRadius: cs.borderRadius,
+      size: Math.round(r.width) + "x" + Math.round(r.height),
+      outerHTML: (el.outerHTML || "").slice(0, 400)
+    };
+  };
+  var onMove = function (e) {
+    if (!picking) return;
+    hovered = e.target;
+    paint(hovered);
+  };
+  var onClick = function (e) {
+    if (!picking) return;
+    e.preventDefault(); e.stopPropagation();
+    stop();
+    send({ __mrdayone: "preview-picked", el: describe(e.target) });
+  };
+  var onKey = function (e) { if (picking && e.key === "Escape") { stop(); send({ __mrdayone: "preview-picked", el: null }); } };
+  var start = function () {
+    if (picking) return;
+    picking = true;
+    document.documentElement.style.cursor = "crosshair";
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("click", onClick, true);
+    window.addEventListener("keydown", onKey, true);
+  };
+  var stop = function () {
+    picking = false;
+    document.documentElement.style.cursor = "";
+    paint(null);
+    window.removeEventListener("mousemove", onMove, true);
+    window.removeEventListener("click", onClick, true);
+    window.removeEventListener("keydown", onKey, true);
+  };
+  window.addEventListener("message", function (e) {
+    var d = e && e.data;
+    if (!d || typeof d !== "object" || d.__mrdayone !== "preview-pick") return;
+    if (d.on) start(); else stop();
+  });
+
+  // 桥装好了先报一声：父窗口据此知道这个页面有没有接桥，
+  // 从而决定「指元素」能不能用、控制台面板该显示日志还是显示怎么接。
+  log("info", "调试桥已接入");
+})();`;
+
+// ---- 指元素给 AI ----
 
 /**
- * 把窗格里的一次点击，换算成真实浏览器页面里同一个位置的点击。
+ * 指元素改走调试桥。
  *
- * 换算基准必须是**图片的自然尺寸**（naturalWidth）而不是显示尺寸：画面被缩放过，
- * 用显示尺寸算出来的比例是对的，但乘回去要乘页面的真实视口宽度——那个宽度就是
- * 截图的自然宽度。中间任何一步用显示像素，点击都会整体偏移。
- */
-async function _previewCdpClick(ev, img) {
-  if (!inTauri || !img.naturalWidth) return;
-  const rect = img.getBoundingClientRect();
-  const rx = (ev.clientX - rect.left) / Math.max(1, rect.width);
-  const ry = (ev.clientY - rect.top) / Math.max(1, rect.height);
-  if (rx < 0 || rx > 1 || ry < 0 || ry > 1) return;
-  if (_preview.picking) { _previewPickAt(rx, ry); return; }
-  const x = Math.round(rx * img.naturalWidth);
-  const y = Math.round(ry * img.naturalHeight);
-  try {
-    await backend.invoke("browser_eval", { script: _PREVIEW_CLICK_JS(x, y) });
-    _previewPumpFrame(); // 立刻取一帧，不然要等下一个轮询周期才看得到反应
-  } catch (e) {
-    _previewPushLog({ level: "error", msg: "点击没送到页面：" + String(e?.message || e) });
-  }
-}
-
-/**
- * 在页面里按坐标点击。
+ * 上一版靠 CDP 驱动真实浏览器读 DOM，随「浏览器」引擎一起删掉了。现在是：父窗口发一条
+ * postMessage 让页面进入拾取模式，页面自己在上面盖一层高亮、点中之后把元素信息送回来。
  *
- * 用真实的 pointer/mouse 事件序列而不是 element.click()：现代框架（React 合成事件、
- * Radix/shadcn 那类组件）大量监听 pointerdown/mouseup，只发一个 click 的话，
- * 下拉、开关、拖拽把手这些都不会有反应，看起来就是"点了没用"。
+ * 对本地 dev server 这条路反而更好：不用弹第二个浏览器窗口、没有取帧延迟，而且页面
+ * 自己能读到框架塞的源码定位属性（React/Vue 的 dev 模式会在 DOM 上留 __source），
+ * 比从外面猜选择器准得多。
+ *
+ * 代价是**页面得接过桥**。IDE 内置的预览服务会自动注入；别人的 dev server 没有，
+ * 这时候不能装作在拾取——直接说清楚，并给出一句能贴进去的代码。
  */
-function _PREVIEW_CLICK_JS(x, y) {
-  return `(() => { try {
-    var el = document.elementFromPoint(${x}, ${y});
-    if (!el) return 'no-element';
-    var opts = { bubbles: true, cancelable: true, composed: true, clientX: ${x}, clientY: ${y}, button: 0 };
-    try { el.scrollIntoView && 0; } catch (e) {}
-    for (var type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-      var Ctor = type.indexOf('pointer') === 0 && window.PointerEvent ? PointerEvent : MouseEvent;
-      el.dispatchEvent(new Ctor(type, opts));
-    }
-    if (el.focus) { try { el.focus(); } catch (e) {} }
-    return (el.tagName || '?').toLowerCase() + (el.id ? '#' + el.id : '');
-  } catch (e) { return 'error: ' + String(e); } })()`;
-}
-
-async function _previewPickAt(rx, ry) {
-  _preview.picking = false;
-  _previewRender();
-  let info = null;
-  try {
-    const st = await backend.invoke("browser_eval", { script: _PICK_ELEMENT_JS(rx, ry) });
-    let raw = st && st.result;
-    for (let k = 0; k < 2 && typeof raw === "string"; k++) { try { raw = JSON.parse(raw); } catch { break; } }
-    info = raw;
-  } catch (_e) { /* 下面统一按"没识别到"处理 */ }
-  if (!info || typeof info !== "object" || info.error) {
-    showToast("没识别到元素（" + ((info && info.error) || "换个位置再点一次") + "）");
+function _previewTogglePick() {
+  if (!_preview.url) { showToast("先打开一个地址"); return; }
+  if (!_preview.bridgeSeen) {
+    _confirmDialog("这个页面还没接调试桥",
+      "指元素需要页面自己把选中的元素送出来——iframe 跨源，从外面读不到它的结构。\n\n"
+      + "**按工具栏的运行按钮**起的预览会自动接上。别的 dev server 需要在页面里加一行：\n\n"
+      + "```html\n<script src=\"/__mrdayone_bridge.js\"></script>\n```\n\n"
+      + "（或者把 IDE 生成的那段桥脚本贴进去——控制台面板里有完整内容。）",
+      "知道了", false);
     return;
   }
-  _previewShowPickPanel(info);
+  _preview.picking = !_preview.picking;
+  _previewPostToPage({ __mrdayone: "preview-pick", on: _preview.picking });
+  _previewRender();
+  if (_preview.picking) showToast("在预览里点你想改的那个元素");
 }
 
-/** 选中的元素交给助手：复用聊天里那套面板（免费改文字/改样式，或发给 AI）。 */
+/** 往被预览的页面发一条消息。目标源写死成当前地址的源，不用 "*"。 */
+function _previewPostToPage(msg) {
+  const frame = _preview.el?.querySelector("iframe");
+  if (!frame || !frame.contentWindow || !_preview.url) return;
+  let origin = "";
+  try { origin = new URL(_preview.url).origin; } catch { return; }
+  try { frame.contentWindow.postMessage(msg, origin); } catch { /* 页面还没加载完 */ }
+}
+
+/** 选中元素后的操作面板：复用聊天里那套（免费改文字/改样式，或发给 AI）。 */
 function _previewShowPickPanel(info) {
   const dockBody = _preview.el?.querySelector('[data-lp="dock-body"]');
   if (!dockBody) return;
@@ -5845,20 +6019,6 @@ function _previewShowPickPanel(info) {
   _previewRender();
 }
 
-function _previewTogglePick() {
-  if (_preview.engine !== "cdp") {
-    // 说清楚为什么用不了，并给出一步就能到的出路。直接置灰不说话，是这套 UI 里
-    // 最常被抱怨的那种"点了没反应"。
-    showToast("指元素需要「浏览器」引擎——iframe 跨源读不到页面结构。已为你切换。");
-    _previewSetEngine("cdp");
-    _preview.picking = true;
-    _previewRender();
-    return;
-  }
-  _preview.picking = !_preview.picking;
-  _previewRender();
-}
-
 // ---- 控制台 / 网络面板 ----
 
 function _previewToggleDock() {
@@ -5866,7 +6026,6 @@ function _previewToggleDock() {
   const body = _preview.el?.querySelector('[data-lp="dock-body"]');
   if (body) body.hidden = !_preview.dockOpen;
   _previewRender();
-  _previewSyncTimers();
 }
 
 const _previewLogs = [];
@@ -5880,12 +6039,8 @@ function _previewPushLog(entry) {
 }
 function _previewClearLogs() {
   _previewLogs.length = 0;
-  _previewSeenLogKeys.clear();
   _previewRenderDock();
 }
-/// CDP 那边每次拉的是"页面里累积的最近 N 条"，同一条会被反复读到。按内容去重，
-/// 否则面板每两秒把同样的错误再刷一遍。
-const _previewSeenLogKeys = new Set();
 
 function _previewRenderDock() {
   const body = _preview.el?.querySelector('[data-lp="dock-body"]');
@@ -5906,11 +6061,9 @@ function _previewRenderDock() {
   if (!_previewLogs.length) {
     const note = document.createElement("div");
     note.className = "lp__docknote";
-    note.textContent = _preview.engine === "cdp"
-      ? "还没有捕获到错误或失败请求。页面里发生的 console.error / 加载失败会实时出现在这里。"
-      : (_preview.bridgeSeen
-          ? "这个页面已接入调试桥，暂时没有错误。"
-          : "iframe 跨源读不到这个页面的控制台。切到「浏览器」引擎可以读任意页面的控制台和网络请求；IDE 自带的预览服务则会自动接入调试桥。");
+    note.textContent = _preview.bridgeSeen
+      ? "这个页面已接入调试桥，暂时没有错误。"
+      : "iframe 跨源读不到页面的控制台，需要页面自己把日志送出来。按工具栏的运行按钮起的预览会自动接上这条桥。";
     body.appendChild(note);
     return;
   }
@@ -5936,63 +6089,6 @@ function _previewRenderDock() {
   }
   body.appendChild(list);
   list.scrollTop = list.scrollHeight;
-}
-
-/** CDP 引擎下拉一次页面里累积的错误与失败请求。 */
-async function _previewPumpLogs() {
-  if (_preview.logInFlight || _preview.engine !== "cdp" || !inTauri) return;
-  _preview.logInFlight = true;
-  try {
-    const st = await backend.invoke("browser_eval", { script: _NETWORK_CAPTURE_JS });
-    let raw = st && st.result;
-    for (let k = 0; k < 2 && typeof raw === "string"; k++) { try { raw = JSON.parse(raw); } catch { break; } }
-    if (!raw || typeof raw !== "object") return;
-    for (const err of raw.consoleErrors || []) {
-      _previewAddDeduped({ level: err.level === "warn" ? "warn" : "error", msg: String(err.msg || ""), src: String(err.src || "") });
-    }
-    for (const f of raw.failures || []) {
-      _previewAddDeduped({ level: "error", msg: `资源加载失败${f.status ? "（" + f.status + "）" : ""}：${f.url}`, src: f.type || "" });
-    }
-    for (const a of raw.apiCalls || []) {
-      if (a.ok === false) _previewAddDeduped({ level: "error", msg: `接口失败 ${a.method || "GET"} ${a.status || ""} ${a.url}`, src: a.error || "" });
-    }
-  } catch { /* 浏览器没开/页面正在跳转：下一轮再拉 */ }
-  finally { _preview.logInFlight = false; }
-}
-
-function _previewAddDeduped(entry) {
-  const key = entry.level + "|" + entry.msg + "|" + entry.src;
-  if (_previewSeenLogKeys.has(key)) return;
-  _previewSeenLogKeys.add(key);
-  _previewPushLog(entry);
-}
-
-// ---- 轮询开关 ----
-
-/// 只有"窗格可见 + 该模式真的需要轮询"时才开定时器。这两个条件任何一个变了都要
-/// 重新过一遍这个函数，别在各个分支里零散地 setInterval/clearInterval——聊天里那张
-/// 老卡片就是那么写的，于是卡片被别的渲染换掉之后定时器还活着。
-function _previewSyncTimers() {
-  const visible = !!_preview.el && !_preview.el.hidden && activePath === PREVIEW_TAB_PATH;
-  const wantFrame = visible && _preview.engine === "cdp" && !!_preview.url;
-  const wantLog = visible && _preview.engine === "cdp" && _preview.dockOpen && !!_preview.url;
-  if (wantFrame && !_preview.frameTimer) {
-    _previewPumpFrame();
-    _preview.frameTimer = setInterval(() => _previewPumpFrame(), PREVIEW_CDP_FRAME_MS);
-  } else if (!wantFrame && _preview.frameTimer) {
-    clearInterval(_preview.frameTimer); _preview.frameTimer = 0;
-  }
-  if (wantLog && !_preview.logTimer) {
-    _previewPumpLogs();
-    _preview.logTimer = setInterval(() => _previewPumpLogs(), PREVIEW_LOG_POLL_MS);
-  } else if (!wantLog && _preview.logTimer) {
-    clearInterval(_preview.logTimer); _preview.logTimer = 0;
-  }
-}
-
-function _previewStopTimers() {
-  if (_preview.frameTimer) { clearInterval(_preview.frameTimer); _preview.frameTimer = 0; }
-  if (_preview.logTimer) { clearInterval(_preview.logTimer); _preview.logTimer = 0; }
 }
 
 // ---- file inspector: real structure preview for binary / model / data files ----
@@ -35192,12 +35288,14 @@ function _ensureLiveBrowserPreview(step, url, run) {
   let href = "";
   try { href = new URL(url).href; } catch { return null; }
   const isLocal = _previewIsLocalUrl(href);
+  // agent 跑到外部站点时不接管预览页签：那个窗格只嵌本机地址，接过去只会显示一句
+  // 「外部网站不能嵌进预览」，反而把用户正在看的本地页面顶掉。外部站点的取证走
+  // agent 自己那条浏览器链路（截图卡片），和这个页签无关。
+  if (!isLocal) return null;
 
   const firstTime = !openFiles.has(PREVIEW_TAB_PATH);
-  const localityChanged = !!_preview.url && _previewIsLocalUrl(_preview.url) !== isLocal;
   const wasActive = activePath === PREVIEW_TAB_PATH;
   try {
-    if (firstTime || localityChanged) _previewSetEngine(isLocal ? "live" : "cdp");
     // 页签第一次出现要让用户看见它，之后就安静地原地更新：正在改代码的人不该被
     // agent 的每一次导航拽走。
     openLivePreview(href, { focus: firstTime || wasActive });
@@ -35215,7 +35313,7 @@ function _ensureLiveBrowserPreview(step, url, run) {
   }
   const label = row.querySelector(".mi-preview-jump__label");
   const urlEl = row.querySelector(".mi-preview-jump__url");
-  if (label) label.textContent = isLocal ? "实时预览 · dev server" : "实时预览 · 浏览器画面";
+  if (label) label.textContent = "实时预览 · dev server";
   if (urlEl) urlEl.textContent = href;
   return row;
 }
@@ -73377,14 +73475,17 @@ async function _startDevServer(dir, port, fileName = "") {
     "            file_hashes.update(cur)",
     "            last_change[0] = time.time()",
     "threading.Thread(target=watcher, daemon=True).start()",
-    `RELOAD_JS = b'<script>(function(){var t=0;setInterval(function(){fetch("/__reload__").then(function(r){return r.text()}).then(function(s){var n=parseFloat(s);if(t&&n>t)location.reload();t=n})},800)})()</script>'`,
-    // 调试桥：把页面自己的 console.error / warn / 未捕获错误送给嵌它的那一层。
-    // 实时预览页签用 iframe 直嵌本地服务，而 iframe 跨源，父窗口读不到里面的
-    // console —— 只有页面主动送出来这一条路。判据是 parent !== window（不在
-    // iframe 里就一个字都不发），目标源用 "*"，因为页面不可能知道 IDE 的源；
-    // 接收端按当前预览地址的 origin 校验，非本页的消息一律丢弃。
-    // 整段只用双引号：它躺在一个 Python bytes 字面量 b'...' 里面。
-    `BRIDGE_JS = b'<script>(function(){if(window.parent===window)return;var send=function(l,m,s){try{parent.postMessage({__mrdayone:"preview-log",level:l,msg:String(m).slice(0,600),src:s||""},"*")}catch(e){}};["error","warn"].forEach(function(lv){var o=console[lv];console[lv]=function(){try{send(lv,Array.prototype.map.call(arguments,function(a){if(typeof a==="string")return a;try{return JSON.stringify(a)}catch(e){return String(a)}}).join(" "))}catch(e){}return o.apply(console,arguments)}});window.addEventListener("error",function(e){send("error",(e&&e.message)||"script error",e&&e.filename?e.filename+":"+(e.lineno||0):"")},true);window.addEventListener("unhandledrejection",function(e){var r=e&&e.reason;send("error","unhandledrejection: "+((r&&r.message)||r))})})()</script>'`,
+    // 调试桥改成**单独一个文件**提供：/__mrdayone_bridge.js。
+    //
+    // 上一版是把它压成一行塞进 Python 的 b'...' 字面量再内联进 HTML，于是整段只能用
+    // 双引号、不能换行、不能写注释——加个「拾取元素」就没法写了。现在它是 main.js 里
+    // 一个正常的 JS 常量（_PREVIEW_BRIDGE_JS），用 JSON.stringify 变成 Python 字符串
+    // 字面量传进来。顺带一个好处：别人的 dev server 想要同样的能力，只要在页面里加
+    // 一行 <script src="/__mrdayone_bridge.js">，而这行现在是真的成立的。
+    //
+    // 热重载轮询也并进桥里了，不再是两个脚本。
+    `BRIDGE_SRC = ${JSON.stringify(_PREVIEW_BRIDGE_JS)}`,
+    `BRIDGE_TAG = b'<script src="/__mrdayone_bridge.js"></script>'`,
     "class RH(http.server.SimpleHTTPRequestHandler):",
     "    def do_GET(self):",
     "        if self.path == '/__reload__':",
@@ -73395,9 +73496,20 @@ async function _startDevServer(dir, port, fileName = "") {
     "            self.wfile.write(str(last_change[0]).encode())",
     "            return",
     "        path = self.translate_path(self.path)",
-    "        if os.path.isfile(path) and path.endswith('.html'):",
+    // 目录要先解析成它的 index.html，再判断要不要注入。
+    // translate_path('/') 返回的是**目录**，.endswith('.html') 不成立，于是整个注入
+    // 分支被跳过、直接落到父类去发原文——而 `/` 恰恰是 IDE 自己打开的那个地址。
+    // 症状是热重载和调试桥对根路径**从来没生效过**，显式敲 /index.html 才有。
+    // 这种形状不会有人报 bug，只会觉得「改了代码有时候不刷新」。
+    "        if os.path.isdir(path):",
+    "            for _idx in ('index.html', 'index.htm'):",
+    "                _cand = os.path.join(path, _idx)",
+    "                if os.path.isfile(_cand):",
+    "                    path = _cand",
+    "                    break",
+    "        if os.path.isfile(path) and (path.endswith('.html') or path.endswith('.htm')):",
     "            with open(path, 'rb') as f: data = f.read()",
-    "            data = data.replace(b'</body>', RELOAD_JS + BRIDGE_JS + b'</body>')",
+    "            data = data.replace(b'</body>', BRIDGE_TAG + b'</body>')",
     "            self.send_response(200)",
     "            self.send_header('Content-Type', 'text/html')",
     "            self.send_header('Content-Length', str(len(data)))",

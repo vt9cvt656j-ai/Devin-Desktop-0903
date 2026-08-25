@@ -1437,6 +1437,24 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
   const selAt = RAW_SRC.indexOf('createElement("select")');
   assert.equal(selAt, -1, "又建原生 select 了，它的弹出菜单没法按要求定位");
 
+  // **这条禁令只管 createElement 那一种写法，而绝大多数原生 select 是用 innerHTML 写的。**
+  // 实测：main.js 里有 10 处 `<select` 走 innerHTML（数据库面板、设置、调试配置、
+  // LSP 语言选择…），一处都没被上面那行拦住——2026-08-24 新加的预览工具栏就是从这个
+  // 缝里过去的，而它当场撞上了这条禁令预言的后果：原生弹出菜单的宽度按最长选项的
+  // **字体度量**算，同一份 CSS 在 Chrome 里单排、在 WKWebView 里排成了两排。
+  //
+  // 把那 10 处全改成自绘超出任何单次改动的范围，所以这里上棘轮：**只减不增**。
+  // 新代码想加一个原生 select，这一行立刻红；老的慢慢迁移时这个数往下调。
+  const NATIVE_SELECTS = 10;
+  const nativeCount = (SRC.match(/<select[\s>]/g) || []).length;
+  assert.ok(nativeCount <= NATIVE_SELECTS,
+    `main.js 里的原生 <select> 从 ${NATIVE_SELECTS} 涨到了 ${nativeCount}。`
+    + "新界面请用 buildSelectControl（自绘下拉）——原生控件的弹出菜单由系统画，"
+    + "宽度按最长选项的字体度量算，CSS 管不着，排布会随平台翻转。");
+  if (nativeCount < NATIVE_SELECTS) {
+    assert.fail(`原生 <select> 已经减到 ${nativeCount} 个，把 NATIVE_SELECTS 调下来锁住成果`);
+  }
+
   // 2) 两处入口都走同一个组件——否则同一个面板里两种下拉各弹各的。
   assert.match(SRC, /function buildSelectControl\(/, "自绘下拉组件没了");
   const bc = SRC.slice(RAW_SRC.indexOf("function buildSettingControl"));
