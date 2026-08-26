@@ -143,7 +143,7 @@ const GROUPS = [
   ["Code search", /^(search|find_files|semantic_search|find_symbol|search_tools|deep_search|sourcegraph_search)$/],
   ["Code intelligence", /^(lsp_|get_diagnostics|visual_explain)/],
   ["Git & GitHub", /^(git_|gh_|gitlab_|gitee_|codeberg_)/],
-  ["Terminal & system", /^(run_cmd|run_in_terminal|read_terminal|list_terminals|stop_terminal|system|worktree|docker_compose_up|background_monitor)$/],
+  ["Terminal & system", /^(run_cmd|run_in_terminal|read_terminal|list_terminals|stop_terminal|debug_control|system|worktree|docker_compose_up|background_monitor)$/],
   ["Agents", /^(run_subagent|await_subagent|spawn_multiple_agents|run_worker|research_project|generate_wiki|update_plan|ask_user|recall_conversation|remember)$/],
   ["Web & browser", /^(browser|web_fetch|web_search|http_request|tor_request|screenshot|read_screen|ui_click|automation|computer|capture_|decode_qr|remote|start_demo|stop_demo)/],
   ["Design & media", /^(design_|learn_design|generate_(image|3d|sound|music|voice|motion|texture)|auto_rig|search_game_assets|download_asset|game_scaffold|web_scaffold|visual_compare|preview_choices|iconify_search|color_search)/],

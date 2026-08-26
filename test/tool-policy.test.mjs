@@ -113,6 +113,7 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // capture_replay 能指定任意 method/url/body 直发，是 http 那道门的完整旁路；
     // system 能开 App、切前台窗口、触发任意 App 的菜单项。
     "browser", "docker_compose_up", "capture_replay", "system",
+    "debug",  // 按 op 判：status / await_stop 是纯观察，evaluate / continue 才弹框
       // save_skill 在用户家目录的技能库里建文件；mcp_server 改**持久化配置**并注册一条
     // 可执行命令行（list 是只读的，按调用逐次判，见下面的细则断言）。
     "saveskill", "mcpconfig",
@@ -183,6 +184,7 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     // 是观察，只读模式该放行；动会话、传文件、执行 JS、按提交才是副作用。另三个一刀切挡住：
     // 起容器、发任意 HTTP、开 App 切窗口，没有一种能叫"只读"。
     "browser", "docker_compose_up", "capture_replay", "system",
+    "debug",  // 按 op 判：status / await_stop 是纯观察，evaluate / continue 才弹框
       // 新增：只读模式里不许存技能、不许改 MCP 配置（mcp_server 的 list 仍放行，逐次判）。
     "saveskill", "mcpconfig",
     // 新增（2026-08-23 审计）：subagent。它这一族里有一个会**真的写工作区文件**的——
