@@ -328,11 +328,23 @@ fn start_proxy_process(
     let script = std::env::temp_dir().join("michael_ide_mitm_bridge.py");
     std::fs::write(&script, BRIDGE_ADDON).map_err(|e| format!("写入桥接脚本失败: {e}"))?;
 
-    #[cfg(not(windows))]
-    let resolved = crate::process_util::resolve_command("mitmdump", None);
-    #[cfg(windows)]
-    let resolved = "mitmdump".to_string();
-    if !std::path::Path::new(&resolved).exists() && !resolved.contains('/') {
+    /*
+     * 两个平台都走真正的解析。
+     *
+     * 原来 Windows 分支把 `resolved` 写死成字面量 "mitmdump"，而下面那道守卫是照
+     * **POSIX 的返回形态**写的：解析到了就是绝对路径、必然含 '/'。Windows 上 cwd 里
+     * 不会有一个无扩展名的同名文件，字符串里也没有 '/'（那边是 '\'）——于是
+     * `!exists() && !contains('/')` 恒为真，**装没装 mitmproxy 都返回「未找到」**。
+     *
+     * 而 proxy_status 走的是真解析（按 PATHEXT 找得到 mitmdump.exe），于是面板显示
+     * 「✅ 已装」、一点启动就说「没装」；模型也会照着这句让用户再装一遍，装几次都一样。
+     * 下游的 capture_flows / capture_replay 和整条取证链跟着一起废。
+     *
+     * 判据换成 which_command 那一套：解析结果 ≠ 原名，或它本身就是个文件。
+     * 这和 mcp.rs 之前修过的是同一个形状。
+     */
+    let resolved = crate::process_util::which_command("mitmdump".into(), None);
+    if resolved.is_empty() {
         return Err("未找到 mitmdump（请先安装 mitmproxy）".into());
     }
 
@@ -349,7 +361,8 @@ fn start_proxy_process(
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::null());
-    #[cfg(not(windows))]
+    // Windows 也要加宽 PATH：GUI 启动的进程拿到的是一份很窄的 PATH，mitmdump 自己
+    // 找不到它依赖的 Python 运行时。augmented_path 两个平台都有实现。
     cmd.env("PATH", crate::process_util::augmented_path(None));
 
     let mut child = cmd
@@ -669,6 +682,43 @@ mod proxy_backup_tests {
         assert_eq!(
             parse_proxy_readout("garbage"),
             (false, String::new(), String::new())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 启动抓包时的「找得到 mitmdump 吗」判据，两个平台必须是同一套。
+    ///
+    /// 2026-08-26：Windows 分支原来把 resolved 写死成字面量 "mitmdump"，而守卫是照
+    /// POSIX 的返回形态写的（找到→绝对路径→含 '/'）。Windows 上那两个条件都不成立，
+    /// 于是**装没装都返回「未找到」**——而 proxy_status 走的是真解析、面板显示「已装」。
+    /// 用户看到「已装」却启动不了，模型还会照着报错让他再装一遍。
+    #[test]
+    fn mitmdump_lookup_is_not_platform_forked() {
+        // **必须切掉 #[cfg(test)] 那一段再断言**：下面几条的 needle 就写在这个测试自己的
+        // 源码里，include_str! 会把它们一起读进来，于是「不包含」恒假、断言恒红。
+        // 本仓库为同一个形状栽过（注释把源码断言喂饱）。
+        let full = include_str!("proxy.rs");
+        let src = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
+        assert!(
+            !src.contains(r#"let resolved = "mitmdump".to_string()"#),
+            "Windows 分支又把 mitmdump 写死成字面量了 —— 下面那道守卫会恒真，装了也说没装"
+        );
+        assert!(
+            !src.contains("!resolved.contains('/')"),
+            "又用 '/' 当「解析成功」的判据了 —— Windows 的分隔符是 '\\'，这条在那边恒假"
+        );
+        assert!(
+            src.contains(r#"which_command("mitmdump".into(), None)"#),
+            "没走 which_command —— 那是本仓唯一一处「解析不到就还原名」判据正确的入口"
+        );
+        // PATH 加宽不能只给 POSIX：GUI 启动的进程 PATH 很窄，mitmdump 找不到自己的依赖。
+        assert!(
+            !src.contains("#[cfg(not(windows))]\n    cmd.env(\"PATH\""),
+            "PATH 加宽又变成只给非 Windows 了"
         );
     }
 }
