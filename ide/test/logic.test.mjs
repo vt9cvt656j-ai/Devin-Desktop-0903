@@ -5199,6 +5199,90 @@ test("localStorage chat mirror shares one strict media budget across every sessi
     .reduce((total, attachment) => total + String(attachment.dataUrl || "").length, 0);
   assert.ok(keptMediaChars <= activeMedia.length);
 });
+// 关一个标签页 = 把「这个项目要做什么」整份忘掉。
+//
+// 实测（2026-08-26，conversations.sqlite3）：387 条已关闭会话里
+// anchorRoot / plan / demands / contract / thinks / lastRun / semanticFlags /
+// ctxFloor / intentState 的命中数**全部是 0**；同一张表 35 条未关闭会话这些字段
+// 正常带着（anchorRoot 19、demands 18、lastRun 5）。所以不是「有时会丢」，是关一次必丢。
+//
+// 病因是**二次序列化**：_archiveChatSession 先把活会话跑一遍 _chatSessionDataForStorage，
+// 产出的是存储形状（demands / plan / contract…，没有下划线）；随后
+// _closedChatSessionsForLocalStorage 和 _persistChatHistoryOnce 又在这个归档对象上
+// 再跑一次同一个函数，而里面八个字段只读 `s?._demandLedger` 这类下划线字段 —— 第二遍全是 undefined。
+// pendingSends 是九个里唯一活下来的，因为只有它写了 `|| s?.pendingSends` 回退。
+//
+// 丢掉的恰好是「配合写项目」的全部凭据：需求账本（用户要什么）、验收契约（怎样算做完）、
+// 计划（做到哪一步）、anchorRoot（在哪个目录）。
+//
+// 判据取自源码两端而不是测试台自己编的形状：第一遍的输出直接喂给第二遍，
+// 两次结果必须逐字段相等（幂等）。这样以后任何人新增字段忘了写回退，这条会当场变红。
+test("存储形状再序列化一次必须幂等——关标签页不许丢需求账本/计划/契约", () => {
+  const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
+  const sessionDataForStorage = load("_chatSessionDataForStorage", {
+    CHAT_LOCAL_MEDIA_BUDGET: 1_500_000,
+    _pendingSendsForStorage: pendingForStorage,
+    serializeMessagesForPersistence,
+    _snapshotTranscript: () => "",
+    _ctxReadingForStorage: load("_ctxReadingForStorage"),
+  });
+
+  const memory = new ConversationMemory();
+  memory.push({ role: "user", content: "做一个待办应用" });
+  const live = {
+    id: "s1", name: "待办", mode: "agent", model: "grok-4.6", project: "todo", created: 1,
+    memory,
+    _anchorRoot: "/Users/michael/todo",
+    _planSteps: [{ content: "建项目骨架", status: "done" }, { content: "接后端", status: "running" }],
+    _demandLedger: ["帮我做个待办应用", "要能离线用"],
+    _acceptanceContract: ["npm test 全绿", "离线也能加待办"],
+    _thinkLedger: [{ turn: 2, summary: "选 SQLite 不选 IndexedDB" }],
+    _intentState: { kind: "build" },
+    _semanticProfileFlags: ["frontend"],
+    _ctxRealFloor: { total: 12000, input: 9000, output: 3000, cacheRead: null, cacheWrite: 0, model: "grok-4.6", requestId: "r1", at: 7 },
+    _lastRunState: { steps: 9 },
+    _pendingSends: [],
+  };
+
+  const first = sessionDataForStorage(live, undefined, false, {});
+  // 第一遍必须把九个字段都带上，否则下面的幂等断言会变成「两次都空」的恒真闸。
+  for (const key of ["anchorRoot", "plan", "demands", "contract", "thinks",
+    "intentState", "semanticFlags", "ctxFloor", "lastRun"]) {
+    assert.notEqual(first[key], undefined, `活会话这一遍就没存下 ${key}，判据本身失效了`);
+  }
+
+  const second = sessionDataForStorage(first, undefined, false, {});
+  const lost = ["anchorRoot", "plan", "demands", "contract", "thinks",
+    "intentState", "semanticFlags", "ctxFloor", "lastRun"]
+    .filter((key) => second[key] === undefined);
+  assert.deepEqual(lost, [],
+    "这些字段在第二次序列化时被清空了——关一次标签页就永久丢失：\n  " + lost.join(", ")
+    + "\n修法是给读取加 `|| s?.<存储名>` 回退（pendingSends 已经是这个写法）");
+  assert.deepEqual(second.demands, first.demands, "需求账本必须逐字保住");
+  assert.deepEqual(second.plan, first.plan, "计划必须逐字保住");
+  assert.deepEqual(second.contract, first.contract, "验收契约必须逐字保住");
+  assert.equal(second.anchorRoot, first.anchorRoot, "anchorRoot 丢了就不知道在哪个目录干活");
+});
+
+// 存下来了但没人读回，等于没存。恢复侧原本只读了 intentState/semanticFlags/ctxFloor/
+// lastRun/pendingSends 五个，plan / demands / contract / thinks / anchorRoot 五个从来没读。
+test("_restoreClosedChatSession 必须把九个字段全读回会话对象", () => {
+  const src = stripJsComments(extractFn("_restoreClosedChatSession"));
+  const want = [
+    ["sData.anchorRoot", "_anchorRoot"],
+    ["sData.plan", "_planSteps"],
+    ["sData.demands", "_demandLedger"],
+    ["sData.contract", "_acceptanceContract"],
+    ["sData.thinks", "_thinkLedger"],
+    ["sData.intentState", "_intentState"],
+    ["sData.semanticFlags", "_semanticProfileFlags"],
+    ["sData.lastRun", "_lastRunState"],
+  ];
+  const missing = want.filter(([read]) => !src.includes(read)).map(([read, write]) => `${read} → session.${write}`);
+  assert.deepEqual(missing, [],
+    "这些字段存进去了却没读回来，重开标签页照样是空的：\n  " + missing.join("\n  "));
+  assert.match(src, /_ctxReadingFromStorage\(sData\.ctxFloor\)/, "ctxFloor 走的是专用反序列化器，别改成直读");
+});
 
 test("conversation compaction reports removed media for object URL cleanup", () => {
   const memory = new ConversationMemory();
@@ -32146,9 +32230,14 @@ test("契约跨 run 累积，但换方向时不许旧要求挟持新任务", () 
     "纠正时新条目不钉住——纠正常常是推翻，钉住会把一句「不是这个意思」变成永久义务");
   // 上界沿用已有防线，不新造。
   assert.match(loop, /_mergeRequirementsChecklist\(_carry, "", 12, 2000/);
-  // 跨重启也要活着。
-  assert.match(SRC, /contract: Array\.isArray\(s\?\._acceptanceContract\)/);
-  assert.match(SRC, /session\._acceptanceContract = sData\.contract\.map/);
+  // 跨重启也要活着。原断言钉的是 `contract: Array.isArray(s?._acceptanceContract)`，
+  // 那个写法在**二次序列化**下是空的：归档对象已经是存储形状，下划线字段不在了，
+  // 于是 387 条已关闭会话的 contract 命中数实测全是 0 —— 断言绿着，东西一直在丢。
+  // 现在钉两端各自的真判据：存要能从两处任一取到，读要有两条腿都读回。
+  assert.match(SRC, /contract: _keptList\("_acceptanceContract", "contract"/,
+    "契约的存储腿必须同时认活会话的 _acceptanceContract 和归档对象的 contract");
+  assert.equal([...SRC.matchAll(/session\._acceptanceContract = sData\.contract\.map/g)].length, 2,
+    "两条恢复腿都要读回契约：启动读存档、重开关掉的标签页各一条，少一条就有一半会话是空的");
 });
 
 test("那次付费评审必须真的收到验收契约", () => {

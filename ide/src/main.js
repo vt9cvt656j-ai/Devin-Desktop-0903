@@ -18532,6 +18532,21 @@ function _restoreClosedChatSession(closedIndex) {
   const session = _createChatSession(sData.name, sData.mode, sData.model, sData.project ?? "");
   session.id = sData.id || session.id;
   session.created = sData.created || Date.now();
+  // 存进去了却没人读回来 = 没存。这五个当初只写了存储腿，于是「重开一个刚关掉的标签页」
+  // 之后模型看不见用户要什么（demands）、怎样算做完（contract）、做到哪一步（plan）、
+  // 在哪个目录干活（anchorRoot）—— 只能从头再问一遍需求。
+  // 清洗判据跟启动那条恢复腿逐字一致：存档是磁盘上的普通文件，脏值不能直接进判定链。
+  if (sData.anchorRoot) session._anchorRoot = sData.anchorRoot;
+  if (Array.isArray(sData.plan) && sData.plan.length) session._planSteps = sData.plan.map((p) => ({
+    content: String(p.content || ""),
+    status: p.status || "pending",
+    ...(_PLAN_STEP_KINDS.has(String(p.kind || "").toLowerCase()) ? { kind: String(p.kind).toLowerCase() } : {}),
+  }));
+  if (Array.isArray(sData.demands) && sData.demands.length) session._demandLedger = sData.demands.map((d) => String(d)).filter(Boolean).slice(-40);
+  if (Array.isArray(sData.contract) && sData.contract.length) session._acceptanceContract = sData.contract.map((d) => String(d || "").trim()).filter(Boolean).slice(0, 12);
+  if (Array.isArray(sData.thinks) && sData.thinks.length) session._thinkLedger = sData.thinks
+    .map((t) => ({ turn: Math.max(0, Number(t?.turn) || 0), summary: String(t?.summary || "").slice(0, 400) }))
+    .filter((t) => t.summary).slice(-6);
   if (sData.intentState && typeof sData.intentState === "object") session._intentState = sData.intentState;
   if (Array.isArray(sData.semanticFlags)) session._semanticProfileFlags = sData.semanticFlags.slice();
   { const _ctxRead = _ctxReadingFromStorage(sData.ctxFloor); if (_ctxRead) session._ctxRealFloor = _ctxRead; }
@@ -18754,10 +18769,25 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
               : undefined,
           })
     : undefined;
+  // 这个函数会被跑**两遍**：_archiveChatSession 先把活会话序列化成存储形状，
+  // 之后 _closedChatSessionsForLocalStorage / _persistChatHistoryOnce 又在那个归档对象上
+  // 再跑一遍。第二遍时下划线字段（_demandLedger…）早已不存在，于是九个字段里有八个
+  // 被悄悄清空——实测 387 条已关闭会话命中数全是 0，而 35 条未关闭会话正常带着。
+  // pendingSends 当初活下来靠的就是它那句 `|| s?.pendingSends`，这里把同一个回退补齐。
+  // 丢的正是「配合写项目」的全部凭据：需求账本、验收契约、计划、在哪个目录干活。
+  const _keptList = (underscore, stored, shape) => {
+    const live = Array.isArray(s?.[underscore]) && s[underscore].length ? s[underscore] : null;
+    const kept = live || (Array.isArray(s?.[stored]) && s[stored].length ? s[stored] : null);
+    return kept ? shape(kept) : undefined;
+  };
+  const _keptObj = (underscore, stored) => {
+    const live = s?.[underscore] && typeof s[underscore] === "object" ? s[underscore] : null;
+    return live || (s?.[stored] && typeof s[stored] === "object" ? s[stored] : undefined);
+  };
   const out = {
     id: s?.id, name: s?.name, mode: s?.mode, model: s?.model || null,
     project: s?.project || "",
-    anchorRoot: s?._anchorRoot || undefined,
+    anchorRoot: s?._anchorRoot || s?.anchorRoot || undefined,
     memory,
     history: memory ? undefined : serializeMessagesForPersistence(
       historyLimit === 0 ? [] : (s?.history || []).slice(-historyLimit),
@@ -18765,17 +18795,16 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
       { textBudget: options.textBudget },
     ),
     pendingSends: _pendingSendsForStorage(s?._pendingSends || s?.pendingSends, budget, options.textBudget),
-    plan: Array.isArray(s?._planSteps) && s._planSteps.length ? s._planSteps.map((p) => ({ content: p.content, status: p.status, ...(p.kind ? { kind: p.kind } : {}) })) : undefined,
-    demands: Array.isArray(s?._demandLedger) && s._demandLedger.length ? s._demandLedger.slice(-40) : undefined,
+    plan: _keptList("_planSteps", "plan", (list) => list.map((p) => ({ content: p.content, status: p.status, ...(p.kind ? { kind: p.kind } : {}) }))),
+    demands: _keptList("_demandLedger", "demands", (list) => list.slice(-40)),
     // 验收契约跟着会话一起存：它是「这个项目要做成什么样」的唯一载体，
     // 跨不过重启就等于每次开软件都把项目目标忘干净。
-    contract: Array.isArray(s?._acceptanceContract) && s._acceptanceContract.length ? s._acceptanceContract.slice(0, 12) : undefined,
-    thinks: Array.isArray(s?._thinkLedger) && s._thinkLedger.length ? s._thinkLedger.slice(-6) : undefined, // 方案A：思考结论账本跨重启存活
-    intentState: s?._intentState && typeof s._intentState === "object" ? s._intentState : undefined,
-    semanticFlags: Array.isArray(s?._semanticProfileFlags) && s._semanticProfileFlags.length
-      ? s._semanticProfileFlags.slice() : undefined,
+    contract: _keptList("_acceptanceContract", "contract", (list) => list.slice(0, 12)),
+    thinks: _keptList("_thinkLedger", "thinks", (list) => list.slice(-6)), // 方案A：思考结论账本跨重启存活
+    intentState: _keptObj("_intentState", "intentState"),
+    semanticFlags: _keptList("_semanticProfileFlags", "semanticFlags", (list) => list.slice()),
     ctxFloor: _ctxReadingForStorage(s),
-    lastRun: s?._lastRunState && typeof s._lastRunState === "object" ? s._lastRunState : undefined,
+    lastRun: _keptObj("_lastRunState", "lastRun"),
     created: s?.created,
   };
   if (s?.closedAt) out.closedAt = s.closedAt;
@@ -19721,7 +19750,9 @@ function _applyContextReading(session, reading = {}) {
  * the conversation the client cannot recompute for itself.
  */
 function _ctxReadingForStorage(session) {
-  const real = session?._ctxRealFloor;
+  // 归档过的会话已经是存储形状（ctxFloor），下划线字段早没了。产出形状和入参形状同构，
+  // 所以两处取哪一个都能再跑一遍——不加这条回退，关一次标签页上下文水位线就归零。
+  const real = session?._ctxRealFloor || session?.ctxFloor;
   const total = Math.max(0, Number(real?.total) || 0);
   if (total <= 0) return undefined;
   return {

@@ -67,8 +67,14 @@ test("the session's flags survive a restart and are dropped on a rewind", () => 
   // Session persistence is an explicit whitelist, so a field nobody lists silently does not
   // survive — and a resumed session would then pay a full prefix miss on its first turn for
   // nothing. Two serializers and two rehydrators, matching how _intentState is handled.
-  assert.equal((SRC.match(/semanticFlags: Array\.isArray\(/g) || []).length, 2,
+  // 两个序列化器写法不同是**故意**的：_chatSessionDataForStorage 会被跑两遍
+  // （归档一次、落盘再一次），第二遍拿到的是已经没有下划线字段的存储形状，所以它必须
+  // 走 _keptList 那条「活会话或归档对象取到哪个算哪个」的回退；另一个只跑在活会话上。
+  // 原来两处都写 `Array.isArray(s?._semanticProfileFlags)`，于是关掉的会话一律丢空。
+  assert.equal((SRC.match(/semanticFlags: (Array\.isArray\(|_keptList\()/g) || []).length, 2,
     "both session serializers must write the flags");
+  assert.match(SRC, /semanticFlags: _keptList\("_semanticProfileFlags", "semanticFlags"/,
+    "存储序列化器必须用回退取值，否则二次序列化把 flags 清空、恢复的会话第一轮白付一次前缀未命中");
   assert.equal((SRC.match(/if \(Array\.isArray\(sData\.semanticFlags\)\)/g) || []).length, 2,
     "both rehydrators must read them back");
 
