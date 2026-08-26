@@ -7958,7 +7958,16 @@ test("developer community search is wired through schema, normalization, executi
   assert.match(SRC, /Results keep each source's own relevance or upstream ordering — they are not guaranteed to be sorted by date/);
   assert.match(SRC, /query: \{ type: "string", minLength: 1, description: "The topic or error keyword to search for" \}/);
   assert.match(SRC, /Calling a tool or configuring an endpoint is not success/);
-  assert.doesNotMatch(SRC.match(/name: description: "([^"]+)/)?.[1] || "", /真实可运行|代码全有|首选/);
+  // 工具自己的描述里不许有营销词——模型是照描述选工具的，"首选"会让它无脑先调这一个。
+  //
+  // 这条以前写成 `SRC.match(/name: description: "([^"]+)/)?.[1] || ""`，而
+  // `name: description: "` 这个串在源码里**一次都不出现**：match 返回 null，`|| ""`
+  // 把它变成空串，于是 doesNotMatch("") 恒真，守了个寂寞。改成直接问目录模块要描述。
+  const dcsDesc = [...baseTools(), ...readonlyExternalTools(), ...writeTools()]
+    .find((t) => t.function?.name === "developer_community_search")?.function?.description;
+  assert.ok(dcsDesc, "developer_community_search 不在工具目录里了");
+  assert.doesNotMatch(dcsDesc, /真实可运行|代码全有|首选/,
+    "工具描述里出现营销词——模型会照着它无脑先调这一个");
 
   const directoryDescription = SRC.match(/const _SEARCH_TOOLS_DESCRIPTION = `([^`]+)`;/)?.[1];
   assert.ok(directoryDescription, "search_tools should have a concise runtime description");
@@ -24497,9 +24506,11 @@ test("交付事实只喂模型，不再糊在答案下面", () => {
   // 删的是**显示**：同一条事实照旧喂回模型，"改完别谎报能用"的机制一点没动。
   assert.match(SRC, /parts\.push\(`本轮交付事实（执行记录，非推断）: \$\{facts\}`\)/,
     "没喂回模型 —— 它下一轮照样改完就说能用");
-  const footer = SRC.slice(RAW_SRC.indexOf("elapsedMs: Date.now() - run._recStart"), 
-                          RAW_SRC.indexOf("elapsedMs: Date.now() - run._recStart") + 500);
-  assert.doesNotMatch(footer, /_appendDeliveryFactsBar\(body, run\)/,
+  // 锚点 `elapsedMs: Date.now() - run._recStart` 早就不在源码里了（indexOf 返回 -1，
+  // slice(-1, 499) 得空串，doesNotMatch("") 恒真）——这条守了很久的寂寞。
+  // 改成全局断言：_appendDeliveryFactsBar 至今零调用点，禁令直接对整份源码提。
+  // `(?<!function )`：定义行 `function _appendDeliveryFactsBar(body, run) {` 本身也含这个串。
+  assert.doesNotMatch(SRC, /(?<!function )_appendDeliveryFactsBar\(body, run\)/,
     "又把事实横幅糊回答案下面了 —— 用户点名不要这条");
 });
 
@@ -30501,9 +30512,11 @@ test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
 
   // 撤销**逻辑**（写回本轮前内容、删新建文件、先确认后动手）仍然要正确——2026-08-18
   // 只删了轮末默认挂那条 UI，函数和 checkpoint 都留着，需要时可另开入口。
-  const agentFooter = SRC.slice(RAW_SRC.indexOf("elapsedMs: Date.now() - run._recStart"), 
-                               RAW_SRC.indexOf("elapsedMs: Date.now() - run._recStart") + 500);
-  assert.doesNotMatch(agentFooter, /_appendRunRevertBar\(body, run\)/,
+  // 锚点 `elapsedMs: Date.now() - run._recStart` 早就不在源码里了（indexOf 返回 -1，
+  // slice(-1, 499) 得空串，doesNotMatch("") 恒真）——这条守了很久的寂寞。
+  // 改成全局断言：_appendRunRevertBar 至今零调用点，禁令直接对整份源码提。
+  // `(?<!function )`：定义行 `function _appendRunRevertBar(body, run) {` 本身也含这个串。
+  assert.doesNotMatch(SRC, /(?<!function )_appendRunRevertBar\(body, run\)/,
     "又把撤销条挂回轮末了 —— 用户点名不要这条");
   const bar = stripJsComments(extractFn("_appendRunRevertBar"));
   assert.match(bar, /_toolApprovalDialog/, "写回是破坏性的，必须先确认");
@@ -30841,15 +30854,20 @@ test("会删东西的 find 不许被判成只读命令，批量删除必须弹�
   // 就算安全」对它根本不成立。再加上 shell 删除不进 checkpoint，「全部撤销」也救不回来。
   const roSrc = SRC.slice(RAW_SRC.indexOf("function _looksLikeReadOnlyCommand"));
   const roBody = roSrc.slice(0, roSrc.indexOf("\nfunction "));
-  const isReadOnly = new Function("command", roBody.slice(roBody.indexOf("{") + 1, roBody.lastIndexOf("}")).replace(/_looksLikeReadOnlyCommand/g, "arguments.callee") + "");
-  // 直接用源码里的谓词判据做断言，避免把整个递归函数搬进沙箱。
+  // 这个谓词以前是用 `new Function` + `arguments.callee` 手工拼出来的，然后
+  // **一次都没调用**（末尾一句 `void isReadOnly;`），下面三条全是源码断言。
+  // 改成用正规提取器装起来真跑：行为断言能抓到「谓词写了但接错了」，源码断言抓不到。
+  const isReadOnly = load("_looksLikeReadOnlyCommand");
+  assert.equal(isReadOnly("find . -name '*.js'"), true, "普通 find 是只读的");
+  assert.equal(isReadOnly("find . -delete"), false, "find -delete 会删文件，不是只读");
+  assert.equal(isReadOnly("find . -exec rm {} ;"), false, "find -exec 能跑任意命令，不是只读");
+  // 下面三条源码断言留着：它们钉的是**判据长什么样**，行为断言只能证明当前这几个样例过。
   assert.match(roSrc, /const findIsDestructive = \(segment\) =>/,
     "find 的破坏性谓词判断没了——-delete / -exec 会重新被当成只读命令");
   assert.match(roSrc, /-\(\?:delete\|exec\|execdir\|ok\|okdir\|fls\|fprint\|fprintf\)/,
     "破坏性谓词名单不完整");
   assert.match(roSrc, /!findIsDestructive\(segment\) &&/,
     "谓词判断没有真正接到 segmentOk 上——写了等于没写");
-  void isReadOnly;
 
   // auto 模式下唯一会弹确认框的是 _DANGEROUS_CMD_RE，批量不可逆删除必须在里面。
   const m = /const _DANGEROUS_CMD_RE = (\/.*\/i);/.exec(SRC);
