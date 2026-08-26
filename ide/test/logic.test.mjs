@@ -35480,3 +35480,39 @@ test("下游确实有一条为 [model-empty-output] 准备的自动重开", () =
   assert.match(loop, /_emptyOut \|\| _isRetryableAiError\(_turnErrRaw\)/,
     "零产出没有并进自动重试的判据");
 });
+
+/**
+ * showToast 的第二个参数是**选项对象**，不是毫秒数。
+ *
+ * `showToast(msg, opts = {})` 读的是 `opts?.duration`。传一个裸数字时
+ * `5000?.duration === undefined`，于是**静默退回默认 1900ms**——不报错、不警告。
+ *
+ * 后果正好压在最需要被看到的那些消息上：「已切到你自己的端点，智能体会比走网关时弱」
+ * （本想显示 9 秒）、「settings.json 格式有误，能力声明和权限规则全部未生效」（8 秒）、
+ * 「hooks 全部未生效」（8 秒）——全部只闪 1.9 秒。用户多半根本没看见。
+ *
+ * 2026-08-26 实测有 7 处，其中两处是当天新写的——说明光靠 code review 拦不住，
+ * 得有判据。
+ */
+test("showToast 的第二个参数不许是裸数字", () => {
+  // 括号配平取真正的第二个实参，不能用正则——`.slice(0, 120))` 长得一模一样，
+  // 用行内正则会把它误伤成 `.slice(0, { duration: 120 })`（这个坑当场踩过）。
+  const bad = [];
+  for (const m of RAW_SRC.matchAll(/\bshowToast\(/g)) {
+    let i = m.index + m[0].length, depth = 1, args = [], cur = "";
+    while (i < RAW_SRC.length && depth) {
+      const c = RAW_SRC[i];
+      if ("([{".includes(c)) depth++;
+      else if (")]}".includes(c)) { depth--; if (!depth) break; }
+      if (depth === 1 && c === ",") { args.push(cur); cur = ""; } else cur += c;
+      i++;
+    }
+    args.push(cur);
+    if (args.length >= 2 && /^\s*\d+\s*$/.test(args[1])) {
+      bad.push(`第 ${RAW_SRC.slice(0, m.index).split("\n").length} 行`);
+    }
+  }
+  assert.deepEqual(bad, [],
+    `这些 showToast 传了裸毫秒数，会被静默忽略、退回 1900ms 默认值：${bad.join("、")}\n`
+    + "正确写法是 showToast(msg, { duration: 8000 })。");
+});

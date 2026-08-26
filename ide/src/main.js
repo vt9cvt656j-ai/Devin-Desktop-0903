@@ -9243,7 +9243,7 @@ async function _toggleFullScreen() {
     const w = getCurrentWindow();
     await w.setFullscreen(!(await w.isFullscreen()));
   } catch (e) {
-    showToast(`切换全屏失败：${String(e && e.message ? e.message : e).slice(0, 120)}`, 5000);
+    showToast(`切换全屏失败：${String(e && e.message ? e.message : e).slice(0, 120)}`, { duration: 5000 });
   }
 }
 
@@ -9664,7 +9664,7 @@ async function _persistBackgroundModel(path, model) {
     // CAS 失败 = 从我们读到 expected 到写回之间，磁盘被别人改了。绝不覆盖，
     // 而且必须说出来：这条路径上的失败以前是完全静默的。
     try {
-      showToast(`⚠️ ${basename(path)} 的跨文件改动未能写入（磁盘已被其他程序修改）`, 6000);
+      showToast(`⚠️ ${basename(path)} 的跨文件改动未能写入（磁盘已被其他程序修改）`, { duration: 6000 });
     } catch {}
     throw e;
   } finally {
@@ -15413,7 +15413,7 @@ function _warnCustomEndpointOnce(custom) {
     const seen = JSON.parse(localStorage.getItem(_CUSTOM_WARNED_KEY) || "[]");
     if (Array.isArray(seen) && seen.includes(id)) return;
     localStorage.setItem(_CUSTOM_WARNED_KEY, JSON.stringify([...(Array.isArray(seen) ? seen : []), id]));
-    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩与下一句预测也会关闭。", 9000);
+    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩与下一句预测也会关闭。", { duration: 9000 });
   } catch {}
 }
 
@@ -17254,7 +17254,7 @@ async function _verifiedWorkspaceRoot(root) {
       console.warn("[michael-ide] registerWorkspaceRoot failed:", root, reason);
       // 只对"这个目录不能作为工作区"这类**结论性**拒绝提示用户——瞬时错误不打扰。
       if (/system directory|too broad|must be a directory/i.test(reason)) {
-        try { showToast(`无法把「${root}」设为工作区：${reason}。可以浏览，但写入会被拒绝。`, 8000); } catch {}
+        try { showToast(`无法把「${root}」设为工作区：${reason}。可以浏览，但写入会被拒绝。`, { duration: 8000 }); } catch {}
       }
     }
   }
@@ -22562,7 +22562,7 @@ function _parseSettingsJson(raw, from) {
     if (_settingsParseWarned !== sig) {
       _settingsParseWarned = sig;
       console.error("[settings] parse failed:", from, e);
-      try { showToast(`${from} 格式有误，这份文件里的能力声明和权限规则全部未生效：${msg}`, 8000); } catch {}
+      try { showToast(`${from} 格式有误，这份文件里的能力声明和权限规则全部未生效：${msg}`, { duration: 8000 }); } catch {}
     }
     return { parsed: null, error: `${from}：JSON 格式有误，这份文件里的能力声明**和权限规则**全部未生效 —— ${msg}` };
   }
@@ -59764,7 +59764,7 @@ async function _loadHooks(root) {
       if (_hooksParseWarned !== _sig) {
         _hooksParseWarned = _sig;
         console.error("[hooks] parse failed:", _hooksRel, e);
-        showToast(`${_hooksRel} 格式有误，本工作区的 hooks 全部未生效：${String(e && e.message || e).slice(0, 80)}`, 8000);
+        showToast(`${_hooksRel} 格式有误，本工作区的 hooks 全部未生效：${String(e && e.message || e).slice(0, 80)}`, { duration: 8000 });
       }
       _hooksCache = { root, ts: now, cfg: null };
       return null;
@@ -80589,7 +80589,7 @@ const _refreshShellEnv = async () => {
     _osDetailCache = null; // 这个缓存以前永不失效，会把开机那一刻的 shell/版本冻到关机
     // 给模型一句话：它此前得出的"没装 / 找不到命令"结论可能已经不成立了。
     _envChangedNote = "\n环境已更新：PATH 在上一轮之后发生了变化，此前得出的「找不到命令 / 未安装」结论可能已失效，需要时请重新探测。";
-    try { showToast("🔄 检测到环境变量变化，已刷新", 3000); } catch {}
+    try { showToast("🔄 检测到环境变量变化，已刷新", { duration: 3000 }); } catch {}
   } catch {}
 };
 window.addEventListener("focus", _refreshShellEnv);
