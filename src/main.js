@@ -54590,6 +54590,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         for (const _it of items) {
           const _requestedName = String(_it?.tc?.name || "");
           const _canonicalName = _canonicalToolName(_requestedName) || _requestedName;
+          // 归一化出来的名字必须**写回 tc.name**，不能只用来查注册表。
+          //
+          // 下游按 tc.name 分派的地方有十几处：执行器分叉（subagentNames.has(it.tc.name)
+          // 决定走 runSubagentItem 还是通用 runOne）、_stepRenderable 排除的那六个自绘卡、
+          // update_plan 的台账、后台派发的 _asyncSpawnNames…… 而 _mapToolCall 只在**自己
+          // 内部**认别名：它把 call.type 定对了，tc.name 却原样留着模型写的那个词。
+          //
+          // 于是模型写 `subagent`（表里 run_subagent 的别名）时：call.type = "subagent"
+          // 是对的，subagentNames.has("subagent") = false 是错的 → 落进通用执行器 → 那里
+          // 没有 subagent 这个 case → 一路走到函数末尾的兜底，返回
+          // 「[ERROR] 未识别的工具类型：subagent」。run_worker / spawn_multiple_agents /
+          // research_project / design_research / debate 六个自绘工具全是这个下场。
+          //
+          // 下面那处 `it.tc.name = _healed` 补不上这个洞：它的前提是
+          // `it._unknown || call.type === "unknown"`，而别名恰恰是**映射成功**的那一类。
+          if (_canonicalName !== _requestedName && _reg.has(_canonicalName)) _it.tc.name = _canonicalName;
           if (_canonicalName
               && !_loadedNow.has(_canonicalName)
               && !_requestedNames.has(_canonicalName)
@@ -55239,6 +55255,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const _smShared = it.call.collaboration !== "independent";
           const _smLedgerLen = run._toolLedger && Array.isArray(run._toolLedger.entries) ? run._toolLedger.entries.length : 0;
           const _smJobs = [];
+          // 黑板键（带 run 前缀，跨标签页唯一）和**作业号**（run 内的纯数字）是两码事。
+          // _smJobs 收前者给协同引擎用，这个收后者给回执用——理由见下面 message 那处。
+          const _smJobIds = [];
           for (const spec of specs) {
             run._subAgentJobSeq = (run._subAgentJobSeq || 0) + 1;
             const jobId = run._subAgentJobSeq;
@@ -55303,6 +55322,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               return job.result;
             });
             _smJobs.push(storeId);
+            _smJobIds.push(jobId);
           }
           if (_smShared && window.collaborationEngine) {
             const _collabId = `sm_${Date.now()}_${run._subAgentJobSeq || 0}`;
@@ -55339,7 +55359,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           const _dropNote = Array.isArray(it.call.dropped) && it.call.dropped.length
             ? `\n⚠ 你给的角色里有 ${it.call.dropped.join("；")}——这些视角**没有**被派出去。需要的话补上 focus 重新派一次，不要当成已经覆盖。`
             : "";
-          const message = `[已并发派发 ${_smJobs.length} 个子智能体] ${_smJobs.map((id) => `job#${id}`).join("、")}（协同模式：${_smShared ? "shared_store 发现互相广播 + lead_follower 主从协调" : "independent 完全隔离"}）。它们在后台并行工作，你继续推进当前任务的其他步骤；结果就绪后自动送达，也可用 await_subagent(job="all") 汇合。${_dropNote}`;
+          // 回执里的作业号必须是 **_smJobIds**（run 内的纯数字），不是 _smJobs（黑板键）。
+          //
+          // await_subagent 的查找是 `String(j.id) === _want.replace(/^job#?/, "")`，而 j.id
+          // 就是那个纯数字。这里原来打的是 storeId（`${_smRunToken(run)}_${jobId}`，形如
+          // `r7abc_3`），于是模型照着回执写 await_subagent(job="r7abc_3") → 一条都匹配不上
+          // → 返回「未找到 job#r7abc_3」。同一个文件里单体那条路（第 55500 行附近）打的
+          // 就是 `job#${jobId}`，两条路的回执格式一直不一致。
+          const message = `[已并发派发 ${_smJobIds.length} 个子智能体] ${_smJobIds.map((id) => `job#${id}`).join("、")}（协同模式：${_smShared ? "shared_store 发现互相广播 + lead_follower 主从协调" : "independent 完全隔离"}）。它们在后台并行工作，你继续推进当前任务的其他步骤；结果就绪后自动送达，也可用 await_subagent(job="all") 汇合。${_dropNote}`;
           it.rawResult = { type: "spawnmulti", path: it.call.path || t("subagent.concurrent", { count: _smJobs.length }), content: message };
           return message;
         }
