@@ -4,7 +4,7 @@ import test from "node:test";
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { load } from "./helpers/source.mjs";
+import { load, SRC as SHARED_SRC} from "./helpers/source.mjs";
 import { join, extname } from "node:path";
 
 /*
@@ -20,7 +20,10 @@ import { join, extname } from "node:path";
  * 结果的操作被空 catch 吞掉）在 27 万行上命中 2081 处，收紧到 7 处后逐个看仍有七成
  * 误报（那些空 catch 大多在别处补偿过），所以没有采用。
  */
-const SRC = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+// 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
+// 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
+// 反方向更糟：「main.js 里不许出现 X」这类断言会在 X 搬进模块后恒绿，禁令悄悄失效。
+const SRC = SHARED_SRC;
 
 // 用仓库自己的 load / fnSource，别再手抄一份「按名字抠函数体」的提取器
 // （有一条元测试专门在拦这个：手抄的那些会在函数改名/加参数时静默失效）。

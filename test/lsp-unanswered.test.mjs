@@ -1,4 +1,5 @@
 import test from "node:test";
+import { SRC as SHARED_SRC } from "./helpers/source.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -18,7 +19,10 @@ import { readFileSync } from "node:fs";
  */
 
 const LSP = readFileSync(new URL("../src/lsp-client.js", import.meta.url), "utf8");
-const MAIN = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+// 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
+// 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
+// 反方向更糟：「main.js 里不许出现 X」这类断言会在 X 搬进模块后恒绿，禁令悄悄失效。
+const MAIN = SHARED_SRC;
 
 // ── 把一个 agent* 方法单独抠出来跑 ──────────────────────────────────────────
 function methodOf(name, deps = {}) {

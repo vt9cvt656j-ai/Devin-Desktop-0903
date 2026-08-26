@@ -1,4 +1,5 @@
 import test from "node:test";
+import { SRC as SHARED_SRC } from "./helpers/source.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { blockedInReadOnlyMode, needsApprovalFor, readOnlyBlockedTypes, approvalTypes } from "../src/agent/tool-policy.js";
@@ -13,7 +14,10 @@ import { blockedInReadOnlyMode, needsApprovalFor, readOnlyBlockedTypes, approval
  * list is quietly executable in Explorer/Plan/Reviewer, and nothing fails until a user
  * notices」。这条测试就是那个 notice。
  */
-const SRC = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+// 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
+// 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
+// 反方向更糟：「main.js 里不许出现 X」这类断言会在 X 搬进模块后恒绿，禁令悄悄失效。
+const SRC = SHARED_SRC;
 
 test("带 _wiki 的 subagent 调用要被只读模式挡下，纯调研的照常放行", () => {
   assert.equal(blockedInReadOnlyMode("subagent", { _wiki: true, wikiDest: "README.md" }), true,

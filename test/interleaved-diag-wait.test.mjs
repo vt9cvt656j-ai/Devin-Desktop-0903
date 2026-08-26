@@ -1,4 +1,5 @@
 import test from "node:test";
+import { SRC as SHARED_SRC } from "./helpers/source.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -14,7 +15,10 @@ import { readFileSync } from "node:fs";
  *
  * 这条测试真的跑那段循环（用假时钟，不真等）。
  */
-const SRC = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+// 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
+// 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
+// 反方向更糟：「main.js 里不许出现 X」这类断言会在 X 搬进模块后恒绿，禁令悄悄失效。
+const SRC = SHARED_SRC;
 
 // setTimeout 在 new Function 里拿的是全局那个；用假时钟推进时间即可，等待仍是真实的
 // 150ms×N —— 为了不让测试变慢，把总闸和 TS 闸按毫秒缩小传进去。

@@ -16,9 +16,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 // 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
-import { fnSource as extractFn, CODE } from "./helpers/source.mjs";
+import { fnSource as extractFn, CODE, SRC as SHARED_SRC} from "./helpers/source.mjs";
 
-const SRC = fs.readFileSync("src/main.js", "utf8");
+// 源码文本用共享的那一份（helpers/source.mjs 的 SRC = main.js + src/agent/* 拼接）。
+// 自己 readFileSync("src/main.js") 的话，每从 main.js 搬出一个模块就假红一次；
+// 反方向更糟：「main.js 里不许出现 X」这类断言会在 X 搬进模块后恒绿，禁令悄悄失效。
+const SRC = SHARED_SRC;
 const APP_CSS = fs.readFileSync("src/styles/app.css", "utf8");
 
 

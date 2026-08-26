@@ -118,23 +118,40 @@ test("工具编排的闸门必须区分「裁决未到」和「裁决说不适�
 // 所以建议只留 1 条、总额 4 条，超额时按重要性挑（先建议、再最旧的事实）。
 test("提醒按重要性淘汰，不是按先来后到", () => {
   const factsSrc = /const _NUDGE_FACTS = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
-  const rankSrc = /const _nudgeRank = \(cat\) => [^;]+;/.exec(SRC);
-  assert.ok(factsSrc && rankSrc, "分级表或 _nudgeRank 被改名/挪走了——淘汰会退回按先来后到");
-  const rank = new Function(`${factsSrc[0]}\n${rankSrc[0]}\nreturn _nudgeRank;`)();
+  const onceSrc = /const _NUDGE_ONCE = new Set\(\[[\s\S]*?\]\);/.exec(SRC);
+  const rankSrc = /const _nudgeRank =\s*\n?\s*\(cat\) =>[\s\S]*?;/.exec(SRC);
+  assert.ok(factsSrc && onceSrc && rankSrc, "分级表或 _nudgeRank 被改名/挪走了——淘汰会退回按先来后到");
+  const rank = new Function(`${factsSrc[0]}\n${onceSrc[0]}\n${rankSrc[0]}\nreturn _nudgeRank;`)();
 
   assert.equal(rank("steer"), 0, "用户实时插话必须永远最高优先级");
+
+  // ── 一次性档（2026-08-26）─────────────────────────────────────────────
+  // 判据是**结构性**的，不是重要性：这几条的推送点都由一个 run 级标记守着（读了就置位），
+  // 所以淘汰它们和淘汰 toolReminder / planStale 那种「12 轮后还会再来」的完全不是一回事——
+  // 后者挤掉只是晚几轮再说，前者挤掉就是这一整个 run 再也不会有第二次提起。
+  //
+  // researchFirst 已经因为这条道理从建议类升过一次事实类，但事实类内部仍按「最旧的先走」
+  // 淘汰，而它偏偏是**第一次写入**那一刻推的——四条事实一凑齐，第一个被踢的还是它。
+  // 同一个病，低一层。
+  for (const once of ["researchFirst", "websiteContent", "emptyHistoryFact", "planFinish"]) {
+    assert.equal(rank(once), 1, `${once} 是一次性提醒，挤掉就是整个 run 永久失去`);
+  }
   // researchFirst 2026-08-22 从建议类改判事实类：它陈述的是执行事实（"这次工程语义要求
   // 外部参考，而取证账本是空的"，由 _missingResearchEvidence 按台账算出来），和 websiteContent
   // 是同一个判据的两半。而它偏偏只在**第一次写入**推一次（researchGateNudges < 1，整个 run
   // 就这一次机会），留在建议类里就意味着任何一条更晚的建议都能把它永久挤掉。
-  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery", "researchFirst"]) {
-    assert.equal(rank(fact), 1, `${fact} 是事实类，丢了模型会按错误图景干活`);
+  for (const fact of ["buildFix", "diag", "blindEdit", "subagentResult", "toolRepair", "recovery"]) {
+    assert.equal(rank(fact), 2, `${fact} 是事实类，丢了模型会按错误图景干活`);
   }
   for (const advice of ["planNudge", "midSummary", "stuck", "askBudget"]) {
-    assert.equal(rank(advice), 2, `${advice} 是建议类，可以被事实挤掉`);
+    assert.equal(rank(advice), 3, `${advice} 是建议类，可以被事实挤掉`);
   }
-  assert.equal(rank("someBrandNewNudge"), 2,
+  assert.equal(rank("someBrandNewNudge"), 3,
     "没登记的新提醒必须默认按建议类——要保命就得显式登记，不能靠默认捡到便宜");
+  // 一次性档必须保持短：它挡在 ≤4 的名额前面，列进来的越多，上限越接近失效。
+  const onceCount = [...onceSrc[0].matchAll(/"[a-zA-Z]+"/g)].length;
+  assert.ok(onceCount <= 4,
+    `一次性档有 ${onceCount} 条，已经吃掉 ≤4 名额的大半 —— 加之前先确认它真的被 run 级一次性标记守着`);
 
   // 拿**源码里真实的那段淘汰循环**跑，不照抄一份：照抄的话我改了源码它照样绿。
   // 拿**源码里真实的那段淘汰逻辑**跑，不照抄一份：照抄的话我改了源码它照样绿。

@@ -14130,6 +14130,21 @@ test("工具别名归一化要写回 tc.name，不能只用来查注册表", () 
   assert.match(loop, /subagentNames\.has\(it\.tc\.name\)/, "执行器仍按 tc.name 分叉");
 });
 
+test("后台派发的子智能体作业要记住自己的角色", () => {
+  // 会诊归总（await_subagent 里那段）按 `j.role || "专家"` 给每份报告署名——"后端说 X、
+  // 安全说 Y"。批量派发那条路存了 role，而**默认路径**（模型一个个派 run_subagent(role=…)
+  // 再 await_subagent(job="all")）没存，于是归总里每一份都署名「专家」，主智能体看不出
+  // 这是谁的意见——正是批量那处注释里写着要避免的那件事，只不过发生在更常走的那条路上。
+  const loop = extractFn("_runAgenticLoop");
+  const bg = loop.slice(loop.indexOf('const _asyncSpawnNames = new Set(["run_subagent"'));
+  assert.ok(bg, "后台派发那一段挪走了，这条断言失去落点");
+  assert.match(bg.slice(0, 2000), /const job = \{ id: jobId, desc, role: it\.call\.role \|\| "",/,
+    "后台作业没存 role —— 会诊归总里每一份都会署名「专家」");
+  const exec = extractFn("_executeToolStepInner");
+  assert.match(exec, /`【\$\{j\.role \|\| "专家"\}·\$\{j\.desc\}】/,
+    "归总的署名判据变了，上面那条要跟着改");
+});
+
 test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
   // await_subagent 的查找是 `String(j.id) === _want.replace(/^job#?/, "")`，j.id 是 run 内
   // 的纯数字。批量派发这里原来打的是 storeId（`${_smRunToken(run)}_${jobId}`，形如
@@ -22614,7 +22629,7 @@ test("client modules have no undeclared identifiers", async () => {
 // The `typeof`-guarded names above are only safe BECAUSE of the guard. If someone drops the
 // guard, the allowlist would hide a real ReferenceError, so pin the guard itself.
 test("typeof-guarded globals keep their guards", () => {
-  const code = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const code = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读
   for (const [name, expected] of [["session", 3], ["module", 1]]) {
     const guards = code.match(new RegExp(`typeof\\s+${name}\\s*!==?\\s*["']undefined["']`, "g")) || [];
     assert.ok(guards.length >= expected,
@@ -22999,7 +23014,7 @@ test("the scratchpad renders the whole plan, not a completed-tally", () => {
 // ---- R3: folding source through an error-log extractor destroys what an edit needs ----
 test("folded reads keep a line-anchored skeleton", () => {
   // extractFn only pulls functions; _SKEL_RE is a const regex, so read it from source.
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const src = RAW_SRC;    // 共享源（main.js + src/agent/*），别自己读
   const reSrc = src.match(/const _SKEL_RE = (\/.*\/);/)[1];
   const fn = new Function("_SKEL_RE", extractFn("_codeSkeleton") + "\n;return _codeSkeleton;")(eval(reSrc));
 
@@ -23010,7 +23025,7 @@ test("folded reads keep a line-anchored skeleton", () => {
   assert.ok(!/inner/.test(out), "bodies are dropped; only definitions are kept");
   assert.equal(fn("", 800, 1), "", "empty body yields no skeleton");
 
-  const loop = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const loop = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读
   assert.match(loop, /skeleton: _codeSkeleton\(_safeBody, 800, shownFrom\)/,
     "computed where _safeBody and shownFrom are correct — NOT from the prefixed message body");
   assert.match(loop, /行号真实——用 read_file offset\/limit/,
@@ -23124,7 +23139,7 @@ test("the diagnostic block and auto-verify convergence loop are actually wired",
 // it is needed. Widening by surface alone would over-trigger on backend-heavy `mixed` work, so
 // the verdict's own roleNeeds decides: a pure backend task never lists frontend/design.
 test("design knowledge triggers on mixed-surface work that needs frontend or design", () => {
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const src = RAW_SRC;    // 共享源（main.js + src/agent/*），别自己读
   const m = src.match(/const uiSurface = \[[\s\S]*?\n\s*\|\| \(\(deliverySurface === "mixed"[\s\S]*?\)\);/);
   assert.ok(m, "the widened uiSurface predicate must exist");
   const fn = new Function("deliverySurface", "engineering",
