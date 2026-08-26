@@ -18546,8 +18546,27 @@ test("michael-compression 的档位与前缀在客户端两端都真的接上了
     "Redis 淘汰后必须从 PostgreSQL 恢复无损原文，而不是要求超大历史整包重传");
   assert.match(SERVER_MODELS, /compression_retrieve_history\(/,
     "普通前缀复用和新增压缩段都必须经过精确历史检索");
+  // 前缀失效（网关 409 `[mc-prefix-invalid]`）必须**清令牌但不重试本轮**。
+  //
+  // 两半都要钉。「不自动重发」是原来就有的产品判断，理由是这一轮的 messages 已经被
+  // _applyCompressionPrefix 切掉了前 N 条、turnConfig.mcPrefix 也是循环外算好的——重发
+  // 只能带着同一个死令牌走同一份负载。
+  //
+  // 「清令牌」这一半 2026-08-26 才接上：在那之前 _isCompressionPrefixInvalidError 是
+  // 零调用点，而令牌存在 localStorage 里，另外三个 _mcPrefixInvalidate 调用点全靠
+  // 「本地改写了历史」触发、用户正常聊天一个都走不到。结果是网关一旦淘汰掉前缀记录，
+  // 这个会话每一轮都再发一次同一个死令牌，永远 409，只能换会话。
   assert.doesNotMatch(SRC, /_isCompressionPrefixInvalidError\([^)]*\)[\s\S]{0,500}(?:backend\.aiChat|backend\.aiChatWithTools|continue)/,
     "前缀失效也属于当前请求失败：清理应留给下一次用户发送，不能自动重发完整历史");
+  const retryFn = extractFn("_runModelRequestWithRetry");
+  assert.match(retryFn, /_isCompressionPrefixInvalidError\(attemptError\)[\s\S]{0,200}onPrefixInvalid\(\)/,
+    "认出前缀失效之后必须清掉本地令牌，否则这个会话往后每一轮都再发一次死令牌");
+  assert.match(retryFn, /&& !prefixDied/,
+    "前缀失效不许重试：同一份切过的负载 + 同一个死令牌，重发十次就是十次 409");
+  assert.equal((SRC.match(/onPrefixInvalid: \(\) =>/g) || []).length, 2,
+    "Chat 和 Agent 两条路都要接上 onPrefixInvalid（两边都会带前缀发请求）");
+  assert.match(SRC, /onPrefixInvalid: \(\) => \{ if \(!_isSub\)/,
+    "子智能体从不带前缀，也就不该有权清掉主会话那一份");
   assert.match(SRC, /_MC_PREFIX_STORE_KEY[\s\S]{0,1800}_mcPrefixPersist\(\)/,
     "前缀必须随会话持久化，否则重启 IDE 后 2M\/5M 会退回全量上传");
   assert.match(ai, /Ok\(Ok\(response\)\) => return Ok\(response\)/,

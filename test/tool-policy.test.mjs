@@ -18,7 +18,6 @@ import {
   fileEditTypes,
   fileMutationTypes,
   hookedTypes,
-  isFileEdit,
   isFileMutation,
   mutatesWorkspace,
   needsApproval,
@@ -151,7 +150,7 @@ test("hooked set matches the pre-refactor literal exactly, including format's ab
   ])));
   // `format` writes content but is intentionally NOT hooked. It is the single element that
   // makes this set differ from the file-mutation family, and it was easy to lose.
-  assert.equal(isFileEdit("format"), true);
+  assert.equal(fileEditTypes().has("format"), true);
   assert.equal(toolPolicy("format").hooked, false);
   /*
    * saveskill 曾和 mcpconfig 并列在这里。落点改成 `~/.mrdayone/skills/` 之后摘掉：

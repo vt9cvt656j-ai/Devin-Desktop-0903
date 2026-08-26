@@ -358,7 +358,9 @@ export const readOnlyBlockedTypes = () => typesWhere((p) => p.readOnlyModeBlocke
 // ── Predicates: what call sites should actually use ─────────────────────────
 export const mutatesWorkspace = (type) => toolPolicy(type).mutatesWorkspace;
 export const isFileMutation = (type) => toolPolicy(type).fileMutation;
-export const isFileEdit = (type) => toolPolicy(type).fileEdit;
+// 没有 isFileEdit 的单数版：`fileEdit` 这个属性活着（fileEditTypes() 在 main.js 有五个
+// 消费点），但按单个 type 问它的谓词从来没人调过。它的双胞胎 isFileMutation 有四个
+// 调用点，所以这不是「批量导出的一套」——就是个孤儿，2026-08-26 删掉。
 export const needsApproval = (type) => toolPolicy(type).needsApproval;
 /*
  * 只读模式（Plan / Explorer / Reviewer）里这个调用要不要挡。
