@@ -28752,6 +28752,54 @@ test("记忆卫生·召回：无条件塞进来的条目必须和检索命中分
   }
 });
 
+test("记忆卫生·召回：与当前技术栈无关的笔记不占无条件保底位", () => {
+  // 词表从**真模块** stackTable 派生，不在测试台里手编——手编的词表和生产漂开时，
+  // 这条断言会绿着骗人（本仓库踩过：测试台自编的数据形状和生产不一致）。
+  const LANG_TAGS = load("_KG_LANG_TAGS", { _STACK_TABLE: STACK_TABLE });
+  assert.ok(LANG_TAGS.has("rust") && LANG_TAGS.has("python"),
+    `stackTable 的 lang 派生不出语言词表，整道闸会恒不生效：${[...LANG_TAGS].join(",")}`);
+  // "JS/TS" 这种复合行必须被拆开。只断言 rust/python 抓不到这个形状：它们在
+  // stackTable 里各自独占一行，就算 split 的分隔符写错了也照样在集合里（实测变异漏网）。
+  assert.ok(LANG_TAGS.has("js") && LANG_TAGS.has("ts"),
+    `复合的 lang（"JS/TS"）没被拆开——tags 带 js/ts 的笔记永远不会被判成声明了栈：${[...LANG_TAGS].join(",")}`);
+  assert.ok(!LANG_TAGS.has("cargo") && !LANG_TAGS.has("test") && !LANG_TAGS.has("build"),
+    "词表收进了包管理器/命令名，普通笔记（tags 里带 cargo/test）会被误伤");
+
+  // 形状照抄线上 kg:_global 的真实存量：Rust 那条 tags 带 rust、type=pitfall；
+  // 通用那条 tags 带 cargo/test 但**没有**语言名，必须留下。
+  const notes = [
+    { id: "hit", content: "构建用 vite", type: "fact", created: 5, tags: ["vite"], links: [] },
+    { id: "rustffi", content: "Rust macOS Accessibility FFI 的坑", type: "pitfall", created: 9,
+      tags: ["rust", "macos", "accessibility", "ffi", "crate"], links: [] },
+    { id: "general", content: "光看不做时先想透再一次写对", type: "pitfall", created: 8,
+      tags: ["read/search", "churn", "think", "cargo", "test"], links: [] },
+  ];
+  const stacks = new Map([["/web", { lang: "JS/TS" }], ["/tauri", { lang: "JS/TS + Rust" }]]);
+  const pick = (root, drawer = "") => {
+    const offStackFor = load("_kgOffStackFor", {
+      _KG_LANG_TAGS: LANG_TAGS, _projectStacks: stacks, rootPath: root, workspaceRoots: [],
+    });
+    return load("_kgRetrieve", {
+      _kgSupersededIds: () => new Set(), _kgLoad: () => notes, _kgTokens: KG_TOKENS,
+      _kgKey: () => "k", _kgCacheStore: () => {}, _perfPhase: () => {},
+      _kgOffStackFor: offStackFor, localStorage: { setItem: () => {} },
+    })(drawer, "vite 构建怎么配").map((n) => n.id).sort();
+  };
+  // query 必须真命中 hit：零命中时 _kgRetrieve 会走"最近 3 条"兜底，把两条 pitfall
+  // 一起塞进来，保底位那道闸就被绕过去了，断言会变成恒真。
+  assert.deepEqual(pick("/web/"), ["general", "hit"],
+    "纯前端项目里 Rust FFI 笔记仍占着每轮的无条件保底位（尾斜杠没归一化时也会这么红）");
+  assert.deepEqual(pick("/tauri"), ["general", "hit", "rustffi"],
+    "Tauri 项目本来就有 Rust，把它挡掉是错杀");
+  assert.deepEqual(pick("/unknown"), ["general", "hit", "rustffi"],
+    "当前栈未知时这道闸必须整个不生效——宁可多带，不可错杀");
+  // 第四条腿：闸**只对全局库**生效。项目库已经按项目隔离了，再按语言挡一次是错杀——
+  // 一条讲「用 Python 正则从 .jsc 提字符串常量池」的逆向笔记 tags 带 python，
+  // 会被挡出它自己那个 package.json 项目。
+  assert.deepEqual(pick("/web/", "/web"), ["general", "hit", "rustffi"],
+    "项目库也过了这道闸——项目自己的笔记被按语言挡掉，那是错杀不是降噪");
+});
+
 test("记忆卫生·召回：超预算按整行丢并说明，不把事实截成半句", () => {
   const clamp = load("_kgClampLines", {});
   const lines = ["- " + "甲".repeat(50), "- " + "乙".repeat(50), "- " + "丙".repeat(50)];
