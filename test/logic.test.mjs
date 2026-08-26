@@ -7705,8 +7705,14 @@ test("项目模板不再用 shell 写种子文件，命令按平台展开", () =
   const expand = SRC.slice(expandStart, RAW_SRC.indexOf("shellQuote(name));", expandStart));
   assert.ok(expand.length > 80, "找不到模板命令的展开处");
   assert.match(expand, /_isWin \? "python" : "python3"/, "PY 占位符没按平台展开");
-  assert.match(SRC, /_isWin \? "\.venv\\\\Scripts\\\\activate" : "source \.venv\/bin\/activate"/,
-    "ACTIVATE 占位符没按平台展开");
+  // 2026-08-26：ACTIVATE 改成按**真实的 shell** 展开，不再按操作系统。
+  // `.venv\Scripts\activate` 是 cmd 写法，而 Windows 上优先跑 Git Bash——bash 在无引号
+  // 词里把 `\S`、`\a` 当转义，整串塌成 `.venvScriptsactivate` → 127，而三个模板全用
+  // `&&` 串联，于是 **pip install 根本不会执行**（Django 连 startproject 也一起短路）。
+  assert.match(expand, /_shellKind\(\) === "cmd"/, "ACTIVATE 又按操作系统展开了");
+  assert.match(expand, /source \.venv\/\$\{_isWin \? "Scripts" : "bin"\}\/activate/,
+    "posix 分支要按平台选 Scripts/ 还是 bin/——那问的是文件系统布局，和 shell 无关");
+  assert.doesNotMatch(expand, /_isWin \? "\.venv/, "旧的按操作系统判又回来了");
   // 种子文件要真的被写出来，否则模板建完是空壳。
   assert.match(SRC, /for \(const seed of Array\.isArray\(tmpl\.files\) \? tmpl\.files : \[\]\)/,
     "没有写种子文件那一步");

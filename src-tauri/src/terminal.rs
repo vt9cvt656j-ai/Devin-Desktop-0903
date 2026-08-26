@@ -109,7 +109,9 @@ pub fn term_open(
 
     let _plan = shell_plan_for_pty();
     let mut cmd = CommandBuilder::new(_plan.program.clone());
-    // 交互式参数（cmd.exe 的 /K、bash 的 -i 之类）——这个字段一直没人用。
+    // 交互式参数（cmd.exe 的 /K、bash 的 -i 之类）。**下面那段 UTF-8 处理不要再加一次**
+    // ——`interactive` 对 cmd 就是 `["/K"]`，重复之后 argv 变成
+    // `[cmd.exe, "/K", "/K", "chcp 65001>nul"]`，第二个 /K 被当成命令名。
     for a in &_plan.interactive {
         cmd.arg(a);
     }
@@ -135,7 +137,11 @@ pub fn term_open(
             cmd.arg("-Command");
             cmd.arg("chcp 65001 > $null; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8");
         } else {
-            cmd.arg("/K");
+            // **不再补 /K**：上面那个 interactive 循环已经加过一次（cmd 的 plan 就是
+            // `["/K"]`）。重复的后果是终端一开就顶一句「'/K' 不是内部或外部命令」，
+            // 而 chcp 从来没执行过 —— 代码页停在 936，然后这个终端按严格 UTF-8 解码，
+            // 直写 UTF-8 字节的程序（Go / MSYS 那类）就是乱码。
+            // 只影响没装 Git for Windows 的机器（那时才会走 cmd 兜底）。
             cmd.arg("chcp 65001>nul");
         }
     }
@@ -538,5 +544,37 @@ mod windows_command_tests {
         // 非可执行扩展名不动，免得把 README.md 也塞成一条"命令"
         assert!(super::windows_bare_names("README.md").is_empty());
         assert!(super::windows_bare_names("gopls").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// cmd 兜底时 `/K` 只许出现一次。
+    ///
+    /// `interactive` 对 cmd 就是 `["/K"]`，而下面那段 UTF-8 处理原来又补了一个，
+    /// argv 变成 `[cmd.exe, "/K", "/K", "chcp 65001>nul"]` —— 第二个 /K 被当成命令名，
+    /// 终端一开就顶一句「'/K' 不是内部或外部命令」，而 **chcp 从来没执行过**：
+    /// 代码页停在 936，这个终端却按严格 UTF-8 解码，直写 UTF-8 字节的程序就是乱码。
+    /// 只影响没装 Git for Windows 的机器（那时才走 cmd 兜底）。
+    #[test]
+    fn cmd_terminal_gets_exactly_one_slash_k() {
+        // 断言源码形状：真正构造 argv 要起一个 PTY，测试里跑不了。
+        // 切掉 #[cfg(test)] 再断言——needle 就写在这个测试自己的源码里。
+        let full = include_str!("terminal.rs");
+        let src = &full[..full.find("#[cfg(test)]").unwrap_or(full.len())];
+        let win = src
+            .find("#[cfg(windows)]")
+            .map(|i| &src[i..])
+            .unwrap_or(src);
+        let head = &win[..win.len().min(2000)];
+        assert!(
+            !head.contains("cmd.arg(\"/K\");"),
+            "UTF-8 那段又补了一次 /K —— interactive 循环已经加过，重复会让 chcp 变成命令名"
+        );
+        assert!(
+            head.contains("cmd.arg(\"chcp 65001>nul\");"),
+            "chcp 那句没了 —— 代码页会停在 936，而这个终端按严格 UTF-8 解码"
+        );
     }
 }
