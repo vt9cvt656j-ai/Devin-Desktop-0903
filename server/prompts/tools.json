@@ -4368,5 +4368,40 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "debug_control",
+      "description": "Drive a debug session that is ALREADY running. Starting one needs adapter installation and user consent, so the user presses F5 / the Debug button; you drive it from there. This is the only path to the real debugger: the breakpoints the user set, real stack frames, and expression evaluation inside a live frame. 【When to use】The moment a bug turns on a value you cannot get by reading code. Instead of adding print statements, rebuilding and re-running, ask the user to set a breakpoint and press F5, then await_stop and evaluate the expression right there. 【vs alternatives】run_cmd re-runs the whole program from outside and sees only what it prints; get_diagnostics is static analysis and never observes a value. await_stop answers with exactly one of stopped / terminated / timeout — terminated means the process is gone and waiting again is pointless, timeout means the breakpoint was never hit (wrong line, or that code path never runs).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "status",
+              "await_stop",
+              "evaluate",
+              "continue"
+            ],
+            "description": "status = is it stopped and where; await_stop = block until it hits a breakpoint, answering stopped / terminated / timeout; evaluate = evaluate an expression in the selected stack frame (requires stopped); continue = resume, then wait for the next stop"
+          },
+          "expression": {
+            "type": "string",
+            "description": "For evaluate: the expression, evaluated in the selected stack frame exactly as the debug console would"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 300000,
+            "description": "For await_stop / continue: how long to wait, default 30000; clamped to 1000-300000"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
   }
 ]

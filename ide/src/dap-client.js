@@ -23,6 +23,13 @@ export function createDapManager(options) {
 
   let session = null;
   let previousStop = Promise.resolve();
+  // awaitStop 的等待者。callbacks 是单槽的（UI 占着），所以另立一张表：工具调用和
+  // 界面可以同时等同一次停顿，谁也不覆盖谁。
+  const stopWaiters = new Set();
+
+  function _settleStopWaiters(payload) {
+    for (const w of [...stopWaiters]) { stopWaiters.delete(w); w(payload); }
+  }
 
   function isActive() {
     return !!session;
@@ -216,7 +223,14 @@ export function createDapManager(options) {
     if (body.text || body.description) {
       pushConsole("console", `Paused: ${body.description || body.reason}${body.text ? ` — ${body.text}` : ""}\n`, target);
     }
-    await refreshStack(target);
+    // 先把 refreshStack 挂出去、立刻应答等待者，**再**去 await 它。
+    // 挂在它后面是个真陷阱：refreshStack 走的是 stackTrace 请求，sendRequest 的超时
+    // 预算是 20s，适配器慢一点 awaitStop 就会在「程序确实停了」的情况下回 timeout——
+    // 那正是三态里最不该说错的一态。（实测：假后端不答 stackTrace 时，挂后面的版本
+    // 5s 预算下回了 timeout。）
+    target.stackRefresh = refreshStack(target);
+    _settleStopWaiters({ state: "stopped", reason: target.stopReason, threadId: target.threadId });
+    await target.stackRefresh;
     if (session !== target) return;
     const top = target.frames[0];
     if (top && top.source?.path) {
@@ -343,6 +357,9 @@ export function createDapManager(options) {
     session = null;
     const stopPromise = Promise.resolve(backend.dapStop(adapterId)).catch(() => {});
     previousStop = stopPromise;
+    // 进程没了也必须把等待者唤醒，而且给的是 terminated 而不是 timeout：
+    // 「它不会再停下来了」和「这次没等到」的下一步完全不同。
+    _settleStopWaiters({ state: "terminated", reason: String(reason || "terminated") });
     emit("onTerminated", { reason, console: finalConsole });
     emit("onState");
     return stopPromise;
@@ -455,7 +472,33 @@ export function createDapManager(options) {
     return body?.threads || [];
   }
 
+  /**
+   * 等下一次停顿。**三态，绝不复用 null**：
+   *   stopped    —— 命中断点/单步停下了，带 reason / threadId / frames
+   *   terminated —— 进程结束了，再等下去没有意义
+   *   timeout    —— 预算内没动静，带 waitedMs
+   * 三者的下一步完全不同（读变量 / 看退出码重来 / 改断点或加时间），一个 null 说不清。
+   */
+  function awaitStop(options) {
+    const budget = Math.max(1000, Math.min(300000, Math.floor(Number(options?.timeoutMs) || 30000)));
+    // stopped 的载荷要带真栈帧，但不能被 stackTrace 的 20s 预算拖住 → 自己封一个 3s 顶。
+    const withFrames = async (payload) => {
+      if (payload.state !== "stopped") return payload;
+      const pending = session?.stackRefresh;
+      if (pending) await Promise.race([pending.catch(() => {}), new Promise((r) => setTimeout(r, 3000))]);
+      return { ...payload, frames: (session?.frames || []).slice(0, 20) };
+    };
+    if (!session) return Promise.resolve({ state: "terminated", reason: "no session" });
+    if (session.stopped) return withFrames({ state: "stopped", reason: session.stopReason || "paused", threadId: session.threadId });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { stopWaiters.delete(waiter); resolve({ state: "timeout", waitedMs: budget }); }, budget);
+      const waiter = (payload) => { clearTimeout(timer); resolve(withFrames(payload)); };
+      stopWaiters.add(waiter);
+    });
+  }
+
   return {
+    awaitStop,
     isActive,
     isStopped,
     capabilities,

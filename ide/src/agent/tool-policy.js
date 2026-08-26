@@ -337,6 +337,17 @@ function seed() {
   // capture_replay：可以指定任意 method / url / body 直接发出去，而且**不要求真有一条
   //   抓包记录**——等于绕开 http_request 那道审批门的一条完整旁路。同门同待遇。
   defineTool("capture_replay", { needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "重放抓到的请求" });
+
+// debug：会话由用户按 F5 起，模型只驱动。status / await_stop 是纯观察（"停了没、停在哪"），
+// evaluate 会在真实栈帧里执行一段表达式、continue 会让进程接着跑——那两个才有副作用。
+// 一刀切 true 会让"快速试一个表达式"每次都弹框，观察动作立刻变贵；照 browser / system 的
+// 按动作判形状来。
+const DEBUG_OBSERVE_OPS = new Set(["status", "await_stop"]);
+defineTool("debug", {
+  needsApproval: (call) => !DEBUG_OBSERVE_OPS.has(String(call?.op || "status")),
+  readOnlyModeBlocked: (call) => !DEBUG_OBSERVE_OPS.has(String(call?.op || "status")),
+  readOnlyBlockedVerb: "驱动调试器（在真实栈帧里求值 / 放行进程）",
+});
   // system：开 App、切前台窗口、触发任意 App 的菜单项 —— 那几个确实是副作用。
   //   但 apps / windows / frontmost / menu_items 是**纯读**：它们回答的是"现在开着什么、
   //   哪个在前台、这个 App 有哪些菜单项"。一刀切成"要审批 + 只读模式拦"之后，

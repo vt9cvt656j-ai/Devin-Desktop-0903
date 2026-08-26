@@ -11874,6 +11874,35 @@ test("strict verification uses process exit status, including timeout", async ()
   assert.equal((await snakeCaseTimeout("/repo", "build")).timedOut, true);
 });
 
+// 验证报告只暴露第一条失败：一次改动打断三个测试时，模型只看得见一个，
+// 修完再跑再发现下一个 —— 三轮才走完本可以一轮走完的路。
+test("验证报告要同时暴露多条失败，不是只给第一条", async () => {
+  const lines = [];
+  for (let i = 0; i < 100; i++) lines.push(`log line ${i}`);
+  lines[8] = "FAIL alpha.test.js";   // 旧版只会拿到这一条
+  lines[50] = "FAIL beta.test.js";   // 落在 head+30 窗口之外
+  lines[80] = "FAIL gamma.test.js";  // tail 只有最后 10 行，也够不着
+  const run = load("_interleavedTest", {
+    inTauri: true,
+    backend: { taskRunCapture: async () => ({ code: 1, stdout: lines.join("\n"), stderr: "" }) },
+  });
+  const r = await run("/repo", "npm test");
+  for (const n of ["FAIL alpha", "FAIL beta", "FAIL gamma"]) assert.match(r.report, new RegExp(n));
+
+  // 单条失败时的头尾结构不许变
+  const one = [];
+  for (let i = 0; i < 60; i++) one.push(`log line ${i}`);
+  one[20] = "FAILED only-one";
+  const single = load("_interleavedTest", {
+    inTauri: true,
+    backend: { taskRunCapture: async () => ({ code: 1, stdout: one.join("\n"), stderr: "" }) },
+  });
+  const sres = await single("/repo", "npm test");
+  assert.match(sres.report, /log line 0/);
+  assert.match(sres.report, /log line 59/);
+  assert.doesNotMatch(sres.report, /还有更多失败/);
+});
+
 test("long chat transcripts stay bounded while paging both directions", () => {
   assert.match(SRC, /const _RENDER_LIMIT = 56/);
   assert.match(SRC, /const _RENDER_PAGE = 32/);
@@ -12832,6 +12861,55 @@ test("dev-server discovery is scoped to the current run and workspace", () => {
   entry.exited = true;
   assert.equal(ownedUrl(run), "");
   assert.doesNotMatch(SRC, /const _probe = \[5173, 5174/);
+});
+
+// 启动输出识别。旧版只认明写的 loopback URL，于是 uvicorn / flask / gin / rails / docker
+// 这一大片框架的默认输出一律认不出来 —— 预览面板就是空的，模型也拿不到地址去自查。
+// 三级判据：① 明写的 loopback URL；② 通配地址（0.0.0.0/[::]）改写成 127.0.0.1；
+// ③ 只印了端口号的那一行 —— 但第三级必须同时含服务动词，否则 postgres DSN 的 5432、
+// Redis 的 6379、npm WARN 里的 "port 3000" 都会被当成开发服务器（实测三种误报）。
+test("启动输出识别：loopback 之外的常见形态也要认出来，局域网地址仍然不认", () => {
+  const localUrl = load("_localDevServerUrl");
+  // ── 存量契约，一个字不许变 ──
+  assert.equal(localUrl("\u001b[36mLocal: http://localhost:5173/app\u001b[0m"), "http://localhost:5173/app");
+  assert.equal(localUrl("Network: http://192.168.1.5:5173"), "",
+    "认了 Network 就会把预览指到网卡地址——无线网下经常不通");
+  // ── ①级：明写的 loopback URL ──
+  assert.equal(localUrl("  VITE v5.2.0  ready in 312 ms\n\n  ->  Local:   http://localhost:5173/\n  ->  Network: use --host to expose"), "http://localhost:5173/");
+  assert.equal(localUrl("Starting development server at http://127.0.0.1:8000/"), "http://127.0.0.1:8000/");
+  // ── ②级：通配地址 → 改写成 127.0.0.1 ──
+  assert.equal(localUrl("INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)"), "http://127.0.0.1:8000");
+  assert.equal(localUrl(" * Running on all addresses (0.0.0.0)\n * Running on http://0.0.0.0:5000"), "http://127.0.0.1:5000");
+  assert.equal(localUrl("* Listening on http://0.0.0.0:3000\nUse Ctrl-C to stop"), "http://127.0.0.1:3000");
+  // ── ③级：只印了端口号 ──
+  assert.equal(localUrl("Server listening on port 3000"), "http://127.0.0.1:3000");
+  assert.equal(localUrl("[GIN-debug] Listening and serving HTTP on :8080"), "http://127.0.0.1:8080");
+  // ── 第三级的误报反例：这四条今天全都会被认成开发服务器 ──
+  assert.equal(localUrl("postgres://user:pw@localhost:5432/appdb"), "",
+    "数据库 DSN 不是开发服务器——预览会指到 postgres 端口");
+  assert.equal(localUrl("Redis ready to accept connections on port 6379"), "",
+    "Redis 不是开发服务器");
+  assert.equal(localUrl("npm WARN config port 3000 is deprecated"), "",
+    "警告文案里的端口号不是服务器地址");
+  // ── 崩掉的服务不算就绪：EADDRINUSE 那行自己就带着端口号 ──
+  assert.equal(localUrl("Error: listen EADDRINUSE: address already in use :::3000"), "");
+  assert.equal(localUrl(""), "");
+});
+
+// 兜底验证把跑出来的输出交回模型时，用的是裸 slice(0, 4000) —— 从**头部**截。
+// 而测试框架的失败汇总几乎总在末尾，头部截断正好把唯一有用的那段砍掉。
+test("兜底验证交回模型的输出要留住报错行，不是砍掉尾部", () => {
+  // 用 extractFn(..., {code:true}) 而不是 SRC.slice(indexOf(...))：注释里原样引用了
+  // 被替换掉的旧代码，用原文断言会被自己的注释喂绿（本仓库踩过六次）。
+  const loop = extractFn("_runAgenticLoop", { code: true });
+  const at = loop.indexOf("[AUTO_VERIFY]");
+  assert.ok(at > 0, "找不到 AUTO_VERIFY 注入点——锚点失效了，下面的切片会是空串");
+  // 窗口取 1500 而不是 800：补丁之后 800 只剩约 270 字余量，再加两行注释就会静默失效。
+  const seg = loop.slice(at, at + 1500);
+  assert.ok(seg.length >= 400, `切片只有 ${seg.length} 字，锚点多半失效`);
+  assert.match(seg, /_clipPreservingErrors\(/,
+    "又退回裸 slice 了——测试的失败汇总几乎总在末尾，头部截断正好把它砍掉");
+  assert.doesNotMatch(seg, /\.slice\(0, 4000\)/);
 });
 
 test("tool success and verification command checks reject fake green command results", () => {
@@ -25437,6 +25515,29 @@ test("客户端注册表与网关 tools.json 名称和递归参数契约完全�
     const shape = (tool) => normalize(tool?.function?.parameters || {});
     assert.deepEqual(shape(server), shape(client), name + " 的客户端/网关参数契约漂移");
   }
+});
+
+// 485 行的 DAP 调试器躺在 src/dap-client.js 里，141 条工具 schema 一条都不通向它——
+// 模型只能靠 print 调试。这条钉三处触达：缺任何一处模型都够不到。
+test("模型够得到调试器：debug_control 在注册表、网关目录、执行分发三处都在", () => {
+  const registered = new Set(buildRegisteredToolSchemas().map((t) => t.function.name));
+  assert.ok(registered.has("debug_control"), "客户端注册表里没有——L0 只发工具名，这一侧缺了它就不会被发出去");
+  const gateway = new Set(JSON.parse(SERVER_TOOLS).map((t) => t?.function?.name));
+  assert.ok(gateway.has("debug_control"), "网关 tools.json 里没有——运行时是网关那份说了算，只改客户端等于没加");
+  const mapper = load("_mapToolCall", {
+    _applyToolArgDefaults: undefined,
+    _normalizeArgKeys: (args) => args,
+    _STR_ARG_KEYS: new Set(),
+    _KNOWN_TOOLS: new Set(["debug_control"]),
+    _canonicalToolName: () => null,
+    _mcpToolMap: new Map(),
+    _finiteNumberArg: load("_finiteNumberArg"),
+  });
+  const call = mapper("debug_control", { action: "await_stop", timeout_ms: 45000 });
+  assert.equal(call.type, "debug");
+  assert.equal(call.op, "await_stop");
+  assert.equal(call.timeoutMs, 45000);
+  assert.equal(mapper("debug_control", {}).timeoutMs, 30000, "默认预算");
 });
 
 test("工具注册表只宣告可发现且语义明确的能力", () => {

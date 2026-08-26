@@ -140,7 +140,7 @@ import {
   toolPolicy,
 } from "./agent/tool-policy.js";
 import { _TOOL_ALIASES, _lev } from "./agent/tool-aliases.js";
-import { TERM_COMMON_CMDS } from "./agent/terminal-commands.js";
+import { TERM_COMMON_CMDS, _localDevServerUrl, _detectTerminalReady, _looksLikeServiceCommand, _stripTimeoutWrapper } from "./agent/terminal-commands.js";
 import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
   normalizeCapabilities, userToolShortName,
@@ -22225,6 +22225,12 @@ function _approvalLabel(call) {
       title: `重放请求：${String(call.method || "GET").toUpperCase()}？`,
       detail: String(call.url || "").slice(0, 300),
     };
+    // 会弹框的只有 evaluate / continue：前者在真实栈帧里执行一段表达式（可以带副作用），
+    // 后者放走一个停着的进程。框上必须写出是哪一种、表达式是什么，否则就是闭眼点同意。
+    case "debug": return {
+      title: call.op === "evaluate" ? "在调试器里求值这个表达式？" : "让被调试的进程继续跑？",
+      detail: (call.op === "evaluate" ? String(call.expression || "") : "继续执行，等下一次停顿").slice(0, 300),
+    };
     case "system": return {
       title: "操作系统 / 其它应用？",
       detail: `${call.action || call.op || "?"} ${String(call.app || call.target || call.item || "")}`.trim().slice(0, 300),
@@ -35122,7 +35128,7 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   let _galleryMode = false;
   try { _galleryMode = !inTauri && new URLSearchParams(location.search).get("play") === "tools"; } catch {}
   if (!inTauri && !_galleryMode) {
-    const desktopOnly = new Set(["mcp_server", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
+    const desktopOnly = new Set(["mcp_server", "debug_control", "run_in_terminal", "read_terminal", "list_terminals", "stop_terminal", "browser", "screenshot", "http_request", "download_file", "decode_qr", "remote", "system", "capture_start", "capture_flows", "capture_stop", "capture_replay", "automation", "computer", "read_screen", "ui_click", "background_monitor", "local_discovery", "live_environment", "game_scaffold", "web_scaffold", "generate_3d", "generate_sound", "generate_music", "generate_voice", "auto_rig", "generate_motion", "generate_texture", "search_game_assets", "download_asset",
   // 这 40 个的执行器里都以 `if (!inTauri) return "[不可用] 只能在桌面 App 里用"` 开头，
   // 却一直照样把 schema 发给模型：网页版里模型手上摆着 arxiv_search、db_query、
   // gh_pr_view，选中一个就是一轮白烧，search_tools 也照样能把它们装进工具窗口、
@@ -36880,6 +36886,7 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     case "read_terminal": return { type: "termread", name: args.name || "" };
     case "read_logs": return { type: "logs", path: String(args.path || ""), paths: Array.isArray(args.paths) ? args.paths : [], name: String(args.name || ""), lines: Number.isFinite(+args.lines) ? Math.floor(+args.lines) : undefined, includeTerminal: args.include_terminal !== false };
     case "list_terminals": return { type: "termlist" };
+    case "debug_control": return { type: "debug", op: String(args.action || "status"), expression: String(args.expression || ""), timeoutMs: Number(args.timeout_ms || args.timeoutMs) || 30000 };
     case "stop_terminal": return { type: "termstop", name: args.name || "" };
     case "start_demo": return { type: "demostart", title: args.title || "" };
     case "stop_demo": return { type: "demostop", path: args.path || args.dest || "" };
@@ -50331,6 +50338,7 @@ function _recLabel(call) {
     case "move": return "移动 " + p;
     case "git": return "git " + (call.op || "");
     case "diag": return "诊断检查";
+    case "debug": return "调试器 " + (call.op || "");
     case "think": return "思考";
     case "recall": return "回忆检索 “" + (call.query || "") + "”";
     default: return call.type + (p ? " " + p : "");
@@ -55584,7 +55592,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             const _avOk = _toolExecutionSucceeded(_avCall, _avRes);
             messages.push({ role: "user", content: _ORCH_NOTE
               + `[AUTO_VERIFY] 你改完之后没有跑验证，IDE 替你跑了一次 \`${_avCmd}\`（这是 harness 代跑的，不是你调的工具）：\n`
-              + (_stripAnsi(String(_avRes?.content || _avOut)) || "(无输出)").slice(0, 4000)
+              // 头部截断会把测试的失败汇总（几乎总在末尾）整段砍掉，模型收到的是一堆
+              // 编译进度加半句话。42807 那个裁剪器留头尾、并把中段的报错行按行追回，
+              // 预算内放得下时原样返回（零行为变化）。这是「只暴露第一条失败」在**活着**
+              // 的那条路上的真实形态——_interleavedTest 那条今天零调用点。
+              + _clipPreservingErrors(_stripAnsi(String(_avRes?.content || _avOut)) || "(无输出)", 4000)
               + (_avOk
                 ? `\n绿了——这一版的验证证据已经记上，别再重复跑同一条，继续往下做。`
                 : `\n**红了**：先修这个再谈交付。上面就是真实输出，按它定位，别猜。`) });
@@ -57449,7 +57461,7 @@ function _createToolStep(call) {
   const step = document.createElement("div");
   step.className = `agent-tool-step agent-tool-step--${call.type}${_isKSearch ? " agent-tool-step--ksearch" : ""}${call.type === "current_time" ? " agent-tool-step--current_time" : ""}${call.type === "game_scaffold" ? " agent-tool-step--game_scaffold" : ""}${call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" ? " agent-tool-step--game_asset" : ""}`;
 
-  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
+  const _nonClickable = call.type === "cmd" || call.type === "search" || call.type === "find" || call.type === "web" || call.type === "websearch" || call.type === "localdiscovery" || call.type === "liveenvironment" || call.type === "readscreen" || call.type === "uiclick" || call.type === "search_tools" || call.type === "skill" || call.type === "unknown" || call.type === "vizcompare" || call.type === "memory" || call.type === "recall" || call.type === "think" || call.type === "delete" || call.type === "move" || call.type === "diag" || call.type === "git" || call.type === "gh" || call.type === "findsymbol" || call.type === "semsearch" || call.type === "knowledge" || call.type === "lsp" || call.type === "mkdir" || call.type === "copy" || call.type === "termtask" || call.type === "termread" || call.type === "termlist" || call.type === "termstop" || call.type === "debug" || call.type === "http" || call.type === "download" || call.type === "genimage" || call.type === "mcp" || call.type === "mcpconfig" || call.type === "demostart" || call.type === "demostop" || call.type === "screenshot" || call.type === "browser" || call.type === "db" || call.type === "qr" || call.type === "remote" || call.type === "system" || call.type === "automation" || call.type === "askuser" || call.type === "current_time" || _isAwaitSub || call.type === "game_scaffold" || call.type === "generate_3d" || call.type === "generate_sound" || call.type === "generate_music" || call.type === "generate_voice" || call.type === "auto_rig" || call.type === "generate_motion" || call.type === "generate_texture" || call.type === "search_game_assets" || call.type === "download_asset" || _isKSearch;
   let pathHtml = _nonClickable
     ? `<span class="atc-path atc-path--text">${_escHtml(pathDisplay)}</span>`
     : `<span class="atc-path atc-path--clickable" data-filepath="${_escAttr(pathDisplay)}">${dirPath ? '<span class="atc-dir">' + _escHtml(dirPath) + '/</span>' : ''}<span class="atc-file">${_escHtml(fileName)}</span></span>`;
@@ -62709,6 +62721,33 @@ async function _executeToolStepInner(step, call, root, run) {
         ? `当前 IDE 可读终端（普通终端 + Agent任务终端，按最近活动排序）:\n${lines.join("\n")}\nread_terminal 可以用 label、URL、cwd 或命令片段匹配；长期服务日志也会被 read_logs(includeTerminal=true) 读取。`
         : "(当前 IDE 没有打开终端。长期运行后端请用 run_in_terminal；一次性命令用 run_cmd。)" };
 
+    } else if (call.type === "debug") {
+      // 141 条 schema 里一条都通不到 src/dap-client.js —— 那是一个完整的调试器（断点、
+      // 栈帧、变量树、REPL evaluate），却只有人点得到，模型只能靠 print 调试。
+      // 这里开的是最小可用的一条：会话由人按 F5 起（launch 配置牵涉适配器安装与授权，
+      // 不该让模型代起），模型负责「等它停下来 → 就地求值 → 放行」这一圈。
+      if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "debug", path: call.op, content: "[不可用] debug_control 只能在桌面 App 里用。" }; }
+      if (!dapManager?.isActive()) { res.className = "atc-result atc-result--err"; res.textContent = "没有调试会话"; return { type: "debug", path: call.op, content: "[失败] 现在没有调试会话。请用户在编辑器里打好断点、按 F5（或点 Debug）起一个，再调 debug_control。" }; }
+      const _fmtFrames = (fs) => (fs || []).slice(0, 12).map((f) => `  ${f.name} @ ${f.source?.path || "?"}:${f.line}`).join("\n");
+      if (call.op === "evaluate") {
+        if (!dapManager.isStopped()) { res.className = "atc-result atc-result--err"; res.textContent = "还在跑"; return { type: "debug", path: call.op, content: "[失败] 程序正在运行，没有栈帧可求值。先 await_stop。" }; }
+        const _ev = await dapManager.evaluate(String(call.expression || ""), dapManager.activeFrameId(), "repl");
+        if (!_ev) { res.className = "atc-result atc-result--err"; res.textContent = "求值失败"; return { type: "debug", path: call.op, content: `[失败] 适配器拒绝了这个表达式：\`${call.expression}\`（在当前栈帧里不合法，或这门语言不支持）。` }; }
+        res.textContent = "已求值";
+        return { type: "debug", path: call.op, content: `${call.expression} = ${_ev.result}${_ev.type ? `  (${_ev.type})` : ""}` };
+      }
+      if (call.op === "continue") await dapManager.cont();
+      if (call.op === "status") {
+        const _st = dapManager.isStopped() ? "stopped" : "running";
+        res.textContent = _st;
+        return { type: "debug", path: call.op, content: `state=${_st}\n${_fmtFrames(dapManager.currentFrames()) || "（没有栈帧：程序在跑，用 await_stop 等它停）"}` };
+      }
+      const _w = await dapManager.awaitStop({ timeoutMs: call.timeoutMs });
+      res.textContent = _w.state;
+      return { type: "debug", path: call.op, content: `state=${_w.state}`
+        + (_w.state === "stopped" ? `  reason=${_w.reason}\n${_fmtFrames(_w.frames) || "（停住了但取不到栈帧）"}`
+        : _w.state === "terminated" ? `  进程已经结束（${_w.reason}）——它不会再停下来了，别再等。要重来请让用户再按一次 F5。`
+        : `  ${_w.waitedMs}ms 内没有停下来：断点可能没被命中，或者那条代码路径根本没走到。改断点位置，或换更长的 timeout_ms 再等。`) };
     } else if (call.type === "termstop") {
       if (!inTauri) { res.className = "atc-result atc-result--err"; res.textContent = "桌面专用"; return { type: "termstop", path: call.name || "", content: "[不可用] stop_terminal 只能在桌面 App 里用。" }; }
       const ent = _findTaskTerm(call.name);
@@ -70856,14 +70895,27 @@ async function _interleavedTest(root, testCmd) {
       detail = out;
     } else {
       const head = lines.slice(0, 6).join("\n");
-      // Pull the FIRST FAIL block — most useful signal, the rest is noise.
-      const failIdx = lines.findIndex((l) => /FAIL|FAILED|✗|✘|✖|×|Test (suite )?failed|expected/i.test(l));
-      // Start after the head slice when the failure keyword is inside it, so the
-      // diagnostic body that follows still shows without duplicating the head.
-      const failStart = failIdx >= 0 ? Math.max(failIdx, 6) : -1;
-      const failBlock = failStart >= 0 ? lines.slice(failStart, Math.min(failStart + 30, lines.length)).join("\n") : "";
+      // 多条失败要一起给。只给第一条会让模型改完一处就以为修完了，下一轮再撞第二条——
+      // 套件红几条就要几轮。上限 3 段 × 16 行：再多会把 report 的 4000 字预算吃光，
+      // 反而看不见 tail（收尾统计行常常在那儿）。
+      const FAIL_RE = /FAIL|FAILED|✗|✘|✖|×|Test (suite )?failed|expected/i;
+      const blocks = [];
+      let cursor = 0;
+      while (blocks.length < 3 && cursor < lines.length) {
+        const idx = lines.findIndex((l, i) => i >= cursor && FAIL_RE.test(l));
+        if (idx < 0) break;
+        // 关键词落在 head 切片里时从第 6 行起，诊断正文照样露出来且不和 head 重复。
+        const start = Math.max(idx, 6);
+        if (start >= lines.length) break;
+        const end = Math.min(start + 16, lines.length);
+        blocks.push(lines.slice(start, end).join("\n"));
+        cursor = Math.max(end, idx + 1);
+      }
+      const more = blocks.length >= 3 && lines.slice(cursor).some((l) => FAIL_RE.test(l));
       const tail = lines.slice(-10).join("\n");
-      detail = `${head}${failBlock ? "\n…\n" + failBlock : ""}\n…\n${tail}`;
+      detail = `${head}${blocks.length ? "\n…\n" + blocks.join("\n…\n") : ""}`
+        + (more ? `\n…\n（还有更多失败没列出——本地重跑 \`${testCmd}\` 看完整输出）` : "")
+        + `\n…\n${tail}`;
     }
     const report = `${timedOut ? "验证超时" : "验证失败"}：\`${testCmd}\` 退出 ${code}：\n${detail}`;
     return { ran: true, ok: false, code, timedOut, report: report.slice(0, 4000), verification: true };
@@ -77905,73 +77957,6 @@ function _findTaskTerm(name) {
 function _sameWorkspace(a, b) {
   const norm = (v) => String(v || "").replace(/\\/g, "/").replace(/\/+$/, "");
   return !!norm(a) && norm(a) === norm(b);
-}
-
-function _localDevServerUrl(output) {
-  const plain = String(output || "").replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "");
-  const matches = plain.match(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{2,5})(?:\/[^\s]*)?/gi) || [];
-  return (matches.at(-1) || "").replace(/[),.;]+$/, "");
-}
-
-// 终端 ready/失败信号检测：给 run_in_terminal 的自动就绪轮询用。只做纯文本判定、
-// 不发任何请求。失败模式优先于 ready 模式：启动报错的服务往往也会印出端口/URL，
-// 先判错误才不会把崩掉的服务误报成已就绪。返回 { ready, failed?, pattern }。
-function _detectTerminalReady(logText) {
-  const plain = String(logText || "").replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "");
-  if (!plain.trim()) return { ready: false, pattern: "" };
-  const failPatterns = [/EADDRINUSE/i, /error:/i, /cannot find module/i, /fatal/i];
-  for (const re of failPatterns) {
-    if (re.test(plain)) return { ready: false, failed: true, pattern: String(re) };
-  }
-  const readyPatterns = [
-    /listening on/i,
-    /server (?:ready|running|started)/i,
-    /ready in \d/i,
-    /compiled successfully/i,
-    /local:\s*https?:\/\//i,
-    /started server/i,
-    // 裸 /✓/ 已删：单独的 ✓ 在测试通过/安装步骤等非 ready 场景大量出现，误报率高；
-    // 真正的 ready 行（如 "✓ ready in 300ms"）已被上下文中其他模式覆盖
-    /webpack.*compiled/i,
-    /vite.*ready/i,
-    /serving (?:at|on)/i,
-    /port\s*\d{2,5}/i,
-  ];
-  for (const re of readyPatterns) {
-    if (re.test(plain)) return { ready: true, pattern: String(re) };
-  }
-  return { ready: false, pattern: "" };
-}
-
-// 简单启发式判断"服务型命令"：dev server / serve / start 这类长驻启动才值得自动
-// 轮询 ready 信号；npm test / build 这类一次性命令跑完就退出，不轮询。
-function _looksLikeServiceCommand(command) {
-  const cmd = String(command || "");
-  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build)\b/i.test(cmd)) return false;
-  return /\b(?:dev|serve|start|preview|run)\b/.test(cmd);
-}
-
-// 剥掉 `timeout`/`gtimeout` 包装，取出被它包住的内层命令。GNU timeout 形如
-// `timeout [选项] <时长> <内层命令>`，选项可能带独立取值（-k 5 / -s TERM）或
-// 等号形式（--kill-after=5 / --signal=TERM），也有无值开关（--preserve-status）。
-// 用按空白分词的方式解析（天然对 \r\n 免疫，无需在正则里处理换行）：命中 timeout
-// 前缀、且时长位是合法数字（可带 s/m/h/d 后缀）时，返回内层命令字符串；否则返回
-// ""（不是 timeout 包装、或不成形，一律不剥离，避免误伤）。
-function _stripTimeoutWrapper(command) {
-  const toks = String(command || "").trim().split(/\s+/);
-  if (!toks.length || !/^g?timeout$/i.test(toks[0])) return "";
-  let i = 1;
-  // 跳过 timeout 自身的选项；-k / -s / --kill-after / --signal 的独立取值形式
-  // 会多占一个 token（下一个 token 是它的取值），要一并跳过。
-  while (i < toks.length && /^-/.test(toks[i])) {
-    const opt = toks[i];
-    i++;
-    if (/^(?:-k|-s|--kill-after|--signal)$/i.test(opt) && i < toks.length) i++;
-  }
-  // 时长位必须是合法数字，否则视为不成形的 timeout，不剥离
-  if (i >= toks.length || !/^\d+(?:\.\d+)?[smhd]?$/i.test(toks[i])) return "";
-  i++;
-  return toks.slice(i).join(" ").trim();
 }
 
 function _runOwnedDevServerUrl(run) {

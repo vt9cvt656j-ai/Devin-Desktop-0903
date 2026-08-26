@@ -92,6 +92,14 @@ const TOOL_METADATA = Object.freeze({
     priority: 'medium',
     usage_note: '【何时用】不确定有哪些后台任务在跑时。【vs 替代】已知终端名直接 read_terminal。'
   },
+  debug_control: {
+    category: 'execution',
+    use_cases: ['断点停住后就地读变量真值', '判断断点到底有没有被命中'],
+    triggers: ['需要运行期的真实变量值', '想避免加 print 重跑一轮'],
+    example_call: "debug_control(action='await_stop', timeout_ms=30000)",
+    priority: 'high',
+    usage_note: '【何时用】要一个只有运行期才知道的值时。【前提】会话由用户按 F5 起，你只驱动。【vs 替代】run_cmd 只看得到程序打印出来的；get_diagnostics 是静态的。'
+  },
   stop_terminal: {
     category: 'execution',
     use_cases: ['停止不再需要的后台任务', '释放端口冲突'],
@@ -512,6 +520,7 @@ const TOOL_EXAMPLES = Object.freeze({
   gh_pr_reply: { number: 42, body: "Fixed and verified in the latest commit." },
   read_terminal: { name: "dev-server" },
   list_terminals: {},
+  debug_control: { action: "await_stop", timeout_ms: 30000 },
   stop_terminal: { name: "dev-server" },
   lsp_symbols: { path: "src/main.ts" },
   find_symbol: { name: "createSession" },
