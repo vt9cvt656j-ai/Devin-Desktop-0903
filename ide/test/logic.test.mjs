@@ -822,8 +822,9 @@ test("reasoning cards render in stream order instead of staying fixed at the top
     "plain chat thinking must not be pinned above later answer text");
   assert.doesNotMatch(send, /body\.insertBefore\(e,\s*body\.firstChild\)/,
     "final plain-chat render must not move all thinking cards back to the top");
-  assert.match(send, /if \(ev\.kind === "reasoning"\) \{\s*accepted = appendPlainReasoning\(ev\.delta \|\| ""\);/,
-    "plain chat must let the one-way phase gate decide whether native reasoning is accepted");
+  // 同上：纯聊天那条路是同一个形状，一起改。
+  assert.match(send, /if \(ev\.kind === "reasoning"\) \{[\s\S]{0,180}accepted = appendPlainReasoning\(ev\.delta \|\| "", true\);/,
+    "厂商的 reasoning 通道必须免闸——工具调用会置真 answerStarted，「想→调工具→再想」的模型从第一次调用起思考全丢");
   assert.match(send, /else if \(ev\.kind === "toolCall"\) \{[\s\S]{0,220}_inlineThinkState\.answerStarted = true;/,
     "an accepted plain-chat tool call must close the current reasoning phase");
 
@@ -852,8 +853,25 @@ test("reasoning cards render in stream order instead of staying fixed at the top
     "only visible answer prose may flush and fold the current thinking card in-place");
   assert.match(agentTurn, /else if \(ev\.kind === "toolCall"\) \{[\s\S]{0,220}if \(reasoningAcc\.trim\(\)\) renderReasoning\(\);[\s\S]{0,100}settleReasoning\(\);/,
     "an accepted tool call must flush and fold the current thinking card before execution");
-  assert.match(agentTurn, /if \(ev\.kind === "reasoning"\) \{\s*accepted = appendReasoning\(ev\.delta \|\| ""\);/,
-    "agent turns must let the one-way phase gate decide whether native reasoning is accepted");
+  // ── 2026-08-26：厂商的 reasoning 通道不再受这道闸约束 ────────────────────
+  //
+  // 「一次性相位闸」这个设计本身是对的，但它管得过宽。周围这几条断言描述的语义是：
+  // 工具调用/可见正文 **flush 并折叠当前那张卡**（renderReasoning → settleReasoning），
+  // 也就是「关掉**当前**这一段思考」。而 settleReasoning 会把 reasoningEl 置空，
+  // 所以下一段思考本来就该开一张**新卡**——上面那条合并断言写的
+  // 「Timeline-separated cards (thinking→tool→thinking) still never merge」
+  // 预设的正是这个序列。
+  //
+  // 可 answerStarted 一旦置真，appendReasoning 就把**之后所有**的 reasoning 增量整段
+  // 丢掉（return 在写 reasoningAcc/reasoningAll 之前：不上屏、不进历史 m.reasoning、
+  // 不进崩溃草稿）。于是那个被合并逻辑预设的第二段 thinking 结构性地不可能发生——
+  // 两处互相矛盾。用户用 grok-4.6 跑 agent 时「工具调用正常、一张思考卡都没有」就是
+  // 这个形状：模型先调工具，之后的思考全被吞了。
+  //
+  // answerStarted 的本意是给**内联 `<think>` 标签**那套启发式兜底（正文开始后再冒出
+  // 一个 `<think>`，多半是模型打了个尖括号）。厂商通道是独立字段，不存在误判问题。
+  assert.match(agentTurn, /if \(ev\.kind === "reasoning"\) \{[\s\S]{0,180}accepted = appendReasoning\(ev\.delta \|\| "", true\);/,
+    "厂商的 reasoning 通道必须免闸——工具调用会置真 answerStarted，「想→调工具→再想」的模型从第一次调用起思考全丢");
   assert.match(agentTurn, /else if \(ev\.kind === "toolCall"\) \{[\s\S]{0,320}_inlineThinkState\.answerStarted = true;/,
     "an accepted agent tool call must close the current reasoning phase");
   assert.match(agentTurn, /const _reasoningFinal = reasoningAll;/,
