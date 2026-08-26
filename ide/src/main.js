@@ -22773,6 +22773,9 @@ async function _refreshUserCapabilities(root) {
   }
   _userCaps = mergeCapabilities(scopes);
   _userCapsCache = { root: key, ts: now };
+  // 声明变了，那份按进程 memo 的静态工具名单就过期了——不清的话，第一次调用那一刻的
+  // 状态会冻住整个进程（开 app 时还没读到声明，之后读到了也进不去）。
+  __staticToolNames = null;
   return _userCaps;
 }
 
@@ -34997,8 +35000,12 @@ function _buildAgentToolSchemas(includeWrite, mcpTools = []) {
   if (mcpTools.length) tools.push(...mcpTools);
   // 用户自己声明接进来的能力，走和 MCP 完全相同的那条轨：注册表(_buildToolRegistry)、
   // 开局窗口(_selectInitialTools)、search_tools 全在这一处的下游，所以只需要在这里推进去。
-  // 名字带 `user__` 前缀，于是它天然落在 _staticToolNames() 之外，schema 会随请求体一起
-  // 发出，不依赖网关那份产品目录（那份用户改不了）。
+  // **这里以前写着「名字带 user__ 前缀，于是它天然落在 _staticToolNames() 之外」——
+  // 那句是假的**：_staticToolNames() 正是从 _buildToolRegistry(true) 建的，而它遍历的
+  // 就是这个函数的返回值，用户工具在下一行被推进来，当然也在里面。前缀不构成任何豁免。
+  // 后果：L0 会把它的 schema 丢掉、只发名字，而网关按自己那份目录回填——**那份目录里
+  // 没有用户的工具**，于是用户自己接进来的能力在默认线路上整条消失。豁免在 L0 那边显式
+  // 写着（搜 _delegate），不靠前缀"天然"成立。
   for (const t of _userCapabilities().tools) tools.push(compileToolSchema(t));
   const browserSchema = tools.find((t) => t?.function?.name === "browser");
   const browserProps = browserSchema?.function?.parameters?.properties;
@@ -46838,6 +46845,12 @@ function _l0On(config = null) {
 // 网关能注入的工具名（它的 tools.json == 我们的静态工具目录）。不在此集合里的（MCP / 运行时
 // 工具）网关没有 schema，必须仍由请求体携带 —— 所以 L0 拆分：静态名→走头部(网关注入)、
 // 其余→照旧留在 body.tools。懒加载 + 缓存。
+/*
+ * 这份名单是**按进程 memo** 的，而它的输入（_buildAgentToolSchemas）含用户声明的能力
+ * ——声明是会变的（用户改 settings.json、切工作区）。没有失效点的话，第一次调用那一刻
+ * 的状态会冻住整个进程：开 app 时还没读到声明，之后即使读到了，这份名单里也永远没有
+ * 那些工具。所以 _refreshUserCapabilities 之后要清掉它（搜 __staticToolNames = null）。
+ */
 let __staticToolNames = null;
 function _staticToolNames() {
   if (!__staticToolNames) {
@@ -47134,7 +47147,11 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         const _stat = _staticToolNames(), _names = [], _keep = [];
         for (const _t of toolSchemas) {
           const _n = _t && _t.function && _t.function.name;
-          const _delegate = _n && _stat.has(_n) && !(_dispatchNames && _dispatchNames.has(_n));
+          // `user__*` 是**用户自己声明**的能力，网关那份产品目录里根本没有它——
+          // 交给网关回填等于把它整条丢掉。它的 schema 必须随请求体发出去。
+          const _userDeclared = typeof _n === "string" && _n.startsWith("user__");
+          const _delegate = _n && _stat.has(_n) && !_userDeclared
+            && !(_dispatchNames && _dispatchNames.has(_n));
           if (_delegate) _names.push(_n); else if (_t) _keep.push(_t);
         }
         _turnConfig.ideMode = _isSub ? "subagent" : ideMode;

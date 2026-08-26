@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -100,5 +100,73 @@ test("网关说还有别的出口时，走快速重发而不是限流长退避",
   assert.ok(
     src.slice(at, at + 600).includes("!attemptRetryElsewhere"),
     "限流判据没有排掉「还有别的出口」这种情况 —— 会白等 15 秒",
+  );
+});
+
+/**
+ * sprite 容器**不许用 display:none**。
+ *
+ * WKWebView（Tauri）里 `display:none` 子树中的渐变解析不出来：`<use>` 克隆得到纯色
+ * 路径，但 `fill="url(#…)"` 指向的 paint server 拿不到，画出来是空白。
+ * 2026-08-26 实测：带渐变的 qwen / minimax 全空，纯色的 anthropic / xiaomimimo 正常。
+ *
+ * 症状极具误导性 —— 看起来像「这两家没有图标」，人会去翻图标库和厂商判定，
+ * 而那两处都是好的。**判据是「带渐变的才空」。**
+ *
+ * 这条同时守住「sprite 里确实有带渐变的标」：哪天渐变标全没了，这条测试就该被重新审视，
+ * 而不是继续挡着一个不再存在的问题。
+ */
+test("sprite 容器不能用 display:none，否则带渐变的图标画不出来", () => {
+  // 沿用这个文件顶上已经读好的 `sprite`，不另开一份读法。
+  const install = sprite.slice(sprite.indexOf("export function installBrandSprite"));
+  assert.ok(
+    !/style\.display\s*=\s*["']none["']/.test(install),
+    "sprite 容器又用回 display:none 了 —— 带渐变的厂商标会全部变成空白，而且不报错",
+  );
+  assert.ok(
+    install.includes("position:absolute") && install.includes("overflow:hidden"),
+    "没有用留在渲染树里的隐藏方式，渐变仍然解析不出来",
+  );
+  // 确实有带渐变的标，这条测试才有意义。
+  assert.ok(
+    /linearGradient|radialGradient/.test(sprite),
+    "sprite 里已经没有带渐变的标了 —— 这条测试守的问题可能已不存在，重新审视它",
+  );
+});
+
+/**
+ * IDE 的图标库必须和**后台的图标目录**一致。
+ *
+ * # 为什么要有这条
+ *
+ * `brand-sprite.js` 头上一直写着「由脚本从 VendorMark.tsx 生成」，而在 2026-08-26
+ * 之前**那个脚本不在仓库里**。于是「在后台加一家图标」这件事，IDE 那边不会自动跟上，
+ * 也不会报错 —— 表现只是某个模型没有图标，而人会去怀疑厂商判定（那里通常是好的）。
+ *
+ * 现在脚本补上了（`scripts/gen-brand-sprite.mjs`），这条守住「跑过了没有」。
+ *
+ * 后台那份不在这个仓库里时（只克隆 ide/ 的场景）跳过，而不是报一个查不下去的错。
+ */
+test("IDE 的图标库和后台的图标目录一致（漏跑生成脚本会红）", () => {
+  const catalog = join(ROOT, "../server/admin-ui/src/components/VendorMark.tsx");
+  if (!existsSync(catalog)) return; // 单独克隆 ide/ 时比不了，跳过。
+  const tsx = readFileSync(catalog, "utf8");
+  const body = tsx.slice(tsx.indexOf("const MARKS: Record<string, Mark> = {"));
+  const inCatalog = new Set(
+    [...body.matchAll(/^ {2}([a-z0-9]+): \{\n {4}name: "/gm)].map((m) => m[1]),
+  );
+  assert.ok(inCatalog.size > 100, `只从后台目录里认出 ${inCatalog.size} 个 —— 解析规则和它的排版对不上了`);
+
+  const missing = [...inCatalog].filter((v) => !spriteIds.has(`i-brand-${v}`));
+  assert.deepEqual(
+    missing,
+    [],
+    `后台有这些图标而 IDE 没有：${missing.join("、")} —— 跑 \`node scripts/gen-brand-sprite.mjs\``,
+  );
+  const extra = [...spriteIds].filter((id) => !inCatalog.has(id.replace("i-brand-", "")));
+  assert.deepEqual(
+    extra,
+    [],
+    `IDE 有这些图标而后台已经没有了：${extra.join("、")} —— 同样跑一次生成脚本`,
   );
 });

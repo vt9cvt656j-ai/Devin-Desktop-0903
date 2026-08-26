@@ -27,10 +27,22 @@ export function installBrandSprite() {
   installed = true;
   const host = document.createElement("div");
   host.id = "brand-sprite";
-  // aria-hidden + display:none：它只是一堆 <symbol> 定义，不该被读屏器念，
-  // 也不该占任何布局空间。
+  // aria-hidden：它只是一堆 <symbol> 定义，不该被读屏器念。
   host.setAttribute("aria-hidden", "true");
-  host.style.display = "none";
+  // **不能用 display:none。**
+  //
+  // WKWebView（Tauri 就是它）里，`display:none` 子树中的**渐变**解析不出来：
+  // `<use>` 能克隆纯色路径，但 `fill="url(#…)"` 指向的 paint server 在隐藏子树里
+  // 拿不到，画出来是**空白**。实测四个标做对照：qwen、minimax（带渐变）在
+  // display:none 下全空，anthropic、xiaomimimo（纯色）正常；换成下面这种隐藏方式
+  // 之后四个全出来。
+  //
+  // 症状极具误导性 —— 看起来像「这两家没有图标」，于是人会去翻图标库、翻厂商判定，
+  // 而那两处都是好的。判据是「**带渐变的才空**」。
+  //
+  // 这里用的是 SVG sprite 的标准藏法：留在渲染树里，但不占空间、不可见。
+  host.style.cssText =
+    "position:absolute;width:0;height:0;overflow:hidden;border:0;clip:rect(0 0 0 0)";
   host.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg">${SPRITE}</svg>`;
   document.body.appendChild(host);
 }
