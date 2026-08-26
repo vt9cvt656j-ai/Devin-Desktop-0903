@@ -1878,6 +1878,11 @@ const KNOWN_UNCALLED = new Set([
   // test/tool-policy.test.mjs 需要「把整张表拿出来审一遍」（它守的是
   // worker 作用域字段的覆盖度）。留着是为了那条审计，不是忘了接。
   "allPolicies",
+  // 同上一条的兄弟：readOnlyBlockedTypes() 把「只读模式会挡哪些类型」整张表列出来。
+  // 生产代码走的是 blockedInReadOnlyMode(type, call) 单查，这个枚举只有测试要——
+  // logic.test.mjs 的覆盖闸拿它核对「每个会被挡的类型都写了拦截话术」。
+  // （2026-08-26 才第一次出现在这张名单里：在那之前它是箭头函数常量，这道闸根本扫不到。）
+  "readOnlyBlockedTypes",
   // 有意保留、暂无调用点（这一段要写清为什么，别混进上面那份存量）：
   // 这两条 UI 横幅 2026-08-18 由用户点名删掉——它们是糊在模型回答下面的 harness 文字，
   // 正是"不要在回答下面写 harness 内容"那条规矩。删的只是**显示**：同一条交付事实照样
@@ -1967,10 +1972,23 @@ function stripJsComments(source) {
 }
 
 test("新写的能力必须有人调用——死函数只减不增", () => {
-  const names = [...new Set(
-    [...SRC.matchAll(/^(?:async\s+)?function\s+(_?[A-Za-z0-9_]+)\s*\(/gm)].map((m) => m[1]),
-  )];
+  // **两种写法都要认**：`function foo(…)` 和 `const foo = (…) => …`。
+  //
+  // 原来只认前者，于是箭头函数常量对这道闸完全隐形——2026-08-26 一口气清出两个：
+  // `_prioritizeNamedTools`（恒等变换，还有两条源码断言正面钉着它存在）和 `_SIC`
+  // （技能图标构造器，零调用点）。两个都是 `const 名 = (…) =>`。
+  //
+  // 隐形还只是一半。另一半更别扭：下面的墓碑检查要求 KNOWN_UNCALLED 里每个名字都在
+  // names 里，而箭头常量进不了 names —— 于是这类死代码**连白名单都加不进去**，
+  // 只能删或者放着不管。两种写法一起认之后，两个方向才都通。
+  const names = [...new Set([
+    ...[...SRC.matchAll(/^(?:async\s+)?function\s+(_?[A-Za-z0-9_]+)\s*\(/gm)].map((m) => m[1]),
+    // 顶层箭头常量：`const f = (a) =>` / `const f = async (a) =>` / `const f = a =>`
+    ...[...SRC.matchAll(/^const\s+(_?[A-Za-z0-9_]+)\s*=\s*(?:async\s+)?(?:\(|[A-Za-z_$][A-Za-z0-9_$]*\s*=>)/gm)].map((m) => m[1]),
+  ])];
   assert.ok(names.length > 1500, `只解析出 ${names.length} 个顶层函数——取法坏了，这条等于没跑`);
+  assert.ok(names.includes("_nudgeRank") || names.some((n) => /^_[a-z]/.test(n) && SRC.includes(`const ${n} = (`)),
+    "箭头函数常量又扫不到了——那正是这道闸历史上漏掉两个死函数的原因");
 
   // 统计整个 src/ 目录里每个标识符出现多少次：==1 就是"只有定义那一次"，零引用。
   // 整个 src/ 目录（含子目录），而不是只有 main.js —— 调用点可能在别的模块里。

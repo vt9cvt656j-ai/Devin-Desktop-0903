@@ -1925,7 +1925,31 @@ test("titlebar separates Run Debug controls from other tools and hides their lab
 });
 
 test("account dropdown keeps logged-in text contained and puts logout at the bottom", () => {
-  const settingsBlock = INDEX_HTML.slice(INDEX_HTML.indexOf('id="settingsDropdown"'), INDEX_HTML.indexOf("</div>\n          </div>\n        </div>", INDEX_HTML.indexOf('id="settingsDropdown"')));
+  // 按**缩进**找真正的闭合标签，别拿一串写死的空白当锚点。
+  //
+  // 原来的终点锚是 `"</div>\n          </div>\n        </div>"`（10 空格 + 8 空格）——
+  // 那是这块还在纯 HTML 里时的缩进。它搬进 src/app/Shell.jsx 之后缩进变成 16/14/12，
+  // 锚点再也匹配不到，indexOf 返回 -1，slice 一路切到文件倒数第二个字符：
+  // "settingsBlock" 其实是从下拉框到 Shell.jsx 末尾的 35801 字符。
+  // 下面那三条位置断言（快捷键在上、分隔线居中、退出登录在最下）因此是在整份剩余源码上
+  // 比先后，而不是在这个下拉框里——它们碰巧还成立，所以一直绿着。
+  const settingsBlock = (() => {
+    const at = INDEX_HTML.indexOf('id="settingsDropdown"');
+    assert.ok(at > 0, "找不到设置下拉框，这条断言失去落点");
+    const lines = INDEX_HTML.slice(at).split("\n");
+    const openIndent = INDEX_HTML.slice(0, at).split("\n").pop().search(/\S/);
+    for (let i = 1; i < lines.length; i++) {
+      const indent = lines[i].search(/\S/);
+      if (lines[i].trim() === "</div>" && indent >= 0 && indent <= openIndent) {
+        return lines.slice(0, i + 1).join("\n");
+      }
+    }
+    assert.fail("下拉框的闭合标签找不到——缩进变了？");
+  })();
+  // 下拉框本体约 4.5 KB；锚点失效那次切出的是 35801 字符（一路到文件末尾）。
+  // 上限放在两者之间，够宽松到不因为加一两个菜单项就假红，也够紧到抓住"切到外面去了"。
+  assert.ok(settingsBlock.length < 12_000,
+    `切出了 ${settingsBlock.length} 字符——边界又划到下拉框外面去了`);
   const shortcutsAt = settingsBlock.indexOf('data-action="shortcuts"');
   const logoutDividerAt = settingsBlock.indexOf('id="logoutDivider"');
   const logoutAt = settingsBlock.indexOf('id="logoutBtn"');
