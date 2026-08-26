@@ -195,7 +195,21 @@ function normalizeRole(item, source) {
   if (!prompt) return { error: `角色 ${name} 缺少 prompt —— 那正是这个角色和别的角色的区别所在` };
   const tools = (Array.isArray(item.tools) ? item.tools : []).map(str).filter(Boolean);
   const types = (Array.isArray(item.types) ? item.types : []).map(str).filter(Boolean);
-  return { role: { name, prompt, tools, types, source } };
+  /*
+   * 可选：这个角色跑在哪个模型上。参照 Claude Code 的 subagent frontmatter（`model:`）。
+   *
+   * **这里只校验形状，不校验这个模型存不存在。** 模型清单是后端异步装进
+   * MODEL_GROUPS 的，声明可能在它到齐之前就被规整——那时候查表会把每一个合法声明
+   * 都判成非法。这个仓库已经为同一个时序踩过一次（第一发的用户画像是空的）。
+   * 存在性放到**派发那一刻**查，查不到就继承父模型并留下可见提示，见 main.js。
+   *
+   * 没有配套的 `effort`，这是有意的：推理档位在本产品里是**按模型存的用户偏好**，
+   * 角色换了模型，档位自动跟着那个模型的偏好走。再加一个角色级 effort 就等于
+   * 把「用户在转盘上选了一档、实际发出去另一档」装回来——那两道自动降档
+   * 刚刚才被删掉，理由就写在 _applyThinkingToConfig 的注释里。
+   */
+  const model = str(item.model);
+  return { role: { name, prompt, tools, types, model, source } };
 }
 
 /**

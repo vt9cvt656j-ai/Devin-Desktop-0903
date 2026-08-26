@@ -17474,7 +17474,11 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // 加法一旦退回成 max，两个数在 1M 原生模型上重合，整排档位按钮又变成空操作。
   assert.doesNotMatch(SRC, /function _effectiveContextLimit\(modelId\)[\s\S]{0,1400}Math\.max\(\s*native,\s*tierMax/,
     "档位又变成取较大值了，付费档位在 1M 原生模型上会整排失效");
-  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(config\?\.model\)\)/g) || [];
+  // 配置对象的名字不是判据 —— 子体那个调用点用的是 `_subConfig`（角色可以声明自己的
+  // 模型，上下文上限必须跟着**实际**跑的那个模型走，否则声明成小窗口模型的角色会按
+  // 父模型的上限裁剪、然后被上游截断）。判据是「走的是有效窗口而不是原生窗口」，
+  // 下面那条 doesNotMatch 仍然守着 _modelContextLimit。
+  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(\w+\?\.model\)\)/g) || [];
   assert.equal(callSites.length, 2,
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
   assert.doesNotMatch(SRC, /_trimMessagesIfHuge\(messages, \w+, root, _modelContextLimit\(/,
