@@ -163,3 +163,60 @@ test("BOM 不算格式错误，真空才静默", () => {
   assert.match(bad.error, /权限规则/, "没告诉用户权限规则也一起失效了——那是更危险的那一半");
   assert.equal(bad.parsed, null);
 });
+
+/**
+ * 用户自己声明的能力，在**默认线路**上必须真的到达模型。
+ *
+ * 2026-08-26 体检查出的最严重一条。代码里那句注释写着「名字带 user__ 前缀，于是它天然
+ * 落在 _staticToolNames() 之外，schema 会随请求体一起发出」——**那句是假的**：
+ * `_staticToolNames()` 正是从 `_buildToolRegistry(true)` 建的，而它遍历的就是
+ * `_buildAgentToolSchemas` 的返回值，用户工具就在那里面被推进来。前缀不构成任何豁免。
+ *
+ * 后果：走网关时 L0 会把它的 schema 丢掉、只发名字，而网关按**自己那份产品目录**回填
+ * ——那份目录里没有用户的工具。于是用户在 settings.json 里接进来的能力，
+ * 在默认线路上整条消失：模型看不见、也调不动。
+ *
+ * 那句注释此前**没有任何断言落点**，所以它一直假着也没人发现。这一组补上落点。
+ */
+test("用户声明的工具确实在静态目录里——所以豁免必须显式写，不能靠前缀「天然」成立", () => {
+  // 先证伪那句老注释：user__ 工具就在 _buildAgentToolSchemas 的产出里。
+  const build = new Function(
+    "inTauri", "_applyCloudToolDescs", "_userCapabilities", "compileToolSchema",
+    "_withoutDisabledTools", "_applyUserRoleEnums", "baseTools", "readonlyExternalTools", "writeTools",
+    `${extractFn("_buildAgentToolSchemas")}\n;return _buildAgentToolSchemas;`,
+  )(
+    true, (t) => t,
+    () => ({ tools: [{ name: "user__probe", description: "d", parameters: {} }], roles: [], commands: [], disabled: [], errors: [] }),
+    (t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: { type: "object", properties: {} } } }),
+    (t) => t, (t) => t, baseTools, readonlyExternalTools, writeTools,
+  );
+  const names = build(true, []).map((t) => t?.function?.name).filter(Boolean);
+  assert.ok(names.includes("user__probe"),
+    "用户工具不在目录里了——那这一整条判据的前提变了，要重新核");
+  // 而 _staticToolNames() 就是从这份目录建的，所以它必然也在里面。
+  assert.match(extractFn("_staticToolNames"), /_buildToolRegistry\(true\)/,
+    "静态名单换来源了——上面那条推理要重做");
+});
+
+test("L0 拆分显式豁免 user__，不把它交给网关回填", () => {
+  const turn = extractFn("_agentModelTurn");
+  assert.match(turn, /_userDeclared = typeof _n === "string" && _n\.startsWith\("user__"\)/,
+    "没有显式豁免——用户声明的能力会被 L0 丢掉，而网关目录里没有它");
+  assert.match(turn, /!_userDeclared/, "豁免算出来了却没接进 _delegate 的判据");
+  // 反向：不许再退回「靠前缀天然成立」的说法。
+  // 允许它出现在「以前写着…那句是假的」这种更正段落里，不允许被当成现状陈述。
+  // （不这么写的话，这条断言会命中更正文本自己——本仓库为同一个形状栽过两次。）
+  const src = readFileSync(join(HERE, "..", "src/main.js"), "utf8");
+  const at = src.indexOf("天然落在 _staticToolNames() 之外");
+  if (at >= 0) {
+    const around = src.slice(Math.max(0, at - 300), at + 300);
+    assert.match(around, /以前写着|那句是假的|已更正/,
+      "那句假注释又被当成现状写回来了——它让人以为不需要豁免");
+  }
+});
+
+test("声明变了要让静态名单失效，否则第一次调用就冻住整个进程", () => {
+  const refresh = extractFn("_refreshUserCapabilities");
+  assert.match(refresh, /__staticToolNames = null;/,
+    "刷新能力之后没清 memo —— 开 app 时还没读到声明的话，之后读到了也永远进不去名单");
+});
