@@ -207,6 +207,9 @@ test("语言服务器没在跑的文件不建 model、不进等待循环，unche
     _TS_EXT: new Set(["ts", "tsx", "mts", "cts"]),
     _INTERLEAVED_DIAG_MAX_FILES: 16,
     _INTERLEAVED_DIAG_MAX_WAIT_MS: 1,
+    // .js 现在走 Monaco 自带 worker 那条短腿（jsFamily），所以这个常量也必须注进来；
+    // 少了它 own() 会 ReferenceError —— 而那恰好证明 .js 真的改走短腿了。
+    _INTERLEAVED_DIAG_TS_WAIT_MS: 1,
     formatDiagnosticsForAgent: () => "",
   });
   const t0 = Date.now();
@@ -237,6 +240,9 @@ test("JS/TS 不受 isRunning 影响（Monaco 自带 worker），unchecked 事实
     _TS_EXT: new Set(["ts", "tsx", "mts", "cts"]),
     _INTERLEAVED_DIAG_MAX_FILES: 16,
     _INTERLEAVED_DIAG_MAX_WAIT_MS: 1,
+    // .js 现在走 Monaco 自带 worker 那条短腿（jsFamily），所以这个常量也必须注进来；
+    // 少了它 own() 会 ReferenceError —— 而那恰好证明 .js 真的改走短腿了。
+    _INTERLEAVED_DIAG_TS_WAIT_MS: 1,
     formatDiagnosticsForAgent: () => "",
   });
   const r = await diag(["a.js", "b.py"], "/w");
