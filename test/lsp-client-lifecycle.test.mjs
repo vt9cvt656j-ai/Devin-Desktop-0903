@@ -531,3 +531,30 @@ test("每条 brew 命令装出来的东西，必须真的是要启动的那个�
     assert.ok(!/\bcs\b/.test(cmd), `${lang} 的命令里出现了裸的 cs`);
   }
 });
+
+/**
+ * 服务器死掉时，stderr 是空的也必须说一声。
+ *
+ * 原来只在 tail 非空、且截得出非空 why 时才提示。而实测常见的语言服务器多数在死掉时
+ * stderr 是**空的**——被 OOM kill、收到信号、干净退出、或者只往 stdout 写东西，
+ * 四种死法一个字都不留。于是 markers 被清空、状态栏少一门语言，界面上零解释。
+ *
+ * 用户看到的是「写着写着红线和补全突然全没了」，下次打开同语言文件又会重启服务器
+ * （clients 已删），所以他的描述是「时好时坏」而不是「坏了」。lsp.rs 里为「说清死因」
+ * 专门建的那条 stderr 转发通道，终点是一个没人渲染的 Map。
+ */
+test("语言服务器无声死掉时也要给出原因，不能什么都不说", () => {
+  const fn = source.slice(source.indexOf("function _handleStopped"), source.indexOf("function _handleStopped") + 2200);
+  assert.ok(fn.length > 300, "_handleStopped 抠不出来");
+  // 判据钉在「有没有兜底赋值」，不钉具体文案。
+  assert.match(fn, /if \(!why\) \{/,
+    "没有兜底分支——stderr 为空时用户一个字都看不到，而那是最常见的死法");
+  // 兜底之后仍然要走同一条出口：记进 lastStopReason（智能体的工具回执要带上它）+ 提示用户。
+  const after = fn.slice(fn.indexOf("if (!why) {"));
+  assert.match(after, /lastStopReason\.set\(langId, why\)/,
+    "兜底原因没进 lastStopReason —— 模型仍然只会说「这个语言没有可用的服务」");
+  assert.match(after, /showToast\(/, "兜底原因没告诉用户");
+  // 反向：不许再出现「tail 为空就整段跳过」的形状。
+  assert.doesNotMatch(fn, /if \(tail\.length\) \{[\s\S]{0,400}lastStopReason\.set/,
+    "又变回「只有 stderr 非空才说」了");
+});
