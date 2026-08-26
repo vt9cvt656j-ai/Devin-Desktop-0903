@@ -14982,11 +14982,21 @@ function _compressionTier() {
 /// 因此改变，网关按内容哈希缓存的分段会全部失效，"压缩缓存"直接退化成"每轮重压"。
 /// 换句话说，两层同时开不只是浪费，是会把网关这套设计的核心收益抵消掉。
 ///
-/// 注意让位的只有 LLM 那层：`_trimMessagesIfHuge` 的棘轮式机械裁剪要保留——它是
-/// 确定性的、一条消息定形后不再变化，前缀依然稳定，而且它先削掉的冗余越多，网关需要
-/// 花钱压缩的内容就越少。两者是互补的。
-function _gatewayHandlesCompression() {
-  return !!_compressionTier();
+/// 这里以前写着"让位的只有 LLM 那层，棘轮式机械裁剪要保留"——2026-08-25 核实已经不成立：
+/// `_trimMessagesIfHuge` 开头也有一条早返回（只剥超大图片就 return）。留着旧说法比没有
+/// 注释更糟，下一个人会照着它推断"上限还在"。现状：档位开启且走网关时三层全部让位，
+/// 只剩 10MB 图片剥离——但判据必须同时认线路，自建端点上让位就等于一层都不剩。
+/*
+ * **两个条件缺一不可**：用户有档位，而且这一轮真的走网关。
+ *
+ * 原来只判档位。发送侧一直认线路（`customModelId ? null : _compressionTier()` 两处），
+ * 让位侧却只看会员身份——持档会员改用自建端点时，网关没收到压缩头（对的，本来就不是
+ * 网关请求），而本地三道防线全部让位。结果是一层都没有，只剩 10MB 图片剥离。
+ * 复用 _isGatewayConfig 而不是第四次手写 customModelId；不传参时它返回 true，
+ * 所以三处 UI 调用点行为不变。
+ */
+function _gatewayHandlesCompression(config) {
+  return _isGatewayConfig(config) && !!_compressionTier();
 }
 
 /// 本地棘轮裁剪该按哪个窗口来。
@@ -22935,10 +22945,10 @@ function _callIsReadOnlyCommand(call) {
 /**
  * 常驻技能声明的 allowed-tools，是**真的约束**，不是卡片上一枚灰色小标签。
  *
- * Claude Code 里 allowed-tools 的语义是"这个技能在场时只准用这几个工具"。这里原来只把
- * 它画在工具卡片上（"正文要用 X"），既不放行也不拦截——一个写着 `allowed-tools: Read, Grep`
- * 的只读技能，启用后模型照样能调 write_file、删文件。用户从那枚标签会以为有约束，
- * 实际一道都没有；这比没有这个字段更糟。
+ * **这句以前把参考实现说反了（2026-08-25 更正）**：Claude Code 的 allowed-tools 是
+ * **预授权**，不是"只准用这几个"。这里刻意取相反语义（收窄），因为这个产品装得到第三方
+ * 市场技能。代价要写明：这道闸在权限规则**之前**静默拒，用户自己的 allow 压不过它，
+ * 下面记着的两次事故都出在这个方向。行为不动，skills-global 那条测试正面钉着。
  *
  * 判据取**并集**而不是交集：同时启用两个技能时，两边声明的工具都该可用——交集会让
  * 「启用得越多能干的越少」，那不是任何人的预期。
@@ -23665,11 +23675,11 @@ function _fallbackConversationSummary(messages) {
   return parts.join("\n") || `早期 ${messages?.length || 0} 条消息已压缩；文件读取版本与范围保留在证据账本。`;
 }
 
-function _compactHistoryIfNeeded(session) {
+function _compactHistoryIfNeeded(session, config = null) {
   const sess = session || _currentSession();
   // 网关档位开启时必须保留原始消息序列。这里的 16K 本地摘要会改写/删除前缀内容，
   // 让服务端永远无法积累到 1M/2M/5M，也会让刚签发的 covered 条数立即失效。
-  if (_gatewayHandlesCompression()) return;
+  if (_gatewayHandlesCompression(config)) return;
   // Operate on the ACTUAL backing array — memory.recent for modern sessions,
   // sess.history for legacy. Previous version used assemble() which returns
   // a throwaway copy — splices were silently lost.
@@ -28791,7 +28801,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     showToast("对话历史未能从本地数据库恢复，本轮不会以不完整上下文继续执行");
     return;
   }
-  try { sess?.memory?.setExternalCompression?.(_gatewayHandlesCompression()); } catch {}
+  try { sess?.memory?.setExternalCompression?.(_gatewayHandlesCompression(config)); } catch {}
   // One settlement scope covers every auxiliary model call made for this user
   // turn. Main Agent iterations still get their own request IDs below.
   const _billingScopeId = _newIdeRequestId();
@@ -29280,7 +29290,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const languageBlock = _languagePreferenceBlock();
   const fullPrompt = sysPrompt + _modelStyleTuning(config.model) + userRulesBlock + skillsBlock + _authContextBlock() + languageBlock + adaptiveBlock;
 
-  _compactHistoryIfNeeded(sess);
+  _compactHistoryIfNeeded(sess, config);
 
   // 场景→工具直觉表 + 完整能力名录是字节稳定的纯字面量，只有待在 system 末尾才真的随前缀进
   // prompt cache。以前它拼在每轮 user 消息尾部：那是每轮的新后缀，永远不命中；历史又只存
@@ -42579,7 +42589,7 @@ async function _settleEagerWritesForBreak(run) {
   return parts.length ? `〔中断前的写入结果〕${parts.join("；")}` : "";
 }
 
-function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 0) {
+function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 0, config = null) {
   try { _perfPhase("trimMessages"); } catch {}
   // michael-compression 依赖逐字稳定的前缀。网关开启时，本地不再改写同一份 Agent
   // transcript；请求体和模型窗口由 mc_prefix + 服务端分段负责。
@@ -42591,7 +42601,8 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
   // active; it did not.) Only oversized IMAGES are stripped, oldest first, so text history stays
   // byte-stable for the prefix in the normal case; if it does fire it has changed the transcript,
   // so the prefix is invalidated with it.
-  if (_gatewayHandlesCompression()) {
+  // 判据要认线路（这条早返回也是让上面那句老注释失效的原因，已一并更正）。
+  if (_gatewayHandlesCompression(config)) {
     let bytes = 0;
     for (const m of messages) bytes += _msgSize(m);
     if (bytes > 10_000_000) {
@@ -42920,7 +42931,7 @@ function _squeezeMessagesForContext(messages) {
  */
 async function _compactHistoryIfHuge(config, session) {
   // 网关接管时整个跳过；尤其不能先 invalidate 再 return，否则下一轮永远回发不了前缀。
-  if (_gatewayHandlesCompression()) return;
+  if (_gatewayHandlesCompression(config)) return;
   // 本地一旦改写历史，网关那个"前 N 条已被摘要覆盖"的前缀就对不上了 —— 继续回发会
   // 让模型收到错位的上下文。宁可下一轮整份重传一次。
   _mcPrefixInvalidate();
@@ -49873,7 +49884,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           ));
         } catch { /* 看不到图不该让整个子任务失败 */ }
       }
-      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(_subConfig?.model));
+      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(_subConfig?.model), _subConfig);
     }
   } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
   finally {
@@ -56228,7 +56239,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // the agent reaches its finish gate. Re-running build/test after every small
       // batch made long tasks spend most of their time proving the same state.
 
-      _trimMessagesIfHuge(messages, run, root, _effectiveContextLimit(config?.model));
+      _trimMessagesIfHuge(messages, run, root, _effectiveContextLimit(config?.model), config);
 
       // Running scratchpad (ACON): after compression, inject a compact progress
       // summary at the context tail so the model retains what it did/found even

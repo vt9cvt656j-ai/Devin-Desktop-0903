@@ -17449,8 +17449,12 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // 两层同时开不只是重复付费：本地压缩把一大段历史**替换**成一条摘要，消息前缀因此
   // 改变，网关按内容哈希缓存的分段全部失效 —— "压缩缓存"退化成"每轮重压"，这套设计的
   // 核心收益被彻底抵消。
-  assert.match(SRC, /async function _compactHistoryIfHuge\(config, session\) \{[\s\S]{0,260}if \(_gatewayHandlesCompression\(\)\) return;/,
-    "本地 LLM 压缩必须在网关接管时整个跳过");
+  // 判据现在要带上本轮 config：只判档位的话，持档会员改用自建端点时网关根本不会压，
+  // 而本地三层全部让位——一层都不剩。窗口放宽到 400 是因为多了一行解释这件事的注释。
+  assert.match(SRC, /async function _compactHistoryIfHuge\(config, session\) \{[\s\S]{0,400}if \(_gatewayHandlesCompression\(config\)\) return;/,
+    "本地 LLM 压缩必须在网关接管时整个跳过，且判据要认线路");
+  assert.match(SRC, /function _gatewayHandlesCompression\(config\) \{\s*return _isGatewayConfig\(config\) && !!_compressionTier\(\);/,
+    "压缩判据又变回只看档位不看线路了——自建端点上会一层防线都不剩");
 
   // 档位只有一处真相：网关按套餐算好、经 /api/me 下发，客户端不自己推断。
   assert.match(extractFn("_compressionTier"), /_normalizeMichaelCompressionCapability\(_michaelUser\?\.michael_compression\)/);
@@ -17464,7 +17468,7 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // 作废前缀，不变量才成立。
   {
     const trim = extractFn("_trimMessagesIfHuge");
-    const open = trim.indexOf("if (_gatewayHandlesCompression()) {");
+    const open = trim.indexOf("if (_gatewayHandlesCompression(config)) {");
     assert.ok(open > 0, "网关分支必须存在");
     // 分支体 = 从 { 到同缩进的收尾 }，即第一处 "\n  }" 
     const body = trim.slice(open, trim.indexOf("\n  }", open) + 4);
@@ -17474,8 +17478,14 @@ test("gateway compression makes the local LLM compaction stand down", () => {
       "兜底剥离改了 transcript，就必须作废前缀，否则 covered 会错位");
     assert.match(body, /return;/, "兜底之后仍然要提前返回，不能继续走本地裁剪");
   }
-  assert.match(SRC, /function _compactHistoryIfNeeded\([\s\S]{0,300}if \(_gatewayHandlesCompression\(\)\) return;/,
-    "跨轮历史也不能再被 16K 本地阈值提前改写");
+  assert.match(SRC, /function _compactHistoryIfNeeded\(session, config = null\)[\s\S]{0,400}if \(_gatewayHandlesCompression\(config\)\) return;/,
+    "跨轮历史也不能再被 16K 本地阈值提前改写，且判据要认线路");
+  // 调用方必须真的把 config 传进去，否则参数加了等于没加（默认 null → _isGatewayConfig(null)
+  // 返回 true → 退回只看档位的老行为，而且是**静默**退回）。
+  assert.match(SRC, /_compactHistoryIfNeeded\(sess, config\);/,
+    "调用点没传 config —— 参数加了等于没加，且会静默退回老行为");
+  assert.match(SRC, /setExternalCompression\?\.\(_gatewayHandlesCompression\(config\)\)/,
+    "记忆层那道机械网的开关还是只看档位");
   // Additive, matching the gateway's capacity_for_native (server/src/compression.rs): the tier is
   // granted ON TOP of the model's own window. Taking the larger of the two contradicted the
   // buttons, which have always been priced additively.
@@ -17493,7 +17503,9 @@ test("gateway compression makes the local LLM compaction stand down", () => {
   // 模型，上下文上限必须跟着**实际**跑的那个模型走，否则声明成小窗口模型的角色会按
   // 父模型的上限裁剪、然后被上游截断）。判据是「走的是有效窗口而不是原生窗口」，
   // 下面那条 doesNotMatch 仍然守着 _modelContextLimit。
-  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(\w+\?\.model\)\)/g) || [];
+  // 第五个参数是本轮 config：棘轮裁剪的让位判据要认线路（自建端点上网关不会压，
+  // 让位就等于一层都不剩）。两个调用点都必须传，否则默认 null 会静默退回老行为。
+  const callSites = SRC.match(/_trimMessagesIfHuge\(messages, \w+, root, _effectiveContextLimit\(\w+\?\.model\), \w+\)/g) || [];
   assert.equal(callSites.length, 2,
     `两个调用点都要用有效窗口（找到 ${callSites.length} 个）`);
   assert.doesNotMatch(SRC, /_trimMessagesIfHuge\(messages, \w+, root, _modelContextLimit\(/,
