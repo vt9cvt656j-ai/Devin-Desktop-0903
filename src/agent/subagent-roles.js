@@ -101,6 +101,27 @@ export function roleCapabilities(role, write, userRoleMap = null) {
   // 模块要能被测试拿一份干净的数据直接驱动，而不是去 stub 一个全局。
   const mine = userRoleMap ? userRoleMap.get(key) : null;
   if (mine) return { tools: [...mine.tools], types: [...mine.types] };
+  /*
+   * 可写矩阵是只读矩阵的**超集**，不是它的兄弟表。
+   *
+   * 两张表是分两次写的：ROLE_CAPABILITIES 先有，后来发现 run_subagent 派出去的子体
+   * 全是 write=false、于是补了 ROLE_CAPABILITIES_READ ——补完没有回头并进可写那张。
+   * 结果是反的：能动手修的那一档反而看不到证据。
+   *   · frontend / design 的可写 worker 拿不到 visual_compare，
+   *     而它才是那个改完 UI、需要比对改前改后截图的人；
+   *   · security 的可写 worker 拿不到 capture_flows，
+   *     而它才是那个要照着真实流量去改代码的人。
+   * 两件工具都是纯读取（visual_compare 比图，capture_flows 读**已经抓到的**请求），
+   * 没有任何安全理由把它们挡在写侧之外。
+   *
+   * 所以这里取并集，并且**判据写成不变量**：任何角色的可写工具集必须包含它的只读工具集。
+   * 测试钉着这条，以后再往只读那张表加东西，不并进来就会红。
+   */
   const spec = ROLE_CAPABILITIES[key];
-  return spec ? { tools: [...spec.tools], types: [...spec.types] } : { tools: [], types: [] };
+  const read = ROLE_CAPABILITIES_READ[key];
+  if (!spec && !read) return { tools: [], types: [] };
+  return {
+    tools: [...new Set([...(read?.tools || []), ...(spec?.tools || [])])],
+    types: [...new Set([...(read?.types || []), ...(spec?.types || [])])],
+  };
 }
