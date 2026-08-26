@@ -19593,14 +19593,6 @@ function _estTokens(x) {
   }
   return Math.round(cjk + (s.length - cjk) / 4);
 }
-function _estRequestTokens(messages, tools = []) {
-  let total = _estTokens(messages);
-  try {
-    const toolText = Array.isArray(tools) && tools.length ? JSON.stringify(tools) : "";
-    if (toolText) total += _estTokens(toolText);
-  } catch {}
-  return Math.max(0, Math.round(total));
-}
 function _tokenShort(n) {
   n = Math.max(0, Math.round(Number(n) || 0));
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
@@ -19796,7 +19788,7 @@ function _setContextMeter(input = {}) {
 // 它是「打字时把整条会话重新估一遍 token」那套东西，唯一的消费者是上下文仪表的兜底分支。
 // 而仪表现在只显示上游真实上报的数（用户原话：「不要估算 全部都走真实的，不要模拟计算」），
 // 那条兜底分支没了，它就没有消费者了 —— 留着的死代码只会让下一个人以为仪表还在用估算。
-// 请求预算那条路用的是另一个函数（_estRequestTokens），不受影响。
+// 请求预算那条路按字节算（_enforceModelRequestBudget 里的 byteLength），不受影响。
 
 function _refreshContextMeterFromDraft(options = {}) {
   try {
@@ -47468,7 +47460,6 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   if (session && meterScope === "main") session._lastMainUsageRequestId = _turnReqId;
   let acc = "";
   let err = null;
-  let _lastRequestEstimateTokens = 0; // fallback meter uses the post-L0/post-budget request, not the bloated source transcript
   const byIndex = new Map();
   let streamEl = null;
   // A native tool block can arrive after provisional prose was already painted.  Once a
@@ -47745,8 +47736,12 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const _mcSourceMessages = _l0Msgs;
       if (_mcTier && !_isSub) _l0Msgs = _applyCompressionPrefix(_l0Msgs, _turnConfig, session);
       _l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP);
-      // 预算判定仍然要这个估算（_enforceModelRequestBudget 上面已经用过），但**它不许画到仪表上**。
-      _lastRequestEstimateTokens = _estRequestTokens(_l0Msgs, _l0Tools);
+      // 这里原来算一遍 _estRequestTokens 存进 _lastRequestEstimateTokens，而那个变量
+      // **全文零读点**（函数局部 let，声明 + 赋值就没了）。旁边那句注释还写着
+      // 「_enforceModelRequestBudget 上面已经用过」——假的：那个函数用的是 byteLength，
+      // 从不调 _estRequestTokens。于是每个模型轮白算一次全量 token 估算，
+      // 实测 3.5MB 请求体（就是 _MODEL_REQUEST_BODY_BYTE_CAP）要 7.43ms。
+      // 该守的不变量是下面那条：仪表只画上游真实上报的数，估算一个像素都不许画。
       // 上下文仪表只显示上游真实上报的数。
       //
       // 这行原来无条件把仪表重画成本地估算，于是每发一条消息、以及 agent run 里的每一轮，
@@ -58223,7 +58218,27 @@ function _mayAttemptArgsParse(entry) {
 
 function _ensureLiveEditorWritePreview(entry, root) {
   const previewable = entry?.name === "write_file" || entry?.name === "edit_file";
-  if (!entry || !previewable || entry._editorPreviewOutcome === "rollback") return null;
+  /*
+   * 复入闸必须同时挡 "card-only"，不是只挡 "rollback"。
+   *
+   * 进闸量的是 `entry._target`（对 edit_file 就是 new_string，通常几十到几百字符），
+   * 退闸量的是拼回去的**整份文件**。于是一个 new_string 很小、而目标文件超过上限的
+   * edit_file 会这样循环：进闸放行 → 读盘、建模型、开标签、didOpen → 拼出整份文件
+   * 发现超限 → 置 card-only、回滚 → 回滚把 `_editorPreview` 清空（58543/58594），
+   * 于是下面那句 `if (entry._editorPreview || ...) return` 也拦不住 → 下一个 delta
+   * 从头再来一遍。
+   *
+   * 500ms 节流救不了：它只在 `_flushLiveEditorWritePreview` 返回 true 时才盖时间戳
+   * （58792），而这条路径永远返回 false。
+   *
+   * 每一轮白付：readTextFile 的 IPC 往返 → getOrCreateModel → openFiles.set →
+   * renderTabs() → lspManager.didOpen → getValue() + 拼整串 → closeFile → 又一次
+   * renderTabs()。三个置 card-only 的点（58228 / 58505 / _removeWritePreview 不置）
+   * 没有一个希望之后重试——它是终态，落盘后的最终快照走 handoff 那条路，不经过这里。
+   */
+  if (!entry || !previewable
+      || entry._editorPreviewOutcome === "rollback"
+      || entry._editorPreviewOutcome === "card-only") return null;
   // The chat card already shows a bounded tail for large writes. Opening a Monaco
   // model for the same large, still-uncommitted payload makes WebKit synchronously
   // tokenize/layout it and wakes the TS worker; the perf log recorded a 23KB preview
