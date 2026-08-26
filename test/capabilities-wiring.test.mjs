@@ -121,3 +121,45 @@ test("执行侧确实复用了内置的 http 通道，没有另抄一份", () =>
   const seg = src.slice(src.indexOf('call.type === "http" || call.type === "userhttp"'));
   assert.match(seg.slice(0, 1500), /buildHttpCall/, "没有用声明去合成请求");
 });
+
+/**
+ * settings.json 读不懂时必须报出来，不能静默吞掉。
+ *
+ * 这一份文件同时喂着能力声明和权限规则，而两处 absorb 原来都是 `catch { return; }`。
+ * 后果不是"少一条声明"：用户配好的东西全部消失，而能力面板把 errors 排在最前面标红
+ * ——那正是这个面板存在的首要理由——此时 errors 是空数组，用户看到的是「我从来没配过」。
+ *
+ * 同一个仓库里 hooks 加载器为同一种情况早就写好了正确的规矩（剥 BOM、真空才静默、
+ * 否则吵）。这几条钉住 capabilities 这侧跟上了。
+ */
+test("settings.json 格式坏掉时，面板能拿到红色的原因", () => {
+  const parse = extractFn("_parseSettingsJson");
+  assert.ok(parse, "共用的解析函数不见了，这条断言失去落点");
+  assert.doesNotMatch(SRC, /try \{ parsed = JSON\.parse\(raw \|\| "\{\}"\); \} catch \{ return; \}/,
+    "静默吞掉又回来了——用户配的东西全没了，而面板显示「你从来没配过」");
+  // 两个 absorb 都必须改过来（同一份文件同时喂能力和权限）。
+  assert.match(SRC, /const \{ parsed \} = _parseSettingsJson\(raw, from \|\| "权限设置"\)/,
+    "权限那侧还在静默吞");
+  assert.match(SRC, /const \{ parsed, error \} = _parseSettingsJson\(raw, source\)/,
+    "能力那侧还在静默吞");
+  assert.match(SRC, /if \(error\) \{ scopes\.push\(\{ errors: \[error\] \}\); return; \}/,
+    "报错没进 scopes —— 面板还是看不到");
+});
+
+test("BOM 不算格式错误，真空才静默", () => {
+  // Windows 上一份内容完全合法、只是带 BOM 的 settings.json，会让能力声明连同
+  // 权限规则一起消失。hooks 那侧已经为一次实拍加了这个处理，这侧当时没跟上。
+  // 去重用的模块级 let 要一起注进来（它在函数外面，抠函数抠不到）。
+  const parse = new Function("showToast", `let _settingsParseWarned = "";\n${extractFn("_parseSettingsJson")}\n;return _parseSettingsJson;`)(() => {});
+  const good = parse('\uFEFF{"capabilities":{"tools":[]}}', "settings.json");
+  assert.equal(good.error, "", "带 BOM 的合法 JSON 被判成坏文件了");
+  assert.ok(good.parsed && good.parsed.capabilities, "剥掉 BOM 之后没解析出内容");
+  // 真空 → 静默，不报错（没配过不是错误）。
+  assert.deepEqual(parse("\uFEFF   \n", "settings.json"), { parsed: null, error: "" });
+  assert.deepEqual(parse("", "settings.json"), { parsed: null, error: "" });
+  // 真的坏 → 有错，且文案要说清「权限规则也一起失效了」。
+  const bad = parse('{"capabilities":', "settings.json");
+  assert.match(bad.error, /settings\.json/, "报错里没说是哪份文件");
+  assert.match(bad.error, /权限规则/, "没告诉用户权限规则也一起失效了——那是更危险的那一半");
+  assert.equal(bad.parsed, null);
+});

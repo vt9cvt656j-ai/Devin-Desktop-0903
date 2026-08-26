@@ -22460,6 +22460,35 @@ const _LEGACY_STATE_DIR = ".michael";
 // 两份都读是**不行**的：老文件里一条 deny 会永远压住用户在新文件里刚改宽的同一条规则
 // （判定是 deny 优先），而且他删不掉——他根本不知道还有一份旧的在生效。所以每个作用域
 // 只取**第一个存在的**：新的一旦存在，旧的完全不看。
+/*
+ * settings.json 读不懂时**必须吵**，不能静默吞掉。
+ *
+ * 同一份文件同时喂着能力声明（工具/知识库/角色/命令/项目栈/官方域名）和权限规则，
+ * 而两处 absorb 原来都是 `catch { return; }`。后果不是"少一条声明"：用户配好的东西
+ * 全部消失，而能力面板把 errors 排在最前面标红——那正是这个面板存在的首要理由——
+ * 此时 errors 是空数组，用户看到的是「我从来没配过」。
+ *
+ * 这个仓库里 hooks 加载器为**同一种情况**已经写好了正确的规矩（见 _hooksParseWarned
+ * 那段）：先剥 BOM，真空才静默，否则报出来。BOM 不是理论——Windows 上一份内容完全
+ * 合法、只是带 BOM 的 settings.json，会让上面那些东西连同权限规则一起消失。
+ * capabilities 这侧当时没跟上，这里补齐。
+ */
+let _settingsParseWarned = "";
+function _parseSettingsJson(raw, from) {
+  const text = String(raw ?? "").replace(/^\uFEFF/, "");
+  if (!text.trim()) return { parsed: null, error: "" }; // 真空＝没配过，静默是对的
+  try { return { parsed: JSON.parse(text), error: "" }; } catch (e) {
+    const msg = String((e && e.message) || e).slice(0, 120);
+    // 按内容指纹去重：这条路径每次刷新能力都会走一遍，不去重会反复弹。
+    const sig = `${from}|${text.length}|${msg}`;
+    if (_settingsParseWarned !== sig) {
+      _settingsParseWarned = sig;
+      console.error("[settings] parse failed:", from, e);
+      try { showToast(`${from} 格式有误，这份文件里的能力声明和权限规则全部未生效：${msg}`, 8000); } catch {}
+    }
+    return { parsed: null, error: `${from}：JSON 格式有误，这份文件里的能力声明**和权限规则**全部未生效 —— ${msg}` };
+  }
+}
 const _stateRels = (name) => [`${_STATE_DIR}/${name}`, `${_LEGACY_STATE_DIR}/${name}`];
 // 装进技能目录里的安装元数据（头像、来源仓库）。同样改名读旧写新——已经装好的技能
 // 目录里躺的还是旧文件名，读不到它只是头像和来源消失，不会报错，最难被发现。
@@ -22640,8 +22669,9 @@ async function _loadPermissionRules(root) {
   // 只说"被规则拦了"而不说在哪，用户还是得自己翻三个作用域去找。
   const origin = new Map();
   const absorb = (raw, { trusted, from = "" }) => {
-    let parsed = null;
-    try { parsed = JSON.parse(raw || "{}"); } catch { return; }
+    // 读不懂时 _parseSettingsJson 会报出来（能力那侧还会把它排进面板），这里照旧不加载。
+    const { parsed } = _parseSettingsJson(raw, from || "权限设置");
+    if (!parsed) return;
     const perms = parsed && typeof parsed === "object" ? parsed.permissions : null;
     if (!perms || typeof perms !== "object") return;
     for (const bucket of ["allow", "ask", "deny"]) {
@@ -22719,8 +22749,11 @@ async function _refreshUserCapabilities(root) {
   //     那个人替模型降低对某个站的怀疑度。
   // 两者都只认用户自己的作用域；报错文案照旧告诉用户抄到哪里去。
   const absorb = (raw, source, { trusted }) => {
-    let parsed = null;
-    try { parsed = JSON.parse(raw || "{}"); } catch { return; }
+    const { parsed, error } = _parseSettingsJson(raw, source);
+    // 读不懂 → 推一个只带 errors 的作用域。mergeCapabilities 全走 `one.X || []`，
+    // 所以这个形状是安全的；面板据此把红色的原因摆在最前面。
+    if (error) { scopes.push({ errors: [error] }); return; }
+    if (!parsed) return;
     const one = normalizeCapabilities(parsed, source);
     if (trusted) { scopes.push(one); return; }
     const dropped = one.tools.length + one.roles.length + one.commands.length
