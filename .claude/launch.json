@@ -51,6 +51,18 @@
         "--strictPort=false"
       ],
       "port": 5177
+    },
+    {
+      "name": "layout-probe",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "5399",
+        "--directory",
+        "/private/tmp/claude-501/-Users-michael-Desktop-Michael-IDE-Devin-Desktop-ide/2f6ab8e7-8a13-4f9b-938f-65b5cb5abf07/scratchpad/probe"
+      ],
+      "port": 5399
     }
   ]
 }
