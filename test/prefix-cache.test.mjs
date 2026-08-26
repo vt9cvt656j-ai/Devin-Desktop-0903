@@ -240,11 +240,23 @@ test("archive handling is reachable from the UI, not just implemented in the bac
     "the old inline archive section must be gone, not merely unused");
 
   // Archive content is untrusted input; it is rendered as text, never as markup.
-  const preview = SRC.slice(SRC.indexOf("function _showArchiveEntryPreview"), SRC.indexOf("function _inspectionArchiveHtml"));
+  // 按 AST 取函数，别拿 indexOf 划窗口。
+  //
+  // 这里原来切的是 `SRC.slice(indexOf("function _showArchiveEntryPreview"),
+  // indexOf("function _inspectionArchiveHtml"))`——而**上面第三行断言刚刚要求
+  // `_inspectionArchiveHtml` 出现 0 次**，于是终点 indexOf 返回 -1，slice 一路切到
+  // 文件倒数第二个字符：preview 是 4.2 MB 的整份源码，template 也是。
+  // 下面那条 doesNotMatch 因此变成「整份 main.js 里不许出现 content.text」——它碰巧
+  // 成立，所以一直是绿的，但它守的早已不是这个模板。
+  const preview = grab("_showArchiveEntryPreview", { code: true });
   assert.match(preview, /querySelector\("pre"\)\.textContent = /,
     "entry content must go in as textContent — innerHTML here is a script-injection path straight " +
     "out of a downloaded archive");
-  const template = preview.slice(preview.indexOf("wrap.innerHTML = `"), preview.indexOf("// textContent"));
+  const tplStart = preview.indexOf("wrap.innerHTML = `");
+  const tplEnd = preview.indexOf("`;", tplStart);
+  assert.ok(tplStart >= 0 && tplEnd > tplStart, "模板字面量的边界找不到了，这条断言失去落点");
+  const template = preview.slice(tplStart, tplEnd);
+  assert.ok(template.length < 2000, `模板切出了 ${template.length} 字符——边界又划到函数外面去了`);
   assert.doesNotMatch(template, /content[?.]*\.text/,
     "the entry's own bytes must never be interpolated into markup — only its name and size, both escaped");
 });
