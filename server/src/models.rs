@@ -4995,6 +4995,19 @@ fn openai_prompt_cache_key(body: &serde_json::Value, run_id: Option<&str>) -> St
 /// 机器亲和这回事（线上 agent 模式零命中只有 2.6%，是全场最好的）；智谱、通义同理。
 /// 给它们塞一个上游不认识的顶层字段，好处为零，风险是被 400 或者改变上游自己的前缀哈希。
 /// 只发给真正需要的那两族。
+/// 这一轮是不是打到 xAI（不管是直连还是经中转）。
+///
+/// 判据既看模型名也看 base_url：中转的 base_url 不含 x.ai（实测线上那条是 mhapi.net），
+/// 只看 URL 会漏掉全部经中转的 Grok；而某些自建网关会把 base_url 写成 x.ai 却用别名模型，
+/// 只看模型名又会漏掉那些。两个都认，宁可多剥一次——剥掉是无损的（意思补进 description）。
+///
+/// 抽成函数是因为这份判据现在有两个用处（顶层分支剥离 + x-grok-conv-id 粘性路由），
+/// 手写第二遍就是本仓库栽过好几次的「两份清单会漂」。
+fn _is_xai_route(model_id: &str, base_url: &str) -> bool {
+    model_id.to_ascii_lowercase().starts_with("grok")
+        || base_url.to_ascii_lowercase().contains("x.ai")
+}
+
 fn route_needs_cache_affinity(model_id: &str, base_url: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
     let u = base_url.to_ascii_lowercase();
@@ -9021,6 +9034,45 @@ pub async fn chat_completions(
                             );
                         }
                     }
+                    /*
+                     * xAI 也不收工具 schema **顶层**的 anyOf / oneOf / allOf。
+                     *
+                     * 这和 Anthropic 那条是同一个病（见 strip_top_level_schema_branches 的
+                     * 注释），只是发现得晚：走 OpenAI 兼容协议的上游里，多数照单全收，
+                     * 于是同一份目录在别家都能用、只有 Grok 400。用户报的原话就是
+                     * 「除了 grok 模型都能用」。
+                     *
+                     * 真实上游错误（网关日志里抓到的，客户端看到的那句 openai_error 是
+                     * 中转盖上去的）：
+                     *   run_subagent: tool parameter root must be an object type
+                     *   (root schema is an anyof/oneof union with a non-object branch)
+                     *
+                     * 而且它**时好时坏**：中转在多个上游之间轮询，只有部分上游严格校验，
+                     * 日志里同一条线路先两次 400、随后又 200。这是它拖到今天的原因——
+                     * 重发一次常常就过了，看着像线路抖动。
+                     *
+                     * 复用 Anthropic 那条已经验证过的路径，而不是从目录里删：那份 anyOf
+                     * 客户端要用来生成工具指引和做本地参数校验，删了是把约束真的扔掉。
+                     * 剥的同时把「二选一」补进 description，模型照样知道。
+                     */
+                    if _is_xai_route(&model_id, &candidate.base_url) {
+                        if let Some(tools) = oai_body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                            for t in tools.iter_mut() {
+                                let Some(f) = t.get_mut("function").and_then(|f| f.as_object_mut()) else {
+                                    continue;
+                                };
+                                let Some(params) = f.get_mut("parameters") else { continue };
+                                let Some(note) = strip_top_level_schema_branches(params) else {
+                                    continue;
+                                };
+                                let merged = match f.get("description").and_then(serde_json::Value::as_str) {
+                                    Some(d) if !d.trim().is_empty() => format!("{d}\n\n{note}"),
+                                    _ => note,
+                                };
+                                f.insert("description".into(), serde_json::Value::String(merged));
+                            }
+                        }
+                    }
                     let mut r = req0
                         .header("Authorization", format!("Bearer {}", candidate_key))
                         .header("User-Agent", CODEX_USER_AGENT)
@@ -9031,10 +9083,7 @@ pub async fn chat_completions(
                     // xAI 用的是**请求头**而不是请求体字段，而且它要的是「会话」粒度：
                     // 同一段对话回到同一台机器。用 IDE 的 run id（一次 agent 运行 = 一段
                     // 对话），拿不到就退回前缀键——退回后至少同前缀仍然粘同一台。
-                    if _affinity
-                        && (model_id.to_ascii_lowercase().starts_with("grok")
-                            || candidate.base_url.to_ascii_lowercase().contains("x.ai"))
-                    {
+                    if _affinity && _is_xai_route(&model_id, &candidate.base_url) {
                         let conv = _run_id
                             .map(str::trim)
                             .filter(|v| !v.is_empty())
@@ -13093,6 +13142,71 @@ mod billing_tests {
         // disabling thinking for them would be the same bug pointed the other way.
         assert_eq!(anthropic_thinking("claude-opus-5", None), None);
 
+    /// xAI 同样不收顶层 anyOf / oneOf / allOf —— 而且这条比 Anthropic 那条更难查。
+    ///
+    /// 2026-08-26 用户报「除了 grok 模型都能用」。真实上游错误（客户端看到的
+    /// `openai_error` 是中转盖上去的）：
+    ///   run_subagent: tool parameter root must be an object type
+    ///   (root schema is an anyof/oneof union with a non-object branch)
+    ///
+    /// 难查在于它**时好时坏**：中转在多个上游之间轮询，只有部分严格校验，
+    /// 同一条线路先两次 400、随后又 200，重发一次常常就过了，看着像线路抖动。
+    #[test]
+    fn no_shipped_tool_reaches_xai_with_a_top_level_branch() {
+        // 判据本身：三个带顶层分支的工具，剥完必须既没有分支、也没丢掉意思。
+        for name in ["local_discovery", "live_environment", "run_subagent"] {
+            let mut schema = json!({
+                "type": "object",
+                "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                "anyOf": [{ "required": ["a"] }, { "required": ["b"] }]
+            });
+            let note = strip_top_level_schema_branches(&mut schema)
+                .unwrap_or_else(|| panic!("{name}: 顶层分支没被剥掉"));
+            assert!(
+                schema.get("anyOf").is_none(),
+                "{name}: 剥完顶层还留着 anyOf，xAI 照样 400"
+            );
+            assert!(
+                note.contains("Provide exactly one of:"),
+                "{name}: 剥掉了却没生成二选一说明 —— 那是把约束直接扔了"
+            );
+        }
+        // 线路判据：经中转的 Grok（base_url 不含 x.ai）必须也认得出来。
+        // 线上那条实测是 mhapi.net —— 只看 URL 会漏掉全部经中转的 Grok。
+        assert!(super::_is_xai_route("grok-4.6", "https://mhapi.net"), "经中转的 Grok 没被认出来");
+        assert!(super::_is_xai_route("grok-4.5", "https://api.x.ai/v1"), "直连的 Grok 没被认出来");
+        assert!(super::_is_xai_route("some-alias", "https://api.x.ai/v1"), "别名模型走 x.ai 也要认");
+        assert!(!super::_is_xai_route("claude-opus-4-8", "https://api.anthropic.com"), "误伤了别家线路");
+        assert!(!super::_is_xai_route("gpt-5.6", "https://api.openai.com/v1"), "误伤了别家线路");
+
+        // 上面两组只验了「函数会剥」和「线路认得出」。真正要守的是**它被接在了发送路径上**
+        // ——本仓库为「写了但没人调用」栽过好几次，所以按源码钉住那个调用点。
+        // 剥完还必须把 note 并进 description：剥掉不等于把意思也扔了。
+        let src = include_str!("models.rs");
+        let call = src
+            .split("fn _is_xai_route")
+            .next()
+            .unwrap_or("")
+            .to_string()
+            + src.split("fn _is_xai_route").nth(1).unwrap_or("");
+        assert!(
+            call.contains("if _is_xai_route(&model_id, &candidate.base_url) {"),
+            "OpenAI 兼容那条发送路径上没有 xAI 分支 —— 剥离函数写了却没人调，Grok 照样 400"
+        );
+        assert!(
+            call.contains("strip_top_level_schema_branches(params)"),
+            "xAI 分支里没有真的调剥离函数"
+        );
+        assert!(
+            call.contains(r#"f.insert("description".into(), serde_json::Value::String(merged));"#),
+            "剥了却没把二选一说明并进 description —— 那是把约束直接扔了"
+        );
+        // 粘性路由那处也必须走同一份判据，别再手写第二遍（两份清单必漂）。
+        assert!(
+            call.contains("if _affinity && _is_xai_route(&model_id, &candidate.base_url) {"),
+            "x-grok-conv-id 那处还在手写自己的 grok 判据"
+        );
+    }
 
         // A disabled turn must not collect the headroom meant for thinking, and the client's
         // explicit disable must read as "off" rather than as the bare-toggle "high".
