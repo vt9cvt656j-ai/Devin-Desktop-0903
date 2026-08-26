@@ -980,12 +980,16 @@ pub async fn webhook(
             if let Some(order_id) = order_for_reversal(&state, &mut tx, &obj).await? {
                 // 先把退款记在订单上。退过款的 Checkout Session 在 Stripe 那边仍然报
                 // payment_status: paid，所以没有这个标记，履约和计佣还能再跑一遍。
-                let _ = sqlx::query(
+                // **不许吞。** 这一句报错会让整个事务作废，而 Postgres 对作废事务的
+                // COMMIT 是静默 ROLLBACK 且不报错 —— 于是 handler 照回 200，Stripe
+                // 认为投递成功不再重投，连上面那条幂等认领也一起回滚了。
+                // 用 `?` 才走得到本函数开头那段注释设计的路：500 → Stripe 重投 → 真的重跑。
+                sqlx::query(
                     "UPDATE orders SET refunded_at = COALESCE(refunded_at, now()) WHERE id = $1",
                 )
                 .bind(order_id)
                 .execute(&mut *tx)
-                .await;
+                .await?;
                 crate::referral::reverse(&mut tx, order_id, event_type, ratio_bps).await;
             }
         }
@@ -995,13 +999,13 @@ pub async fn webhook(
         "checkout.session.expired" => {
             let obj = event.pointer("/data/object").cloned().unwrap_or(json!({}));
             if let Some(sid) = obj.get("id").and_then(|v| v.as_str()) {
-                let _ = sqlx::query(
+                sqlx::query(
                     "UPDATE orders SET status = 'canceled' \
                      WHERE stripe_session_id = $1 AND status = 'pending'",
                 )
                 .bind(sid)
                 .execute(&mut *tx)
-                .await;
+                .await?;
             }
         }
         // A referrer's connected account changed — usually onboarding finishing, sometimes
@@ -1016,8 +1020,7 @@ pub async fn webhook(
                 )
                 .bind(acct)
                 .fetch_optional(&mut *tx)
-                .await
-                .unwrap_or(None);
+                .await?;
                 if let Some(uid) = uid {
                     post_commit.push((
                         uid,
@@ -1070,8 +1073,7 @@ pub async fn webhook(
                 .bind(event_type)
                 .bind(fully)
                 .fetch_optional(&mut *tx)
-                .await
-                .unwrap_or(None);
+                .await?;
                 if let Some((uid, cents)) = row {
                     tracing::warn!(transfer = %tr, %uid, cents, "payout came back");
                     /*
@@ -1092,8 +1094,7 @@ pub async fn webhook(
                     )
                     .bind(tr)
                     .fetch_optional(&mut *tx)
-                    .await
-                    .unwrap_or(None);
+                    .await?;
                     if let Some(n) = released {
                         if n > 0 {
                             tracing::warn!(transfer = %tr, released = n, "commissions released back to settled");
@@ -1114,10 +1115,10 @@ pub async fn webhook(
             let won = obj.get("status").and_then(|v| v.as_str()) == Some("won");
             if won {
                 if let Some(order_id) = order_for_reversal(&state, &mut tx, &obj).await? {
-                    let _ = sqlx::query("UPDATE orders SET refunded_at = NULL WHERE id = $1")
+                    sqlx::query("UPDATE orders SET refunded_at = NULL WHERE id = $1")
                         .bind(order_id)
                         .execute(&mut *tx)
-                        .await;
+                        .await?;
                     crate::referral::unreverse(&mut tx, order_id).await;
                 }
             }
@@ -1807,11 +1808,13 @@ async fn fulfil_session(
     .await;
 
     if let Some(cust) = session.get("customer").and_then(|v| v.as_str()) {
-        let _ = sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
+        // 同样不许吞：这一句在共享事务里，报错就让整块作废，而作废之后的 COMMIT
+        // 不会报错。吞掉的唯一效果是「我们不知道」，而不是「它没坏」。
+        sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
             .bind(cust)
             .bind(uid)
             .execute(&mut **tx)
-            .await;
+            .await?;
     }
 
     Ok(Some(Fulfilled {

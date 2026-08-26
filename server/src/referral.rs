@@ -370,14 +370,25 @@ pub async fn bind_at_signup(state: &AppState, uid: uuid::Uuid, code: &str) -> Op
     if !t.enabled {
         return None;
     }
-    let found: Option<(uuid::Uuid, String)> = sqlx::query_as(
+    // 「查库出错」和「这个码不存在」都会走到 None，但后果完全不同：前者是一次
+    // **本该成立的绑定被永久丢掉**（推荐人的佣金从此不存在），后者是正常拒绝。
+    //
+    // 返回值保持 Option 不变 —— 这个函数刻意永不让注册失败（见上面的文档注释）。
+    // 要修的是「出错时一个字都不留」：那让两种情况在事后完全不可区分。
+    let found = sqlx::query_as::<_, (uuid::Uuid, String)>(
         "SELECT id, email FROM users WHERE lower(referral_code) = lower($1) AND referral_enabled",
     )
     .bind(code)
     .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
+    .await;
+    let found = match found {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, %uid,
+                "注册绑推荐人：查邀请码失败 —— 这次绑定被丢掉了，推荐人的佣金不会产生");
+            return None;
+        }
+    };
     let (referrer, referrer_email) = found?;
     if referrer == uid {
         return None;

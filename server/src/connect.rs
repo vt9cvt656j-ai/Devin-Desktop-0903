@@ -96,20 +96,42 @@ pub async fn status(
         })));
     };
 
-    let (payouts_enabled, details_submitted) =
-        account_state(&state, &acct).await.unwrap_or((false, false));
+    // **「查不到」不能说成「没提交」。**
+    //
+    // 这里曾经是 `.unwrap_or((false, false))`：Stripe 接口抖一下，一个**已经做完
+    // onboarding** 的用户就会看到「资料没提交、不能收款」，和真的没做完完全不可区分。
+    // 他多半会跑去重做一遍，而那什么也修不了。
+    //
+    // 返回结构里多一个 status_unknown，让界面能说「这次没查到，不是没提交」。
+    let (payouts_enabled, details_submitted, status_unknown) =
+        match account_state(&state, &acct).await {
+            Some((p, d)) => (p, d, false),
+            // account_state 把四种失败（没配密钥、请求发不出、非 2xx、JSON 解析失败）
+            // 全压成 None。它们的共同点是「我们不知道」，而不是「他没提交」。
+            None => {
+                tracing::warn!(%uid, "查 Stripe 收款账户状态没查成 —— 报「未知」而不是「没提交」");
+                (false, false, true)
+            }
+        };
     let mut missing: Vec<&str> = Vec::new();
-    if !details_submitted {
-        missing.push("details_submitted");
-    }
-    if !payouts_enabled {
-        missing.push("payouts_enabled");
+    // 查不到状态时**不列缺项**：列出来就等于断言「这几项确实没做」，
+    // 而我们此刻恰恰不知道。
+    if !status_unknown {
+        if !details_submitted {
+            missing.push("details_submitted");
+        }
+        if !payouts_enabled {
+            missing.push("payouts_enabled");
+        }
     }
 
     Ok(Json(json!({
         "configured": configured,
         "connected": true,
-        "ready": missing.is_empty(),
+        // 查不到时不能报 ready:true —— 那会让界面放行一个可能收不了款的账号。
+        // 也不报 false 的缺项清单，两者的区别由 status_unknown 表达。
+        "ready": !status_unknown && missing.is_empty(),
+        "status_unknown": status_unknown,
         "missing": missing,
     })))
 }

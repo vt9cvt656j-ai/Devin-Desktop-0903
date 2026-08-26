@@ -392,21 +392,37 @@ async fn pay_one(state: &AppState, uid: uuid::Uuid, min_cents: i64) -> anyhow::R
 ///
 /// 这是 kit 的 rollbackCommissions。少了它，一次「余额不足」就能把一批佣金永久卡在 paid：
 /// 不会被支付，也不会再被扫到，推荐人的钱凭空消失，而且没有任何报错。
+///
+/// # 写失败必须喊出来，而且不能和「没有可放的」同值
+///
+/// 这里曾经把 Result 压成行数、失败时得到 0，然后只在行数大于 0 时打日志 ——
+/// 写失败时**一个字都不留**，而后果是这批佣金停在 `paid` 且挂着一个作废打款的 id：
+/// 既没打出去，也不能再打，钱就卡在那儿。
+///
+/// 「查库出错」和「本来就没有可放的」在结果上是同一个 0，在后果上差着一笔钱。
 pub async fn release(state: &AppState, payout: uuid::Uuid) {
-    let back = sqlx::query(
+    match sqlx::query(
         "UPDATE commissions SET status = 'settled', payout_id = NULL, updated_at = now() \
          WHERE payout_id = $1 AND status = 'paid'",
     )
     .bind(payout)
     .execute(&state.db)
-    .await;
-    let n = back.map(|r| r.rows_affected()).unwrap_or(0);
-    if n > 0 {
-        tracing::info!(payout = %payout, released = n, "payout rejected; commissions released");
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(payout = %payout, released = r.rows_affected(),
+                "payout rejected; commissions released");
+        }
+        Ok(_) => {} // 真的没有可放的，正常
+        Err(e) => tracing::error!(payout = %payout, error = %e,
+            "打款被拒但佣金**没能放回可结算** —— 它们卡在 paid 且挂着作废的 payout_id，\
+             既打不出去也不能重试，需要人工介入"),
     }
 }
 
 pub async fn rollback(state: &AppState, payout: uuid::Uuid, reason: &str) {
+    // 和 release 同一条规矩：写失败不能压成 0，那和「没有可放的」同值，
+    // 而后果是这批佣金卡在 paid、既打不出去也不能重试。
     let back = sqlx::query(
         "UPDATE commissions SET status = 'settled', payout_id = NULL, updated_at = now() \
          WHERE payout_id = $1 AND status = 'paid'",
@@ -414,9 +430,18 @@ pub async fn rollback(state: &AppState, payout: uuid::Uuid, reason: &str) {
     .bind(payout)
     .execute(&state.db)
     .await;
-    let n = back.map(|r| r.rows_affected()).unwrap_or(0);
+    let n = match &back {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::error!(payout = %payout, error = %e, reason,
+                "打款失败，但佣金**没能放回可结算** —— 卡在 paid 且挂着作废的 payout_id，需要人工介入");
+            0
+        }
+    };
 
-    sqlx::query(
+    // 提现单也一样：这一条不落地的话，一笔失败的提现会一直显示成 sending/paid，
+    // 用户看到「打款中」而钱既没到账也不会重试。
+    if let Err(e) = sqlx::query(
         "UPDATE withdrawals SET status = 'failed', failure_reason = $2, updated_at = now() \
          WHERE id = $1 AND status IN ('sending', 'paid')",
     )
@@ -424,13 +449,84 @@ pub async fn rollback(state: &AppState, payout: uuid::Uuid, reason: &str) {
     .bind(reason)
     .execute(&state.db)
     .await
-    .ok();
+    {
+        tracing::error!(payout = %payout, error = %e,
+            "打款失败，但提现单**没能置成 failed** —— 用户那边会一直显示打款中");
+    }
 
-    tracing::warn!(payout = %payout, released = n, reason, "payout failed; commissions released");
+    if back.is_ok() {
+        tracing::warn!(payout = %payout, released = n, reason, "payout failed; commissions released");
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// 放回佣金失败时不许静默，也不许和「没有可放的」同值。
+    ///
+    /// 两处曾经都把 Result 压成行数，而 release 还只在行数大于 0 时打日志 ——
+    /// 写失败时一个字都不留。后果是这批佣金停在 `paid` 且挂着一个作废打款的 id：
+    /// **既打不出去，也不能重试**，钱卡住而没有任何痕迹。
+    #[test]
+    fn a_failed_release_is_never_silent_nor_confused_with_nothing_to_release() {
+        let src = include_str!("payout.rs");
+        let prod_raw = &src[..src.find("\n#[cfg(test)]").unwrap_or(src.len())];
+        // **先剥注释再断言。** 否定断言最容易被注释喂到：一段解释「原来是怎么写的」
+        // 的文档注释会让「不许再出现这种写法」的断言恒红。我写这条测试时就当场
+        // 踩了一次 —— 上面那段文档注释里引用了旧写法。
+        let prod: String = prod_raw
+            .lines()
+            .map(|l| if l.trim_start().starts_with("//") { "" } else { l })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prod = prod.as_str();
+        assert!(
+            !prod.contains("back.map(|r| r.rows_affected()).unwrap_or(0)"),
+            "又把写失败压成 0 了 —— 和「没有可放的」同值，而后果差着一笔钱",
+        );
+        // 按花括号配对抠函数体，不切固定长度的窗口。
+        //
+        // 固定窗口有两种坏法，今天两种都踩了：函数变长时窗口够不到要守的那一行
+        // （测试仍然绿，但它守的东西已经不在它看的那段里）；函数在文件末尾时
+        // 切片直接越界 panic。两者都不是「断言失败」，都是测试本身坏了。
+        let fn_body = |sig: &str| -> String {
+            let at = prod.find(sig).unwrap_or_else(|| panic!("{sig} 不见了"));
+            let open = at + prod[at..].find('{').expect("函数没有花括号");
+            let b = prod.as_bytes();
+            let (mut d, mut i) = (0i32, open);
+            while i < b.len() {
+                match b[i] {
+                    b'{' => d += 1,
+                    b'}' => {
+                        d -= 1;
+                        if d == 0 {
+                            return prod[open..=i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            panic!("{sig} 花括号没配平");
+        };
+
+        // 两个函数都要能区分 Err 和 Ok(0)。
+        for f in ["pub async fn release(", "pub async fn rollback("] {
+            let body = fn_body(f);
+            assert!(
+                body.contains("Err(e)") && body.contains("tracing::error!"),
+                "{f} 写失败时没有 error 级日志 —— 钱卡住而没人知道",
+            );
+        }
+
+        // 提现单置 failed 也不许把失败丢掉：不落地的话用户会一直看到「打款中」。
+        let rb = fn_body("pub async fn rollback(");
+        let at = rb.find("UPDATE withdrawals SET status = 'failed'").expect("提现置失败那句不见了");
+        assert!(
+            rb[..at].contains("if let Err(e)"),
+            "提现单置 failed 的失败被吞了 —— 用户那边会一直显示打款中",
+        );
+    }
+
     /// 抢不到的佣金必须被剔除，而不是一起付掉。
     #[test]
     fn two_concurrent_batches_cannot_pay_the_same_commission() {

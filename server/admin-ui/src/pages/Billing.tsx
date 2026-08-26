@@ -27,12 +27,14 @@ import {
   Truncate,
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Pager, paginate } from "@/components/Pager";
 import { Textarea } from "@/components/ui/textarea";
 import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
 import { creditCentsFromRaw, rawCentsFromCreditDollars, useSettings } from "@/lib/settings";
 import { useRowFlash } from "@/lib/flash";
 import { cents, num, when } from "@/lib/format";
+import { formatMoney, formatTotals, realCharge, sumByCurrency } from "@/lib/money";
 
 /**
  * 收款 — everything that brings money in, on one screen: 订单 / 商品 / 兑换码.
@@ -65,7 +67,10 @@ type Grant = {
 type Price = Grant & {
   id: string;
   label?: string;
+  /** 人民币标价，分。 */
   amount_cents?: number;
+  /** 美元标价，美分。控制台建的商品填不了它，所以经常是空 —— 见下面表格里的「未设」。 */
+  amount_usd_cents?: number | null;
   /** prices.active (migrations/0004_orders.sql) — the buy path refuses anything false. */
   active?: boolean;
   created_at?: string;
@@ -83,22 +88,48 @@ type Order = Grant & {
    */
   charged_cents?: number | null;
   charged_currency?: string | null;
+  /** 退过款的时间。库里**没有退了多少钱**，所以金额无法从营收里减掉，只能把笔数说出来。 */
+  refunded_at?: string | null;
+  /** 下单时打算按哪个币报价。**不代表真按这个币收到了钱** —— 那只看 charged_currency。 */
+  resolved_currency?: string | null;
+  quantity?: number | null;
+  price_id?: string | null;
   status?: string;
   created_at?: string;
 };
 
-/** 一笔订单真正收到的钱。拿不到就退回标价，并让调用方知道这是退回来的。 */
-const realAmount = (o: Order) =>
-  typeof o.charged_cents === "number" ? o.charged_cents : (o.amount_cents || 0);
-
-/** Stripe 的金额是所收币种的最小单位；标价那一路仍按老样子当分处理。 */
+/**
+ * 表格里那一格。
+ *
+ * **有实收就写实收**（charged_cents + charged_currency，Stripe 扣款成功后 webhook 写回来的事实）。
+ * 判据是 `typeof === "number"` 而不是「非 0」：整单优惠券会产生一笔真实的 0 元，
+ * 「收了 0 元」和「没记录收了多少」是两件事，用非 0 判会把前者错当成后者。
+ *
+ * 没实收就只能写标价，而标价**只有人民币这一个数**（amount_cents = 目录人民币价 × 份数，
+ * stripe.rs 那行 INSERT 对美元买家也一样绑人民币价）。
+ *
+ * # 为什么不去把美元报价还原出来
+ *
+ * 试过：按 price_id 去 join `prices.amount_usd_cents`。不行，两个独立原因：
+ *  1. 价目是**原地 UPDATE 同一行**改的（迁移里写死了这条纪律）。实测漂移：20260834 把
+ *     daily_trial 设成 710，20260835 又把同一行改成 700 —— 这中间下的单，今天 join 出来
+ *     已经不是当时那个数了。
+ *  2. 就算没调过价，买家看到的也不是这一列：卡片上的价优先取 **Stripe 实时价**，本地两列
+ *     只是 Stripe 查不到时的兜底。stripe.rs 里点名过同一款：目录写 2799，Stripe 实收 3499。
+ *
+ * 所以这里只说得出的事实：人民币标价是多少、以及当时**打算**按什么币报价（右边那行小字）。
+ * 不换算、不 join、不编。
+ */
 const money = (o: Order) => {
-  if (typeof o.charged_cents !== "number") return cents(o.amount_cents);
-  const ccy = (o.charged_currency || "usd").toUpperCase();
-  return (o.charged_cents / 100).toLocaleString("en-US", {
-    style: "currency",
-    currency: ccy,
-  });
+  const real = realCharge(o);
+  if (real) return formatMoney(real.minor, real.ccy);
+  return `${formatMoney(o.amount_cents || 0, "cny")} 标价`;
+};
+
+/** 报价币种和人民币标价不是一回事时，单独标出来，绝不拿它当上面那个数的单位。 */
+const quoteCcy = (o: Order) => {
+  const c = (o.resolved_currency || "").toLowerCase();
+  return c && c !== "cny" ? c.toUpperCase() : "";
 };
 type Code = Grant & {
   id: string;
@@ -173,7 +204,9 @@ function content(g: Grant) {
 
 function orderStatus(s?: string) {
   if (s === "paid") return <Badge variant="success">已支付</Badge>;
-  if (s === "pending") return <Badge variant="outline">待确认</Badge>;
+  // 「待确认」是人工确认收款时代的说法 —— 那时这一行在等运营点一下。现在付没付由
+  // Stripe 说了算，pending 的意思就是钱没到，没有人要去确认它。
+  if (s === "pending") return <Badge variant="outline">未支付</Badge>;
   if (s === "canceled") return <Badge variant="secondary">已取消</Badge>;
   return <Badge variant="secondary">{s || "—"}</Badge>;
 }
@@ -183,6 +216,8 @@ export function Billing() {
   useSettings();
   const [prices, setPrices] = useState<Price[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
+  const [orderPage, setOrderPage] = useState(1);
+  const [codePage, setCodePage] = useState(1);
   const [codes, setCodes] = useState<Code[]>([]);
   // 两种错误，寿命不同：loadErr 属于这一次轮询，下一次轮询就该被覆盖；err 属于操作员刚做的
   // 动作，必须一直留到他下一次动手为止 —— 否则 30 秒后的轮询会把"订单状态不是待支付"擦掉。
@@ -304,22 +339,33 @@ export function Billing() {
     }
   };
 
+  // 换了筛选就回第一页：留在第 4 页上是「明明筛出来了却是空的」最常见的来源。
+  useEffect(() => { setOrderPage(1); }, [orderFilter]);
+  useEffect(() => { setCodePage(1); }, [codeFilter]);
+
   const paid = orders.filter((o) => o.status === "paid");
+  // 按币种分桶。跨币种相加没有意义 —— 要加就得先定用哪天的汇率，那是另一件事，
+  // 而在没定之前，把 ¥416 和 $12 加成 428 比不显示更糟。
+  const receivedText = formatTotals(sumByCurrency(paid));
+  // 老的手工发放单没有收款记录（charged_* 是 null）。它们确实发出去了权益，
+  // 但没有一笔可以对账的进账，所以不进上面那个数，只在下面点一句。
+  const paidWithoutReceipt = paid.filter((o) => !realCharge(o)).length;
+  // 退款：库里只有「退过款」这个时间戳，没有「退了多少」。所以这些钱**仍然计在上面**，
+  // 只把笔数说出来 —— 减一个猜出来的数，比标注一个已知的缺口更糟。
+  const refunded = paid.filter((o) => !!o.refunded_at).length;
   const pending = orders.filter((o) => o.status === "pending");
-  // 只累加真收到的钱。混币种相加本来就不对,但在把标价当营收之后,这已经是更接近真相的
-  // 版本;真要分币种统计,得先决定用哪天的汇率,那是另一件事。
-  const revenue = paid.reduce((a, o) => a + realAmount(o), 0);
   const unused = codes.filter((c) => c.status === "unused");
   // 在售 = 客户真能买到的，也就是买入路径要求的 active = true（pay.rs:171）。
   const onSale = prices.filter((p) => p.active !== false);
   const shownErr = err || loadErr;
 
-  // 待确认永远排在最前：它是这一屏唯一需要动手的东西。sort 是稳定的，组内仍是 created_at 倒序。
-  const shownOrders = orders
-    .filter((o) => !orderFilter || o.status === orderFilter)
-    .slice()
-    .sort((a, b) => (a.status === "pending" ? 0 : 1) - (b.status === "pending" ? 0 : 1));
+  // 按时间倒序（服务端就是这么给的），不再把未支付的挑到最前 —— 那是人工确认收款时代
+  // 的排法，因为那时它是这一屏唯一需要动手的东西。现在没有任何一行需要动手。
+  const shownOrders = orders.filter((o) => !orderFilter || o.status === orderFilter);
   const shownCodes = codes.filter((c) => !codeFilter || c.status === codeFilter);
+  // 翻页在**筛选之后**做：先筛后分页，页数才对得上筛出来的条数。
+  const orderView = paginate(shownOrders, orderPage);
+  const codeView = paginate(shownCodes, codePage);
 
   const createPrice = () => {
     const label = pLabel.trim();
@@ -367,18 +413,6 @@ export function Billing() {
     }
   };
 
-  const confirmOrder = (o: Order) =>
-    setAsk({
-      title: "确认收款",
-      desc: `确认已收到 ${o.email || o.id} 的 ${money(o)}？确认后立即发放，且无法撤销。`,
-      label: "确认收款并发放",
-      act: async () => {
-        const done = await mutate("已确认收款并发放", () =>
-          api.post<{ ok?: boolean }>(`/api/admin/orders/${o.id}/confirm`),
-        );
-        fire(o.id, done ? "ok" : "error");
-      },
-    });
 
   const cancelOrder = (o: Order) =>
     setAsk({
@@ -427,7 +461,7 @@ export function Billing() {
     <div className="space-y-6">
       <PageHeader
         title="收款"
-        description="商品、订单和兑换码。确认一笔订单会立刻给对应账号发放套餐或额度。"
+        description="商品、订单和兑换码。付款状态由 Stripe 决定，这里只如实显示，没有人工确认这一步。"
       />
 
       <ErrorState message={shownErr} />
@@ -439,11 +473,22 @@ export function Billing() {
 
       {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
       <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="已收款" value={cents(revenue)} hint={`${paid.length} 笔已支付`} />
         <Stat
-          label="待确认订单"
+          label="已收款"
+          value={receivedText}
+          hint={[
+            paidWithoutReceipt
+              ? `${paid.length - paidWithoutReceipt} 笔有收款记录，另 ${paidWithoutReceipt} 笔手工发放（无进账）`
+              : `${paid.length} 笔已支付`,
+            refunded ? `含 ${refunded} 笔已退款，金额未扣除` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        />
+        <Stat
+          label="未支付订单"
           value={num(pending.length)}
-          hint={pending.length ? "需要处理" : "没有积压"}
+          hint={pending.length ? "钱没到，Stripe 结清后会自动转已支付" : "没有挂着的单"}
         />
         <Stat
           label="在售商品"
@@ -495,11 +540,11 @@ export function Billing() {
                 hint={
                   orders.length
                     ? "把状态筛选调回「全部状态」就能看到其余订单。"
-                    : "客户在 IDE 里下单后，订单会出现在这里等你确认收款。"
+                    : "客户付款后，订单会自动出现在这里，不需要人工确认。"
                 }
               />
             ) : (
-              /* 六列写死宽度：买家是邮箱（可长到 80 字符），金额是右对齐等宽，操作列两个按钮不能换行。 */
+              /* 六列写死宽度：买家是邮箱（可长到 80 字符），金额是右对齐等宽，操作列那个按钮不能换行。 */
               <Table className="min-w-[62rem]">
                 <TableHeader>
                   <TableRow>
@@ -508,11 +553,11 @@ export function Billing() {
                     <TableHead numeric className="w-28">金额</TableHead>
                     <TableHead className="w-28">状态</TableHead>
                     <TableHead className="w-28">下单</TableHead>
-                    <TableHead className="w-44 text-right">操作</TableHead>
+                    <TableHead className="w-28 text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {shownOrders.map((o) => (
+                  {orderView.slice.map((o) => (
                     <TableRow
                       key={o.id}
                       data-flash={toneOf(o.id)}
@@ -522,27 +567,34 @@ export function Billing() {
                         <Truncate className="font-medium">{o.email || o.id}</Truncate>
                       </TableCell>
                       <TableCell>{content(o)}</TableCell>
-                      <TableCell numeric>{money(o)}</TableCell>
-                      <TableCell>{orderStatus(o.status)}</TableCell>
+                      <TableCell numeric>
+                        {money(o)}
+                        {!realCharge(o) && quoteCcy(o) && (
+                          <div className="text-xs text-muted-foreground">报价币种 {quoteCcy(o)}</div>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {orderStatus(o.status)}
+                        {o.refunded_at && (
+                          <div className="mt-1 text-xs text-muted-foreground">已退款</div>
+                        )}
+                      </TableCell>
                       <TableCell className="whitespace-nowrap text-muted-foreground">
                         {when(o.created_at)}
                       </TableCell>
                       <TableCell className="text-right">
                         {o.status === "pending" ? (
-                          <div className="flex justify-end gap-2">
-                            <Button size="sm" disabled={busy} onClick={() => confirmOrder(o)}>
-                              确认收款
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className={dangerBtn}
-                              disabled={busy}
-                              onClick={() => cancelOrder(o)}
-                            >
-                              取消
-                            </Button>
-                          </div>
+                          // 只剩「取消」：它把一笔没付的单关掉，不会凭空造出收入。
+                          // 「确认收款」已经删了 —— 付没付由 Stripe 说了算。
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className={dangerBtn}
+                            disabled={busy}
+                            onClick={() => cancelOrder(o)}
+                          >
+                            取消
+                          </Button>
                         ) : (
                           <span className="text-muted-foreground">—</span>
                         )}
@@ -552,6 +604,13 @@ export function Billing() {
                 </TableBody>
               </Table>
             )}
+            <Pager
+              page={orderView.current}
+              pages={orderView.pages}
+              total={shownOrders.length}
+              unit="笔"
+              onPage={setOrderPage}
+            />
           </Panel>
         </TabsContent>
 
@@ -612,7 +671,7 @@ export function Billing() {
                   />
                 </Field>
               )}
-              <Field id="pr-amount" label="售价（$）">
+              <Field id="pr-amount" label="售价（¥ 人民币）">
                 <Input
                   id="pr-amount"
                   type="number"
@@ -642,7 +701,7 @@ export function Billing() {
                     <TableHead className="w-[18rem]">名称</TableHead>
                     <TableHead className="w-24">类型</TableHead>
                     <TableHead className="w-56">内容</TableHead>
-                    <TableHead numeric className="w-28">售价</TableHead>
+                    <TableHead numeric className="w-32">售价</TableHead>
                     <TableHead className="w-28 text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -661,7 +720,17 @@ export function Billing() {
                         {p.kind === "plan" ? "套餐" : "额度"}
                       </TableCell>
                       <TableCell>{content(p)}</TableCell>
-                      <TableCell numeric>{cents(p.amount_cents)}</TableCell>
+                      <TableCell numeric>
+                        {formatMoney(p.amount_cents || 0, "cny")}
+                        <div
+                          className="text-xs text-muted-foreground"
+                          title="目录里存的美元价。结账卡片上优先显示 Stripe 的实时价，两者可能不一致（实测有一款目录写 27.99、Stripe 实收 34.99）。"
+                        >
+                          {typeof p.amount_usd_cents === "number"
+                            ? `${formatMoney(p.amount_usd_cents, "usd")} 目录价`
+                            : "美元价未设"}
+                        </div>
+                      </TableCell>
                       <TableCell className="text-right">
                         <Button
                           size="sm"
@@ -825,7 +894,7 @@ export function Billing() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {shownCodes.map((c) => (
+                  {codeView.slice.map((c) => (
                     <TableRow key={c.id}>
                       <TableCell className="max-w-[13rem] font-mono">
                         <Truncate>{c.code || "—"}</Truncate>
@@ -865,6 +934,13 @@ export function Billing() {
                 </TableBody>
               </Table>
             )}
+            <Pager
+              page={codeView.current}
+              pages={codeView.pages}
+              total={shownCodes.length}
+              unit="个"
+              onPage={setCodePage}
+            />
           </Panel>
         </TabsContent>
       </Tabs>

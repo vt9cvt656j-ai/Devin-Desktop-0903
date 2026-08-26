@@ -256,17 +256,45 @@ async fn gather(state: &AppState, caps: &[String]) -> (String, Vec<String>) {
     }
 
     if has("read.orders") {
-        if let Ok((n, cents)) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT count(*)::bigint, COALESCE(sum(amount_cents),0)::bigint \
-             FROM orders WHERE status = 'paid'",
+        // 只统计**真收到的钱**，并且按币种分开。
+        //
+        // 原来这里是 `sum(amount_cents)` 然后写成 `$` —— 两处都错：amount_cents 是目录里的
+        // **人民币**标价（prices.amount_cents × quantity，见 stripe.rs 的 INSERT，对美元买家
+        // 也一样绑人民币价），跟这笔到底收没收到、按什么币收都没关系。于是模型拿到的
+        // 「合计 $425.90」实际是 ¥425.90，而且把一笔没有任何进账的手工发放单也算了进去。
+        //
+        // 这条是喂给 AI 员工当**事实**用的，错的数字比没有数字更糟：模型不会怀疑它。
+        if let Ok(rows) = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT lower(charged_currency), count(*)::bigint, COALESCE(sum(charged_cents),0)::bigint \
+             FROM orders WHERE status = 'paid' AND charged_cents IS NOT NULL \
+               AND charged_currency IS NOT NULL AND refunded_at IS NULL \
+             GROUP BY 1 ORDER BY 3 DESC",
         )
-        .fetch_one(&state.db)
+        .fetch_all(&state.db)
         .await
         {
-            out.push_str(&format!(
-                "## 收款\n- 已收 {n} 笔，合计 ${:.2}\n\n",
-                cents as f64 / 100.0
-            ));
+            let total: i64 = rows.iter().map(|(_, n, _)| n).sum();
+            let money = rows
+                .iter()
+                .map(|(ccy, _, cents)| {
+                    let sym = match ccy.as_str() {
+                        "cny" => "¥",
+                        "usd" => "$",
+                        _ => "",
+                    };
+                    if sym.is_empty() {
+                        format!("{:.2} {}", *cents as f64 / 100.0, ccy.to_uppercase())
+                    } else {
+                        format!("{sym}{:.2}", *cents as f64 / 100.0)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            if total > 0 {
+                out.push_str(&format!("## 收款\n- 实收 {total} 笔，合计 {money}\n\n"));
+            } else {
+                out.push_str("## 收款\n- 暂无实际进账记录\n\n");
+            }
         }
         used.push("read.orders".into());
     }

@@ -28,6 +28,9 @@ mod code_corpus;
 mod knowledge;
 mod manifest_check;
 mod reconcile;
+mod relay_adapter;
+mod relay_rates;
+mod relay_sync;
 mod model_catalog;
 mod model_probe;
 mod models;
@@ -46,6 +49,7 @@ mod sessions;
 mod settings;
 mod settlement;
 mod skills;
+mod plan_health;
 mod stripe;
 mod update;
 
@@ -100,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
     // 运营参数进内存。必须在建路由之前——面值分母在展示路径上是除数，套餐额度在发放
     // 路径上使用，两者都不能等到第一个请求才有值。读不到会沿用与改造前一致的默认值。
     settings::load(&db).await;
+    // 充值汇率也要在建路由之前进内存：它是**选路**的排序依据，第一个请求就会读它。
+    // 读不到就是「一个站都没填」，选路沿用只按倍率排的旧行为。
+    relay_rates::load(&db).await;
     {
         let s = settings::current();
         tracing::info!(
@@ -160,6 +167,8 @@ async fn main() -> anyhow::Result<()> {
     manifest_check::spawn(state.clone());
     // 中转账户余额的定时快照 —— 对账里「成本」那一侧的唯一真实来源。
     reconcile::spawn(state.clone());
+    // 网关适配器：认出每家中转跑什么、拉真实进价、抓涨价。
+    relay_sync::spawn(state.clone());
     // 智能员工的定时工。
     employees::spawn(state.clone());
 
@@ -293,6 +302,8 @@ async fn main() -> anyhow::Result<()> {
             post(deploy::deploy_site).layer(axum::extract::DefaultBodyLimit::max(35 * 1024 * 1024)),
         )
         .route("/api/admin/users", get(auth::admin_users))
+        .route("/api/admin/customers", get(auth::admin_customers))
+        .route("/api/admin/plan-health", get(plan_health::admin_plan_health))
         .route("/api/admin/users/:id/role", post(auth::set_user_role))
         .route("/api/admin/users/:id/grant", post(codes::admin_grant))
         .route(
@@ -361,10 +372,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/webhooks/stripe", post(stripe::webhook))
         .route("/api/orders", post(pay::create_order))
         .route("/api/admin/orders", get(pay::admin_list_orders))
-        .route(
-            "/api/admin/orders/:id/confirm",
-            post(pay::admin_confirm_order),
-        )
+
         .route(
             "/api/admin/orders/:id/cancel",
             post(pay::admin_cancel_order),
@@ -384,6 +392,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/channel-rates",
             get(channel_rates::admin_list).post(channel_rates::admin_create),
+        )
+        .route(
+            "/api/admin/relay-rates",
+            get(relay_rates::admin_list).post(relay_rates::admin_save),
+        )
+        .route(
+            "/api/admin/relay-model-prices",
+            get(relay_rates::admin_model_prices),
+        )
+        .route(
+            "/api/admin/ratio-sync",
+            get(relay_rates::admin_ratio_preview).post(relay_rates::admin_ratio_apply),
         )
         .route(
             "/api/admin/channel-rates/:id",
@@ -442,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/models",
             get(models::admin_list).post(models::admin_create),
         )
+        .route("/api/admin/models/sort", post(models::admin_sort))
         .route(
             "/api/admin/models/:id",
             delete(models::admin_delete).post(models::admin_update),
@@ -485,6 +506,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/route-health", get(route_endpoints::admin_health))
         .route("/api/admin/reconciliation", get(reconcile::admin_reconciliation))
         .route("/api/admin/endpoint-prices", post(reconcile::admin_save_price))
+        .route("/api/admin/relay-adapters", get(relay_sync::admin_list))
+        .route("/api/admin/relay-adapters/sync", post(relay_sync::admin_sync))
+        .route("/api/admin/relay-adapters/guard", post(relay_sync::admin_guard))
         // 发一封真的测试告警：「地址在列表里」和「这封信真能到」是两件事，
         // QQ 邮箱对陌生发件域尤其严，静默丢掉在服务端看也是「已发送」。
         .route(

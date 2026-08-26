@@ -97,8 +97,12 @@ pub async fn snapshot_once(state: &AppState) {
                 continue;
             }
             tried += 1;
-            let Some(b) = crate::route_endpoints::read_balance(
-                &http,
+            // 和健康面板、网关适配器走**同一个入口**。这里曾经直接调 route_endpoints
+            // 那份独立实现，而它对 sub2api 打的是要控制台令牌的那条路 —— 三处各自
+            // 查余额、其中两处拿不到，那正是这次要消灭的形状。
+            let Some(b) = crate::relay_sync::balance_now(
+                state,
+                id,
                 &base,
                 &crate::models::model_key(&key),
                 &crate::models::model_key(&btok),
@@ -121,6 +125,69 @@ pub async fn snapshot_once(state: &AppState) {
             .execute(&state.db)
             .await;
             got += 1;
+
+            // 余额比上一次高 = 充值。
+            //
+            // 这是**没有控制台令牌时唯一能拿到充值事实的途径**，也是套餐表的交叉验证：
+            // 到账金额对不上任何一档套餐，说明套餐表过期了，或者这笔是站外充的
+            // （实测 zyz 那家 payment_enabled=false，充值走站外）。
+            //
+            // 阈值不是防抖，是防「同一个数的浮点尾巴」：实测两次读数会在小数点后
+            // 第八位抖动，不夹的话每半小时就记一笔金额为 0.00000001 的「充值」。
+            if let Some(now_bal) = b.remaining_usd {
+                let prev: Option<f64> = sqlx::query_scalar(
+                    "SELECT remaining_usd FROM endpoint_balance \
+                     WHERE endpoint_id = $1 AND remaining_usd IS NOT NULL \
+                       AND taken_at < now() - INTERVAL '1 second' \
+                     ORDER BY taken_at DESC LIMIT 1",
+                )
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+                if let Some(prev) = prev {
+                    let delta = now_bal - prev;
+                    if delta > 0.01 {
+                        // 就近匹配一档套餐。匹配不上就留空，**不猜一个价** ——
+                        // 猜出来的人民币金额会让「1 元买到多少」整个失真。
+                        let hit: Option<(String, f64, String)> = sqlx::query_as(
+                            "SELECT plan_key, price, currency FROM endpoint_topup_plan \
+                             WHERE endpoint_id = $1 AND granted IS NOT NULL \
+                               AND abs(granted - $2) < greatest(0.01, $2 * 0.02) \
+                             ORDER BY abs(granted - $2) LIMIT 1",
+                        )
+                        .bind(id)
+                        .bind(delta)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+                        let (plan, price, cur) = match hit {
+                            Some((k, p, c)) => (k, Some(p), c),
+                            None => (String::new(), None, String::new()),
+                        };
+                        let _ = sqlx::query(
+                            "INSERT INTO endpoint_topup_event \
+                               (endpoint_id, route_id, before_bal, after_bal, granted, \
+                                matched_plan, price, currency) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                        )
+                        .bind(id)
+                        .bind(r.id)
+                        .bind(prev)
+                        .bind(now_bal)
+                        .bind(delta)
+                        .bind(&plan)
+                        .bind(price)
+                        .bind(&cur)
+                        .execute(&state.db)
+                        .await;
+                        tracing::info!(%id, prev, now_bal, delta, plan = %plan,
+                            "余额上升，记为一次充值");
+                    }
+                }
+            }
         }
     }
 
@@ -152,7 +219,7 @@ pub fn spawn(state: AppState) {
 
 // ---------------------------------------------------------------- 对账
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Clone)]
 struct ModelUsage {
     endpoint_id: uuid::Uuid,
     model_id: String,
@@ -161,6 +228,7 @@ struct ModelUsage {
     prompt_tokens: i64,
     completion_tokens: i64,
     cached_tokens: i64,
+    cache_creation_tokens: i64,
 }
 
 #[derive(sqlx::FromRow, Clone)]
@@ -170,6 +238,9 @@ pub struct ModelPrice {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
     pub cached_per_mtok: Option<f64>,
+    /// 每百万「写入缓存的 token」多少美元。NULL = 没录，按输入价 × 1.25 推
+    /// （上游普遍的倍数）—— **不按 0**。按 0 就是这个 bug 的原样重演。
+    pub cache_write_per_mtok: Option<f64>,
     pub note: String,
 }
 
@@ -191,6 +262,9 @@ pub struct ModelRow {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cached_tokens: i64,
+    /// 写进缓存的 token。**成本大头**，界面必须画出来 —— 不画的话
+    /// 「输入才 2 个 token 怎么扣了 46 分」这种问题永远问不明白。
+    pub cache_creation_tokens: i64,
     pub revenue_usd: f64,
     /// token × 录入单价。None = **这个模型的进价还没录**，不是 0。
     pub cost_usd: Option<f64>,
@@ -200,6 +274,9 @@ pub struct ModelRow {
     pub output_per_mtok: Option<f64>,
     pub cached_per_mtok: Option<f64>,
     pub price_note: String,
+    /// 这个价是**推算**的（官方价 × 倍率），不是抓来的。
+    /// 界面必须分开显示 —— 把推算的和实测的混成一个数，等于把一个假设说成事实。
+    pub price_derived: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -222,6 +299,11 @@ pub struct ReconRow {
     pub margin_pct: Option<f64>,
     /// 用过但还没录价的模型。非空 = 上面三个数都是 None。
     pub unpriced_models: Vec<String>,
+    /// 这一行的成本里，有多少美元是按「官方价 × 倍率」推出来的。
+    pub derived_cost_usd: f64,
+    /// 这一行的调用/收入来自**按出口聚合的老表**（那段流量发生在按模型记账上线之前）。
+    /// 成本拆不出来不是因为没录价，是因为没有模型维度可以乘单价。
+    pub legacy_only: bool,
     /// 余额读数差出来的成本。和上面那个各自独立，用来**互相印证** ——
     /// 两个都有而且对不上，说明单价录错了或者中转在按另一份价目表收费。
     pub cost_by_balance_usd: Option<f64>,
@@ -248,12 +330,75 @@ pub struct ReconQuery {
 ///
 /// `cached_per_mtok` 没录时按输入价算：那等于「这家不给缓存折扣」，是**保守**的方向
 /// （宁可把成本算高一点，也不要把毛利算得比实际好看）。
+/// 上游普遍的缓存写入倍数：输入价的 1.25 倍。没录写入价时按它推。
+///
+/// 推一个数而不是当 0：0 是**确定错的**（上游一定收了这笔钱），而 1.25 是
+/// 实测普遍值。宁可估得接近，也不要一个确定为假的零。
+const CACHE_WRITE_FACTOR: f64 = 1.25;
+
+/// 抓不到价目时，按 **OpenRouter 官方价 × 这个出口的倍率** 推一个进价。
+///
+/// # 为什么这不是「编一个数」
+///
+/// 中转本来就是这么定价的：我们真抓到的价目里，`group_multiplier` 就是原样折在
+/// 单价上的（梦幻API 的 grok-heavy 分组 0.2 倍 → $2 的官方价标成 $0.40）。
+/// 所以「官方价 × 倍率」复现的是它们自己的定价规则，不是拍脑袋。
+///
+/// 官方价取自 OpenRouter 的实时目录（`official_price`，和计费用的是同一份），
+/// 那是全网最全也最新的一份公开价目 —— 411 个模型，每半小时刷新。
+///
+/// # 但它仍然是推算，必须标出来
+///
+/// 用户明确要求过「都不要估算，都要真实的计算」，而那次删掉的估算
+/// （`收入 × 进价折扣 ÷ 计费倍率`）**前提是假的** —— 那个折扣是排序旋钮不是价格。
+/// 这一条不同：前提是中转真实的定价规则。但它终究是推的，所以
+/// `price_note` 会写明来源，界面上和抓来的真价分开显示，合计也分开报。
+///
+/// 目录里没有这个模型 → 返回 None，仍然是「待录单价」。**不猜。**
+fn derived_price(endpoint_id: uuid::Uuid, model_id: &str, ratio: f64) -> Option<ModelPrice> {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    let (inp, out) = crate::models::official_price(model_id)?;
+    // 缓存价跟着目录的真实倍数走，和 compute_cost 一个做法 —— 目录给了就用它的比例，
+    // 没给就留空，由 model_cost_usd 按输入价推。
+    let live = crate::model_catalog::lookup(model_id);
+    let scale = |v: Option<f64>| match (v, inp) {
+        (Some(c), i) if i > 0.0 => Some(c / i * inp * ratio),
+        _ => None,
+    };
+    Some(ModelPrice {
+        endpoint_id,
+        model_id: model_id.to_string(),
+        input_per_mtok: inp * ratio,
+        output_per_mtok: out * ratio,
+        cached_per_mtok: scale(live.as_ref().and_then(|e| e.cache_read_price)),
+        cache_write_per_mtok: scale(live.as_ref().and_then(|e| e.cache_write_price)),
+        note: format!("推算：OpenRouter 官方价 × 倍率 {}", (ratio * 10000.0).round() / 10000.0),
+    })
+}
+
+/// 一个模型这段时间的真实成本。
+///
+/// # 缓存写入必须算进来
+///
+/// 上一版只算「新鲜输入 + 缓存读 + 输出」，**完全漏掉了写入**。而上游按输入价的
+/// 1.25 倍收写入，实测一次 claude-opus-5 调用里写入是新鲜输入的一百六十倍
+/// （381 vs 61,634）—— 那一笔 $1.16 的成本里有 $1.156 是写入。
+///
+/// 后果不是随机误差，是**系统性单向偏差**：收入那一侧一直算了写入
+/// （`compute_cost` 里的 write_tok），成本这一侧当 0，于是毛利被高估，
+/// 而且缓存命中率越高的模型账面越漂亮、实际越亏。
 fn model_cost_usd(u: &ModelUsage, p: &ModelPrice) -> f64 {
     let cached = u.cached_tokens.max(0).min(u.prompt_tokens.max(0));
     let fresh = (u.prompt_tokens.max(0) - cached) as f64;
     let cached_price = p.cached_per_mtok.unwrap_or(p.input_per_mtok);
+    let write_price = p
+        .cache_write_per_mtok
+        .unwrap_or(p.input_per_mtok * CACHE_WRITE_FACTOR);
     (fresh * p.input_per_mtok
         + cached as f64 * cached_price
+        + u.cache_creation_tokens.max(0) as f64 * write_price
         + u.completion_tokens.max(0) as f64 * p.output_per_mtok)
         / 1_000_000.0
 }
@@ -286,7 +431,8 @@ pub async fn admin_reconciliation(
                 SUM(revenue_micro_usd)::bigint AS revenue_micro, \
                 SUM(prompt_tokens)::bigint     AS prompt_tokens, \
                 SUM(completion_tokens)::bigint AS completion_tokens, \
-                SUM(cached_tokens)::bigint     AS cached_tokens \
+                SUM(cached_tokens)::bigint     AS cached_tokens, \
+                SUM(cache_creation_tokens)::bigint AS cache_creation_tokens \
          FROM endpoint_model_usage \
          WHERE day > current_date - $1::int \
          GROUP BY endpoint_id, model_id",
@@ -296,19 +442,87 @@ pub async fn admin_reconciliation(
     .await
     .unwrap_or_default();
 
-    let prices: Vec<ModelPrice> = sqlx::query_as("SELECT * FROM endpoint_model_price")
+    // 价目有两个来源，**自动的优先**：
+    //
+    //   · `endpoint_auto_price` —— 网关适配器从中转自己的接口拉回来的，会随倍率变化
+    //     自动跟上；
+    //   · `endpoint_model_price` —— 运维手填的，只在拉不到时兜底（有些中转把价目
+    //     接口关了，one-api 上游干脆没有）。
+    //
+    // 这里曾经**只读手填那张**：适配器拉回来的 535 条真实进价一条都没被用上，
+    // 于是「明明自动拉到了价，对账页成本还是空的」。
+    let mut price_of: HashMap<(uuid::Uuid, String), ModelPrice> = HashMap::new();
+    for p in sqlx::query_as::<_, ModelPrice>("SELECT * FROM endpoint_model_price")
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default();
-    let price_of: HashMap<(uuid::Uuid, String), ModelPrice> = prices
-        .into_iter()
-        .map(|p| ((p.endpoint_id, p.model_id.clone()), p))
-        .collect();
+        .unwrap_or_default()
+    {
+        price_of.insert((p.endpoint_id, p.model_id.clone()), p);
+    }
+    #[derive(sqlx::FromRow)]
+    struct AutoPrice {
+        endpoint_id: uuid::Uuid,
+        model_id: String,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        cached_per_mtok: Option<f64>,
+        cache_write_per_mtok: Option<f64>,
+        source: String,
+    }
+    for a in sqlx::query_as::<_, AutoPrice>(
+        // cache_write_per_mtok 这一列在 endpoint_auto_price 里**一直有**，只是从来没被
+        // 读出来过 —— 抓价的时候存了，算成本的时候没用。
+        "SELECT endpoint_id, model_id, input_per_mtok, output_per_mtok, cached_per_mtok, \
+                cache_write_per_mtok, source \
+         FROM endpoint_auto_price",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    {
+        price_of.insert(
+            (a.endpoint_id, a.model_id.clone()),
+            ModelPrice {
+                endpoint_id: a.endpoint_id,
+                model_id: a.model_id,
+                input_per_mtok: a.input_per_mtok,
+                output_per_mtok: a.output_per_mtok,
+                cached_per_mtok: a.cached_per_mtok,
+                cache_write_per_mtok: a.cache_write_per_mtok,
+                note: format!("自动拉取（{}）", a.source),
+            },
+        );
+    }
 
     let mut by_ep: HashMap<uuid::Uuid, Vec<ModelUsage>> = HashMap::new();
     for u in usage {
         by_ep.entry(u.endpoint_id).or_default().push(u);
     }
+
+    // 按模型记账是后加的，之前的流量只在 `endpoint_usage` 里（按出口聚合，没有模型维度）。
+    //
+    // 不读这张表的话，那段时间的行会显示成「这段时间没跑过」—— 而它跑了几千次。
+    // **那是一句假话**，比空白更糟：它会让人以为这条线路闲着。
+    // 成本仍然拆不出来（没有模型就乘不了单价），但「跑了多少、收了多少」是真的，
+    // 而且正是判断「这条线路值不值得配价」的依据。
+    #[derive(sqlx::FromRow)]
+    struct LegacyUsage {
+        endpoint_id: uuid::Uuid,
+        calls: i64,
+        cost_micro: i64,
+    }
+    let legacy: HashMap<uuid::Uuid, (i64, i64)> = sqlx::query_as::<_, LegacyUsage>(
+        "SELECT endpoint_id, SUM(calls)::bigint AS calls, \
+                SUM(cost_micro_usd)::bigint AS cost_micro \
+         FROM endpoint_usage WHERE day > current_date - $1::int GROUP BY endpoint_id",
+    )
+    .bind(days as i32)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|l| (l.endpoint_id, (l.calls, l.cost_micro)))
+    .collect();
 
     // 余额那条独立的证据链，留着和单价算出来的数互相印证。
     let edges: Vec<BalanceEdge> = sqlx::query_as(
@@ -340,24 +554,35 @@ pub async fn admin_reconciliation(
             &crate::models::allowed_ids(r),
             &r.base_url,
         );
-        let mut targets: Vec<(uuid::Uuid, String, bool, bool)> =
-            vec![(r.id, format!("{}（自带地址）", r.label), true, true)];
+        // 多带一个倍率：抓不到价目时要靠它从官方价推算（见 derived_price）。
+        // 线路自带地址没有这一列，按 1.0 —— 那正是「我按官方价进货」的意思。
+        let mut targets: Vec<(uuid::Uuid, String, bool, bool, f64)> =
+            vec![(r.id, format!("{}（自带地址）", r.label), true, true, 1.0)];
         for e in eps.get(&r.id).into_iter().flatten() {
             let label = if e.label.trim().is_empty() { "未命名出口".to_string() } else { e.label.clone() };
-            targets.push((e.id, label, false, e.active));
+            targets.push((e.id, label, false, e.active, e.cost_ratio));
         }
 
-        for (id, label, is_own, active) in targets {
+        for (id, label, is_own, active, ratio) in targets {
             let used = by_ep.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
             let mut models: Vec<ModelRow> = Vec::new();
             let mut unpriced: Vec<String> = Vec::new();
             let mut revenue = 0.0_f64;
             let mut cost = 0.0_f64;
+            // 这一行的成本里有多少来自推算。全额报出去 —— 「其中 X 是推的」
+            // 和「全部都是实测的」是两句话，不能压成一个数。
+            let mut derived_cost = 0.0_f64;
+            // 老表兜底时用它顶替 calls —— 那时没有按模型的行可数。
+            let mut legacy_calls = 0i64;
 
             for u in used {
                 let rev = u.revenue_micro as f64 / 1_000_000.0;
                 revenue += rev;
-                let p = price_of.get(&(id, u.model_id.clone()));
+                // 价的三级：手录 → 抓来的 → **按 OpenRouter 官方价 × 这个出口的倍率推算**。
+                // 前两级是事实，第三级是推算，界面上必须分得开（看 price_note / derived）。
+                let fetched = price_of.get(&(id, u.model_id.clone())).cloned();
+                let derived = fetched.is_none().then(|| derived_price(id, &u.model_id, ratio)).flatten();
+                let p = fetched.as_ref().or(derived.as_ref());
                 let c = p.map(|p| model_cost_usd(u, p));
                 match &c {
                     Some(v) => cost += v,
@@ -369,6 +594,7 @@ pub async fn admin_reconciliation(
                     prompt_tokens: u.prompt_tokens,
                     completion_tokens: u.completion_tokens,
                     cached_tokens: u.cached_tokens,
+                    cache_creation_tokens: u.cache_creation_tokens,
                     revenue_usd: rev,
                     cost_usd: c,
                     margin_usd: c.map(|c| rev - c),
@@ -376,13 +602,27 @@ pub async fn admin_reconciliation(
                     output_per_mtok: p.map(|p| p.output_per_mtok),
                     cached_per_mtok: p.and_then(|p| p.cached_per_mtok),
                     price_note: p.map(|p| p.note.clone()).unwrap_or_default(),
+                    price_derived: derived.is_some(),
                 });
+                if derived.is_some() {
+                    if let Some(v) = c {
+                        derived_cost += v;
+                    }
+                }
             }
             // 贵的排前面：一个出口上二十个模型时，该先看哪个由金额决定。
             models.sort_by(|a, b| b.revenue_usd.partial_cmp(&a.revenue_usd).unwrap_or(std::cmp::Ordering::Equal));
 
             // 少录一个模型的价，整行的成本就是未知 —— 把没录的那部分按 0 加进来，
             // 得到的是一个看起来很精确的错数字，而且它会让这一行显示成高毛利。
+            // 按模型没有记录、但老表有量：那段流量发生在「按模型记账」上线之前。
+            // 调用数和收入照实显示，成本明确标成拆不出来 —— 而不是把整行说成没跑过。
+            let legacy_hit = used.is_empty().then(|| legacy.get(&id)).flatten();
+            if let Some(&(lcalls, lmicro)) = legacy_hit {
+                revenue = lmicro as f64 / 1_000_000.0;
+                legacy_calls = lcalls;
+            }
+
             let row_cost = unpriced.is_empty().then_some(cost).filter(|_| !used.is_empty());
             let margin = row_cost.map(|c| revenue - c);
             let (bal_cost, bal_basis, _samples, bal_note) = balance_cost(edges.get(&id));
@@ -395,13 +635,15 @@ pub async fn admin_reconciliation(
                 vendor,
                 is_own,
                 active,
-                calls: used.iter().map(|u| u.calls).sum(),
+                calls: if used.is_empty() { legacy_calls } else { used.iter().map(|u| u.calls).sum() },
                 revenue_usd: revenue,
                 cost_usd: row_cost,
                 margin_usd: margin,
                 // 收入是 0 时毛利率没有意义（分母为零），不报 0% —— 那读起来像「打平」。
                 margin_pct: margin.filter(|_| revenue > 0.0).map(|m| m / revenue * 100.0),
                 unpriced_models: unpriced,
+                derived_cost_usd: derived_cost,
+                legacy_only: legacy_hit.is_some(),
                 cost_by_balance_usd: bal_cost,
                 balance_basis: bal_basis,
                 balance_note: bal_note,
@@ -428,8 +670,11 @@ pub async fn admin_reconciliation(
     // 还差多少个模型没录价 —— 这是「离能看真数还有多远」的唯一进度条。
     let unpriced_total: usize = rows.iter().map(|r| r.unpriced_models.len()).sum();
 
+    let accounts = account_rates(&state, days).await;
+
     Ok(Json(serde_json::json!({
         "days": days,
+        "accounts": accounts,
         "rows": rows,
         "totals": {
             "revenue_usd": revenue_total,
@@ -439,6 +684,8 @@ pub async fn admin_reconciliation(
             "counted_rows": counted.len(),
             "total_rows": rows.len(),
             "unpriced_models": unpriced_total,
+            // 合计里有多少是推算的。分开报，让「实测覆盖了多少」一眼可见。
+            "derived_cost_usd": counted.iter().map(|r| r.derived_cost_usd).sum::<f64>(),
         },
     })))
 }
@@ -498,6 +745,279 @@ pub async fn admin_save_price(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// 一个**中转账户**这段时间的实测费率。
+#[derive(serde::Serialize)]
+pub struct AccountRate {
+    pub base_url: String,
+    /// 共用这个账户的线路名。两把不同的密钥挂在同一个账户下是常态。
+    pub routes: Vec<String>,
+    /// 余额掉了多少（美元）。None = 采样不足、或期间充过值。
+    pub spent_usd: Option<f64>,
+    pub user_tokens: i64,
+    /// 探活烧掉的 token。**必须算进分母** —— 那笔钱也是从这个余额里出的。
+    pub probe_tokens: i64,
+    /// 实测单价：余额掉的钱 ÷ 总 token。**这是执行事实，不是任何人的声明。**
+    pub implied_per_mtok: Option<f64>,
+    /// 按价目表算出来的**预测消耗**（美元总额）。
+    ///
+    /// **可比的是这个数，不是每 M 单价。** 单价那一列是混合费率 —— 真实计费是
+    /// `输入×输入价 + 输出×输出价`，而输出价通常是输入价的 4~5 倍，所以
+    /// 「余额差 ÷ 总 token」完全取决于这一段的输入输出配比，拿去乘别的用量会错得离谱。
+    /// 美元总额没有这个问题：两边都是「这一段花了多少钱」，同一批 token、同一个窗口。
+    pub predicted_usd: Option<f64>,
+    /// 按价目表加权的混合费率。**只用于展示这一段的量级，不能当单价用**（理由同上）。
+    pub listed_per_mtok: Option<f64>,
+    /// 两者的偏差百分比。差得远 = 中转在按另一份价目收费，或者我们的价目过期了。
+    pub gap_pct: Option<f64>,
+    pub note: String,
+}
+
+/// 按**账户**算实测费率。
+///
+/// # 为什么必须按账户，不能按线路
+///
+/// 实测：Claude 和 GPT 是两把不同的密钥（`c32100dd` / `f27979fa`），但余额到小数点后
+/// 8 位同步变动 —— 同一个中转账户下的两把 key。按线路算的话，同一笔扣款会被算进
+/// 两条线路，加总时**重复计算**。
+///
+/// 归并判据是地址：同一个 host 下的线路默认同账户。但**不盲信** —— 如果它们在同一
+/// 时刻报出不同的余额，那就是两个账户，此时不归并并在 note 里说明。
+///
+/// # 为什么这个数比价目表更硬
+///
+/// 价目表是中转的**声明**，余额差是**真金白银**。两者对不上，说明中转在按另一份
+/// 价目收费，或者我们抄来的表过期了 —— 而这正是「有没有在亏钱」里最难发现的一种。
+async fn account_rates(state: &AppState, days: i64) -> Vec<AccountRate> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        base_url: String,
+        label: String,
+        endpoint_id: uuid::Uuid,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT base_url, label, id AS endpoint_id FROM models WHERE active = true ORDER BY base_url",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut by_host: HashMap<String, Vec<Row>> = HashMap::new();
+    for r in rows {
+        by_host.entry(r.base_url.clone()).or_default().push(r);
+    }
+
+    let mut out = Vec::new();
+    for (base_url, group) in by_host {
+        let ids: Vec<uuid::Uuid> = group.iter().map(|g| g.endpoint_id).collect();
+
+        // 同一时刻余额不一致 = 不是同一个账户。归并会把两笔账混成一笔。
+        let distinct: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT remaining_usd) FROM endpoint_balance \
+             WHERE endpoint_id = ANY($1) AND remaining_usd IS NOT NULL \
+               AND taken_at = (SELECT max(taken_at) FROM endpoint_balance \
+                               WHERE endpoint_id = ANY($1))",
+        )
+        .bind(&ids)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(1);
+        if distinct > 1 {
+            out.push(AccountRate {
+                base_url: base_url.clone(),
+                routes: group.iter().map(|g| g.label.clone()).collect(),
+                spent_usd: None,
+                user_tokens: 0,
+                probe_tokens: 0,
+                implied_per_mtok: None,
+                predicted_usd: None,
+                listed_per_mtok: None,
+                gap_pct: None,
+                note: format!(
+                    "同一个地址下有 {distinct} 个不同余额 —— 这是 {distinct} 个独立账户，\
+                     没有归并（合起来算会把两笔账混成一笔）"
+                ),
+            });
+            continue;
+        }
+
+        // **两边必须覆盖同一段时间。**
+        //
+        // `predicted` 来自 `endpoint_model_usage`，那张表 2026-08-25 才上线；而余额差
+        // 覆盖整个窗口。实测这一天的后果：hanhegufei 七天里计费流水 10,848 次
+        // / 3.14 亿 token，而按模型记账只有 132 次 / 776 万 —— 拿 2.5% 的流量算出来的
+        // 成本去比 100% 的余额下降，界面上就报出 **+2156%「中转扣的和它自己的价目表
+        // 对不上」**。那句话是错的，而且指着一个无辜的中转。
+        //
+        // 所以余额差也**从按模型记账有数据的那天算起**。两边同一段，比出来的才是话。
+        let cover_from: Option<chrono::NaiveDate> = sqlx::query_scalar(
+            "SELECT min(day) FROM endpoint_model_usage \
+             WHERE endpoint_id = ANY($1) AND day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        // 余额差：取这一组里任意一个出口的首尾（它们是同一个数）。
+        let edge: Option<(Option<f64>, Option<f64>, i64)> = sqlx::query_as(
+            "WITH w AS (SELECT * FROM endpoint_balance \
+                        WHERE endpoint_id = ANY($1) AND remaining_usd IS NOT NULL \
+                          AND taken_at > now() - ($2::int * INTERVAL '1 day') \
+                          AND ($3::date IS NULL OR taken_at >= $3::date)) \
+             SELECT (SELECT remaining_usd FROM w ORDER BY taken_at ASC LIMIT 1), \
+                    (SELECT remaining_usd FROM w ORDER BY taken_at DESC LIMIT 1), \
+                    (SELECT count(DISTINCT taken_at)::bigint FROM w)",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .bind(cover_from)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        let (spent, note) = match edge {
+            Some((Some(first), Some(last), n)) if n >= 2 => {
+                let d = first - last;
+                if d >= 0.0 {
+                    (Some(d), String::new())
+                } else {
+                    // 余额涨了 = 期间充过值。**不能报成负消耗**。
+                    (None, "期间余额上升（充过值），这段的实测费率算不出来".into())
+                }
+            }
+            Some((_, _, n)) if n < 2 => (None, format!("只采到 {n} 个余额点，算不出差额")),
+            _ => (None, "这个账户还没有余额读数".into()),
+        };
+
+        let user_tokens: i64 = sqlx::query_scalar(
+            // 缓存写也烧钱，也从这个余额里出 —— 不进分母的话实测单价会偏高。
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens + cache_creation_tokens), 0)::bigint \
+             FROM endpoint_model_usage WHERE endpoint_id = ANY($1) AND day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+        // 探活的 token 也从这个余额里出。不算进分母的话，实测单价会偏高，
+        // 而那个数字看起来完全正常 —— 没有任何迹象说它被污染了。
+        let probe_tokens: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
+             FROM endpoint_probe_usage WHERE endpoint_id = ANY($1) AND day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+        let total = user_tokens + probe_tokens;
+        let implied = spent.filter(|_| total > 0).map(|d| d / total as f64 * 1_000_000.0);
+
+        // 预测消耗：按价目表把这一段的每个模型逐个乘出来再相加。
+        //
+        // **这才是和余额差可比的那个数。** 不能用「平均单价 × 总 token」代替 ——
+        // 那等于假设所有 token 同价，而输出价通常是输入价的 4~5 倍。
+        //
+        // 公式必须和 `model_cost_usd` **逐项一致**：新鲜输入 + 缓存读 + 缓存写 + 输出。
+        // 上一版只算「prompt × 输入价 + completion × 输出价」，两处偏差方向相反且都不小：
+        //   · 缓存读按全价算 —— 高估（实测 grok-4.6 七百万输入里四百万是缓存读）；
+        //   · 缓存写完全不算 —— 低估，而它常常是成本大头。
+        // 同一个「成本」有两份实现，这是这个仓库里反复吃亏的那种形状。
+        let predicted: Option<f64> = sqlx::query_scalar(
+            "SELECT SUM( \
+                 GREATEST(u.prompt_tokens - LEAST(u.cached_tokens, u.prompt_tokens), 0) \
+                   * p.input_per_mtok \
+                 + LEAST(u.cached_tokens, u.prompt_tokens) \
+                   * COALESCE(p.cached_per_mtok, p.input_per_mtok) \
+                 + u.cache_creation_tokens \
+                   * COALESCE(p.cache_write_per_mtok, p.input_per_mtok * 1.25) \
+                 + u.completion_tokens * p.output_per_mtok \
+             ) / 1000000.0 \
+             FROM endpoint_model_usage u \
+             JOIN endpoint_auto_price p \
+               ON p.endpoint_id = u.endpoint_id AND p.model_id = u.model_id \
+             WHERE u.endpoint_id = ANY($1) AND u.day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        // 混合费率，只用于展示量级。
+        let listed: Option<f64> = sqlx::query_scalar(
+            "SELECT CASE WHEN SUM(u.prompt_tokens + u.completion_tokens) > 0 \
+                    THEN SUM(u.prompt_tokens * p.input_per_mtok \
+                             + u.completion_tokens * p.output_per_mtok) \
+                         / SUM(u.prompt_tokens + u.completion_tokens) \
+                    ELSE NULL END \
+             FROM endpoint_model_usage u \
+             JOIN endpoint_auto_price p \
+               ON p.endpoint_id = u.endpoint_id AND p.model_id = u.model_id \
+             WHERE u.endpoint_id = ANY($1) AND u.day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        // **偏差按美元总额算，不按每 M 单价算。**
+        // 单价那两个数各自都是混合费率，相除等于拿两个「平均」去比，
+        // 而它们的加权口径本来就一样 —— 比出来的百分比和按总额算是同一个数，
+        // 但用总额表达不会让人误以为那是单价的偏差。
+        let gap = match (spent, predicted) {
+            (Some(a), Some(p)) if p > 0.0 => Some((a - p) / p * 100.0),
+            _ => None,
+        };
+
+        // 实际比的是几天，必须说出来。
+        //
+        // 按模型记账 2026-08-25 才上线，所以选「7 天」时这一行很可能只覆盖两天。
+        // 不说的话，用户看到的是「7 天的账对不上」，而实际上比的是两天 —— 那句话
+        // 会把一个无辜的中转指成多收钱。判据是**执行事实**（真有数据的最早那天），
+        // 不是我们希望它覆盖多久。
+        let covered_days = cover_from
+            .map(|d| (chrono::Utc::now().date_naive() - d).num_days() + 1)
+            .unwrap_or(0);
+        let short = covered_days > 0 && covered_days < days as i64;
+        let note = if !note.is_empty() {
+            note
+        } else if total == 0 {
+            "这段时间这个账户没有任何 token 消耗，反推不出单价".into()
+        } else if short {
+            format!(
+                "只比了最近 {covered_days} 天 —— 按模型记账从那天才有数据，\
+                 余额差也只取了同一段（两边不同段的话，比出来的百分比没有意义）"
+            )
+        } else {
+            String::new()
+        };
+
+        out.push(AccountRate {
+            base_url,
+            routes: group.iter().map(|g| g.label.clone()).collect(),
+            spent_usd: spent,
+            user_tokens,
+            probe_tokens,
+            implied_per_mtok: implied,
+            predicted_usd: predicted,
+            listed_per_mtok: listed,
+            gap_pct: gap,
+            note,
+        });
+    }
+    out.sort_by(|a, b| b.spent_usd.unwrap_or(0.0).partial_cmp(&a.spent_usd.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// 从首尾两条余额读数算成本。
 ///
 /// 返回 (成本, 口径, 采样点数, 说明)。成本为 None 时说明里一定有一句话 ——
@@ -547,6 +1067,31 @@ mod tests {
         all.split("\n#[cfg(test)]").next().unwrap().to_string()
     }
 
+    /// 按花括号配对抠出一个函数体。
+    ///
+    /// 不切固定长度的窗口：函数一长，窗口就够不到要守的那一行，而测试**仍然是绿的**
+    /// —— 它守的东西已经不在它看的那段里了。
+    fn fn_body(src: &str, sig: &str) -> String {
+        let at = src.find(sig).unwrap_or_else(|| panic!("找不到 {sig}"));
+        let open = at + src[at..].find('{').expect("函数没有花括号");
+        let b = src.as_bytes();
+        let (mut d, mut i) = (0i32, open);
+        while i < b.len() {
+            match b[i] {
+                b'{' => d += 1,
+                b'}' => {
+                    d -= 1;
+                    if d == 0 {
+                        return src[open..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{sig} 花括号没配平");
+    }
+
     fn edge(fr: Option<f64>, lr: Option<f64>, fu: Option<f64>, lu: Option<f64>, n: i64) -> BalanceEdge {
         BalanceEdge {
             endpoint_id: uuid::Uuid::nil(),
@@ -567,6 +1112,9 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_tokens: cached,
+            // 老的这几条测试都是「没有缓存写入」的形态 —— 补 0 之后它们的期望值
+            // 一个字都不用改，这正说明这次改动没动到任何一条没有写入的账。
+            cache_creation_tokens: 0,
         }
     }
 
@@ -577,6 +1125,7 @@ mod tests {
             input_per_mtok: inp,
             output_per_mtok: out,
             cached_per_mtok: cached,
+            cache_write_per_mtok: None,
             note: String::new(),
         }
     }
@@ -633,6 +1182,350 @@ mod tests {
         assert!(
             s.contains("filter(|r| r.cost_usd.is_some())"),
             "合计把没录价的行按零成本计入了，毛利会凭空变好看",
+        );
+    }
+
+    /// 自动拉到的价必须真的被用上。
+    ///
+    /// 账单核对的两边必须覆盖**同一段时间**，而且成本公式只许有一份。
+    ///
+    /// # 这条钉的是一次把无辜中转指成小偷的误报
+    ///
+    /// `predicted` 来自 `endpoint_model_usage`（2026-08-25 才上线），`spent` 来自余额
+    /// 快照（覆盖整个窗口）。实测 hanhegufei 七天：计费流水 10,848 次 / 3.14 亿 token，
+    /// 而按模型记账只有 132 次 / 776 万 —— 拿 **2.5% 的流量**算出来的成本去比
+    /// **100% 的余额下降**，界面报出 `+2156% ← 中转扣的和它自己的价目表对不上`。
+    ///
+    /// 那句话是错的。40 倍的流量差对上 22.6 倍的缺口，同一个量级 —— 缺口整个是
+    /// 窗口错配造出来的。**一个自信、具体、而且冤枉人的结论，比没有结论糟得多。**
+    #[test]
+    fn the_account_check_compares_the_same_window_with_one_cost_formula() {
+        let src = include_str!("reconcile.rs");
+        // **按行首锚定。** 直接 find("pub async fn account_rates(") 会先在**这条测试
+        // 自己写的那句字面量**上命中（真实签名没有 pub），于是切片从测试内部开始，
+        // 下面每一条断言都在自己身上命中 —— 恒真。第一版就是这么绿的。
+        let at = src
+            .find("\nasync fn account_rates(")
+            .expect("按账户核对的函数不见了");
+        let rest = &src[at..];
+        // **两个边界都要看，取先到的那个。**
+        //
+        // `account_rates` 是这个文件里最后一个 `pub async fn`，所以只找「下一个函数」
+        // 会一路切到文件末尾、把测试模块也包进来 —— 于是下面每一条断言都能在**它自己
+        // 写的那句字面量**上命中，测试恒真。第一版就是这样：把余额窗口的夹取整个删掉，
+        // 它照样绿。只有故意改坏跑一遍才看得出来。
+        let end = [rest[1..].find("\npub async fn "), rest[1..].find("\n#[cfg(test)]")]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("fn the_account_check_compares"),
+            "切片切到测试模块里去了 —— 下面的断言会在自己身上命中，等于什么都没测",
+        );
+
+        // 余额差必须按「按模型记账有数据的那天」起算。
+        assert!(
+            body.contains("let cover_from"),
+            "没有算覆盖起点 —— 两边又会比不同的时间段",
+        );
+        assert!(
+            body.contains("taken_at >= $3::date"),
+            "余额差没有被覆盖起点夹住 —— 它仍然覆盖整个窗口，而 predicted 只覆盖一部分",
+        );
+        // 实际比了几天要说出来。
+        assert!(
+            body.contains("只比了最近 {covered_days} 天"),
+            "覆盖天数没有回给界面 —— 用户会以为比的是他选的那个天数",
+        );
+
+        // 成本公式和 model_cost_usd 逐项一致：四项都要在。
+        for term in [
+            "p.input_per_mtok",
+            "COALESCE(p.cached_per_mtok, p.input_per_mtok)",
+            "COALESCE(p.cache_write_per_mtok, p.input_per_mtok * 1.25)",
+            "p.output_per_mtok",
+        ] {
+            assert!(
+                body.contains(term),
+                "predicted 少了一项（{term}）—— 它和 model_cost_usd 又分叉了",
+            );
+        }
+        // 分母也要含缓存写：那笔钱同样从这个余额里出。
+        assert!(
+            body.contains("prompt_tokens + completion_tokens + cache_creation_tokens"),
+            "实测单价的分母漏了缓存写 —— 单价会偏高，而那个数看起来完全正常",
+        );
+    }
+
+    /// 抓不到价目时按「官方价 × 倍率」推算 —— 而且**必须标成推算**。
+    ///
+    /// # 为什么允许这一条推算
+    ///
+    /// 用户早先要求过「都不要估算，都要真实的计算」，当时删掉的那个估算是
+    /// `收入 × 进价折扣 ÷ 计费倍率` —— 它的**前提是假的**：那个折扣是多路由用来
+    /// 排序出口的旋钮，不是价格。
+    ///
+    /// 这一条不同：中转本来就是「官方价 × 分组倍率」定价的，我们真抓到的价目里
+    /// `group_multiplier` 就是原样折在单价上的（grok-heavy 0.2 倍 → $2 标成 $0.40）。
+    /// 复现它们自己的定价规则，不是拍脑袋。
+    ///
+    /// # 但它终究是推的
+    ///
+    /// 所以 `price_derived` 必须为真、`price_note` 必须写明来源、合计必须分开报。
+    /// 混进实测数字里，一个假设就变成了事实，而这一页的全部价值就在于它说真数。
+    #[test]
+    fn a_derived_price_is_marked_as_derived_and_never_invented() {
+        let ep = uuid::Uuid::nil();
+        // 目录里没有的模型 → 不猜，仍然是「待录单价」。
+        assert!(derived_price(ep, "完全不存在的模型-9x", 1.0).is_none());
+        // 倍率非法 → 不推。0 会把成本推成 0，那正是「过期的零」那一类错误。
+        assert!(derived_price(ep, "claude-opus-5", 0.0).is_none());
+        assert!(derived_price(ep, "claude-opus-5", -1.0).is_none());
+        assert!(derived_price(ep, "claude-opus-5", f64::NAN).is_none());
+
+        // 目录里有的话，价必须是 官方价 × 倍率。
+        //
+        // **这一段是条件成立的**：`official_price` 读的是实时目录，测试环境里通常是空的，
+        // 整块会被跳过。所以「必须标成推算」那条断言**不能放在这里面** —— 第一版就放了，
+        // 于是把 note 里的「推算」二字删掉，测试照样绿。下面改成扫源码，与目录无关。
+        if let Some((oi, oo)) = crate::models::official_price("claude-opus-5") {
+            let p = derived_price(ep, "claude-opus-5", 0.25).expect("目录里有就该推得出来");
+            assert!((p.input_per_mtok - oi * 0.25).abs() < 1e-9, "输入价不是官方价×倍率");
+            assert!((p.output_per_mtok - oo * 0.25).abs() < 1e-9, "输出价不是官方价×倍率");
+            assert!(p.note.contains("推算"), "推算出来的价没有标明来源：{}", p.note);
+        }
+
+        // 取价的顺序：抓来的优先，抓不到才推。反过来的话，真价会被推算盖住。
+        let src = include_str!("reconcile.rs");
+        let at = src.find("let fetched = price_of.get(").expect("取价那段变了");
+        let seg = &src[at..at + 400.min(src.len() - at)];
+        assert!(
+            seg.contains("fetched.is_none().then(|| derived_price("),
+            "推算不是只在抓不到时才跑 —— 真实价目会被一个推算值盖掉",
+        );
+        assert!(
+            seg.contains("fetched.as_ref().or(derived.as_ref())"),
+            "取价优先级反了：推算排在抓来的前面",
+        );
+        // 标签必须写在源码里，和实时目录有没有加载无关。
+        let fnbody = {
+            let a = src.find("fn derived_price(").expect("推算函数不见了");
+            let r = &src[a..];
+            let e = r[1..].find("\n/// ").map(|i| i + 1).unwrap_or(r.len());
+            &r[..e]
+        };
+        assert!(
+            fnbody.contains(r#"note: format!("推算："#),
+            "推算出来的价没有在 note 里标明它是推的 —— 它会在界面上冒充实测价",
+        );
+        assert!(
+            src.contains("price_derived: derived.is_some()"),
+            "推算标记没有跟着行走 —— 界面分不出哪一行是推的",
+        );
+    }
+
+    /// 缓存写入必须算进成本，而且**不许当 0**。
+    ///
+    /// # 这条钉的是一个真实的单向偏差
+    ///
+    /// 上一版 `model_cost_usd` 只算「新鲜输入 + 缓存读 + 输出」。而上游按输入价的
+    /// 1.25 倍收缓存写入，实测 2026-08-26 一次 claude-opus-5 调用：新鲜输入 381、
+    /// **写入 61,634**、输出 1152 —— 那一笔 $1.19 的成本里 $1.156 是写入。
+    ///
+    /// 收入那一侧一直算了它（`compute_cost` 里的 write_tok），成本这一侧当 0，
+    /// 于是**毛利被系统性高估，而且缓存命中率越高的模型账面越漂亮、实际越亏**。
+    /// 这不是随机误差，是永远朝一个方向偏。
+    #[test]
+    fn cache_writes_are_part_of_the_cost_never_zero() {
+        let u = ModelUsage {
+            endpoint_id: uuid::Uuid::nil(),
+            model_id: "claude-opus-5".into(),
+            calls: 1,
+            revenue_micro: 0,
+            prompt_tokens: 381,
+            completion_tokens: 1152,
+            cached_tokens: 0,
+            cache_creation_tokens: 61_634,
+        };
+        let p = ModelPrice {
+            endpoint_id: uuid::Uuid::nil(),
+            model_id: "claude-opus-5".into(),
+            input_per_mtok: 15.0,
+            output_per_mtok: 25.0,
+            cached_per_mtok: None,
+            cache_write_per_mtok: None, // 没录 → 按输入价 × 1.25 推
+            note: String::new(),
+        };
+        let got = model_cost_usd(&u, &p);
+        // 381×15 + 61634×18.75 + 1152×25，除以一百万。
+        let want = (381.0 * 15.0 + 61_634.0 * 18.75 + 1152.0 * 25.0) / 1_000_000.0;
+        assert!((got - want).abs() < 1e-9, "算出来 {got}，应当是 {want}");
+
+        // 漏掉写入会少算多少：这里是二十倍。
+        let without_write = (381.0 * 15.0 + 1152.0 * 25.0) / 1_000_000.0;
+        assert!(
+            got > without_write * 20.0,
+            "写入贡献了绝大部分成本，漏掉它就是把成本算成零头",
+        );
+
+        // 录了写入价就用录的那个，不再去推。
+        let p2 = ModelPrice { cache_write_per_mtok: Some(3.0), ..p.clone() };
+        let got2 = model_cost_usd(&u, &p2);
+        let want2 = (381.0 * 15.0 + 61_634.0 * 3.0 + 1152.0 * 25.0) / 1_000_000.0;
+        assert!((got2 - want2).abs() < 1e-9, "录了写入价却没用它");
+
+        // 一个写入为 0 的调用，结果必须和改造前逐字相同 —— 这次改动不该动到
+        // 任何一条没有缓存写入的历史账。
+        let u0 = ModelUsage { cache_creation_tokens: 0, ..u.clone() };
+        assert!((model_cost_usd(&u0, &p) - without_write).abs() < 1e-9);
+    }
+
+    /// 第一版这里只读手填的 `endpoint_model_price`，而适配器把 535 条真实进价写进了
+    /// `endpoint_auto_price` —— 一条都没被读。表现是「明明自动拉到了价，对账页的
+    /// 成本还是空的」，而且看起来像适配器没工作。
+    #[test]
+    fn auto_fetched_prices_are_actually_used() {
+        let s = src();
+        assert!(
+            s.contains("FROM endpoint_auto_price"),
+            "对账没读自动价表 —— 适配器拉回来的价一条都用不上",
+        );
+        // 自动的要覆盖手填的（手填只在拉不到时兜底），所以自动那一轮必须在后面插入。
+        let manual = s.find("SELECT * FROM endpoint_model_price").expect("手填价没读");
+        let auto = s.find("FROM endpoint_auto_price").expect("自动价没读");
+        assert!(manual < auto, "自动价没有覆盖手填价 —— 倍率变了之后手填的旧值会一直赢");
+    }
+
+    /// 「跑过但没按模型记账」不许说成「没跑过」。
+    ///
+    /// 按模型记账是后加的，之前的流量只在按出口聚合的老表里。不读那张表的话，
+    /// 那些行会显示成「这段时间没跑过」—— 而它们跑了几千次。**那是一句假话**，
+    /// 比空白更糟：它会让人以为这条线路闲着。
+    #[test]
+    fn traffic_without_per_model_detail_is_not_reported_as_no_traffic() {
+        let s = src();
+        assert!(
+            s.contains("FROM endpoint_usage WHERE day >"),
+            "没读按出口聚合的老表 —— 按模型记账上线之前的流量会显示成「没跑过」",
+        );
+        assert!(s.contains("legacy_only"), "没有把「老口径」这件事标出来");
+        // 老表只在按模型没有记录时才顶上，不能盖掉真实的按模型数据。
+        assert!(
+            s.contains("used.is_empty().then(|| legacy.get(&id)).flatten()"),
+            "老表数据会盖掉按模型的真实数据 —— 两者口径不同，混在一起就都不可信了",
+        );
+        // 界面必须分开说。
+        let ui = include_str!("../admin-ui/src/pages/Reconcile.tsx");
+        assert!(
+            ui.contains("r.calls === 0 && !r.legacy_only"),
+            "界面还是把老口径的行说成「没跑过」",
+        );
+    }
+
+    /// 实测费率必须按**账户**算，而且探活的 token 要进分母。
+    ///
+    /// 两个错法各自的后果：
+    ///   · 按线路算 —— 同一个账户下的两把密钥（实测 Claude 和 GPT 就是）会把同一笔
+    ///     扣款各算一遍，加总直接翻倍；
+    ///   · 探活 token 不进分母 —— 那笔钱也是从这个余额里出的，不算进去的话实测单价
+    ///     偏高，而那个数字看起来完全正常，没有任何迹象说它被污染了。
+    #[test]
+    fn the_implied_rate_is_per_account_and_counts_probe_tokens() {
+        let body = fn_body(&src(), "async fn account_rates(");
+        assert!(
+            body.contains("by_host") && body.contains("endpoint_id = ANY($1)"),
+            "没有按账户归并 —— 同一账户下的多把密钥会把扣款重复计算",
+        );
+        assert!(
+            body.contains("endpoint_probe_usage"),
+            "探活 token 没进分母 —— 实测单价会偏高，而且看不出来",
+        );
+        assert!(
+            body.contains("user_tokens + probe_tokens"),
+            "分母不是两者之和",
+        );
+    }
+
+    /// 账单核对必须按**美元总额**比，不能按每 M 单价比。
+    ///
+    /// 真实计费是 `输入×输入价 + 输出×输出价`，而输出价通常是输入价的 4~5 倍。
+    /// 所以「余额差 ÷ 总 token」是一个**混合费率**，完全取决于这一段的输入输出配比 ——
+    /// 拿它当单价去乘别的用量会错得离谱。
+    ///
+    /// 美元总额没有这个问题：两边都是「这一段花了多少钱」，同一批 token、同一个窗口。
+    /// 这条守的就是「别再把混合费率当单价用」。
+    #[test]
+    fn the_bill_check_compares_dollars_not_blended_rates() {
+        let body = fn_body(&src(), "async fn account_rates(");
+        // 预测消耗必须逐模型乘出来再相加，不能用平均单价 × 总 token。
+        assert!(
+            body.contains("u.prompt_tokens * p.input_per_mtok")
+                && body.contains("u.completion_tokens * p.output_per_mtok"),
+            "预测消耗没有逐模型分输入输出算 —— 那等于假设所有 token 同价",
+        );
+        // 偏差按总额算。
+        assert!(
+            body.contains("let gap = match (spent, predicted)"),
+            "偏差还在按每 M 单价算 —— 那会让人以为那是单价的偏差",
+        );
+
+        // 界面上混合费率必须标成不可当单价用，而且**必须是可见文本**。
+        //
+        // 上一版把这句话写在 JSX 注释 `{/* ... */}` 里 —— 断言跑在源码上，通过了；
+        // 而注释在构建时被剥掉，线上包里 0 处命中，用户永远看不到。
+        // **测试守的东西没有出现在真正发出去的产物里**，这是最难发现的一种假绿。
+        // 所以这里先把注释整个剥掉，再断言。
+        let ui_raw = include_str!("../admin-ui/src/pages/Reconcile.tsx");
+        let ui: String = ui_raw
+            .replace("{/*", "\u{0}")
+            .split('\u{0}')
+            .enumerate()
+            .map(|(i, part)| {
+                if i == 0 {
+                    part.to_string()
+                } else {
+                    part.split_once("*/}").map(|(_, rest)| rest.to_string()).unwrap_or_default()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            ui.contains("混合费率") && ui.contains("不是单价"),
+            "「不是单价」这句话不在可见文本里（多半又写进了 JSX 注释）—— \
+             构建时会被剥掉，用户看不到，而这条断言在源码上照样绿",
+        );
+        assert!(
+            !ui.contains("实测 $/M"),
+            "「实测 $/M」这个标题会被读成单价，而它不是",
+        );
+    }
+
+    /// 同一个地址下余额不一致时**不许归并**。
+    ///
+    /// 那是两个独立账户。合起来算会把两笔账混成一笔，而结果看起来是个正常的数。
+    #[test]
+    fn two_accounts_on_one_host_are_not_merged() {
+        let body = fn_body(&src(), "async fn account_rates(");
+        assert!(
+            body.contains("count(DISTINCT remaining_usd)") && body.contains("if distinct > 1"),
+            "没有检查同一地址下是不是同一个账户 —— 两个账户会被合成一个",
+        );
+        assert!(
+            body.contains("没有归并"),
+            "不归并的时候没有说明原因 —— 那一行会是一片空白",
+        );
+    }
+
+    /// 充值期间算不出实测费率，而且不能报成负消耗。
+    #[test]
+    fn a_top_up_window_yields_no_implied_rate() {
+        let body = fn_body(&src(), "async fn account_rates(");
+        assert!(
+            body.contains("if d >= 0.0") && body.contains("充过值"),
+            "余额上升时没有作废这一段 —— 会算出负的消耗和负的单价",
         );
     }
 

@@ -2052,6 +2052,54 @@ fn ide_request_id(headers: &HeaderMap) -> ApiResult<Option<String>> {
 }
 
 /// 落库加密的 context（= 列身份，绑进 AAD）。见 field_crypto.rs。
+/// 线路 / 出口的上游协议取值。**只此一处**——两个校验入口（线路保存、出口保存）和
+/// 报错文案都从这里读，免得加第三个值时只改一半：出口协议会覆盖线路协议
+/// （route_endpoints.rs 的 effective 协议），只放行线路那侧的话，表现是
+/// 「线路设成新协议了，走的还是老的那条路」。
+///
+/// · anthropic      —— 原生 /v1/messages，body 由 oai_to_anthropic_with_cache 翻译
+/// · openai         —— OpenAI 兼容 /v1/chat/completions，body 原样透传
+/// · xai_responses  —— xAI 的 /v1/responses。加它的唯一理由：xAI 在 Chat Completions
+///   上**不返回思考内容**（官方对比页原文 "No reasoning content returned"，且那一列
+///   标着 Deprecated），可读的思考摘要只在 Responses 上给。
+pub(crate) const PROTOCOLS: [&str; 3] = ["anthropic", "openai", "xai_responses"];
+
+/// 上游的**线协议**。由 `PROTOCOLS` 里的字符串解析而来。
+///
+/// 存在的理由是那 6 处各拼各的 URL 后缀：以前全写成
+/// `if 是 anthropic { /messages } else { /chat/completions }`，加第三个值时每一处
+/// else 都会默认把它当 openai 走——这类错不报任何错，只会安静地打到错误的端点上。
+/// 有了它，「协议 → 路径」只有一处判据。
+///
+/// **未知字符串一律落 OpenAi**，和加这个枚举之前的行为逐字一致：白名单在入口挡着
+/// （见 PROTOCOLS 的两个校验点），走到这里的未知值只可能是手工改库改出来的，
+/// 那时候退回旧行为比 panic 好。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Wire {
+    Anthropic,
+    OpenAi,
+    XaiResponses,
+}
+
+impl Wire {
+    pub(crate) fn of(protocol: &str) -> Self {
+        match protocol {
+            "anthropic" => Wire::Anthropic,
+            "xai_responses" => Wire::XaiResponses,
+            _ => Wire::OpenAi,
+        }
+    }
+
+    /// 拼在 `api_base(...)` 后面的路径后缀。
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Wire::Anthropic => "/messages",
+            Wire::OpenAi => "/chat/completions",
+            Wire::XaiResponses => "/responses",
+        }
+    }
+}
+
 pub(crate) const MODEL_KEY_CTX: &str = "models.api_key";
 
 /// 取出一条线路的上游 api_key 明文。存的是密文（`fc1:...`）或遗留明文，这里统一解开。
@@ -3340,10 +3388,11 @@ pub async fn admin_update(
     let protocol = match req.protocol.as_deref().map(|p| p.trim().to_ascii_lowercase()) {
         None => m.protocol,                       // 没传 = 不改
         Some(p) if p.is_empty() => m.protocol,    // 传了空串 = 不改，和没传同义
-        Some(p) if p == "openai" || p == "anthropic" => p,
+        Some(p) if PROTOCOLS.contains(&p.as_str()) => p,
         Some(p) => {
             return Err(AppError::bad(format!(
-                "上游协议只能是 anthropic 或 openai（收到「{p}」）"
+                "上游协议只能是 {}（收到「{p}」）",
+                PROTOCOLS.join(" / ")
             )))
         }
     };
@@ -7338,6 +7387,204 @@ fn anthropic_stop_sequences(stop: Option<&serde_json::Value>) -> Option<Vec<Stri
     }
 }
 
+/// OpenAI chat body → xAI **Responses** body。
+///
+/// # 为什么有这条桥
+///
+/// xAI 在 Chat Completions 上**不返回思考内容**（官方对比页那一列标着 Deprecated，
+/// 原文 "No reasoning content returned"），可读的思考摘要只在 Responses 上给。
+/// 客户端全程只说 OpenAI 形状，所以翻译发生在网关：这里翻请求，`XaiRespSse` 翻响应。
+///
+/// # 形状差异（全部对着生产线路实测过，见 testdata/xai_responses_*.sse）
+///
+/// | OpenAI chat            | Responses                                   |
+/// |------------------------|---------------------------------------------|
+/// | `messages`             | `input`（**同一个数组形状**，含 role=system）|
+/// | `max_tokens`           | `max_output_tokens`（两个名字都收，取前者）  |
+/// | `tools[].function.{…}` | `tools[].{…}` —— **扁平**，包一层会 400      |
+/// | `reasoning_effort`     | `reasoning: { effort }`                     |
+/// | assistant.tool_calls   | `{type:"function_call", call_id, name, arguments}` |
+/// | role=tool 的结果       | `{type:"function_call_output", call_id, output}`   |
+/// | `stream_options`       | **不存在**，带上去是未知参数                 |
+///
+/// # 白名单式重建
+///
+/// 和 `oai_to_anthropic_with_cache` 同一个写法：`out` 从零建起，只有被显式搬过去的键
+/// 才会到达上游。clone-then-delete 的写法每次上游加一个我们没想到的键都要追着删，
+/// 而漏一个就是一次 400。
+fn oai_to_xai_responses(
+    body: &serde_json::Value,
+    effort_passthrough: bool,
+) -> Result<serde_json::Value, String> {
+    let mut out = serde_json::Map::new();
+    let model_str = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    out.insert("model".into(), json!(model_str));
+
+    // ── input：messages 数组基本可以原样搬，只有两类要改形状 ────────────────
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    let msgs = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing messages array".to_string())?;
+    for m in msgs {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        // 工具结果：OpenAI 用 role=tool + tool_call_id，Responses 用一个独立 item。
+        if role == "tool" {
+            let call_id = m
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "tool message is missing tool_call_id".to_string())?;
+            let output = match m.get("content") {
+                Some(serde_json::Value::String(t)) => t.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
+        // 助手轮里的工具调用：每个 tool_call 变成一个独立的 function_call item。
+        // 正文（如果有）另起一条 message —— Responses 的 item 是**扁平并列**的，
+        // 不像 OpenAI 那样把 content 和 tool_calls 塞进同一个对象。
+        if role == "assistant" {
+            if let Some(text) = m.get("content").and_then(|v| v.as_str()).filter(|t| !t.is_empty())
+            {
+                input.push(json!({"role": "assistant", "content": text}));
+            }
+            if let Some(calls) = m.get("tool_calls").and_then(|v| v.as_array()) {
+                for c in calls {
+                    let f = c.get("function").unwrap_or(&serde_json::Value::Null);
+                    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        return Err("assistant tool_call is missing function.name".into());
+                    }
+                    let call_id = c
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "assistant tool_call is missing id".to_string())?;
+                    // 参数原样带走。**空串补成 `{}`**：Responses 侧要求合法 JSON，
+                    // 而 OpenAI 侧的无参调用常见就是空串。
+                    let args = f
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .filter(|a| !a.trim().is_empty())
+                        .unwrap_or("{}");
+                    input.push(json!({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": args,
+                    }));
+                }
+            }
+            continue;
+        }
+        // system / developer / user：形状一致，原样搬（含多模态数组）。
+        input.push(json!({
+            "role": role,
+            "content": m.get("content").cloned().unwrap_or(json!("")),
+        }));
+    }
+    if input.is_empty() {
+        return Err("no usable input items".into());
+    }
+    out.insert("input".into(), json!(input));
+
+    // ── tools：**摊平**，并在扁平形状上做同一套顶层分支剥离 ──────────────────
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        let mut flat: Vec<serde_json::Value> = Vec::new();
+        for t in tools {
+            // 只翻 function 工具；xAI 自带的 web_search / x_search 这类原样带过去。
+            let Some(f) = t.get("function") else {
+                flat.push(t.clone());
+                continue;
+            };
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return Err("tool is missing function.name".into());
+            }
+            let mut params = f.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            // 和 Chat Completions 那条路同一个理由：xAI 不收顶层 anyOf/oneOf/allOf，
+            // 剥掉之后把语义并进描述，别让模型丢掉那条约束。判据函数是共用的。
+            let note = strip_top_level_schema_branches(&mut params);
+            let mut desc = f
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(n) = note {
+                if !desc.is_empty() {
+                    desc.push('\n');
+                }
+                desc.push_str(&n);
+            }
+            flat.push(json!({
+                "type": "function",
+                "name": name,
+                "description": desc,
+                "parameters": params,
+            }));
+        }
+        if !flat.is_empty() {
+            out.insert("tools".into(), json!(flat));
+        }
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        out.insert("tool_choice".into(), tc.clone());
+    }
+
+    // ── 思考档位 ───────────────────────────────────────────────────────────
+    //
+    // Responses 收的是 `reasoning: { effort }`。摘要**不需要**任何开关：实测
+    // grok-4.6 默认就回 summary（响应里 reasoning.summary 是 "detailed"）。
+    //
+    // 封顶判据和 Anthropic 那条路逐字同源：手工开关 **或** 实时目录说这个模型真支持
+    // 这一档。目录声明 grok-4.6 支持 xhigh，实测也确实收（HTTP 200）。
+    if let Some(effort) = thinking_effort_for(body).filter(|e| !e.is_empty() && **e != *"off") {
+        let sendable =
+            effort_passthrough || crate::model_catalog::supports_effort(model_str, effort);
+        // 目录没收录、线路也没开直通：退到 high，别拿一个上游可能不认的词赌。
+        let effort = if sendable {
+            effort
+        } else if effort == "xhigh" || effort == "max" {
+            "high"
+        } else {
+            effort
+        };
+        out.insert("reasoning".into(), json!({ "effort": effort }));
+    }
+
+    // ── 其余按名字搬，能对上的才搬 ─────────────────────────────────────────
+    if let Some(v) = body.get("stream") {
+        out.insert("stream".into(), v.clone());
+    }
+    // OpenAI 叫 max_tokens，Responses 叫 max_output_tokens。实测两个名字都收，
+    // 但只发规范的那个——发两个等于把「上游按哪个算」交给运气。
+    if let Some(v) = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_output_tokens"))
+    {
+        out.insert("max_output_tokens".into(), v.clone());
+    }
+    for key in ["temperature", "top_p", "user"] {
+        if let Some(v) = body.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    // 缓存抓手：xAI 的提示缓存是自动的，靠这个键把同一段前缀认出来。
+    // 网关本来就在往 chat/completions 上发它（见下方分派点），这里一起带走。
+    if let Some(v) = body.get("prompt_cache_key") {
+        out.insert("prompt_cache_key".into(), v.clone());
+    }
+    // **stream_options 不搬**：Responses 上没有这个参数，usage 恒在
+    // response.completed 事件里。带上去就是一个未知参数。
+
+    Ok(serde_json::Value::Object(out))
+}
+
 fn oai_to_anthropic_with_cache(
     body: &serde_json::Value,
     prompt_cache: bool,
@@ -7677,6 +7924,87 @@ fn anthropic_usage_merged(au: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Anthropic non-streaming response → OpenAI /chat/completions response.
+/// xAI Responses 的**非流式**响应 → OpenAI chat completion 形状。
+///
+/// 形状来自实测（见 oai_body_becomes_a_responses_body 那几条探针的返回）：
+/// 顶层是 `{id, model, output: [...], usage: {...}}`，`output` 是并列的 item 数组，
+/// 每项 type 是 reasoning / message / function_call。
+///
+/// 和流式那条桥（XaiRespSse）翻的是同一套语义，只是一次性给完。
+fn xai_responses_to_oai(rv: &serde_json::Value, model: &str) -> serde_json::Value {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    for item in rv.get("output").and_then(|v| v.as_array()).into_iter().flatten() {
+        match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "message" => {
+                for c in item.get("content").and_then(|v| v.as_array()).into_iter().flatten() {
+                    if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                        content.push_str(t);
+                    }
+                }
+            }
+            // 思考摘要在 reasoning 项的 summary[] 里，每项 {type:"summary_text", text}。
+            "reasoning" => {
+                for part in item.get("summary").and_then(|v| v.as_array()).into_iter().flatten() {
+                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                        reasoning.push_str(t);
+                    }
+                }
+            }
+            "function_call" => {
+                tool_calls.push(json!({
+                    "id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        // 空参数补成 `{}`：客户端会 JSON.parse 它。
+                        "arguments": item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .filter(|a| !a.trim().is_empty())
+                            .unwrap_or("{}"),
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), json!("assistant"));
+    message.insert("content".into(), json!(content));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(reasoning));
+    }
+    let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".into(), json!(tool_calls));
+    }
+    let u = rv.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let input = u.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let output = u.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    json!({
+        "id": rv.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0, "message": serde_json::Value::Object(message), "finish_reason": finish}],
+        // usage 归一化的口径和 XaiRespSse::usage 逐字相同 —— 尤其是缓存 token 只放
+        // prompt_tokens_details，绝不写 cache_read_input_tokens（那是 compute_cost
+        // 判形状的开关，映过去会把缓存 token 收两遍）。
+        "usage": {
+            "prompt_tokens": input,
+            "completion_tokens": output,
+            "total_tokens": input + output,
+            "prompt_tokens_details": {
+                "cached_tokens": u.pointer("/input_tokens_details/cached_tokens").and_then(|v| v.as_i64()).unwrap_or(0)
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": u.pointer("/output_tokens_details/reasoning_tokens").and_then(|v| v.as_i64()).unwrap_or(0)
+            }
+        }
+    })
+}
+
 fn anthropic_to_oai(av: &serde_json::Value, model: &str) -> serde_json::Value {
     let mut text = String::new();
     let mut reasoning = String::new();
@@ -7831,6 +8159,436 @@ impl ThinkingStreamTelemetry {
         .into_iter()
         .flatten()
         .min()
+    }
+}
+
+/// xAI **Responses** SSE → OpenAI chunk 流。
+///
+/// 和 `AnthSse` 同构：泵只认 `push` / `finish` / `usage` / `usage_is_authoritative`
+/// 四个方法加几个诊断读数，心跳、空闲斩、缓存、计费、SettleGuard 全在泵里、与协议无关，
+/// 按同一形状实现就能一分不改地白拿。
+///
+/// # 事件形状全部来自**真实抓包**
+///
+/// testdata/xai_responses_a.sse（普通一轮）和 _b.sse（23 条思考摘要 + 一次工具调用），
+/// 对着生产的 grok 线路抓的。**不要照 OpenAI Responses 的文档硬写**：这条线走中转，
+/// 事件名和字段位置都可能被改过，而 xAI 官方 REST 参考页里 reasoning.effort 那段
+/// 本身就是陈旧的（写着「只有 grok-4.3 支持、没有 xhigh」，和能力页直接矛盾）。
+///
+/// 实测到的事件（按出现顺序）：
+///   response.created / response.in_progress        —— 信封，只用来发一次 role
+///   response.output_item.added   item.type=reasoning     —— 思考块开
+///   response.reasoning_summary_part.added                —— 摘要段开
+///   response.reasoning_summary_text.delta   .delta       —— **思考文本**
+///   response.reasoning_summary_text.done / _part.done    —— 摘要段收
+///   response.output_item.added   item.type=function_call —— 工具开（call_id / name）
+///   response.function_call_arguments.delta  .delta       —— 工具参数（可能一次给完）
+///   response.function_call_arguments.done                —— 工具参数收
+///   response.content_part.added                          —— 正文段开
+///   response.output_text.delta   .delta                  —— **正文**
+///   response.output_text.done / content_part.done / output_item.done
+///   response.completed  .response.usage                  —— **usage 只在这里**
+///
+/// **没有 `data: [DONE]`**——这正是不能让 Responses 流落进 OpenAiSseValidator 的原因：
+/// 那个校验器会判「协议不完整」并给客户端抛 InvalidData，看着像上游挂了。
+/// 泵手里那个转换器。
+///
+/// 泵只认一组方法，谁实现都行——但这里用**枚举**而不是 `Box<dyn Trait>`：
+/// 两个实现都在本文件里、数量有界，枚举不需要新 trait、不装箱、
+/// 而且泵里那十几处 `conv.as_ref()` / `conv.as_mut()` 的调用点一个字都不用改。
+enum SseBridge {
+    Anth(AnthSse),
+    XaiResponses(XaiRespSse),
+}
+
+impl SseBridge {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            SseBridge::Anth(c) => c.push(bytes),
+            SseBridge::XaiResponses(c) => c.push(bytes),
+        }
+    }
+    fn finish(&self) -> Result<Vec<u8>, String> {
+        match self {
+            SseBridge::Anth(c) => c.finish(),
+            SseBridge::XaiResponses(c) => c.finish(),
+        }
+    }
+    fn usage(&self) -> serde_json::Value {
+        match self {
+            SseBridge::Anth(c) => c.usage(),
+            SseBridge::XaiResponses(c) => c.usage(),
+        }
+    }
+    fn usage_is_authoritative(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.usage_is_authoritative(),
+            SseBridge::XaiResponses(c) => c.usage_is_authoritative(),
+        }
+    }
+    fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
+        match self {
+            SseBridge::Anth(c) => c.thinking_telemetry(),
+            SseBridge::XaiResponses(c) => c.thinking_telemetry(),
+        }
+    }
+    fn saw_thinking_block(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.saw_thinking_block(),
+            SseBridge::XaiResponses(c) => c.saw_thinking_block(),
+        }
+    }
+    fn output_tokens(&self) -> i64 {
+        match self {
+            SseBridge::Anth(c) => c.output_tokens(),
+            SseBridge::XaiResponses(c) => c.output_tokens(),
+        }
+    }
+    fn stop_reason_label(&self) -> &str {
+        match self {
+            SseBridge::Anth(c) => c.stop_reason_label(),
+            SseBridge::XaiResponses(c) => c.stop_reason_label(),
+        }
+    }
+    fn thinking_only_end_turn(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.thinking_only_end_turn(),
+            SseBridge::XaiResponses(c) => c.thinking_only_end_turn(),
+        }
+    }
+    fn thinking_requested_but_none_returned(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.thinking_requested_but_none_returned(),
+            SseBridge::XaiResponses(c) => c.thinking_requested_but_none_returned(),
+        }
+    }
+    fn thinking_swallowed_by_upstream(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.thinking_swallowed_by_upstream(),
+            SseBridge::XaiResponses(c) => c.thinking_swallowed_by_upstream(),
+        }
+    }
+    fn thinking_block_never_opened(&self) -> bool {
+        match self {
+            SseBridge::Anth(c) => c.thinking_block_never_opened(),
+            SseBridge::XaiResponses(c) => c.thinking_block_never_opened(),
+        }
+    }
+    /// 遥测日志里那个 protocol 字段。以前硬写成 "anthropic"，加了第二种实现之后
+    /// 它会开始说谎——而那条日志正是「思考回没回来」的唯一诊断依据。
+    fn protocol_label(&self) -> &'static str {
+        match self {
+            SseBridge::Anth(_) => "anthropic",
+            SseBridge::XaiResponses(_) => "xai_responses",
+        }
+    }
+}
+
+struct XaiRespSse {
+    model: String,
+    buf: Vec<u8>,
+    role_sent: bool,
+    /// 上游的 output_index → OpenAI 侧的 tool_calls 下标。
+    ///
+    /// 两套下标必须桥接：Responses 的 output_index 把思考块也算一格（实测思考是 0、
+    /// 第一个工具是 1），而 OpenAI 的 tool_calls 下标必须从 0 连续排。直接透传的话
+    /// 客户端会看到一个跳号的数组。
+    tool_slots: std::collections::HashMap<i64, usize>,
+    next_tool_slot: usize,
+    saw_tool_call: bool,
+    saw_text: bool,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read: i64,
+    reasoning_tokens: i64,
+    input_usage_reported: bool,
+    output_usage_reported: bool,
+    thinking_telemetry: ThinkingStreamTelemetry,
+    started_at: Option<std::time::Instant>,
+    stop_reason: String,
+}
+
+impl XaiRespSse {
+    fn new(model: &str, started_at: Option<std::time::Instant>) -> Self {
+        Self {
+            model: model.to_string(),
+            buf: Vec::new(),
+            role_sent: false,
+            tool_slots: std::collections::HashMap::new(),
+            next_tool_slot: 0,
+            saw_tool_call: false,
+            saw_text: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            reasoning_tokens: 0,
+            input_usage_reported: false,
+            output_usage_reported: false,
+            thinking_telemetry: ThinkingStreamTelemetry::default(),
+            started_at,
+            stop_reason: String::new(),
+        }
+    }
+
+    fn chunk(&self, delta: serde_json::Value, finish: Option<&str>) -> Vec<u8> {
+        let choice = json!({"index":0,"delta":delta,"finish_reason": match finish { Some(f) => json!(f), None => serde_json::Value::Null }});
+        format!(
+            "data: {}\n\n",
+            json!({"object":"chat.completion.chunk","model":self.model,"choices":[choice]})
+        )
+        .into_bytes()
+    }
+
+    fn ensure_role(&mut self, out: &mut Vec<u8>) {
+        if !self.role_sent {
+            out.extend(self.chunk(json!({"role":"assistant","content":""}), None));
+            self.role_sent = true;
+        }
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.started_at.map(|t| t.elapsed().as_millis() as u64)
+    }
+
+    /// 第一件真事是什么（遥测用）。和 AnthSse 一样只记**第一次**。
+    fn note_first(&mut self, kind: &'static str) {
+        if self.thinking_telemetry.first_native_event_kind == "none" {
+            self.thinking_telemetry.first_native_event_kind = kind;
+            self.thinking_telemetry.first_native_event_ms = self.elapsed_ms();
+        }
+    }
+
+    fn handle(&mut self, ev: &serde_json::Value, out: &mut Vec<u8>) {
+        let ty = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match ty {
+            "response.created" | "response.in_progress" => {
+                self.ensure_role(out);
+            }
+            // ── 思考 ────────────────────────────────────────────────────────
+            //
+            // 两个事件名都认。实测这条线路走 reasoning_summary_text.delta，但 xAI 文档
+            // 把 reasoning_text.delta 和它并列，中转也可能只转发其中一个。两个都往同一个
+            // 出口灌是安全的：**同一次响应里只会来一种**（实测 b.sse 里 23 条全是 summary
+            // 那一种，一条 reasoning_text 都没有）。若哪天两种同时来，思考文本会翻倍——
+            // 下面那条测试用真抓包钉着当前形状，形状变了会红。
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                let Some(t) = ev.get("delta").and_then(|v| v.as_str()).filter(|t| !t.is_empty())
+                else {
+                    return;
+                };
+                self.note_first("thinking");
+                if self.thinking_telemetry.first_nonempty_thinking_delta_ms.is_none() {
+                    self.thinking_telemetry.first_nonempty_thinking_delta_ms = self.elapsed_ms();
+                }
+                self.thinking_telemetry.nonempty_thinking_deltas += 1;
+                self.thinking_telemetry.thinking_utf8_chars += t.chars().count();
+                self.ensure_role(out);
+                out.extend(self.chunk(json!({"reasoning_content": t}), None));
+            }
+            // ── 正文 ────────────────────────────────────────────────────────
+            "response.output_text.delta" => {
+                let Some(t) = ev.get("delta").and_then(|v| v.as_str()).filter(|t| !t.is_empty())
+                else {
+                    return;
+                };
+                self.note_first("text");
+                if self.thinking_telemetry.first_nonempty_text_delta_ms.is_none() {
+                    self.thinking_telemetry.first_nonempty_text_delta_ms = self.elapsed_ms();
+                }
+                self.thinking_telemetry.visible_text_utf8_chars += t.chars().count();
+                self.saw_text = true;
+                self.ensure_role(out);
+                out.extend(self.chunk(json!({"content": t}), None));
+            }
+            // ── 工具调用开始：名字和 call_id 在这里，参数在后面的 delta 里 ────
+            "response.output_item.added" => {
+                let item = ev.get("item").unwrap_or(&serde_json::Value::Null);
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                    return;
+                }
+                let idx = ev.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                // 上游下标 → OpenAI 下标。**同一个 output_index 只开一格**：中转重发
+                // 同一条 added 时不该多开一个空工具（AnthSse 也有同款去重）。
+                let slot = match self.tool_slots.get(&idx) {
+                    Some(s) => *s,
+                    None => {
+                        let s = self.next_tool_slot;
+                        self.next_tool_slot += 1;
+                        self.tool_slots.insert(idx, s);
+                        s
+                    }
+                };
+                self.saw_tool_call = true;
+                self.note_first("tool_use");
+                if self.thinking_telemetry.first_tool_use_start_ms.is_none() {
+                    self.thinking_telemetry.first_tool_use_start_ms = self.elapsed_ms();
+                }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                self.ensure_role(out);
+                out.extend(self.chunk(
+                    json!({"tool_calls":[{"index": slot, "id": call_id, "type": "function",
+                                          "function": {"name": name, "arguments": ""}}]}),
+                    None,
+                ));
+            }
+            "response.function_call_arguments.delta" => {
+                let Some(t) = ev.get("delta").and_then(|v| v.as_str()).filter(|t| !t.is_empty())
+                else {
+                    return;
+                };
+                let idx = ev.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                // 参数先到、added 没到（中转乱序）时也要有个格子，否则整串参数丢掉。
+                let slot = match self.tool_slots.get(&idx) {
+                    Some(s) => *s,
+                    None => {
+                        let s = self.next_tool_slot;
+                        self.next_tool_slot += 1;
+                        self.tool_slots.insert(idx, s);
+                        self.saw_tool_call = true;
+                        s
+                    }
+                };
+                if self.thinking_telemetry.first_nonempty_tool_delta_ms.is_none() {
+                    self.thinking_telemetry.first_nonempty_tool_delta_ms = self.elapsed_ms();
+                }
+                self.ensure_role(out);
+                out.extend(self.chunk(
+                    json!({"tool_calls":[{"index": slot, "function": {"arguments": t}}]}),
+                    None,
+                ));
+            }
+            // ── 收尾：usage 只在这里 ────────────────────────────────────────
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                if let Some(u) = ev.pointer("/response/usage") {
+                    self.harvest_usage(u);
+                }
+                if let Some(st) = ev.pointer("/response/status").and_then(|v| v.as_str()) {
+                    self.stop_reason = st.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Responses 的 usage 字段名和 OpenAI chat 完全不同，这里是唯一的归一化点。
+    ///
+    /// **只增不减**：中转可能在多个事件上报一个滚动值，最后那个（最大的）不能被早先的
+    /// 部分值盖掉。这条和 AnthSse::harvest_usage 同款。
+    fn harvest_usage(&mut self, u: &serde_json::Value) {
+        if let Some(v) = u.get("input_tokens").and_then(|v| v.as_i64()) {
+            self.input_tokens = self.input_tokens.max(v);
+            self.input_usage_reported = true;
+        }
+        if let Some(v) = u.get("output_tokens").and_then(|v| v.as_i64()) {
+            self.output_tokens = self.output_tokens.max(v);
+            self.output_usage_reported = true;
+        }
+        if let Some(v) = u.pointer("/input_tokens_details/cached_tokens").and_then(|v| v.as_i64()) {
+            self.cache_read = self.cache_read.max(v);
+        }
+        if let Some(v) = u
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(|v| v.as_i64())
+        {
+            self.reasoning_tokens = self.reasoning_tokens.max(v);
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        // **按行切**，和 OpenAiSseValidator / AnthSse 同款：一条 SSE 事件的 payload
+        // 就是一行 `data:`。`event:` 行只是标签，判据一律取 data 里的 `type` ——
+        // 中转可能不转发 event 行（实测这条线两者都有，但只信 JSON 更稳）。
+        //
+        // 只在**看到换行**时才消费，半行留在 buf 里等下一个 chunk：SSE 帧会被
+        // TCP 任意切开，这一点 AnthSse 的注释里也写着。
+        while let Some(newline) = self.buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = self.buf.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let Some(payload) = line.trim().strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            // 解不出来的行**跳过而不是报错**：中转偶尔混进心跳注释或自己的控制行，
+            // 为一行看不懂的东西把整轮打死不值得。真正的截断由 finish() 判。
+            let Ok(ev) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            self.handle(&ev, &mut out);
+        }
+        Ok(out)
+    }
+
+    fn finish(&self) -> Result<Vec<u8>, String> {
+        if !self.buf.iter().all(u8::is_ascii_whitespace) {
+            return Err("xAI Responses upstream stream ended with an incomplete SSE frame".into());
+        }
+        let mut out = Vec::new();
+        let reason = if self.saw_tool_call { "tool_calls" } else { "stop" };
+        out.extend(self.chunk(json!({}), Some(reason)));
+        out.extend_from_slice(b"data: [DONE]\n\n");
+        Ok(out)
+    }
+
+    fn usage(&self) -> serde_json::Value {
+        json!({
+            "input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+            // **cached 只放 prompt_tokens_details 这一层。**
+            //
+            // 绝不能写成 cache_read_input_tokens：那个键是 compute_cost 判「prompt 里
+            // 含不含缓存部分」的**形状开关**，映过去缓存 token 会被收两遍。
+            "prompt_tokens": self.input_tokens, "completion_tokens": self.output_tokens,
+            "total_tokens": self.input_tokens + self.output_tokens,
+            "prompt_tokens_details": {"cached_tokens": self.cache_read},
+            "completion_tokens_details": {"reasoning_tokens": self.reasoning_tokens},
+            "thinking_chars": self.thinking_telemetry.thinking_utf8_chars,
+        })
+    }
+
+    fn usage_is_authoritative(&self) -> bool {
+        self.input_usage_reported && self.output_usage_reported
+    }
+
+    fn thinking_telemetry(&self) -> ThinkingStreamTelemetry {
+        self.thinking_telemetry
+    }
+    fn saw_thinking_block(&self) -> bool {
+        self.thinking_telemetry.nonempty_thinking_deltas > 0
+    }
+    fn output_tokens(&self) -> i64 {
+        self.output_tokens
+    }
+    fn stop_reason_label(&self) -> &str {
+        if self.stop_reason.is_empty() { "unknown" } else { &self.stop_reason }
+    }
+    /// 其余三个「思考健康」判据在这条线路上一律返回 false。
+    ///
+    /// 它们守的是 Anthropic 那条路特有的形状（thinking 块开了但文本是空串，见
+    /// display:"omitted" 那段长注释）。Responses 上没有这个形状：思考要么以
+    /// reasoning_summary_text.delta 的形式带着文本来，要么根本不来。硬套过来只会
+    /// 制造假警报，而假警报会让真警报没人看。
+    fn thinking_only_end_turn(&self) -> bool {
+        false
+    }
+    /// 但**这一个**在这条路上是真判据，而且必须实现。
+    ///
+    /// 调用方（thinking_went_missing）已经在外面判过「这一轮要没要思考」了，这里只回答
+    /// 「回没回来」。它唯一的下游是**缓存闸**：要了思考却一个字都没回的那一份不许写进
+    /// 缓存——中转偶尔会把 Responses 降级成 chat/completions（那条路结构上不回思考正文），
+    /// 一旦把那一份缓存住，接下来一小时同一个请求体都会拿回这份「没有思考」的副本，
+    /// 而用户看到的就是「明明修好了怎么还是没有」。
+    fn thinking_requested_but_none_returned(&self) -> bool {
+        self.thinking_telemetry.nonempty_thinking_deltas == 0
+    }
+    fn thinking_swallowed_by_upstream(&self) -> bool {
+        false
+    }
+    fn thinking_block_never_opened(&self) -> bool {
+        false
     }
 }
 
@@ -9085,13 +9843,28 @@ pub async fn chat_completions(
             // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
             // else OpenAI-compat /chat/completions passthrough. Route ordering still prefers a
             // non-cooled line, but one inbound chat request selects exactly one line and sends once.
-            let candidate_anthropic = candidate.protocol == "anthropic";
-            let candidate_url = if candidate_anthropic {
-                format!("{}/messages", api_base(&candidate.base_url))
-            } else {
-                format!("{}/chat/completions", api_base(&candidate.base_url))
-            };
-            let mut candidate_upstream_body = if candidate_anthropic {
+            let candidate_wire = Wire::of(&candidate.protocol);
+            // **保留这一行不动。** 下面还有五处读它（思考钳位 / 遥测 / 1M 上下文 /
+            // beta 头 / 请求构造），它们的语义全都是「是不是 anthropic」而不是「是不是
+            // 非 openai」，跟着改类型只会把两条既有协议的 diff 撑大、把风险带到它们身上。
+            let candidate_anthropic = candidate_wire == Wire::Anthropic;
+            let candidate_url = format!("{}{}", api_base(&candidate.base_url), candidate_wire.path());
+            let mut candidate_upstream_body = if candidate_wire == Wire::XaiResponses {
+                match oai_to_xai_responses(&body, candidate.effort_passthrough) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        err_status = 400;
+                        err_low = format!("xAI Responses request conversion failed: {err}")
+                            .to_lowercase();
+                        // **不置 upstream_answered_with_error。** 和 Anthropic 那条翻译
+                        // 失败分支逐字同款：翻译失败时一个字节都没发出去，换下一条候选
+                        // 是安全的；而那个标志的语义是「上游完整地回了一个错误响应」，
+                        // 多置一处就等于把「卡死」也放进了换线路径。
+                        // （models.rs 的 one_send_per_route_… 那条测试正面钉着它只出现一次。）
+                        continue;
+                    }
+                }
+            } else if candidate_anthropic {
                 match oai_to_anthropic_with_cache(
                     &body,
                     route_supports_prompt_cache(candidate),
@@ -9240,7 +10013,42 @@ pub async fn chat_completions(
                 } else {
                     String::new()
                 };
-                let mut req = if candidate_anthropic {
+                let mut req = if candidate_wire == Wire::XaiResponses {
+                    // ── xAI Responses ────────────────────────────────────────────
+                    //
+                    // 认证头和 chat/completions 一模一样（实测），所以这里只做两件事：
+                    // 翻 body，和把**四件 Grok 专用的事**带过来。那四件今天全长在下面
+                    // 那条 openai 分支里，判据是 _is_xai_route（按 model_id 前缀或
+                    // base_url 含 x.ai，**不看 protocol**）——把一条 Grok 线路翻成新协议
+                    // 时它们一个都不会走，而那正是「换了协议 Grok 反而更差」的来源：
+                    //   ① 顶层 anyOf/oneOf/allOf 剥离 → 已在 oai_to_xai_responses 里做
+                    //      （扁平 tools 上做，形状不同，不能照抄下面那段）
+                    //   ② prompt_cache_key（提示缓存的粘性键）→ 下面这段
+                    //   ③ x-grok-conv-id（会话粒度的机器亲和）→ 下面这段
+                    //   ④ 工具参数完整性 → 由 XaiRespSse 在响应侧做，同 AnthSse
+                    let _run_id = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok());
+                    let _affinity = route_needs_cache_affinity(&model_id, &candidate.base_url);
+                    if _affinity {
+                        if let Some(o) = candidate_upstream_body.as_object_mut() {
+                            o.insert(
+                                "prompt_cache_key".into(),
+                                serde_json::Value::String(openai_prompt_cache_key(&body, _run_id)),
+                            );
+                        }
+                    }
+                    let mut r = req0
+                        .header("Authorization", format!("Bearer {}", candidate_key))
+                        .header("User-Agent", CODEX_USER_AGENT);
+                    if _affinity && _is_xai_route(&model_id, &candidate.base_url) {
+                        let conv = _run_id
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(|v| v.chars().take(64).collect::<String>())
+                            .unwrap_or_else(|| openai_prompt_cache_key(&body, None));
+                        r = r.header("x-grok-conv-id", conv);
+                    }
+                    r.json(&candidate_upstream_body)
+                } else if candidate_anthropic {
                     req0
                         .header("x-api-key", &candidate_key)
                         .header("anthropic-version", "2023-06-01")
@@ -9739,7 +10547,9 @@ pub async fn chat_completions(
         }
     };
     let status = resp.status();
-    let anthropic = conn.protocol == "anthropic";
+    // 响应侧的协议判据取自**胜出的那条线路**（conn），不是请求侧循环里的候选。
+    let wire = Wire::of(&conn.protocol);
+    let anthropic = wire == Wire::Anthropic;
 
     if streaming {
         // 深思考请求（xhigh/max/带 thinking 预算）静默期可超 3 分钟：固定 180s 的上游
@@ -9773,7 +10583,13 @@ pub async fn chat_completions(
         let request_id_task = request_id.clone();
         let gateway_request_started_at_task = gateway_request_started_at;
         // 思考钳位探测：只对"开了思考的 Anthropic 原生请求"检测丢块签名。
-        let thinking_clip_probe = anthropic
+        // 「这一轮要没要思考」——两条**会翻译**的协议都要判。
+        //
+        // 原来写死 `anthropic &&`，于是 xai_responses 线路上一条「要了思考却没回」的
+        // 坏流会被照常缓存一小时（缓存闸 thinking_went_missing 依赖它）。
+        // 钳位记账那一支不受影响：那条另外还要 thinking_only_end_turn，而
+        // XaiRespSse 对它恒返回 false（Anthropic 特有的形状，套过来是假警报）。
+        let thinking_clip_probe = (anthropic || wire == Wire::XaiResponses)
             && (body.get("thinking").is_some()
                 || body
                     .get("reasoning_effort")
@@ -9816,16 +10632,26 @@ pub async fn chat_completions(
             let mut client_closed = false;
             let mut stream_failure: Option<String> = None;
             // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
-            let mut conv = if anthropic {
-                Some(AnthSse::with_tool_argument_rules_started_at(
+            let mut conv = match wire {
+                Wire::Anthropic => Some(SseBridge::Anth(
+                    AnthSse::with_tool_argument_rules_started_at(
+                        &req_model,
+                        tool_argument_rules.clone(),
+                        gateway_request_started_at_task,
+                    ),
+                )),
+                Wire::XaiResponses => Some(SseBridge::XaiResponses(XaiRespSse::new(
                     &req_model,
-                    tool_argument_rules.clone(),
-                    gateway_request_started_at_task,
-                ))
-            } else {
-                None
+                    Some(gateway_request_started_at_task),
+                ))),
+                Wire::OpenAi => None,
             };
-            let mut openai_validator = if anthropic {
+            // **有转换器就不能再挂 OpenAiSseValidator。** 它判的是 OpenAI 兼容流的
+            // 完整性，而 Responses 流里根本没有 `data: [DONE]` —— 挂上去会判「协议
+            // 不完整」并给客户端抛 InvalidData，看着像上游挂了。
+            // 这个「有转换器 ⇒ 不校验」的语义本来就写在下面每一处 conv.is_none() 里，
+            // 这里只是把构造条件跟着改成同一个判据。
+            let mut openai_validator = if conv.is_some() {
                 None
             } else {
                 Some(OpenAiSseValidator::with_tool_argument_rules(
@@ -10079,7 +10905,10 @@ pub async fn chat_completions(
                 tracing::info!(
                     request_id = request_id_task.as_deref().unwrap_or(""),
                     model = %req_model,
-                    protocol = "anthropic",
+                    // 以前这里硬写成 "anthropic"。加了第二种转换器之后它会开始说谎，
+                    // 而这条日志正是「思考回没回来」的唯一诊断依据——说谎的诊断比没有
+                    // 诊断更糟。
+                    protocol = converter.protocol_label(),
                     stream_result = if complete { "completed" } else { "failed" },
                     nonempty_thinking_delta_chunks = thinking.nonempty_thinking_deltas,
                     thinking_utf8_chars = thinking.thinking_utf8_chars,
@@ -10188,10 +11017,13 @@ pub async fn chat_completions(
             });
         }
         // Anthropic native response → OpenAI shape for the IDE (usage kept in a form compute_cost bills).
-        let mut data = if anthropic {
-            anthropic_to_oai(&raw, &model_id)
-        } else {
-            raw
+        let mut data = match wire {
+            Wire::Anthropic => anthropic_to_oai(&raw, &model_id),
+            // 不翻的话客户端拿到的是 `{output:[...]}`，读不到 choices —— 表现成
+            // 「模型什么都没说」。非流式这条路 IDE 走得少（辅助调用会用），但错法
+            // 和流式一样安静。
+            Wire::XaiResponses => xai_responses_to_oai(&raw, &model_id),
+            Wire::OpenAi => raw,
         };
         // Repair upstream's malformed `tool_calls[*].function.arguments`. Some relays
         // (Claude→OpenAI-compat translators) concat the initial empty-arg placeholder
@@ -10869,6 +11701,28 @@ mod billing_tests {
     /// 出口那侧的 clean_protocol 一直是 trim + 小写 + 400；线路这侧原来是大小写敏感
     /// 精确匹配、认不出就 `_ => m.protocol`。同一个字段两个表单行为相反：
     /// 出口填错当场红，线路填错**保存成功但一个字没变**，而运维以为切过去了。
+    #[test]
+    /// 两侧白名单读的是同一份常量。
+    ///
+    /// 出口协议会覆盖线路协议，只放行一侧的话不会报任何错，只会安静地走错路。
+    #[test]
+    fn both_protocol_whitelists_read_the_same_constant() {
+        let src = include_str!("models.rs");
+        assert!(
+            src.contains("Some(p) if PROTOCOLS.contains(&p.as_str()) => p,"),
+            "线路保存又手抄了一份取值清单",
+        );
+        assert!(
+            super::PROTOCOLS.contains(&"xai_responses"),
+            "xai_responses 不在取值表里 —— 桥写了也存不进 DB，永远走不到",
+        );
+        // 报错文案是从同一份常量拼的：手写的话会出现「代码收了新值、文案还说只有两个」。
+        assert!(
+            src.contains(r#""上游协议只能是 {}（收到「{p}」）","#),
+            "报错文案没跟着常量走",
+        );
+    }
+
     #[test]
     fn a_bad_protocol_on_a_route_is_rejected_not_silently_kept() {
         let src = include_str!("models.rs");
@@ -11667,6 +12521,229 @@ mod billing_tests {
             upstream_failure_status(500, "no available provider account"),
             StatusCode::FAILED_DEPENDENCY,
         );
+    }
+
+    /// xAI Responses → OpenAI 的翻译，喂的是**真抓包**。
+    ///
+    /// 事件形状一律来自 testdata/xai_responses_*.sse（对着生产 grok 线路抓的：
+    /// a 是普通一轮，b 含 23 条思考摘要增量 + 一次工具调用）。
+    ///
+    /// 为什么必须用抓包而不是手写合成事件：这条线走中转，事件名和字段位置都可能
+    /// 被改过；而 xAI 官方 REST 参考页里 reasoning.effort 那段本身就是陈旧的
+    /// （写着「只有 grok-4.3 支持、没有 xhigh」，和能力页直接矛盾）。手写的话，
+    /// 测的是「我以为 xAI 长这样」。AnthSse 那条同款测试的注释写的是
+    /// `Event shapes copied verbatim from a real zyz streaming response`，同一个道理。
+    #[test]
+    fn xai_responses_stream_becomes_openai_chunks() {
+        let raw = include_str!("../testdata/xai_responses_b.sse");
+        let mut sse = super::XaiRespSse::new("grok-4.6", None);
+        // 逐字节喂，模拟 TCP 把 SSE 帧切在任意位置。半行必须留在 buf 里等下一片，
+        // 一次性喂整份是测不出这个的。
+        let mut out = Vec::new();
+        for b in raw.as_bytes().chunks(7) {
+            out.extend(sse.push(b).expect("push 不该失败"));
+        }
+        out.extend(sse.finish().expect("finish 不该失败"));
+        let text = String::from_utf8(out).expect("输出必须是 UTF-8");
+
+        let chunks: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|p| *p != "[DONE]")
+            .map(|p| serde_json::from_str(p).expect("每一条都必须是合法 JSON"))
+            .collect();
+        assert!(chunks.len() > 20, "只翻出 {} 条 chunk", chunks.len());
+        for c in &chunks {
+            assert_eq!(c["object"], "chat.completion.chunk", "形状必须是 OpenAI 的 chunk");
+            assert_eq!(c["model"], "grok-4.6");
+        }
+
+        // ① 思考真的翻出来了 —— 这是整条桥存在的理由。
+        let thinking: String = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str())
+            .collect();
+        assert!(
+            thinking.contains("weather in Beijing"),
+            "思考摘要没翻出来（拿到的是 {:?}）",
+            &thinking.chars().take(80).collect::<String>()
+        );
+        assert!(thinking.len() > 60, "思考只翻出 {} 字节，抓包里有 23 条增量", thinking.len());
+
+        // ② 工具调用：名字、call_id、参数三样都要到，且下标从 0 开始连续。
+        //    上游的 output_index 把思考块也算一格（实测思考是 0、工具是 1），
+        //    直接透传的话客户端会看到一个跳号的 tool_calls 数组。
+        let tool_chunks: Vec<&serde_json::Value> = chunks
+            .iter()
+            .filter(|c| c["choices"][0]["delta"]["tool_calls"].is_array())
+            .collect();
+        assert!(!tool_chunks.is_empty(), "工具调用一条都没翻出来");
+        for c in &tool_chunks {
+            assert_eq!(
+                c["choices"][0]["delta"]["tool_calls"][0]["index"], 0,
+                "第一个工具的 OpenAI 下标必须是 0，不是上游的 output_index",
+            );
+        }
+        let name = tool_chunks
+            .iter()
+            .find_map(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str())
+            .unwrap_or("");
+        assert_eq!(name, "get_weather");
+        let call_id = tool_chunks
+            .iter()
+            .find_map(|c| c["choices"][0]["delta"]["tool_calls"][0]["id"].as_str())
+            .unwrap_or("");
+        assert!(call_id.starts_with("call-"), "call_id 没带过来：{call_id:?}");
+        let args: String = tool_chunks
+            .iter()
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .collect();
+        assert!(args.contains("\"city\""), "工具参数没翻出来：{args:?}");
+        serde_json::from_str::<serde_json::Value>(&args).expect("拼起来的参数必须是合法 JSON");
+
+        // ③ 收尾：有工具调用时 finish_reason 必须是 tool_calls，且要发 [DONE]。
+        //    客户端那侧是 OpenAI 形状的解析器，少了这两样它不知道这一轮结束了。
+        let finish = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["finish_reason"].as_str())
+            .last();
+        assert_eq!(finish, Some("tool_calls"));
+        assert!(text.ends_with("data: [DONE]\n\n"), "没有终止帧");
+        // 首个 chunk 必须先立 role，否则客户端拼不出 assistant 消息。
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+
+        // ④ usage：只在 response.completed 里，字段名和 OpenAI 完全不同。
+        let u = sse.usage();
+        assert!(sse.usage_is_authoritative(), "usage 没被认领 —— 会按 0 结账");
+        assert!(u["prompt_tokens"].as_i64().unwrap_or(0) > 0);
+        assert!(u["completion_tokens"].as_i64().unwrap_or(0) > 0);
+        // **cached 只放 prompt_tokens_details 这一层。**写成 cache_read_input_tokens
+        // 会把 compute_cost 的形状开关拨过去，缓存 token 被收两遍。
+        assert!(u.get("cache_read_input_tokens").is_none(), "缓存 token 会被双收");
+        assert!(u["prompt_tokens_details"]["cached_tokens"].is_i64());
+        assert!(u["completion_tokens_details"]["reasoning_tokens"].is_i64());
+
+        // ⑤ 遥测：思考增量被数上了。这是「思考回没回来」在日志里唯一的判据。
+        let t = sse.thinking_telemetry();
+        assert!(t.nonempty_thinking_deltas >= 20, "思考增量只数到 {}", t.nonempty_thinking_deltas);
+        assert!(t.thinking_utf8_chars > 60);
+        assert!(sse.saw_thinking_block());
+    }
+
+    /// 普通一轮（没有思考、没有工具）也要翻得对，且不许凭空造出思考。
+    #[test]
+    fn xai_responses_plain_turn_has_text_and_no_phantom_thinking() {
+        let raw = include_str!("../testdata/xai_responses_a.sse");
+        let mut sse = super::XaiRespSse::new("grok-4.6", None);
+        let mut out = sse.push(raw.as_bytes()).expect("push");
+        out.extend(sse.finish().expect("finish"));
+        let text = String::from_utf8(out).unwrap();
+        let chunks: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|p| *p != "[DONE]")
+            .map(|p| serde_json::from_str(p).unwrap())
+            .collect();
+
+        let content: String = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert!(!content.trim().is_empty(), "正文没翻出来");
+        assert_eq!(
+            sse.thinking_telemetry().nonempty_thinking_deltas,
+            0,
+            "这一轮上游没回思考，不许凭空造出来",
+        );
+        assert!(!sse.saw_thinking_block());
+        // 没有工具调用时 finish_reason 是 stop。
+        let finish = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["finish_reason"].as_str())
+            .last();
+        assert_eq!(finish, Some("stop"));
+    }
+
+    /// 请求侧：OpenAI chat body → Responses body。
+    #[test]
+    fn oai_body_becomes_a_responses_body() {
+        let body = json!({
+            "model": "grok-4.6",
+            "stream": true,
+            "max_tokens": 1024,
+            "reasoning_effort": "xhigh",
+            "stream_options": {"include_usage": true},
+            "messages": [
+                {"role": "system", "content": "你是助手"},
+                {"role": "user", "content": "北京天气"},
+                {"role": "assistant", "content": "我查一下", "tool_calls": [
+                    {"id": "call-1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"BJ\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "晴 25C"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather", "description": "查天气",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }}]
+        });
+        let out = super::oai_to_xai_responses(&body, true).expect("翻译不该失败");
+
+        // messages → input，且形状保留。
+        let input = out["input"].as_array().expect("input 必须是数组");
+        assert_eq!(input[0]["role"], "system", "system 照样放在 input 里");
+        assert_eq!(input[1]["role"], "user");
+        // 助手轮的正文和工具调用**拆成并列的两条 item**（Responses 的 item 是扁平的）。
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["call_id"], "call-1");
+        assert_eq!(input[3]["name"], "get_weather");
+        // 工具结果换成独立 item。
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call-1");
+        assert_eq!(input[4]["output"], "晴 25C");
+
+        // tools 必须**摊平** —— 包一层 function 会被上游 400（实测原文
+        // "tools[0].name 不能为空"）。
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["name"], "get_weather");
+        assert!(out["tools"][0].get("function").is_none(), "tools 没摊平");
+
+        assert_eq!(out["max_output_tokens"], 1024, "max_tokens 要改名");
+        assert!(out.get("max_tokens").is_none(), "别同时发两个名字");
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
+        assert!(out.get("reasoning_effort").is_none(), "档位要放进 reasoning 对象");
+        // **stream_options 不许带过去**：Responses 上没有这个参数，usage 恒在
+        // response.completed 事件里。带上去就是一个未知参数。
+        assert!(out.get("stream_options").is_none());
+        assert!(out.get("messages").is_none(), "别把 messages 也留着");
+        assert_eq!(out["stream"], true);
+
+        // 白名单式重建：没被显式搬过去的键不许出现。
+        let known = [
+            "model", "input", "tools", "tool_choice", "reasoning", "stream",
+            "max_output_tokens", "temperature", "top_p", "user", "prompt_cache_key",
+        ];
+        for k in out.as_object().unwrap().keys() {
+            assert!(known.contains(&k.as_str()), "多带了一个没想到的键：{k}");
+        }
+    }
+
+    /// 目录没收录、线路也没开直通时，不许拿一个上游可能不认的档位去赌。
+    #[test]
+    fn an_unsupported_effort_falls_back_instead_of_gambling() {
+        let body = json!({
+            "model": "some-unknown-model",
+            "reasoning_effort": "xhigh",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = super::oai_to_xai_responses(&body, false).expect("翻译不该失败");
+        assert_eq!(out["reasoning"]["effort"], "high", "目录不认的档位要退到 high");
+        // 线路开了直通就照发 —— 用户在界面上拨到「极限」，网关不该替他改主意。
+        let out = super::oai_to_xai_responses(&body, true).expect("翻译不该失败");
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
     }
 
     /// 「400 就不换线」那道闸必须**按协议**判。

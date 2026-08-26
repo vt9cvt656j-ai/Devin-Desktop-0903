@@ -1,5 +1,5 @@
 use axum::async_trait;
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -1233,6 +1233,168 @@ pub async fn admin_users(
     Ok(Json(users))
 }
 
+/// 「这个人现在是有效会员吗」——**全站只有这一处定义**。
+///
+/// 它同时被三个地方用：列表的筛选、四个统计卡片里的「有效会员」、以及前端每一行的徽章。
+/// 前两个在这里（同一个常量拼进两条 SQL），第三个在 Customers.tsx 的 `isActive`。
+/// 这条口径一旦分叉，症状是「筛选出 13 个，卡片写 12 个」——两边都不报错，谁也说不清哪个对。
+/// 本仓库最常见的一类 bug（见 `refresh_interval_is_a_single_source_of_truth` 那条注释）。
+///
+/// `plan_expires_at IS NULL` 算**有效**而不是过期：那是「永久」，和前端的
+/// `!u.plan_expires_at || …` 一致。
+const ACTIVE_MEMBER_SQL: &str =
+    "plan <> '' AND plan <> 'none' AND (plan_expires_at IS NULL OR plan_expires_at > now())";
+
+/// 一页最多多少行。上限存在的理由：`page_size` 是客户端传的，不夹住的话一条
+/// `?page_size=999999` 就等于把全表拉下来，而这个接口本来就是为了**不**这么干才加的。
+const CUSTOMERS_MAX_PAGE_SIZE: i64 = 200;
+const CUSTOMERS_DEFAULT_PAGE_SIZE: i64 = 20;
+
+#[derive(Deserialize)]
+pub struct CustomersQuery {
+    pub q: Option<String>,
+    pub filter: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+/// 把用户输入变成一个 LIKE 模式，并且**转义掉通配符**。
+///
+/// 不转义的话，搜 `100%` 会把 `%` 当成「任意字符」，搜出全表；搜 `a_b` 会匹配 `axb`。
+/// 用户在搜索框里打的是字面量，不是模式。Postgres 的 LIKE 默认转义符就是反斜杠，
+/// 所以反斜杠自己也要先转义，且必须**排在最前**——否则后面补的那些反斜杠会被再转一次。
+fn like_pattern(raw: &str) -> String {
+    let escaped = raw
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// 页码从 1 起。0、负数、超大值都夹回合法区间，而不是报错——分页控件不该因为
+/// 一个坏参数就把整屏变成错误页。
+fn clamp_page(raw: Option<i64>) -> i64 {
+    raw.unwrap_or(1).max(1)
+}
+
+fn clamp_page_size(raw: Option<i64>) -> i64 {
+    raw.unwrap_or(CUSTOMERS_DEFAULT_PAGE_SIZE)
+        .clamp(1, CUSTOMERS_MAX_PAGE_SIZE)
+}
+
+/// 列表的 WHERE。`$1` = 搜索模式（NULL 表示不搜），`$2` = 筛选项（NULL 表示全部）。
+///
+/// 筛选项走的是**绑定参数里的等值比较**，不是把字符串拼进 SQL。看着绕，但这一段是
+/// 唯一一处让用户输入影响 SQL 结构的地方，拼字符串就等于开了注入的门。
+fn customers_where() -> String {
+    format!(
+        "WHERE ($1::text IS NULL OR email ILIKE $1 OR role ILIKE $1 OR plan ILIKE $1 OR id::text ILIKE $1) \
+           AND ($2::text IS NULL OR ( \
+                 ($2 = 'member' AND ({active})) \
+              OR ($2 = 'none'   AND NOT ({active})) \
+              OR ($2 = 'admin'  AND role = 'admin') \
+              OR ($2 NOT IN ('member', 'none', 'admin') AND plan = $2) \
+           ))",
+        active = ACTIVE_MEMBER_SQL,
+    )
+}
+
+/// GET /api/admin/customers —— 按页取客户，带搜索、筛选和全量统计。
+///
+/// # 为什么不是给 `/api/admin/users` 加参数
+///
+/// 那个接口还有第二个消费者：总览页的套餐分布和注册趋势两张图，要的是「最近 500 位的
+/// 完整名单」而不是某一页。两件事的正确答案不一样，塞进一个接口就得靠参数分叉，
+/// 于是每个调用点都要知道另一个调用点想要什么。
+///
+/// # 为什么搜索和筛选必须跟着一起搬到服务端
+///
+/// 分页之后客户端手里只有当页那 20 行。搜索还留在前端就变成「在这 20 行里搜」——
+/// 那不是搜索，是骗人。之前没这个问题，只是因为前端一次就把（最多 500 行的）全量拿在手里。
+///
+/// # 四个统计卡片算的是全量
+///
+/// 它们走一条**独立的聚合**，和上面的 WHERE 无关：卡片回答的是「这盘生意现在什么样」，
+/// 不是「你当前筛出来的这堆什么样」。这也是改动前的语义（前端从未筛选的 `users` 上数），
+/// 搬过来时保持不变。
+pub async fn admin_customers(
+    State(state): State<AppState>,
+    claims: Claims,
+    Query(qs): Query<CustomersQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if claims.role != "admin" {
+        return Err(AppError::forbidden("需要管理员权限"));
+    }
+
+    let pattern = qs
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(like_pattern);
+    let filter = qs
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let page_size = clamp_page_size(qs.page_size);
+    let page = clamp_page(qs.page);
+
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM users {}",
+        customers_where()
+    ))
+    .bind(pattern.as_deref())
+    .bind(filter.as_deref())
+    .fetch_one(&state.db)
+    .await?;
+
+    // 页码可能落在末页之后（筛选变窄、或别人刚删了人）。夹回最后一页，而不是回一页空表——
+    // 空表看着像「没有这个人」，那是另一件事。
+    let pages = ((total + page_size - 1) / page_size).max(1);
+    let page = page.min(pages);
+
+    // 排序补一个 id：只按 created_at 排的话，同一秒注册的几行在两次查询之间顺序可以变，
+    // 于是翻页会**重复或漏掉**行——行数越多越明显，也最难被发现。
+    let users = sqlx::query_as::<_, User>(&format!(
+        "SELECT * FROM users {} ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
+        customers_where()
+    ))
+    .bind(pattern.as_deref())
+    .bind(filter.as_deref())
+    .bind(page_size)
+    .bind((page - 1) * page_size)
+    .fetch_all(&state.db)
+    .await?;
+
+    // `drained` 要和前端 windowUse() 逐字对齐：存的是「本时段还剩多少」，
+    // left = clamp(quota_window_cents, 0, cap)，cap > 0 时 left <= 0 等价于原值 <= 0。
+    let stats = sqlx::query_as::<_, (i64, i64, i64, i64)>(&format!(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE {active}), \
+                count(*) FILTER (WHERE quota_window_cap_cents > 0 AND quota_window_cents <= 0), \
+                count(*) FILTER (WHERE last_login_at > now() - interval '7 days') \
+         FROM users",
+        active = ACTIVE_MEMBER_SQL,
+    ))
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(json!({
+        "users": users,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "stats": {
+            "total": stats.0,
+            "members": stats.1,
+            "drained": stats.2,
+            "recent": stats.3,
+        },
+    })))
+}
+
 #[derive(Deserialize)]
 pub struct SetRoleReq {
     pub role: String,
@@ -1287,6 +1449,140 @@ pub async fn delete_user(
         return Err(AppError::bad("用户不存在"));
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod customers_page_tests {
+    use super::{
+        clamp_page, clamp_page_size, customers_where, like_pattern, ACTIVE_MEMBER_SQL,
+        CUSTOMERS_MAX_PAGE_SIZE,
+    };
+
+    /// 搜索框里打的是**字面量**，不是 LIKE 模式。
+    ///
+    /// 不转义的话，搜 `100%` 里的 `%` 会当成「任意字符」——一个套餐名都没打完就搜出全表；
+    /// 搜 `a_b` 会连 `axb` 一起匹配。两种都不报错，只是结果多得莫名其妙。
+    #[test]
+    fn a_wildcard_typed_by_a_human_is_matched_literally() {
+        assert_eq!(like_pattern("abc"), "%abc%");
+        assert_eq!(like_pattern("100%"), "%100\\%%");
+        assert_eq!(like_pattern("a_b"), "%a\\_b%");
+        // 反斜杠必须**先**转义。顺序反了的话，为 `%` 补的那个反斜杠会被再转一次，
+        // 于是 `\%` 变成 `\\%`：反斜杠自己被转义了，`%` 反而重新变回通配符。
+        assert_eq!(like_pattern("a\\%b"), "%a\\\\\\%b%");
+    }
+
+    /// 页大小是客户端传的，不夹住的话一条 `?page_size=999999` 就等于把全表拉下来 ——
+    /// 而这个接口本来就是为了**不**这么干才加的。
+    #[test]
+    fn a_client_cannot_ask_for_the_whole_table_in_one_page() {
+        assert_eq!(clamp_page_size(Some(999_999)), CUSTOMERS_MAX_PAGE_SIZE);
+        assert_eq!(clamp_page_size(Some(0)), 1);
+        assert_eq!(clamp_page_size(Some(-5)), 1);
+        assert_eq!(clamp_page_size(Some(20)), 20);
+        assert_eq!(clamp_page_size(None), super::CUSTOMERS_DEFAULT_PAGE_SIZE);
+        // 页码同理：坏参数夹回合法值，不是把整屏变成错误页。
+        assert_eq!(clamp_page(Some(0)), 1);
+        assert_eq!(clamp_page(Some(-3)), 1);
+        assert_eq!(clamp_page(None), 1);
+        assert_eq!(clamp_page(Some(7)), 7);
+    }
+
+    /// 筛选项是用户传的字符串，**只能**作为绑定参数参与等值比较，不许拼进 SQL。
+    ///
+    /// 这是整条查询里唯一一处让用户输入影响 SQL 结构的地方。写成拼接会短几行，
+    /// 也就同时开了注入的门。
+    #[test]
+    fn the_filter_never_reaches_the_sql_as_text() {
+        let w = customers_where();
+        assert!(w.contains("$2::text IS NULL"), "筛选项没走绑定参数：{w}");
+        assert!(w.contains("$1::text IS NULL"), "搜索词没走绑定参数：{w}");
+        // format! 只拼了 ACTIVE_MEMBER_SQL 这一个常量进去，别的占位符一个都不该有。
+        assert!(!w.contains('{'), "WHERE 里还有没替换掉的占位符：{w}");
+    }
+
+    /// 「有效会员」这条口径全站只能有一处。
+    ///
+    /// 它同时被三个地方用：列表筛选（`filter=member`）、统计卡片里的「有效会员」、
+    /// 以及前端每一行的徽章。前两个都在服务端，靠同一个常量拼进两条 SQL；
+    /// 分叉的症状是「筛出来 13 个，卡片写 12 个」——两边都不报错，谁也说不清哪个对。
+    #[test]
+    fn active_membership_has_exactly_one_definition() {
+        // 列表那侧：member 和 none 是同一个判据的正反面，所以要出现两次。
+        assert_eq!(
+            customers_where().matches(ACTIVE_MEMBER_SQL).count(),
+            2,
+            "member / none 两个分支必须共用同一条判据",
+        );
+        // 统计那侧：从 handler 的源文本里取，确认它也没有自己另写一份。
+        let src = include_str!("auth.rs");
+        let at = src
+            .find("\npub async fn admin_customers(")
+            .expect("admin_customers 改名了 —— 这条测试守的是它的 SQL");
+        let end = src[at + 1..]
+            .find("\n#[derive(")
+            .map(|i| at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("fn active_membership_has_exactly_one_definition"),
+            "切片切进测试模块了，下面的断言会匹配到自己写的字面量",
+        );
+        assert!(
+            body.contains("count(*) FILTER (WHERE {active})"),
+            "统计里的「有效会员」没有引用同一个常量，口径会漂",
+        );
+        // 「时段额度用尽」要和前端 windowUse() 对齐：cap > 0 且本时段剩余 <= 0。
+        assert!(
+            body.contains("quota_window_cap_cents > 0 AND quota_window_cents <= 0"),
+            "「用尽」的判据变了，和前端那条会对不上",
+        );
+        // 翻页要有稳定全序。只按 created_at 排的话，同一秒注册的几行在两次查询之间
+        // 顺序可以变，于是翻页**重复或漏掉**行 —— 行数越多越明显，也最难被发现。
+        assert!(
+            body.contains("ORDER BY created_at DESC, id DESC"),
+            "排序少了 id 这个 tiebreaker，翻页会重复或漏行",
+        );
+    }
+
+    /// 分页之后，搜索和统计**必须**留在服务端。
+    ///
+    /// 客户端手里只有当页那 20 行。在这 20 行里再筛一遍不是筛选，是骗人；
+    /// 在这 20 行上数「有效会员」也一样，翻一页数字就变。
+    /// 改动前没这个问题，只是因为前端一次就把（最多 500 行的）全量拿在手里。
+    #[test]
+    fn the_console_does_not_recount_or_refilter_a_single_page() {
+        let ui = include_str!("../admin-ui/src/pages/Customers.tsx");
+        assert!(
+            ui.contains("/api/admin/customers?"),
+            "列表没走分页接口",
+        );
+        for gone in [
+            "users.filter(isActive).length",
+            "const kw = q.trim().toLowerCase();",
+        ] {
+            assert!(!ui.contains(gone), "前端还在自己数/自己筛：{gone}");
+        }
+        assert!(ui.contains("stats.members"), "统计卡片没读服务端的数");
+        // 前端的每页行数超过服务端上限会被夹住，页数就算错了 —— 分页控件说有 5 页，
+        // 实际翻到第 3 页就没了。页大小现在是四张表共用的（components/Pager.tsx），
+        // 所以从那里读：这条断言因此同时守住了另外三张表。
+        let pager = include_str!("../admin-ui/src/components/Pager.tsx");
+        let ps: i64 = pager
+            .split("export const PAGE_SIZE = ")
+            .nth(1)
+            .and_then(|t| t.split(';').next())
+            .and_then(|t| t.trim().parse().ok())
+            .expect("Pager.tsx 里找不到 PAGE_SIZE");
+        assert!(
+            ui.contains("PAGE_SIZE") && ui.contains("@/components/Pager"),
+            "客户页没在用共享的分页组件了，这条上限断言就守不到它",
+        );
+        assert!(
+            ps >= 1 && ps <= CUSTOMERS_MAX_PAGE_SIZE,
+            "前端每页 {ps} 行，超出服务端上限 {CUSTOMERS_MAX_PAGE_SIZE}",
+        );
+    }
 }
 
 #[cfg(test)]

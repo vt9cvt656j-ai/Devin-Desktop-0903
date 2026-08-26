@@ -302,7 +302,12 @@ export function RouteHealth() {
                         </div>
                         <p className="text-xs text-muted-foreground">
                           {r.label}
-                          {r.cost_ratio < 1 && ` · ${Math.round(r.cost_ratio * 100) / 10} 折`}
+                          {/*
+                            说「倍」不说「折」，而且 ≠1 就显示 —— 上一版是 `< 1` 才显示，
+                            于是一个 1.5 倍的替补出口在这一屏和原价直连长得一模一样。
+                          */}
+                          {r.cost_ratio !== 1 &&
+                            ` · 进价 ${Number(r.cost_ratio.toFixed(4))}×`}
                           {r.capacity != null && ` · 容量 ${r.capacity}`}
                         </p>
                       </div>

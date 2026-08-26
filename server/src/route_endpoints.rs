@@ -19,8 +19,12 @@
 //! 但同一条线路下的几个出口对用户是**完全等价**的 —— 同样的模型、同样的账单，
 //! 只有我的进价不同。既然等价，就没有任何理由让人手排：便宜的先用是唯一正确答案。
 //!
-//! 折扣（0.3 = 三折）而不是绝对价：转卖商就是这么报价的，而且对全部模型同时成立，
-//! 一个数就够。它只进排序，不进账单。
+//! **倍率**（0.3 = 官方价的 0.3 倍）而不是绝对价：转卖商就是这么报价的，而且对全部
+//! 模型同时成立，一个数就够。它只进排序，不进账单。
+//!
+//! 是倍率，不是折扣。两者在 0<v<1 这一段数值相同，但「折扣」自带一条上限 1.0 ——
+//! 而一个比原价贵的替补出口是合法配置（排在直连后面，只有便宜的都坏了才轮到它）。
+//! 词错了，校验就会跟着错，把它在保存时拒掉。
 //!
 //! # 「自动测」为什么是发一次真请求
 //!
@@ -114,22 +118,65 @@ pub struct Endpoint {
     pub balance_token: String,
 }
 
-/// 出口在候选池里的排序键。小的先用。
+/// 探测结论的保质期。
 ///
-/// 两级：**先看探测结论，再看进价**。反过来（先便宜）会让一个已知打不通的便宜出口
-/// 稳定占掉两个尝试位里的一个 —— 每个请求都先去撞它一次，用户每次都多等一个来回。
-/// 便宜是省钱，能用是前提。
+/// 探测每 15 分钟一轮（`PROBE_EVERY_SECS`），2 小时 = 连着八轮没跑成。超过就当
+/// **没测过**，而不是继续拿着那个「测通了」用 —— 陈旧的好消息不是好消息。
+/// 这和 `route_health::classify` 里「上次成功已经旧了就退回不知道」是同一条规矩。
+pub const PROBE_FRESH_SECS: i64 = 2 * 60 * 60;
+
+/// 「慢得离谱」的判据，两个条件**必须同时**成立。
+///
+/// 只看相对倍数：全场都 3 秒的时候，一个 4.5 秒的会被无谓降级，而它其实没问题。
+/// 只看绝对毫秒：整条线路都慢的时候所有人一起降级，等于没降。
+/// 两个一起才只抓住真正该抓的那种 —— 明显比同线路最快的那个慢一大截，而且慢到
+/// 用户能感觉出来。
+pub const SLOW_FACTOR: f64 = 3.0;
+pub const SLOW_FLOOR_MS: f64 = 5_000.0;
+
+/// 可用性档：**能用的在前**。小的先用。
+///
+/// 反过来（先便宜）会让一个已知打不通的便宜出口稳定占掉两个尝试位里的一个 ——
+/// 每个请求都先去撞它一次，用户每次都多等一个来回。便宜是省钱，能用是前提。
 ///
 /// `None`（还没测过）排在「测过并且成功」之后、「测过并且失败」之前：没有证据不等于
 /// 坏，但也不该越过有证据能用的那个。这和 `route_health` 里「绝不因为没有证据就报绿」
 /// 是同一条规矩。
-pub fn order_key(probe_ok: Option<bool>, cost_ratio: f64) -> (u8, f64) {
-    let tier = match probe_ok {
-        Some(true) => 0,
-        None => 1,
+///
+/// 「测通了但那是三天前的事」也算没证据 —— 见 `PROBE_FRESH_SECS`。
+pub fn availability_tier(
+    probe_ok: Option<bool>,
+    probe_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u8 {
+    match probe_ok {
         Some(false) => 2,
+        None => 1,
+        Some(true) => {
+            let fresh = probe_at
+                .map(|t| now.signed_duration_since(t).num_seconds() <= PROBE_FRESH_SECS)
+                // 测通了却没记时间：当成新鲜。这一列是后加的，老行没有它，
+                // 把老行一律打成「不新鲜」等于在升级那一刻把所有出口降一档。
+                .unwrap_or(true);
+            if fresh {
+                0
+            } else {
+                1
+            }
+        }
+    }
+}
+
+/// 这个出口是不是**慢得离谱**。`best_ms` 是同一条线路上还活着的候选里最快的那个。
+///
+/// 没有 `probe_ms`（没测过、或者线路自带地址根本不在这张表里）→ **不降级**。
+/// 没有证据不构成降级理由，这和上面那一档是同一条规矩。
+pub fn is_egregiously_slow(ms: Option<i32>, best_ms: Option<f64>) -> bool {
+    let (Some(ms), Some(best)) = (ms, best_ms) else {
+        return false;
     };
-    (tier, cost_ratio)
+    let ms = ms as f64;
+    ms >= SLOW_FLOOR_MS && best > 0.0 && ms >= SLOW_FACTOR * best
 }
 
 /// 线路自带地址的排序键。
@@ -144,8 +191,8 @@ pub fn order_key(probe_ok: Option<bool>, cost_ratio: f64) -> (u8, f64) {
 /// 这不违反「没有证据不报绿」—— 那条规矩管的是面板和告警怎么**说**，不是先敲哪扇门。
 /// 直连真坏了的时候，冷却、卡顿、连败那套（`route_goes_to_the_back`）会把它往后压，
 /// 那走的是执行事实，比任何探测都硬。
-pub fn own_order_key() -> (u8, f64) {
-    (0, 1.0)
+pub fn own_order_key() -> (u8, u8, f64) {
+    (0, 0, 1.0)
 }
 
 /// 这条线路**连同它的出口**一共能提供哪些模型。
@@ -185,10 +232,10 @@ pub fn priceable(route: &Model, model_id: &str) -> bool {
     route.input_price > 0.0 || route.output_price > 0.0
 }
 
-/// 把「线路」展开成「实际要发请求的出口」。/// 把「线路」展开成「实际要发请求的出口」。
+/// 把「线路」展开成「实际要发请求的出口」。
 ///
-/// 每条线路自带的 `base_url` / `api_key` 也算一个出口，而且是**成本 1.0 的那个**：
-/// 它是原价直连，运维加的转卖出口只要填了折扣就自动排到它前面。这样「不配任何多路由」
+/// 每条线路自带的 `base_url` / `api_key` 也算一个出口，而且是**倍率 1.0 的那个**：
+/// 它是原价直连，运维加的转卖出口只要倍率小于 1 就自动排到它前面。这样「不配任何多路由」
 /// 与今天的行为完全一致 —— 一条线路展开成一个出口，顺序不变。
 ///
 /// 展开出来的每一项都是线路本身的克隆，只换了 `base_url`、`api_key`，并记下
@@ -201,8 +248,13 @@ pub fn expand(
 ) -> Vec<Model> {
     let mut out = Vec::with_capacity(routes.len());
     for r in routes {
-        // (排序键, 线路克隆)
-        let mut targets: Vec<((u8, f64), Model)> = Vec::new();
+        // (排序键, 探测毫秒, 线路克隆)。
+        //
+        // 排序键三级：**能用 → 不慢 → 便宜**。多带一个 probe_ms 是因为「慢不慢」
+        // 是**相对同线路最快的那个**说的，一个候选自己看不出来 —— 要等这一条线路
+        // 的候选都收齐了才算得出。
+        let now = chrono::Utc::now();
+        let mut targets: Vec<((u8, u8, f64), Option<i32>, Model)> = Vec::new();
 
         // 线路自带的地址只在**它自己**有这个模型时才算候选。
         //
@@ -217,7 +269,10 @@ pub fn expand(
         own.endpoint_label = String::new();
         own.endpoint_cost = Some(1.0);
         if own_has {
-            targets.push((own_order_key(), own));
+            // 线路自带地址在 route_endpoints 表里没有行，探测结论无处可存，
+            // 所以它没有 probe_ms —— 于是它永远不会被判「慢」。那是对的：
+            // 没有证据不构成降级理由。
+            targets.push((own_order_key(), None, own));
         }
 
         for e in by_route.get(&r.id).into_iter().flatten() {
@@ -257,17 +312,67 @@ pub fn expand(
             m.endpoint_label = e.label.clone();
             m.endpoint_cost = Some(e.cost_ratio);
             m.endpoint_capacity = e.capacity;
-            targets.push((order_key(e.probe_ok, e.cost_ratio), m));
+            targets.push((
+                (
+                    availability_tier(e.probe_ok, e.probe_at, now),
+                    0, // 慢不慢，等候选收齐再填
+                    e.cost_ratio,
+                ),
+                e.probe_ms,
+                m,
+            ));
+        }
+
+        // 慢得离谱的降一级 —— 这一步必须在**候选收齐之后**，因为判据是相对的：
+        // 「比同线路最快的那个慢三倍以上，而且自己也超过五秒」。
+        //
+        // 基准只取还活着的候选（tier < 2）：一个已知打不通的出口的耗时没有意义，
+        // 拿它当基准会让所有人显得「不慢」。
+        let best_ms = targets
+            .iter()
+            .filter(|((tier, _, _), _, _)| *tier < 2)
+            .filter_map(|(_, ms, _)| ms.map(|v| v as f64))
+            .filter(|v| *v > 0.0)
+            .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))));
+        for ((_, slow, _), ms, _) in targets.iter_mut() {
+            *slow = u8::from(is_egregiously_slow(*ms, best_ms));
+        }
+
+        // 跨中转比价：把「相对官方价的倍数」换成「每一美元官方价实际花多少人民币」。
+        //
+        // 倍率只在同一家中转内部可比 —— 它的单位是那家中转的余额单位，而一块钱余额
+        // 值多少人民币各家差几十倍。线上就有这个形状：梦幻API 的出口 0.05 倍、
+        // hanhegufei 的自带地址 1.0 倍，看倍率是二十倍差距，换算之后完全可能反过来。
+        //
+        // **全有全无**：只要有一个候选的站没填汇率，整条线路退回按倍率排（＝旧行为）。
+        // 把没填的当成 1.0 顶上去是最糟的选择 —— 那会让一个纯粹「没填」的站
+        // 凭空排到前面，而且没有任何地方会报错。这和「没查到 ≠ 没有」是同一条规矩。
+        //
+        // endpoint_cost 一起换：它唯一的去处是 `overflow_weight`（首选被限流时挑替补
+        // 的权重），那也是一个跨出口的比较，同样不能拿两种货币比。
+        let converted: Option<Vec<f64>> = targets
+            .iter()
+            .map(|(k, _, m)| {
+                crate::relay_rates::usd_per_cny(&m.base_url)
+                    .and_then(|r| crate::relay_rates::cny_per_official_usd(k.2, r))
+            })
+            .collect();
+        if let Some(cny) = converted.filter(|v| !v.is_empty()) {
+            for ((k, _, m), c) in targets.iter_mut().zip(cny) {
+                k.2 = c;
+                m.endpoint_cost = Some(c);
+            }
         }
 
         // 稳定排序：进价和探测结论都相同时，保持「线路自带的在前、其余按建立次序」，
         // 免得每次请求随机换一个出口 —— 那会把上游的提示词缓存全部打散。
         targets.sort_by(|a, b| {
             a.0 .0
-                .cmp(&b.0 .0)
-                .then(a.0 .1.partial_cmp(&b.0 .1).unwrap_or(std::cmp::Ordering::Equal))
+                .cmp(&b.0 .0) // 能用的在前
+                .then(a.0 .1.cmp(&b.0 .1)) // 不慢的在前
+                .then(a.0 .2.partial_cmp(&b.0 .2).unwrap_or(std::cmp::Ordering::Equal)) // 便宜的在前
         });
-        out.extend(targets.into_iter().map(|(_, m)| m));
+        out.extend(targets.into_iter().map(|(_, _, m)| m));
     }
     out
 }
@@ -448,6 +553,10 @@ pub fn note_endpoint_usage(
     prompt: i64,
     completion: i64,
     cached: i64,
+    // 写进缓存的 token。**成本大头，而且以前根本没记。**上游按输入价的 1.25 倍收它，
+    // 实测一次调用里它能是新鲜输入的一百六十倍（381 vs 61,634）。不记的话对账
+    // 只能把它当 0 —— 「中转收了」低估、毛利高估，而且缓存命中率越高错得越多。
+    cache_creation: i64,
 ) {
     let db = state.db.clone();
     // 分转微美元。看板要看得见「三分钱」这种量级，按分存会全是 0。
@@ -457,14 +566,16 @@ pub fn note_endpoint_usage(
         let _ = sqlx::query(
             "INSERT INTO endpoint_usage \
                (day, endpoint_id, route_id, calls, cost_micro_usd, \
-                prompt_tokens, completion_tokens, cached_tokens) \
-             VALUES (current_date, $1, $2, 1, $3, $4, $5, $6) \
+                prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens) \
+             VALUES (current_date, $1, $2, 1, $3, $4, $5, $6, $7) \
              ON CONFLICT (day, endpoint_id) DO UPDATE SET \
                calls = endpoint_usage.calls + 1, \
                cost_micro_usd = endpoint_usage.cost_micro_usd + EXCLUDED.cost_micro_usd, \
                prompt_tokens = endpoint_usage.prompt_tokens + EXCLUDED.prompt_tokens, \
                completion_tokens = endpoint_usage.completion_tokens + EXCLUDED.completion_tokens, \
                cached_tokens = endpoint_usage.cached_tokens + EXCLUDED.cached_tokens, \
+               cache_creation_tokens = endpoint_usage.cache_creation_tokens \
+                 + EXCLUDED.cache_creation_tokens, \
                updated_at = now()",
         )
         .bind(endpoint_id)
@@ -473,6 +584,7 @@ pub fn note_endpoint_usage(
         .bind(prompt)
         .bind(completion)
         .bind(cached)
+        .bind(cache_creation)
         .execute(&db)
         .await;
 
@@ -480,17 +592,22 @@ pub fn note_endpoint_usage(
         // 两种问法，一个来源。分两张表而不是让健康面板改查这张：那块屏幕在正常工作，
         // 而且旧表有历史，为一个新报表去动它不划算（这一段的代价只是一次 upsert）。
         if !model.is_empty() {
-            let _ = sqlx::query(
+            // **不吞错误。** 这条写失败的话，对账页的真实成本会永远没有数据源，
+            // 而表现只是「那一页没有数」—— 和「还没有流量」长得一模一样。
+            // 今天就因为这个把一次「还没跑过流量」误判成「写不进去」。
+            let r = sqlx::query(
                 "INSERT INTO endpoint_model_usage \
                    (day, endpoint_id, route_id, model_id, calls, revenue_micro_usd, \
-                    prompt_tokens, completion_tokens, cached_tokens) \
-                 VALUES (current_date, $1, $2, $3, 1, $4, $5, $6, $7) \
+                    prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens) \
+                 VALUES (current_date, $1, $2, $3, 1, $4, $5, $6, $7, $8) \
                  ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
                    calls = endpoint_model_usage.calls + 1, \
                    revenue_micro_usd = endpoint_model_usage.revenue_micro_usd + EXCLUDED.revenue_micro_usd, \
                    prompt_tokens = endpoint_model_usage.prompt_tokens + EXCLUDED.prompt_tokens, \
                    completion_tokens = endpoint_model_usage.completion_tokens + EXCLUDED.completion_tokens, \
                    cached_tokens = endpoint_model_usage.cached_tokens + EXCLUDED.cached_tokens, \
+                   cache_creation_tokens = endpoint_model_usage.cache_creation_tokens \
+                     + EXCLUDED.cache_creation_tokens, \
                    updated_at = now()",
             )
             .bind(endpoint_id)
@@ -500,8 +617,12 @@ pub fn note_endpoint_usage(
             .bind(prompt)
             .bind(completion)
             .bind(cached)
+            .bind(cache_creation)
             .execute(&db)
             .await;
+            if let Err(e) = r {
+                tracing::warn!(error = %e, model = %model, "按模型用量写失败 —— 对账的真实成本会缺这一笔");
+            }
         }
     });
 }
@@ -533,194 +654,13 @@ pub struct BalanceReading {
     pub used_usd: Option<f64>,
 }
 
-/// 从一份不知道确切形状的 JSON 里把「还剩多少 / 已用多少」挑出来。
-///
-/// # 为什么是「找」不是「按字段读」
-///
-/// 各家中转没有统一的响应结构，同一个数可能在顶层、在 `data` 里、在 `user` 里。
-/// 写死一条路径的话，换一家就整个失效，而失效的样子是「查不到余额」——和「这家
-/// 没有余额接口」一模一样，没人分得出来。
-///
-/// # 只认这几个名字，而且**不猜单位**
-///
-/// 取到的数字原样带出来，不做任何除法。有些系统的 `quota` 是「点」（One API 那族
-/// 惯例 50 万点 = 1 美元），有些就是美元。猜错的代价是面板上显示一个差 50 万倍的
-/// 数字，而它看起来完全正常。原值 + 字段名一起显示，对不对一眼就能看出来。
-fn pick_balance(v: &serde_json::Value) -> Option<BalanceReading> {
-    // 顶层、data、user、result 各找一遍 —— 这四种嵌法覆盖了实测见过的全部形状。
-    let scopes: Vec<&serde_json::Value> = std::iter::once(v)
-        .chain(["data", "user", "result"].iter().filter_map(|k| v.get(*k)))
-        .collect();
-
-    let num = |o: &serde_json::Value, names: &[&str]| -> Option<(String, f64)> {
-        for n in names {
-            if let Some(x) = o.get(*n) {
-                // 有些家把金额当字符串发（避免浮点精度问题），两种都收。
-                let f = x.as_f64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok()));
-                if let Some(f) = f.filter(|f: &f64| f.is_finite()) {
-                    return Some(((*n).to_string(), f));
-                }
-            }
-        }
-        None
-    };
-
-    for o in scopes {
-        let left = num(o, &["balance", "remaining", "remain_quota", "credit", "credits", "quota"]);
-        let used = num(o, &["used", "used_quota", "total_used", "usage", "consumed"]);
-        if left.is_none() && used.is_none() {
-            continue;
-        }
-        let text = match (&left, &used) {
-            (Some((ln, lv)), Some((un, uv))) => format!("{ln} {lv:.4}（{un} {uv:.4}）"),
-            (Some((ln, lv)), None) => format!("{ln} {lv:.4}"),
-            (None, Some((un, uv))) => format!("已用 {un} {uv:.4}"),
-            (None, None) => unreachable!(),
-        };
-        return Some(BalanceReading {
-            text,
-            remaining_usd: left.map(|(_, v)| v),
-            used_usd: used.map(|(_, v)| v),
-        });
-    }
-    None
-}
-
-/// 给面板用的那层：只要展示串。
-pub(crate) async fn query_balance(
-    http: &reqwest::Client,
-    base_url: &str,
-    key: &str,
-    balance_token: &str,
-) -> Option<String> {
-    read_balance(http, base_url, key, balance_token).await.map(|b| b.text)
-}
-
-pub(crate) async fn read_balance(
-    http: &reqwest::Client,
-    base_url: &str,
-    key: &str,
-    // balance_token：控制台令牌。空就退回去用 key —— 有些中转两者通用，试一次不亏。
-    balance_token: &str,
-) -> Option<BalanceReading> {
-    let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
-    // 有令牌就用令牌，没有就拿调用密钥试。两者都空时直接放弃 —— 不带 Authorization
-    // 打过去只会拿回一个 401，白费一个来回。
-    let cred = if balance_token.trim().is_empty() { key } else { balance_token.trim() };
-    if cred.trim().is_empty() {
-        return None;
-    }
-    let bearer = format!("Bearer {cred}");
-
-    // 形态零：自建中转那一族（线上三家 zyz / hanhegufei / polly 都是同一套）。
-    //
-    // 认出它的判据是错误结构：未鉴权时三家一字不差地回
-    // `{"code":"UNAUTHORIZED","message":"Authorization header is required"}`。
-    // 放在最前面试，是因为它是**线上实际在用的那一族** —— 后面三种是通用兜底。
-    for path in ["/api/v1/auth/me", "/api/v1/subscriptions/summary"] {
-        let Ok(r) = http.get(format!("{root}{path}")).header("authorization", &bearer).send().await
-        else {
-            continue;
-        };
-        if !r.status().is_success() {
-            continue;
-        }
-        let Ok(text) = r.text().await else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        if let Some(b) = pick_balance(&v) {
-            return Some(b);
-        }
-        // 请求成功、JSON 也解出来了，但认不出余额字段。**把原文带出来**：
-        // 这是「这家的字段名和我们猜的不一样」和「这家根本没有余额」之间唯一的区别，
-        // 静默返回 None 的话，两者在面板上长得一模一样，而修法完全不同。
-        return Some(BalanceReading {
-            text: format!("认不出余额字段：{}", text.chars().take(160).collect::<String>()),
-            remaining_usd: None,
-            used_usd: None,
-        });
-    }
-
-    // 形态一：One API / New API
-    if let Ok(r) = http
-        .get(format!("{root}/api/user/self"))
-        .header("authorization", &bearer)
-        .send()
-        .await
-    {
-        if r.status().is_success() {
-            if let Ok(v) = r.json::<serde_json::Value>().await {
-                let d = v.get("data").unwrap_or(&v);
-                if let Some(q) = d.get("quota").and_then(|x| x.as_f64()) {
-                    let used = d.get("used_quota").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    // 这一族的 quota 是「点」，惯例 500000 点 = 1 美元。
-                    let left = q / 500_000.0;
-                    let spent = used / 500_000.0;
-                    return Some(BalanceReading {
-                        text: format!("${left:.2}（已用 ${spent:.2}）"),
-                        remaining_usd: Some(left),
-                        used_usd: Some(spent),
-                    });
-                }
-            }
-        }
-    }
-
-    // 形态二：OpenRouter
-    if let Ok(r) = http
-        .get(format!("{root}/api/v1/auth/key"))
-        .header("authorization", &bearer)
-        .send()
-        .await
-    {
-        if r.status().is_success() {
-            if let Ok(v) = r.json::<serde_json::Value>().await {
-                let d = v.get("data").unwrap_or(&v);
-                let used = d.get("usage").and_then(|x| x.as_f64());
-                let left = d.get("limit_remaining").and_then(|x| x.as_f64());
-                match (left, used) {
-                    (Some(l), u) => {
-                        return Some(BalanceReading {
-                            text: format!("${l:.2}"),
-                            remaining_usd: Some(l),
-                            used_usd: u,
-                        })
-                    }
-                    (None, Some(u)) => {
-                        return Some(BalanceReading {
-                            text: format!("已用 ${u:.2}（未设上限）"),
-                            remaining_usd: None,
-                            used_usd: Some(u),
-                        })
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    // 形态三：OpenAI 官方
-    if let Ok(r) = http
-        .get(format!("{root}/dashboard/billing/subscription"))
-        .header("authorization", &bearer)
-        .send()
-        .await
-    {
-        if r.status().is_success() {
-            if let Ok(v) = r.json::<serde_json::Value>().await {
-                if let Some(x) = v.get("hard_limit_usd").and_then(|x| x.as_f64()) {
-                    // 上限**不是**余额，也不是已用。拿它去算成本会算出一个纯属虚构的数字，
-                    // 所以这里只给展示串，两个数值都留空。
-                    return Some(BalanceReading {
-                        text: format!("上限 ${x:.2}"),
-                        remaining_usd: None,
-                        used_usd: None,
-                    });
-                }
-            }
-        }
-    }
-    None
-}
+// 「问一个中转还剩多少额度」的实现**不在这里**。
+//
+// 它曾经在，而且和 relay_adapter 那份并存过一段时间 —— 两份对 sub2api 的做法不同，
+// 于是同一批线路在「网关适配器」页有余额、在「健康」页显示「查不到」。
+// 现在唯一的入口是 `relay_sync::balance_now`，它按识别出的家族分派。
+//
+// 要加一家新中转的余额支持，改 `relay_adapter::fetch_balance`，别在这里再开一份。
 
 // ---------------------------------------------------------------- 调度
 
@@ -1004,6 +944,32 @@ pub struct ProbeOutcome {
 /// `protocol` 空 = 跟线路一样。`only_models` 空 = 线路的全部 —— 探一个只有 sonnet 的
 /// 出口时必须拿 sonnet 去探，拿线路的第一个模型（可能是 opus）去探会得到一个 404，
 /// 然后把一个好出口判成坏的。
+/// 这段响应体**真的是一次对话结果**吗，还是一个用 200 包起来的错误页。
+///
+/// # 为什么 2xx 不够
+///
+/// 转卖网关会用 200 包一个错误体，也会回空壳。model_probe.rs 里记着这条教训：
+/// 拿「没报错」当「能用」会得出荒唐的结论。
+///
+/// # 为什么是 pub(crate)
+///
+/// 这个判据曾经只长在 `probe_once` 里，而 `route_health::canary_once` 打的是
+/// **同一个地址、同一个模型、同一个密钥**，判成功却只看 `status().is_success()`。
+/// 于是一个「200 + 错误体」的上游：出口页显示「回了 200 但不是对话响应」，
+/// 而健康页、状态药丸和邮件告警把它记成一次成功、清零连败、点亮绿灯 ——
+/// 正是这套监控要消灭的那件事，发生在它自己身上。
+///
+/// 判据只许有一份。要放宽或收紧改这里，两边一起变。
+pub(crate) fn looks_like_a_real_completion(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|v| {
+            v.get("content").is_some_and(|c| c.is_array())
+                || v.get("choices").is_some_and(|c| c.is_array())
+                || v.get("usage").is_some()
+        })
+}
+
 pub async fn probe_once(
     http: &reqwest::Client,
     route: &Model,
@@ -1028,23 +994,32 @@ pub async fn probe_once(
         };
     };
 
-    let anthropic = if protocol.is_empty() {
-        route.protocol == "anthropic"
+    // 出口协议覆盖线路协议；出口没填就跟线路。判据只此一处，URL 和请求体都从它来。
+    let wire = crate::models::Wire::of(if protocol.is_empty() {
+        &route.protocol
     } else {
-        protocol == "anthropic"
-    };
-    let base = crate::models::api_base(base_url);
-    let url = if anthropic {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/chat/completions")
-    };
-    // max_tokens 取 1：验的是「这条路通不通」，不是它会说什么。
-    let body = serde_json::json!({
-        "model": model_id,
-        "max_tokens": 1,
-        "messages": [{ "role": "user", "content": "hi" }],
+        protocol
     });
+    let anthropic = wire == crate::models::Wire::Anthropic;
+    let base = crate::models::api_base(base_url);
+    let url = format!("{base}{}", wire.path());
+    // max_tokens 取 1：验的是「这条路通不通」，不是它会说什么。
+    //
+    // Responses 的最小请求体是**另一套名字**（input / max_output_tokens）。用
+    // chat/completions 那套去探，上游要么 400 要么把这条从没验证过的出口探成绿灯——
+    // 后者更糟：探绿之后它会被排到前面接管真实流量，然后每一发都失败。
+    let body = match wire {
+        crate::models::Wire::XaiResponses => serde_json::json!({
+            "model": model_id,
+            "max_output_tokens": 1,
+            "input": [{ "role": "user", "content": "hi" }],
+        }),
+        _ => serde_json::json!({
+            "model": model_id,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }],
+        }),
+    };
 
     let mut req = http.post(&url).json(&body);
     req = if anthropic {
@@ -1086,16 +1061,7 @@ pub async fn probe_once(
         return ProbeOutcome { ok: false, ms: elapsed, note: why };
     }
 
-    // 2xx 还不够。转卖网关会用 200 包一个错误体，也会回一个空壳 —— 这正是
-    // model_probe.rs 里记着的那条教训：拿「没报错」当「能用」会得出荒唐的结论。
-    // 所以要求响应里确实有生成内容的那几个字段之一。
-    let looks_real = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .is_some_and(|v| {
-            v.get("content").is_some_and(|c| c.is_array())
-                || v.get("choices").is_some_and(|c| c.is_array())
-                || v.get("usage").is_some()
-        });
+    let looks_real = looks_like_a_real_completion(&text);
     if !looks_real {
         return ProbeOutcome {
             ok: false,
@@ -1223,7 +1189,31 @@ pub fn vendor_of(provider: &str, models: &[String], base_url: &str) -> &'static 
             return vendor;
         }
     }
-    // 模型名认不出来时，再看这条线路指向哪儿。
+    // 手写表认不出来时，问**实时目录**。
+    //
+    // 目录里每个 id 都是 `厂商/模型` 的形状，那份映射每半小时刷新、覆盖四百多个模型 ——
+    // 比上面那张 58 条的手写表宽得多。图标库有 149 家，而手写表只够触发其中 43 家；
+    // 剩下 106 个图标一直躺在库里没人用得上，因为没有任何模型名能命中它们。
+    //
+    // 放在手写表**之后**：那张表里的次序是刻意的（claude 要在 bedrock 前面、gpt 要靠后），
+    // 那些判断目录给不出来。目录只负责补它没覆盖到的那一大片。
+    for m in models {
+        let pref = crate::model_catalog::lookup(m)
+            .map(|e| e.vendor)
+            .filter(|v| !v.is_empty());
+        let Some(pref) = pref else { continue };
+        // 别名优先：`mistralai` 要变成 `mistral`。再直查：`nvidia` 这类本来就同名。
+        if let Some((_, key)) = VENDOR_ALIASES.iter().find(|(from, _)| *from == pref) {
+            return key;
+        }
+        if let Some(k) = ICON_KEYS.iter().find(|k| **k == pref) {
+            return k;
+        }
+        // 目录知道它属于谁，但我们没有这家的图 —— 回空串走中性图标，
+        // 而不是回一个画不出来的名字。继续看下一个模型。
+    }
+
+    // 模型名和目录都认不出来时，再看这条线路指向哪儿。
     //
     // 次序不能反：模型比管道重要。一条指向 openrouter 但跑 claude-opus 的线路该显示
     // Claude —— 运维想知道的是「这条线路卖的是谁家的模型」，不是「它从哪个中间商买的」。
@@ -1237,6 +1227,55 @@ pub fn vendor_of(provider: &str, models: &[String], base_url: &str) -> &'static 
     }
     ""
 }
+
+/// 图标库里**确实有图**的全部厂商键，和 `ide/src/brand-sprite.js` 的 `BRANDS` 一一对应
+/// （有测试守着，改一边不改另一边会红）。
+///
+/// 为什么服务端要留一份：`vendor_of` 回的是 `&'static str`，而目录给的厂商前缀是运行时
+/// 字符串 —— 得在这张表里对上，才能变成一个静态引用。顺带它也是一道闸：目录里那些
+/// 没有图的小微调作者（poolside、sao10k、undi95…）对不上，于是回空串、前端画中性图标，
+/// 而不是回一个画不出来的名字。
+const ICON_KEYS: &[&str] = &[
+    "ai2", "ai21", "ai302", "ai360", "aihubmix", "akashchat", "alephalpha", "alibaba",
+    "alibabacloud", "anspire", "anthropic", "anyscale", "apple", "arcee", "atlascloud", "aws",
+    "azure", "azureai", "baai", "baichuan", "baidu", "baiducloud", "bailian", "baseten",
+    "bedrock", "bfl", "bilibiliindex", "burncloud", "bytedance", "centml", "cerebras",
+    "cloudflare", "codegeex", "cohere", "cometapi", "crusoe", "dbrx", "deepcogito", "deepinfra",
+    "deepmind", "deepseek", "doubao", "elevenlabs", "featherless", "fireworks", "fishaudio",
+    "flux", "friendli", "gemma", "giteeai", "glama", "google", "googlecloud", "groq", "hailuo",
+    "huawei", "huaweicloud", "huggingface", "hunyuan", "hyperbolic", "ibm", "ideogram",
+    "iflytekcloud", "infermatic", "infinigence", "inflection", "internlm", "jimeng", "jina",
+    "kling", "kluster", "kwaipilot", "lambda", "leptonai", "lg", "liquid", "llmapi", "lmstudio",
+    "longcat", "luma", "meta", "microsoft", "midjourney", "minimax", "mistral", "modelscope",
+    "monica", "moonshot", "nebius", "newapi", "novita", "nplcloud", "nvidia", "ollama",
+    "openai", "openchat", "openrouter", "parasail", "perplexity", "pika", "poe", "ppio",
+    "qingyan", "qiniu", "qwen", "recraft", "replicate", "runway", "rwkv", "sambanova",
+    "sensenova", "siliconcloud", "skywork", "snowflake", "sophnet", "spark", "stability",
+    "statecloud", "stepfun", "straico", "streamlake", "submodel", "suno", "targon", "tencent",
+    "tencentcloud", "tii", "together", "udio", "upstage", "venice", "vertexai", "vidu", "vllm",
+    "volcengine", "voyage", "wenxin", "workersai", "worldrouter", "xai", "xiaomimimo",
+    "xinference", "xuanyuan", "yandex", "yuanbao", "zai", "zenmux", "zeroone", "zhipu"
+];
+
+/// 目录的厂商前缀 → 图标库的键。**只收手工确认过的**。
+///
+/// 不按字符串相似度自动认：`anthracite-org` 和 `anthropic` 前七个字母一样，而前者是个
+/// 微调组织，跟 Anthropic 没关系。给一家画上别人的标，比不画糟得多 —— 这条规矩
+/// 和 `NEEDLES` 那张表是同一条。
+const VENDOR_ALIASES: &[(&str, &str)] = &[
+    ("mistralai", "mistral"),
+    ("z-ai", "zai"),
+    ("moonshotai", "moonshot"),
+    ("meta-llama", "meta"),
+    ("bytedance-seed", "bytedance"),
+    ("x-ai", "xai"),
+    ("ibm-granite", "ibm"),
+    ("xiaomi", "xiaomimimo"),
+    ("arcee-ai", "arcee"),
+    ("amazon", "aws"),
+    // AI2 就是 Allen Institute for AI，目录里写作 `allenai`，图标键写作 `ai2`。
+    ("allenai", "ai2"),
+];
 
 /// (出现在 base_url 里的片段, 厂商)。只在模型名认不出来时才轮到它。
 const HOSTS: &[(&str, &str)] = &[
@@ -1310,8 +1349,22 @@ const NEEDLES: &[(&str, &str)] = &[
     ("mistral", "mistral"),
     ("mixtral", "mistral"),
     ("magistral", "mistral"),
+    // 小米 MiMo。图标库里那家的键是 `xiaomimimo`，不是 `mimo` —— 这两个不对齐的话，
+    // `hasBrandMark` 会说「没有这家」，前端画中性图标，而图其实躺在 sprite 里。
+    // 放在 minimax 前后都安全：`minimax-m2` 不含 `mimo`。
+    ("mimo", "xiaomimimo"),
+    ("xiaomi", "xiaomimimo"),
     ("minimax", "minimax"),
     ("abab", "minimax"),
+    // 下面这几家都在图标库里，只是判定表一直没收。挑的都是**不会撞进别人名字**的长词
+    // —— 短词（`yi`、`nova`、`seed`）一律不收，给智谱画上别家的标比不画糟得多。
+    ("longcat", "longcat"),
+    ("kwaipilot", "kwaipilot"),
+    ("hailuo", "hailuo"),
+    ("codegeex", "codegeex"),
+    ("falcon", "tii"),
+    ("dbrx", "dbrx"),
+    ("rwkv", "rwkv"),
     ("baichuan", "baichuan"),
     ("hunyuan", "hunyuan"),
     ("doubao", "doubao"),
@@ -1654,14 +1707,19 @@ pub async fn admin_health(
             let h = crate::route_health::snapshot(&state, id).await;
             let u = by_ep.get(&id);
             let mf = crate::manifest_check::report_for(id);
+            // 走**和网关适配器同一个入口**。这里曾经有自己的一份实现，对 sub2api
+            // 打的是要控制台令牌的那条路，于是适配器页有余额、这一页显示「查不到」，
+            // 而两页说的是同一件事。那份已经删掉了。
             let balance = if want_balance && !(key.trim().is_empty() && btok.trim().is_empty()) {
-                query_balance(
-                    &http,
+                crate::relay_sync::balance_now(
+                    &state,
+                    id,
                     &base,
                     &crate::models::model_key(&key),
                     &crate::models::model_key(&btok),
                 )
                 .await
+                .map(|b| b.text)
             } else {
                 None
             };
@@ -1866,17 +1924,30 @@ fn yes() -> bool {
     true
 }
 
-/// 折扣的合理区间。
+/// 进价**倍率**的合理区间。
 ///
-/// 上限 1.0：比原价还贵的转卖没有存在意义，填出来只会是小数点点错（10 当成十倍折扣）。
+/// 上一版的上限是 1.0，理由写的是「比原价还贵的转卖没有存在意义」。那条上限是从
+/// **错词**里推出来的，不是从事实里：这个数是倍率不是折扣，而倍率没有 1.0 这条天花板。
+/// 比原价贵的替补出口是合法配置 —— 它排在直连后面，只有便宜的那些都坏了才轮到它，
+/// 恰恰是「贵一点也比断服强」。按折扣建模，保存时就会把它拒掉，而拒绝的理由
+/// （「不能大于原价」）在事实层面根本不成立。
+///
+/// 上限 10 留着，但它只是**点错小数点**的护栏（想写 1.0 手滑成 10），不是语义上限：
+/// 现实里的分组倍率没有到十倍的。它只影响先敲哪扇门，不进任何一笔账单 ——
+/// `endpoint_cost` 唯一的去处是 `overflow_weight`，那是让位时的挑替补权重。
+///
 /// 下限不设 0：`cost_ratio > 0` 由表上的 CHECK 兜着，而 0 会让「免费」永远排第一，
 /// 那反而是对的 —— 真有免费额度的出口就该先用。
 fn clean_ratio(v: f64) -> ApiResult<f64> {
     if !v.is_finite() || v <= 0.0 {
-        return Err(AppError::bad("进价折扣要是个大于 0 的数（0.3 = 三折）"));
+        return Err(AppError::bad(
+            "进价倍率要是个大于 0 的数（0.3 = 按官方价的 0.3 倍进货）",
+        ));
     }
-    if v > 1.0 {
-        return Err(AppError::bad("进价折扣不能大于 1.0（1.0 就是原价）"));
+    if v >= 10.0 {
+        return Err(AppError::bad(
+            "进价倍率到 10 倍了 —— 这个数多半是小数点点错（1.0 写成了 10）",
+        ));
     }
     Ok(v)
 }
@@ -1888,10 +1959,13 @@ fn clean_ratio(v: f64) -> ApiResult<f64> {
 /// 在入口挡住，错误就停在填表的人面前。
 fn clean_protocol(v: &str) -> ApiResult<String> {
     let p = v.trim().to_ascii_lowercase();
-    if p.is_empty() || p == "anthropic" || p == "openai" {
+    if p.is_empty() || crate::models::PROTOCOLS.contains(&p.as_str()) {
         Ok(p)
     } else {
-        Err(AppError::bad("上游协议只能是 anthropic 或 openai（留空 = 跟线路一样）"))
+        Err(AppError::bad(format!(
+            "上游协议只能是 {}（留空 = 跟线路一样）",
+            crate::models::PROTOCOLS.join(" / ")
+        )))
     }
 }
 
@@ -2411,16 +2485,180 @@ mod tests {
         }
     }
 
+    /// 跨中转比价必须按**人民币**，不是按倍率。
+    ///
+    /// 线上现成的形状：Grok 这条线路的自带地址在 hanhegufei（倍率 1.0），挂的出口
+    /// 在梦幻API（倍率 0.05）。按倍率排，梦幻便宜二十倍、稳排第一。但一块钱在两家
+    /// 买到的余额差七十倍 —— 换算成人民币之后**顺序反过来**。
+    ///
+    /// 这条钉的就是这个反转：同一份配置，不填汇率是一个顺序，填了是另一个。
+    /// 它同时钉住第三种情况——只填了一半时**不许**混着算。
+    #[test]
+    fn cross_relay_ranking_follows_real_money_not_the_multiplier() {
+        let mut r = model("openai");
+        r.base_url = "https://api.hanhegufei.online".into();
+        let mut map = HashMap::new();
+        map.insert(r.id, vec![ep(0.05, Some(true), "https://mhapi.net")]);
+        let first = |routes: &[Model]| -> String {
+            expand(routes, &map, "claude-opus-5")
+                .into_iter()
+                .map(|m| m.base_url)
+                .next()
+                .expect("展开出来一个都没有")
+        };
+
+        // ① 一个都没填 —— 沿用旧行为，按倍率排，0.05 倍排第一。
+        crate::relay_rates::set_for_test(&[]);
+        assert_eq!(
+            first(std::slice::from_ref(&r)),
+            "https://mhapi.net",
+            "没有汇率时必须和改造前一模一样（按倍率排）",
+        );
+
+        // ② 两家都填了。hanhegufei ¥1 买 10 额度、梦幻 ¥1 买 0.14 美元：
+        //      hanhegufei: 1.0  / 10   = ¥0.100 每官方美元
+        //      梦幻:       0.05 / 0.14 = ¥0.357 每官方美元
+        //    真实成本差三倍半，而且和倍率给出的结论**相反**。
+        crate::relay_rates::set_for_test(&[
+            ("api.hanhegufei.online", 10.0),
+            ("mhapi.net", 0.14),
+        ]);
+        assert_eq!(
+            first(std::slice::from_ref(&r)),
+            "https://api.hanhegufei.online",
+            "换算成人民币之后自带地址才是便宜的那个，顺序必须反过来",
+        );
+
+        // ③ 只填了一半 —— 整条线路退回按倍率排。
+        //    把没填的那家当成 1.0 顶上去是最糟的：那是拿「不知道」当「一比一」，
+        //    而且不会有任何地方报错。
+        //
+        //    这里的 0.01 是**挑出来的**，不是随手写的。第一版用的是 0.14，那个数
+        //    让「退回按倍率排」和「缺失当 1.0」给出同一个顺序 —— 于是这条断言
+        //    在两种实现下都通过，等于什么都没测。故意把代码改坏跑一遍才看出来。
+        //    0.01 让两者分叉：兜底成 1.0 的话梦幻算出 5.0、自带地址 1.0，自带地址排前面；
+        //    而正确行为是整条退回按倍率排，梦幻（0.05 倍）排前面。
+        crate::relay_rates::set_for_test(&[("mhapi.net", 0.01)]);
+        assert_eq!(
+            first(std::slice::from_ref(&r)),
+            "https://mhapi.net",
+            "缺一家汇率就该整条退回按倍率排，不许拿默认值把缺口补上",
+        );
+
+        crate::relay_rates::set_for_test(&[]);
+    }
+
+    /// 换算是**全有全无**的，缺一个不许拿默认值补。
+    ///
+    /// 上一条测的是行为，这一条钉的是写法：`Option<Vec<f64>>` 那个 collect 一旦被
+    /// 改成逐个 `unwrap_or(1.0)`，行为退化得非常隐蔽 —— 排序照常有结果，只是把
+    /// 「没填汇率」的站当成了一个极好的汇率，凭空排到前面。
+    #[test]
+    fn a_missing_exchange_rate_is_never_defaulted() {
+        let me = src();
+        assert!(
+            me.contains("let converted: Option<Vec<f64>> = targets"),
+            "全有全无那个 collect 没了 —— 换算很可能变成逐个兜底",
+        );
+        for banned in [
+            "usd_per_cny(&m.base_url).unwrap_or(",
+            "usd_per_cny(&m.base_url).unwrap_or_default()",
+            "usd_per_cny(&m.base_url).unwrap_or_else(",
+        ] {
+            assert!(
+                !me.contains(banned),
+                "汇率缺失被兜底了（{banned}）—— 没填汇率的站会凭空排到最前面",
+            );
+        }
+    }
+
     #[test]
     fn cheaper_endpoint_goes_first_but_only_when_it_works() {
+        let now = chrono::Utc::now();
+        // 排序键三级：(能用档, 慢不慢, 价钱)。
+        let k = |ok, slow: u8, cost: f64| (availability_tier(ok, Some(now), now), slow, cost);
+
         // 便宜且能用 → 排第一。
-        assert!(order_key(Some(true), 0.3) < order_key(None, 1.0));
+        assert!(k(Some(true), 0, 0.3) < k(None, 0, 1.0));
         // 便宜但已知打不通 → 排到没测过的后面。这是最要紧的一条：反过来的话，
-        // 每个请求都会先去撞那个便宜的死出口，而一个请求只有两次机会。
-        assert!(order_key(Some(false), 0.1) > order_key(None, 1.0));
-        assert!(order_key(Some(false), 0.1) > order_key(Some(true), 1.0));
+        // 每个请求都会先去撞那个便宜的死出口。
+        assert!(k(Some(false), 0, 0.1) > k(None, 0, 1.0));
+        assert!(k(Some(false), 0, 0.1) > k(Some(true), 0, 1.0));
         // 同一档里才比价钱。
-        assert!(order_key(Some(true), 0.3) < order_key(Some(true), 0.5));
+        assert!(k(Some(true), 0, 0.3) < k(Some(true), 0, 0.5));
+        // 「慢得离谱」排在能用之内、比价钱之前：一个慢三倍还超过五秒的便宜出口
+        // 不该霸占首选位 —— 那正是「配了十五个，最快的那个永远轮不到」的形状。
+        assert!(k(Some(true), 0, 0.9) < k(Some(true), 1, 0.1));
+        // 但慢只在同一个可用档里说话：慢的活出口仍然好过一个已知打不通的。
+        assert!(k(Some(true), 1, 0.9) < k(Some(false), 0, 0.1));
+    }
+
+    /// 陈旧的「测通了」不是「测通了」。
+    ///
+    /// 探测每 15 分钟一轮。三天前那次成功不能继续把这个出口钉在第一档 ——
+    /// 那和 `route_health::classify` 里「上次成功已经旧了就退回不知道」是同一条规矩。
+    /// 没记时间的老行按新鲜处理：把它们一律降档等于在升级那一刻把所有出口降一级。
+    #[test]
+    fn a_stale_probe_stops_counting_as_evidence() {
+        let now = chrono::Utc::now();
+        let fresh = now - chrono::Duration::seconds(PROBE_FRESH_SECS / 2);
+        let stale = now - chrono::Duration::seconds(PROBE_FRESH_SECS + 60);
+        assert_eq!(availability_tier(Some(true), Some(fresh), now), 0);
+        assert_eq!(availability_tier(Some(true), Some(stale), now), 1, "陈旧的好消息不是好消息");
+        assert_eq!(availability_tier(Some(true), None, now), 0, "没记时间的老行不该被降档");
+        // 失败就是失败，不看新鲜度：坏消息过期不会自己变好。
+        assert_eq!(availability_tier(Some(false), Some(stale), now), 2);
+        assert_eq!(availability_tier(None, None, now), 1);
+    }
+
+    /// 前端那份判据必须和这边**逐字**对齐。
+    ///
+    /// 多路由那一屏不是显示服务端排好的顺序，而是拿同一套判据**自己重算**一遍
+    /// （为了在保存之前就能看到「改成 0.3 倍会排第几」）。也就是说那里有一份
+    /// TypeScript 副本。两边一旦分叉，那一屏显示的顺序就不是真正会发生的顺序 ——
+    /// 而它看起来完全正常，没有任何地方会报错。
+    #[test]
+    fn the_console_mirrors_the_same_ranking_criteria() {
+        let ui = include_str!("../admin-ui/src/pages/RouteEndpoints.tsx");
+        // 两边的数必须同时改。只断言前端有这一行、不断言后端的值，
+        // 改了后端就照样漏过去。
+        assert_eq!(PROBE_FRESH_SECS, 2 * 60 * 60);
+        assert!(
+            ui.contains("const PROBE_FRESH_SECS = 2 * 60 * 60;"),
+            "前端的探测保质期和服务端对不上了",
+        );
+        assert_eq!(SLOW_FACTOR, 3.0);
+        assert!(ui.contains("const SLOW_FACTOR = 3;"), "前端的慢速倍数对不上了");
+        assert_eq!(SLOW_FLOOR_MS, 5_000.0);
+        assert!(ui.contains("const SLOW_FLOOR_MS = 5000;"), "前端的慢速地板对不上了");
+
+        // 三级排序，不是两级。少一级的话前端画出来的顺序里「慢」这一档不存在。
+        assert!(
+            ui.contains("a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2]"),
+            "前端还在按两级排 —— 它显示的顺序和真正发生的不是一回事",
+        );
+
+        // 「一个请求最多换 2 个出口」那道闸已经拆了。前端只要还留着这个常量，
+        // 界面上就还写着那句话，而那句话现在是**假的** —— 用户会照着它只配两个。
+        assert!(
+            !ui.contains("TRIED_PER_REQUEST"),
+            "前端还留着「最多试两个」的常量和文案，而那道闸已经不存在了",
+        );
+    }
+
+    /// 「慢得离谱」两个条件必须同时成立。
+    #[test]
+    fn only_egregiously_slow_outlets_are_demoted() {
+        // 比最快的慢 3.2 倍，而且自己 8 秒 → 降级。这就是线上梦幻API 那条 7994ms
+        // 和 2943ms 并存的形状。
+        assert!(is_egregiously_slow(Some(8000), Some(2500.0)));
+        // 慢三倍多，但自己才 3 秒 —— 用户根本感觉不出来，不该为此让出首选。
+        assert!(!is_egregiously_slow(Some(3000), Some(900.0)));
+        // 自己 8 秒，但全场最快的也要 6 秒 —— 整条线路就是慢，降级等于没降。
+        assert!(!is_egregiously_slow(Some(8000), Some(6000.0)));
+        // 没有证据不构成降级理由（线路自带地址在探测表里没有行）。
+        assert!(!is_egregiously_slow(None, Some(1000.0)));
+        assert!(!is_egregiously_slow(Some(9000), None));
     }
 
     /// 同价位时直连要留在前面。
@@ -2775,14 +3013,28 @@ mod tests {
 
     /// 协议只认两个值。
     #[test]
-    fn protocol_is_one_of_two_words() {
+    fn protocol_is_one_of_the_known_words() {
         assert_eq!(clean_protocol("").ok(), Some(String::new()));
         assert_eq!(clean_protocol(" Anthropic ").ok(), Some("anthropic".into()));
         assert_eq!(clean_protocol("openai").ok(), Some("openai".into()));
+        assert_eq!(clean_protocol("xai_responses").ok(), Some("xai_responses".into()));
         // 不认识的值会一路带到发请求那步，走进「不是 anthropic 就当 openai」的分支，
         // 拼出一个 /chat/completions 打给只认 /v1/messages 的上游，报一个看不懂的 404。
         assert!(clean_protocol("gemini").is_err());
         assert!(clean_protocol("anthropic-v2").is_err());
+        assert!(clean_protocol("responses").is_err(), "别让半个名字也过 —— 它和 xai_responses 是两回事");
+
+        // **两侧白名单必须是同一份**。出口协议会覆盖线路协议（见 effective 协议那处），
+        // 只放行线路那一侧的话，表现是「线路设成新协议了，走的还是老的那条路」——
+        // 而这种错不会报任何错，只会安静地走错。所以两边都从 PROTOCOLS 读。
+        for p in crate::models::PROTOCOLS {
+            assert_eq!(clean_protocol(p).ok(), Some(p.to_string()), "{p} 在出口这侧被挡住了");
+        }
+        let src = include_str!("route_endpoints.rs");
+        assert!(
+            src.contains("crate::models::PROTOCOLS.contains(&p.as_str())"),
+            "出口校验又手抄了一份取值清单 —— 下次加协议只会改一半",
+        );
     }
 
     /// 全选要归一成空。
@@ -2813,17 +3065,82 @@ mod tests {
     }
 
     #[test]
-    fn ratio_must_be_a_discount() {
+    fn ratio_is_a_multiplier_not_a_discount() {
         assert!(clean_ratio(0.3).is_ok());
         assert!(clean_ratio(1.0).is_ok());
-        // 小数点点错成 10（想写 1.0）不能进库：它会让这个出口永远排最后，
-        // 而运维以为自己配的是「十倍便宜」。
+        // 大于 1 必须能存。这条曾经被拒，理由是「折扣不能大于 1.0」——
+        // 而这个数不是折扣。比原价贵的替补出口排在直连后面，只在便宜的都坏了
+        // 才轮到它；拒掉它等于把「贵一点也比断服强」这个选项从产品里删了。
+        assert!(clean_ratio(1.5).is_ok());
+        assert!(clean_ratio(9.99).is_ok());
+        // 小数点点错成 10（想写 1.0）仍然不能进库：它会让这个出口永远排最后，
+        // 而运维以为自己配的是「十倍便宜」。这是护栏，不是语义上限。
         assert!(clean_ratio(10.0).is_err());
         assert!(clean_ratio(0.0).is_err());
         assert!(clean_ratio(-1.0).is_err());
         assert!(clean_ratio(f64::NAN).is_err());
         // NaN 尤其要挡：它参与排序时所有比较都返回 false，会让次序变成
         // 「取决于库里的行序」——一个看起来随机、永远查不出来的 bug。
+    }
+
+    /// 进价倍率在任何一处**会被人看见的文字**里都不许被说成「折」。
+    ///
+    /// 这条不是措辞洁癖，它守的是一条真实发生过的因果链：**词错 → 校验跟着错 →
+    /// 合法配置被拒**。「折」是十分制、只在 0<v<1 这一段说得通；一旦用它说话，
+    /// 1.5 就无话可说，而 `v >= 1 → "进价原价"` 那种分支会把 1.2 一并说成原价 ——
+    /// 一句关于钱的假话。上一版正是从这个词推出了「不能大于 1.0」的上限，
+    /// 把「比原价贵的替补出口」整个拒在了门外。
+    ///
+    /// **先剥注释再断言**：解释「为什么不说折」的注释本身必然含「折」字，
+    /// 照着源文本硬断言的话，这条测试第一天就会红在它自己的说明上。
+    #[test]
+    fn the_cost_ratio_is_never_worded_as_a_discount() {
+        // 块注释（JSX 的 {/* ... */} 也是这个形状）+ 整行 `//`。
+        fn strip_comments(s: &str) -> String {
+            let mut out = String::new();
+            let mut rest = s;
+            while let Some(a) = rest.find("/*") {
+                out.push_str(&rest[..a]);
+                rest = match rest[a..].find("*/") {
+                    Some(b) => &rest[a + b + 2..],
+                    None => "",
+                };
+            }
+            out.push_str(rest);
+            out.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let mut bad: Vec<String> = Vec::new();
+        for (name, raw) in [
+            ("server/src/route_endpoints.rs", src()),
+            (
+                "admin-ui/src/pages/RouteEndpoints.tsx",
+                include_str!("../admin-ui/src/pages/RouteEndpoints.tsx").to_string(),
+            ),
+            (
+                "admin-ui/src/pages/RouteHealth.tsx",
+                include_str!("../admin-ui/src/pages/RouteHealth.tsx").to_string(),
+            ),
+        ] {
+            // 「折算 / 折合 / 折叠」是别的意思，先摘掉，别把它们当成回潮。
+            let code = strip_comments(&raw)
+                .replace("折算", "")
+                .replace("折合", "")
+                .replace("折叠", "");
+            for l in code.lines() {
+                if l.contains('折') {
+                    bad.push(format!("  {name}: {}", l.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "进价倍率又被说成「折」了 —— 这个数是倍率，可以大于 1：\n{}",
+            bad.join("\n"),
+        );
     }
 
     /// 前端真实发出的那个载荷，必须能反序列化。
@@ -2909,7 +3226,7 @@ mod tests {
             "protocol": serde_json::Value::Null,
         });
         let r = serde_json::from_value::<SaveReq>(v).expect("解不出来");
-        assert_eq!(r.cost_ratio, 1.0, "null 折扣该落到默认的原价");
+        assert_eq!(r.cost_ratio, 1.0, "null 倍率该落到默认的 1.0（原价）");
         assert!(r.active, "null 该落到「投入轮转」");
         assert_eq!(r.protocol, "", "null 协议该落到「跟线路一样」");
     }
@@ -2952,15 +3269,24 @@ mod tests {
     fn probe_never_reports_ok_on_a_bare_200() {
         // 这一条钉的是 model_probe.rs 里记着的那条教训：转卖网关会用 200 包错误页。
         let s = src();
-        let i = s.find("pub async fn probe_once(").expect("探测函数不见了");
-        let body = &s[i..];
+        // 判据本体现在是共用函数。**两个调用方都要检查** —— 只钉 probe_once 的话，
+        // 告警那侧退回「只看状态码」是发现不了的（这正是刚修的那个 bug）。
         assert!(
-            body.contains("looks_real"),
-            "探测不再检查响应形状了——那就退回成「只要不报错就算好」"
+            s.contains("pub(crate) fn looks_like_a_real_completion(")
+                && s.contains(r#"v.get("content")"#)
+                && s.contains(r#"v.get("choices")"#),
+            "响应形状的共用判据不见了或被改窄了",
         );
+        let i = s.find("pub async fn probe_once(").expect("探测函数不见了");
         assert!(
-            body.contains(r#"v.get("content")"#) && body.contains(r#"v.get("choices")"#),
-            "响应形状的判据被改窄了"
+            s[i..].contains("looks_like_a_real_completion(&text)"),
+            "出口探测不再检查响应形状了——那就退回成「只要不报错就算好」",
+        );
+        let health = include_str!("route_health.rs");
+        assert!(
+            health.contains("looks_like_a_real_completion("),
+            "告警那侧（canary_once）没用同一个判据 —— 一个「200 + 错误体」的上游\
+             会在出口页报红、在健康页报绿，而两边打的是同一个地址",
         );
     }
 
@@ -3169,6 +3495,195 @@ mod tests {
     ///
     /// 给一条智谱线路画上 OpenAI 的标，比不画标糟得多：不画只是朴素，画错是错误信息，
     /// 而运维扫一眼图标就以为自己看懂了这条线路是谁家的。
+    /// 手写表认不出来的模型，实时目录得能顶上。
+    ///
+    /// # 这道口子原本堵在哪
+    ///
+    /// 图标库里有 149 家，而 `NEEDLES` 只有 67 条、够触发其中 43 家。剩下一百来个图标
+    /// 一直躺在库里没人用得上 —— 不是没画，是没有任何模型名能命中它们。表现就是
+    /// qwen / minimax / mimo 这些在列表里显示成中性图标。
+    ///
+    /// 目录那边每半小时刷新、四百多个模型，每条 id 都带着 `厂商/模型` 的形状，
+    /// 本来就有答案。
+    ///
+    /// # 为什么探针名里不写厂商
+    ///
+    /// 写成 `nvidia/xxx` 的话 `NEEDLES` 自己就答得出来，这个测试会**静音**——
+    /// 把目录那段整段删掉它照样绿（实测过）。所以探针用不带厂商的裸名，
+    /// 并且先断言「没种进目录之前谁也答不出」，那之后的任何答案就只可能来自目录。
+    /// 中转商本来也大量卖裸名（`kimi-k2` 而不是 `moonshotai/kimi-k2`），这正是目录顶上的那一片。
+    #[test]
+    fn the_live_catalog_fills_in_vendors_the_needles_never_knew() {
+        use crate::model_catalog::Entry;
+        const URL: &str = "https://probe.invalid";
+        fn ask(id: &str) -> &'static str {
+            vendor_of("", &[id.to_string()], URL)
+        }
+        fn seed(id: &str, vendor: &str) {
+            crate::model_catalog::seed_for_test(&[(
+                id,
+                Entry { vendor: vendor.to_string(), ..Default::default() },
+            )]);
+        }
+
+        // 自检：种进目录之前，这三个名字对手写表和域名表都是隐形的。
+        for id in ["probe-x1", "probe-x2", "probe-x3"] {
+            assert_eq!(ask(id), "", "{id} 已经能被别的路答出来了，这个测试测不到目录");
+        }
+
+        // 目录前缀和图标键同名：直查。
+        seed("probe-x1", "nvidia");
+        assert_eq!(ask("probe-x1"), "nvidia");
+
+        // 目录前缀和图标键不同名：走别名。`mistralai` 的图标键是 `mistral`。
+        seed("probe-x2", "mistralai");
+        assert_eq!(ask("probe-x2"), "mistral");
+
+        // 目录知道它属于谁，但我们没有这家的图：回空串走中性图标，
+        // **不能**回一个前端画不出来的名字。
+        seed("probe-x3", "poolside");
+        assert_eq!(
+            ask("probe-x3"),
+            "",
+            "没有图的厂商必须回空串，否则前端拿到一个画不出来的键",
+        );
+
+        // 手写表的次序是刻意的，目录不许把它顶掉：bedrock 上的 claude 仍然算 Anthropic。
+        seed("probe-x4-claude", "amazon");
+        assert_eq!(
+            vendor_of("bedrock", &["probe-x4-claude".into()], URL),
+            "anthropic",
+            "NEEDLES 里 claude 排在 bedrock 前面，这个次序不能被目录改写",
+        );
+    }
+
+    /// 名字像，不等于是同一家。
+    ///
+    /// `anthracite-org` 和 `anthropic` 前七个字母一样，而前者是个做微调的小组织。
+    /// 这个测试存在的原因是：给图标表挑别名时，任何「按相似度自动补全」的做法
+    /// 第一个撞上的就是这一对 —— 我自己写这张表时也是先被它绊了一下。
+    /// 给一家画上另一家的标，比不画糟得多，所以它必须停在中性图标上。
+    #[test]
+    fn a_lookalike_name_never_borrows_someone_elses_logo() {
+        use crate::model_catalog::Entry;
+        crate::model_catalog::seed_for_test(&[(
+            "probe-x5",
+            Entry { vendor: "anthracite-org".into(), ..Default::default() },
+        )]);
+        assert_eq!(
+            vendor_of("", &["probe-x5".into()], "https://probe.invalid"),
+            "",
+            "anthracite-org 不是 Anthropic",
+        );
+    }
+
+    /// 服务端认得出的厂商键，必须和 IDE 的图标库**一一对应**。
+    ///
+    /// # 为什么两边都要有这张表
+    ///
+    /// `vendor_of` 回的是 `&'static str`，而实时目录给的厂商前缀是运行时字符串 ——
+    /// 得在 `ICON_KEYS` 里对上才能变成静态引用。于是这份键表在服务端有一份、
+    /// 在 `ide/src/brand-sprite.js` 的 `BRANDS` 里有一份。
+    ///
+    /// 两份必然会漂，而漂了**不会报错**：表现只是某一家的图标突然变成中性图标，
+    /// 或者判定回了一个前端画不出来的名字。所以这里逐字对。
+    #[test]
+    fn the_icon_key_table_matches_the_ide_sprite() {
+        let sprite = include_str!("../../ide/src/brand-sprite.js");
+        let at = sprite
+            .find("export const BRANDS = new Set([")
+            .expect("brand-sprite.js 里找不到 BRANDS —— 它的形状变了");
+        let line = &sprite[at..sprite[at..].find('\n').map(|i| at + i).unwrap_or(sprite.len())];
+        let in_sprite: std::collections::BTreeSet<&str> = line
+            .split('"')
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))
+            .collect();
+        let ours: std::collections::BTreeSet<&str> = ICON_KEYS.iter().copied().collect();
+        assert!(in_sprite.len() > 100, "只从 sprite 里认出 {} 个键", in_sprite.len());
+        let missing: Vec<_> = in_sprite.difference(&ours).collect();
+        let extra: Vec<_> = ours.difference(&in_sprite).collect();
+        assert!(missing.is_empty(), "sprite 有而服务端没有：{missing:?}");
+        assert!(extra.is_empty(), "服务端有而 sprite 没有（会回一个画不出来的名字）：{extra:?}");
+    }
+
+    /// 别名只许指向**真的有图**的那些键。
+    ///
+    /// 别名指向一个不存在的键，等于把这一家从「中性图标」变成「一个画不出来的名字」——
+    /// 前端两种都退回中性图标，所以**不会报错**，只是白写一条别名。
+    ///
+    /// 另一半更要紧：别名**不许按字符串相似度自动生成**。`anthracite-org` 和 `anthropic`
+    /// 前七个字母一样，而前者是个微调组织，跟 Anthropic 没关系 —— 给一家画上别人的标，
+    /// 比不画糟得多。
+    #[test]
+    fn vendor_aliases_point_at_icons_that_exist() {
+        for (from, to) in VENDOR_ALIASES {
+            assert!(
+                ICON_KEYS.contains(to),
+                "别名 {from} → {to}，而 {to} 没有图标",
+            );
+            assert!(
+                !ICON_KEYS.contains(from),
+                "{from} 本身就有图标，不该再给它配别名（直查就够了）",
+            );
+        }
+    }
+
+    /// 线上**每一个正在开放的模型**都得认得出厂商。
+    ///
+    /// # 为什么用真实 id 而不是造几个
+    ///
+    /// 造出来的 id 只能证明判定表自洽。这条钉的是「用户在 IDE 里到底看不看得到图标」，
+    /// 而那取决于他**实际配了什么**。2026-08-26 实测：`mimo-v2.5` 判不出来 ——
+    /// 判定表里没有这一家，而图标库里明明有（键叫 `xiaomimimo`，不叫 `mimo`）。
+    ///
+    /// 两边的键必须逐字对齐。前端 `hasBrandMark(vendor)` 查的就是这个字符串，
+    /// 对不上就画中性图标，而且**不报错** —— 表现只是「这家没有图」，
+    /// 让人以为图标库缺货，其实是判定表没收。
+    #[test]
+    fn every_live_model_resolves_to_a_vendor_with_an_icon() {
+        // 2026-08-26 线上九条线路开放的全部模型。
+        let live: &[(&str, &str, &str)] = &[
+            ("claude-opus-5", "https://api.hanhegufei.online", "anthropic"),
+            ("claude-sonnet-5", "https://api.hanhegufei.online", "anthropic"),
+            ("claude-fable-5", "https://api.hanhegufei.online", "anthropic"),
+            ("gpt-5.6-sol", "https://zyz.qingyanzhiying.top", "openai"),
+            ("gpt-5.6-luna", "https://zyz.qingyanzhiying.top", "openai"),
+            ("gpt-5.6-terra", "https://zyz.qingyanzhiying.top", "openai"),
+            ("deepseek-v4-pro", "https://api.hanhegufei.online", "deepseek"),
+            ("deepseek-v4-flash", "https://api.hanhegufei.online", "deepseek"),
+            ("glm-5.2", "https://api.hanhegufei.online", "zhipu"),
+            ("glm-5.3", "https://api.hanhegufei.online", "zhipu"),
+            ("grok-4.5", "https://api.hanhegufei.online", "xai"),
+            ("grok-4.6", "https://api.hanhegufei.online", "xai"),
+            ("qwen3.7-max", "https://llm.ohub.vip", "qwen"),
+            ("qwen3.7-plus", "https://llm.ohub.vip", "qwen"),
+            ("qwen3.8-max", "https://llm.ohub.vip", "qwen"),
+            ("mimo-v2.5", "https://llm.ohub.vip", "xiaomimimo"),
+            ("mimo-v2.5-pro", "https://llm.ohub.vip", "xiaomimimo"),
+            // 「牛来」自起的名字，模型名什么都说明不了 —— 这时地址是唯一有信息量的东西。
+            ("stealth/ox-alpha", "https://openrouter.ai/api/v1", "openrouter"),
+        ];
+        for (id, base, want) in live {
+            let got = vendor_of("other", &[id.to_string()], base);
+            assert_eq!(
+                got, *want,
+                "{id} 判成了 {got:?}，期望 {want:?} —— IDE 里这个模型会没有图标",
+            );
+        }
+
+        // 判定表回的每一个厂商，图标库里都必须真的有。两边对不上时前端不报错，
+        // 只是画一个中性图标 —— 看起来像「图标库缺这家」，其实是键不一致。
+        let sprite = include_str!("../../ide/src/brand-sprite.js");
+        for (_, _, want) in live {
+            // 查 sprite 导出的 BRANDS 集合，不去匹配 symbol 标签里那串被转义的引号 ——
+            // 那种写法转义一错就静默失效（第一版就把字符串提前闭合了，直接编译不过）。
+            assert!(
+                sprite.contains(&format!("\"{want}\"")),
+                "图标库里没有 {want} 这个 symbol -- 判定认出来了但画不出来",
+            );
+        }
+    }
+
     #[test]
     fn an_unknown_vendor_is_never_guessed() {
         assert_eq!(vendor_of("some-reseller", &["mystery-model-v9".into()], ""), "");

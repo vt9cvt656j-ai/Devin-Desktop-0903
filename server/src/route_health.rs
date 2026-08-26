@@ -219,6 +219,46 @@ fn canary_enabled() -> bool {
     std::env::var("ROUTE_CANARY").ok().as_deref() != Some("0")
 }
 
+/// 把一次探活烧掉的 token 记下来。
+///
+/// **火后不管**：丢一笔对反推单价的影响远小于让探活阻塞在写库上。但和别处的
+/// 「火后不管」不同，这里**不吞错误** —— 这张表少了数据的后果是反推出来的单价偏高，
+/// 而那个数字看起来完全正常，没有任何迹象说它被污染了。
+fn note_probe_usage(
+    state: &AppState,
+    route_id: uuid::Uuid,
+    model_id: &str,
+    tokens: ProbeTokens,
+) {
+    if model_id.is_empty() || (tokens.prompt == 0 && tokens.completion == 0) {
+        return; // 上游没回 usage —— 记一行全 0 只会稀释判据
+    }
+    let db = state.db.clone();
+    let model = model_id.to_string();
+    tokio::spawn(async move {
+        let r = sqlx::query(
+            "INSERT INTO endpoint_probe_usage \
+               (day, endpoint_id, route_id, model_id, calls, prompt_tokens, completion_tokens) \
+             VALUES (current_date, $1, $1, $2, 1, $3, $4) \
+             ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
+               calls = endpoint_probe_usage.calls + 1, \
+               prompt_tokens = endpoint_probe_usage.prompt_tokens + EXCLUDED.prompt_tokens, \
+               completion_tokens = endpoint_probe_usage.completion_tokens + EXCLUDED.completion_tokens, \
+               updated_at = now()",
+        )
+        .bind(route_id)
+        .bind(&model)
+        .bind(tokens.prompt)
+        .bind(tokens.completion)
+        .execute(&db)
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, model = %model,
+                "探活用量写失败 —— 按余额差反推单价时会把这笔摊到用户 token 上，算高");
+        }
+    });
+}
+
 /// 对一条线路发一次最小真实请求。
 ///
 /// 返回 `None` = **这一次没有产生任何证据**，调用方必须什么都不记。
@@ -230,13 +270,34 @@ fn canary_enabled() -> bool {
 ///
 /// 探哪个模型要和**派单口径一致**（`allowed_ids`）：`enabled_models` 为空时派单会回落到
 /// `model_id`，那种线路照样在接真实流量，不能因为第一个字段是空的就当它不存在。
-async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16)> {
+/// 一次探活烧掉的 token。
+///
+/// 探活发的是**真实推理请求**，所以它真的花钱。不把这个数带出来的话，那笔钱在账上
+/// 完全不存在 —— 而它会以「余额对不上」的形式出现在对账页，看起来像别处出了问题。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProbeTokens {
+    pub prompt: i64,
+    pub completion: i64,
+}
+
+async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16, ProbeTokens, String)> {
     let http = reqwest::Client::builder().timeout(CANARY_TIMEOUT).build().ok()?;
     let ids = crate::models::allowed_ids(m);
     let model_id = ids.first()?;
     let key = crate::models::model_key(&m.api_key);
     let base = crate::models::api_base(&m.base_url);
-    let req = if m.protocol == "anthropic" {
+    let wire = crate::models::Wire::of(&m.protocol);
+    // xAI Responses：端点和请求体都是另一套名字。用 chat/completions 那套去探，
+    // 一条从没验证过的线路会被探成绿灯、排到前面接管流量，然后每一发都失败。
+    let req = if wire == crate::models::Wire::XaiResponses {
+        http.post(format!("{base}/responses"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&serde_json::json!({
+                "model": model_id,
+                "max_output_tokens": 1,
+                "input": [{ "role": "user", "content": "hi" }],
+            }))
+    } else if wire == crate::models::Wire::Anthropic {
         http.post(format!("{base}/messages"))
             .header("x-api-key", &key)
             .header("anthropic-version", "2023-06-01")
@@ -257,10 +318,45 @@ async fn canary_once(m: &crate::models::Model) -> Option<(bool, u16)> {
     match req.send().await {
         Ok(r) => {
             let s = r.status().as_u16();
-            Some((r.status().is_success(), s))
+            if !r.status().is_success() {
+                return Some((false, s, ProbeTokens::default(), model_id.clone()));
+            }
+            // 2xx 还不够，判据和出口探测共用一份。
+            //
+            // 这里曾经只看 `status().is_success()`，而 route_endpoints 那边打**同一个
+            // 地址、同一个模型、同一个密钥**却要求响应里真的有 content/choices/usage。
+            // 于是一个「200 + 错误体」的上游（转卖网关的常见形态）会在出口页报红、
+            // 在健康页和邮件告警里报绿 —— 而告警侧用的恰好是宽的那一份。
+            //
+            // 「没有证据不许报绿」是这套监控的立身之本，它却在自己身上破了功。
+            let body = r.text().await.unwrap_or_default();
+            // 顺手把 usage 抠出来 —— 这一发请求的钱已经花了，不记下来它就只会
+            // 以「余额对不上」的形式出现在别处。两家协议的字段名不同，都认。
+            let tokens = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    let u = v.get("usage")?.clone();
+                    let g = |names: &[&str]| -> i64 {
+                        names
+                            .iter()
+                            .find_map(|n| u.get(*n).and_then(|x| x.as_i64()))
+                            .unwrap_or(0)
+                    };
+                    Some(ProbeTokens {
+                        prompt: g(&["prompt_tokens", "input_tokens"]),
+                        completion: g(&["completion_tokens", "output_tokens"]),
+                    })
+                })
+                .unwrap_or_default();
+            Some((
+                crate::route_endpoints::looks_like_a_real_completion(&body),
+                s,
+                tokens,
+                model_id.clone(),
+            ))
         }
         // 超时/连不上：和派单路径上的卡死是同一种坏，用同一个码，面板上读起来一致。
-        Err(_) => Some((false, 504)),
+        Err(_) => Some((false, 504, ProbeTokens::default(), model_id.clone())),
     }
 }
 
@@ -347,14 +443,14 @@ pub fn spawn_stall_recovery(state: &AppState, m: crate::models::Model) {
                 return;
             }
             match canary_once(&m).await {
-                Some((true, status)) => {
+                Some((true, status, _, _)) => {
                     crate::models::clear_route_stall(m.health_id());
                     crate::models::clear_route_cooldown(m.health_id());
                     record_ok(&st, m.health_id()).await;
                     tracing::info!(route = %m.label, status, "卡死线路已由后台探针确认恢复，回到轮换");
                     return;
                 }
-                Some((false, status)) => {
+                Some((false, status, _, _)) => {
                     // 还没好：把记号续上，让它在停机期间持续降权、持续短预算。
                     crate::models::mark_route_stall(m.health_id());
                     record_fail(&st, m.health_id(), status).await;
@@ -664,13 +760,19 @@ pub fn spawn(state: AppState) {
                 if !fresh && canary_enabled() && probed < CANARY_MAX_PER_ROUND {
                     probed += 1;
                     match canary_once(m).await {
-                        Some((ok, status)) => {
+                        Some((ok, status, tokens, model_id)) => {
                             if ok {
                                 record_ok(&state, m.id).await;
                             } else {
                                 record_fail(&state, m.id, status).await;
                             }
-                            tracing::info!(route = %m.label, ok, status, "线路探活（最小真实请求）");
+                            // 这一发请求的钱已经花了 —— 记下来，否则它只会以
+                            // 「余额对不上」的形式出现在对账页，看起来像别处出了问题。
+                            // 失败的探活也照记：请求发出去了，上游多半也计了费。
+                            note_probe_usage(&state, m.id, &model_id, tokens);
+                            tracing::info!(route = %m.label, ok, status,
+                                probe_prompt = tokens.prompt, probe_completion = tokens.completion,
+                                "线路探活（最小真实请求）");
                             // 探活的结果不用在这儿回读：下面的 best_word 会重新取一次
                             // 快照（它还要同时看这条线路挂的多路由出口）。
                         }
@@ -824,8 +926,16 @@ mod tests {
         assert!(body.contains("anthropic"), "没有按协议分支");
         assert!(body.contains("x-api-key") && body.contains("anthropic-version"),
             "anthropic 分支缺鉴权头，那条路上的线路会被全部误判成坏的");
-        assert!(body.contains("/messages") && body.contains("/chat/completions"),
-            "两种协议的端点必须各走各的");
+        assert!(
+            body.contains("/messages")
+                && body.contains("/chat/completions")
+                && body.contains("/responses"),
+            "三种协议的端点必须各走各的 —— 少一条就是「拿另一套请求体去探，探绿了却根本不通」",
+        );
+        assert!(
+            body.contains("max_output_tokens") && body.contains("\"input\""),
+            "Responses 的最小请求体是另一套名字（input / max_output_tokens），照抄 chat 那套探不出真相",
+        );
         // 最小请求：只问「接不接得通」，不让它真去生成。
         assert!(body.contains("\"max_tokens\": 1"), "探测请求不是最小的，会白烧 token");
     }
@@ -905,9 +1015,19 @@ mod tests {
             .and_then(|s| s.split("\n// ").next())
             .expect("canary_once 不见了");
 
+        // 钉住**承载语义的那部分**，不钉元组的完整形状。
+        //
+        // 这里原本写死 `-> Option<(bool, u16)>`。后来为了把探活烧掉的 token 记进账，
+        // 返回值多带了两个字段 —— 语义一个字没变（还是 Option，None 仍然表示
+        // 「这一次没有证据」），但断言当场红了。
+        //
+        // 逐字钉签名的守卫会把「加了一个字段」和「把 Option 拆了」判成同一件事，
+        // 而它们一个是无害的、一个是这条守卫真正要防的。所以只钉两件：
+        // 是 Option（能表达无证据），前两位仍是 (成功与否, 状态码)。
         assert!(
-            body.contains("-> Option<(bool, u16)>"),
-            "返回类型必须能表达「这一次没有证据」，否则调用方只能在成功和失败里二选一",
+            body.contains("-> Option<(bool, u16"),
+            "返回类型必须是 Option 且前两位是 (ok, status) —— \
+             不是 Option 的话，调用方只能在成功和失败里二选一，「无从探起」就没地方放了",
         );
         assert!(
             !body.contains("return (true,"),

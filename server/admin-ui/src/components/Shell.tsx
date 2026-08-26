@@ -4,6 +4,9 @@ import {
   BarChart3,
   BookOpen,
   Bot,
+  Scale,
+  PlugZap,
+  Coins,
   Calculator,
   ChevronRight,
   History,
@@ -43,10 +46,15 @@ export type NavKey =
   | "routing"
   | "routing-health"
   | "routing-groups"
+  | "routing-sort"
   | "routing-endpoints"
   | "routing-icons"
   | "routing-reconcile"
+  | "routing-reconcile-accounts"
+  | "routing-adapters"
+  | "routing-adapters-changes"
   | "employees"
+  | "relay-rates"
   | "pricing"
   | "commission"
   | "commission-pending"
@@ -111,6 +119,9 @@ export const NAV: (Leaf | Group)[] = [
       { key: "routing-health", label: "健康" },
       { key: "routing", label: "线路" },
       { key: "routing-groups", label: "分组" },
+      // 排序紧跟分组：两者都只改「用户看到的先后」——除了一处例外，
+      // 同一个模型被两条线路开放时，次序还决定谁接单、按谁计费。那一屏自己会说。
+      { key: "routing-sort", label: "排序" },
       // 一条线路挂多个上游出口。和「线路」是两件事：那里改的是这条线路是什么、卖多少钱，
       // 这里改的只是这一次请求从哪个门发出去 —— 换门换不动账单。
       { key: "routing-endpoints", label: "多路由" },
@@ -118,12 +129,44 @@ export const NAV: (Leaf | Group)[] = [
       // 某条线路的图标是灰的，到底是没这家的图，还是判定没认出来。
       { key: "routing-icons", label: "模型图标" },
       // 对账放最后：前面几屏回答「怎么配、能不能用」，这一屏回答「这么配下来赚没赚钱」。
-      { key: "routing-reconcile", label: "对账" },
     ],
   },
   // 智能员工紧跟在模型线路后面：它干的多数事情就是盯着线路，
   // 而且它用的模型也是上面配的那些线路。
+  // 这两个从「模型线路」组里提到了顶层。
+  //
+  // 嵌在里面是按「都和线路有关」分的，但那不是用户的动线：配线路是偶尔为之，
+  // 而「这些线路认出来没有、赚不赚钱」是天天要看的。天天看的东西不该藏在
+  // 一个要先展开的二级菜单里。
+  //
+  // 「状态」和「价格异动」拆成两个入口，而不是页面里的两个按钮：页面内的标签页
+  // 只有先走到这一屏才看得见，于是「最近有没有人偷偷涨价」这件事得先点进来才知道
+  // 有得看。侧栏是常驻的 —— 入口在侧栏，它才算存在。
+  {
+    group: "routing-adapters",
+    label: "网关适配器",
+    icon: PlugZap,
+    children: [
+      { key: "routing-adapters", label: "适配器状态" },
+      { key: "routing-adapters-changes", label: "价格异动" },
+    ],
+  },
+  // 拆成两条子项：一条回答「每个出口赚没赚钱」，一条回答「中转扣的钱和它自己的
+  // 价目表对不对得上」。后者是**核对上游有没有多扣**，和前者不是同一个问题，
+  // 挤在一页里的话上面那张账户表会被下面的出口流水挤到看不见。
+  {
+    group: "routing-reconcile",
+    label: "模型对账",
+    icon: Scale,
+    children: [
+      { key: "routing-reconcile", label: "出口明细" },
+      { key: "routing-reconcile-accounts", label: "账单核对" },
+    ],
+  },
   { key: "employees", label: "智能员工", icon: Bot },
+  // 每家中转的充值汇率。单独一个顶级入口，不塞进「模型线路」里：
+  // 它回答的是「哪家真的便宜」，而那个问题跨所有线路，不属于某一条。
+  { key: "relay-rates", label: "模型汇率", icon: Coins },
   { key: "pricing", label: "定价试算", icon: Calculator },
   // 分销是四屏，不是一屏：规则、待结算的钱、谁在推荐、被谁推荐来的。挤在一页里
   // 要滚过两块无关内容才能结算一笔佣金。

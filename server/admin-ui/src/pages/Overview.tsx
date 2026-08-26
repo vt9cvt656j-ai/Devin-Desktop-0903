@@ -11,7 +11,8 @@ import { SectionReveal } from "@/components/motion/section-reveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
-import { cents, num, when } from "@/lib/format";
+import { num, when } from "@/lib/format";
+import { formatMoney, formatTotals, sumByCurrency } from "@/lib/money";
 
 /**
  * Leads with money. The old dashboard's three tiles were 总用户 / 今日新增 / 当前在线 — and
@@ -69,7 +70,9 @@ const EVENT_LABEL: Record<string, string> = {
   login: "登录",
   redeem: "兑换码",
   order_created: "下单",
-  order_paid: "确认收款",
+  // 「确认收款」是人工确认时代的说法。这个事件现在只由 Stripe 那条线写（webhook / 对账器），
+  // 没有人去确认它，所以它的意思就是「钱到了」。
+  order_paid: "付款成功",
   user_updated: "客户变更",
   role_change: "角色变更",
   notify: "群发通知",
@@ -89,7 +92,8 @@ const str = (data: Event["data"], key: string) => {
 function subject(ev: Event) {
   const d = ev.data;
   const who = str(d, "email") || str(d, "by") || str(d, "tag");
-  const amount = typeof d?.amount_cents === "number" ? cents(d.amount_cents) : "";
+  // 事件里带的 amount_cents 是目录的人民币标价（pay.rs / stripe.rs 记事件时绑的就是它）。
+  const amount = typeof d?.amount_cents === "number" ? formatMoney(d.amount_cents, "cny") : "";
   const action = str(d, "action");
   return [who, amount, action].filter(Boolean).join(" · ");
 }
@@ -140,17 +144,11 @@ export function Overview() {
   // "not paid" counts every CANCELLED order as needing action. The tile then shows a backlog
   // that never clears and disagrees with Billing, which filters correctly.
   const pending = loadedOrders.filter((o) => o.status === "pending");
-  /*
-   * 优先用 Stripe 实收的钱。
-   *
-   * amount_cents 是目录里的人民币标价（「Power」= 18800 分），这一栏却按美元渲染 ——
-   * 一笔实收 $34.99 的订单会显示成 $188.00，整体营收虚高五六倍。Billing.tsx 已经改过，
-   * 这里是同一个数的另一处显示。
-   */
-  const revenue = paid.reduce(
-    (a, o) => a + (typeof o.charged_cents === "number" ? o.charged_cents : o.amount_cents || 0),
-    0,
-  );
+  // 口径在 lib/money.ts，和收款页共用一份。以前这里是自己写的一份，只做到「优先用
+  // charged_cents」，拿不到就退回 amount_cents（人民币标价）再按美元渲染 —— 于是没进账的
+  // 手工单被算成钱，人民币被报成美元。两份抄在一起的东西只要有一处先改，另一处就会
+  // 带着一句「Billing.tsx 已经改过」的注释继续错下去，这里原来就是那样。
+  const receivedText = formatTotals(sumByCurrency(paid));
 
   const loadedUsers = users ?? [];
   const active = (u: User) =>
@@ -222,13 +220,13 @@ export function Overview() {
       <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat
           label="已收款"
-          value={orders ? cents(revenue) : "—"}
+          value={orders ? receivedText : "—"}
           hint={orders ? `${paid.length} 笔` : "读取中"}
         />
         <Stat
-          label="待确认订单"
+          label="未支付订单"
           value={orders ? num(pending.length) : "—"}
-          hint={!orders ? "读取中" : pending.length ? "需要处理" : "没有积压"}
+          hint={!orders ? "读取中" : pending.length ? "钱没到，Stripe 结清后自动转已支付" : "没有挂着的单"}
         />
         <Stat label="总用户" value={stats ? num(stats.total_users) : "—"} />
         <Stat label="今日新增" value={stats ? num(stats.today_users) : "—"} />
@@ -295,11 +293,11 @@ export function Overview() {
         <SectionReveal as="section" delay={200} className="flex">
           <div className="flex w-full flex-col rounded-xl border border-border bg-card">
             <header className="flex items-center justify-between border-b border-border px-5 py-3">
-              <h2 className="text-sm font-semibold">待确认订单</h2>
+              <h2 className="text-sm font-semibold">未支付订单</h2>
               {pending.length > 0 && <Badge variant="outline">{pending.length}</Badge>}
             </header>
             {!orders ? (
-              <TableSkeleton rows={4} columns={["46%", "18%"]} label="待确认订单读取中" />
+              <TableSkeleton rows={4} columns={["46%", "18%"]} label="未支付订单读取中" />
             ) : (
               <div className="flex flex-1 flex-col divide-y divide-border">
                 {pending.slice(0, 6).map((o) => (
@@ -307,11 +305,14 @@ export function Overview() {
                     <span className="min-w-0 truncate" title={o.email || o.id}>
                       {o.email || o.id}
                     </span>
-                    <span className="shrink-0 whitespace-nowrap tabular-nums">{cents(o.amount_cents)}</span>
+                    {/* 没付钱的单没有实收金额，这里只能显示标价 —— 而标价是人民币。 */}
+                    <span className="shrink-0 whitespace-nowrap tabular-nums">
+                      {formatMoney(o.amount_cents || 0, "cny")}
+                    </span>
                   </div>
                 ))}
                 {!pending.length && (
-                  <EmptyState compact title="没有待确认订单" hint="有人付款后会出现在这里。" />
+                  <EmptyState compact title="没有未支付订单" hint="有人付款后会出现在这里。" />
                 )}
               </div>
             )}

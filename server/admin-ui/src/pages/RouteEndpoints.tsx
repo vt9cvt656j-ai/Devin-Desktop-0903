@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Check,
-  CircleSlash,
+  Turtle,
   ListChecks,
   PauseCircle,
   PlayCircle,
@@ -43,17 +43,19 @@ import { cn } from "@/lib/utils";
  *
  * # 这一屏的主角是「顺序」，所以按顺序排，不按表格排
  *
- * 加出口这件事本身只有三个输入（地址、密钥、几折），不值得一整屏。真正需要看见的是
+ * 加出口这件事本身只有三个输入（地址、密钥、进价倍率），不值得一整屏。真正需要看见的是
  * **同一条线路下这几个出口谁先被用**，因为那是这个功能的全部意义：便宜的先用、坏的靠后。
  * 做成一张平表（每行一个出口、有个"优先级"列）就要读着数字在脑子里重排一遍；
  * 直接按生效顺序竖着列，第一眼就是答案。
  *
- * # 为什么把「只有前两个会被用到」画出来
+ * # 挂多少个就能用多少个
  *
- * 网关一个请求最多换两个出口就收手（`CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED = 2`，
- * 再多客户端等不起）。所以挂十个不等于十次机会 —— 第三个往后只有在前面的被探测判坏、
- * 掉到后面之后才轮得到。这件事不画出来，运维会以为自己配了十重保险，而实际上第三个
- * 之后基本躺着。宁可界面上多一条分割线，也不能让人对可用性有错误预期。
+ * 以前网关一个请求最多换**两个**出口就收手，于是挂十个不等于十次机会 —— 第三个往后
+ * 基本躺着。那道闸已经拆了：现在的闸是**时间**（客户端自己的耐心算出来的预算），
+ * 而换线只发生在上游明确回了错误的时候，那类失败两三百毫秒就回来。十个这样的失败
+ * 加起来还不到三秒，所以次数根本不是瓶颈，时间才是。
+ *
+ * 因此这一屏不再画「前两个」那条线。要画的是**顺序**本身：谁先被敲门。
  *
  * # 密钥只写不读
  *
@@ -125,42 +127,100 @@ type Draft = {
   names: Record<string, string>;
 };
 
-/** 网关一个请求最多试几个出口。和 models.rs 的常量对齐 —— 改那边要改这里。 */
-const TRIED_PER_REQUEST = 2;
+/**
+ * 和服务端 `route_endpoints.rs` 的常量逐字对齐 —— 改那边必须改这里。
+ * 这一屏是按同一套判据**重算**顺序的（为了在保存之前就能看到「改成 0.3 倍会排第几」），
+ * 两边一旦分叉，这一屏显示的顺序就不是真正会发生的顺序。
+ */
+const PROBE_FRESH_SECS = 2 * 60 * 60;
+const SLOW_FACTOR = 3;
+const SLOW_FLOOR_MS = 5000;
 
-/** 探测结论 → 排序档位。和服务端 `order_key` 同一套判据。 */
-function tier(probeOk: boolean | null): number {
-  if (probeOk === true) return 0;
+/**
+ * 可用性档。和服务端 `availability_tier` 同一套判据。
+ *
+ * 「测通了，但那是三天前的事」算没证据，不算测通 —— 陈旧的好消息不是好消息。
+ * 没记时间的老行按新鲜处理，否则升级那一刻所有出口一起降档。
+ */
+function tier(probeOk: boolean | null, probeAt: string | null, now: number): number {
+  if (probeOk === false) return 2;
   if (probeOk === null) return 1;
-  return 2;
+  if (!probeAt) return 0;
+  const t = Date.parse(probeAt);
+  if (!Number.isFinite(t)) return 0;
+  return now - t <= PROBE_FRESH_SECS * 1000 ? 0 : 1;
+}
+
+/** 慢得离谱。和服务端 `is_egregiously_slow` 同一套判据：两个条件必须同时成立。 */
+function egregiouslySlow(ms: number | null, bestMs: number | null): boolean {
+  if (ms == null || bestMs == null || !(bestMs > 0)) return false;
+  return ms >= SLOW_FLOOR_MS && ms >= SLOW_FACTOR * bestMs;
 }
 
 /**
  * 按生效顺序排出这条线路的出口，线路自带地址算成本 1.0 的那个。
  *
- * 这里重算一遍而不是让服务端回排好的：这一屏要的是「**如果**我把这个改成三折，
+ * 这里重算一遍而不是让服务端回排好的：这一屏要的是「**如果**我把这个改成 0.3 倍，
  * 它会排到第几」，而那要在保存之前就看得到。判据和服务端是同一套。
  */
 function ordered(r: Route): Array<Endpoint | null> {
-  const rows: Array<{ k: [number, number]; v: Endpoint | null }> = [
+  const now = Date.now();
+  const live = r.endpoints.filter((e) => e.active);
+  // 「慢不慢」是**相对同线路最快的那个**说的，一个出口自己看不出来。基准只取还活着的
+  // 候选：一个已知打不通的出口耗时没有意义，拿它当基准会让所有人显得「不慢」。
+  const bestMs = live
+    .filter((e) => tier(e.probe_ok, e.probe_at, now) < 2)
+    .map((e) => e.probe_ms)
+    .filter((v): v is number => v != null && v > 0)
+    .reduce<number | null>((a, v) => (a == null ? v : Math.min(a, v)), null);
+
+  const rows: Array<{ k: [number, number, number]; v: Endpoint | null }> = [
     // 线路自带的地址按第 0 档算，不是「还没测过」：它是在任的那个，今天所有流量都从它走。
     // 走「还没测过」的话，一个原价的备用中转只要测通就会把直连顶掉 —— 同价位凭空多一跳。
+    // 它在探测表里没有行，所以也没有耗时，因此永远不会被判「慢」。
     // 判据和服务端 own_order_key 一致。
-    { k: [0, 1], v: null },
-    ...r.endpoints
-      .filter((e) => e.active)
-      .map((e) => ({ k: [tier(e.probe_ok), e.cost_ratio] as [number, number], v: e })),
+    { k: [0, 0, 1], v: null },
+    ...live.map((e) => ({
+      k: [
+        tier(e.probe_ok, e.probe_at, now),
+        egregiouslySlow(e.probe_ms, bestMs) ? 1 : 0,
+        e.cost_ratio,
+      ] as [number, number, number],
+      v: e,
+    })),
   ];
-  rows.sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1]);
+  rows.sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2]);
   return rows.map((x) => x.v);
 }
 
+/** 这个出口在这一屏上是不是被判了「慢」。渲染徽章用，判据和 ordered() 同一处。 */
+function slowOnThisRoute(r: Route, e: Endpoint | null): boolean {
+  if (!e) return false;
+  const now = Date.now();
+  const live = r.endpoints.filter((x) => x.active);
+  const bestMs = live
+    .filter((x) => tier(x.probe_ok, x.probe_at, now) < 2)
+    .map((x) => x.probe_ms)
+    .filter((v): v is number => v != null && v > 0)
+    .reduce<number | null>((a, v) => (a == null ? v : Math.min(a, v)), null);
+  return egregiouslySlow(e.probe_ms, bestMs);
+}
+
+/**
+ * 这个数**一律说「倍」，不说「折」**。
+ *
+ * 不是措辞偏好：折是十分制、只在 0<v<1 这一段说得通。用折说话，1.5 这个合法的值
+ * 无话可说；而上一版的 `v >= 1 → "进价原价"` 会把 1.2 也说成原价 ——
+ * 那是一句关于钱的假话，而且正是它让人以为这里天生不能大于 1。
+ *
+ * 一律带「进价」二字：不带的话，列表里一个孤零零的「0.3×」很容易被当成卖价的倍率，
+ * 而卖价那个是线路页上另一个数。
+ *
+ * `Number(toFixed(4))` 是为了去掉浮点尾巴（0.1+0.2 那类），不是四舍五入到四位：
+ * 0.05 还是 0.05，0.35 还是 0.35。
+ */
 function ratioText(v: number): string {
-  if (v >= 1) return "进价原价";
-  // 0.3 → 三折。中文习惯说折，小数点后一位足够；0.35 这种就直接给倍数。
-  // 一律带「进价」二字：不带的话，列表里一个孤零零的「3 折」很容易被当成卖价。
-  const tenth = Math.round(v * 100) / 10;
-  return Number.isInteger(tenth) ? `进价 ${tenth} 折` : `进价 ${v}×`;
+  return `进价 ${Number(v.toFixed(4))}×`;
 }
 
 /**
@@ -442,9 +502,12 @@ export function RouteEndpoints() {
 
           <SectionReveal as="section" delay={140} className="space-y-4">
             <p className="text-xs leading-relaxed text-muted-foreground">
-              同一条线路下按 <b className="text-foreground">「能用的在前，便宜的在前」</b>{" "}
-              自动排序。一个请求最多换 {TRIED_PER_REQUEST} 个出口就收手（再多客户端等不起），
-              所以真正常用的是每条线路的前 {TRIED_PER_REQUEST} 个，再往后是它们都坏掉时的兜底。
+              同一条线路下按{" "}
+              <b className="text-foreground">「能用的在前 → 不慢的在前 → 便宜的在前」</b>{" "}
+              自动排序。<b className="text-foreground">挂多少个就能用多少个</b>——
+              一个请求能换几个出口由<b className="text-foreground">时间</b>决定，不由次数决定：
+              换线只发生在上游明确回了错误的时候，而那类失败（401 / 404 / 429）两三百毫秒就回来，
+              十个加起来还不到三秒。总时长由客户端自己的耐心封顶，多试几个不会让人多等。
             </p>
 
             {list.map((r) => {
@@ -495,17 +558,14 @@ export function RouteEndpoints() {
 
                   <ol className="divide-y divide-border">
                     {rows.map((e, i) => {
-                      const beyond = i >= TRIED_PER_REQUEST;
+                      // 「前两个之后就躺着」那条分割线删了 —— 它描述的那道闸已经不存在。
+                      // 现在压暗的判据换成「被判了慢」：那才是这一屏上唯一还会让一个
+                      // 出口往后靠的东西，而且它是可解释的（比最快的慢三倍且超过五秒）。
+                      const slow = slowOnThisRoute(r, e);
+                      const beyond = slow;
                       const id = e?.id ?? r.id;
-                      const showCut = i === TRIED_PER_REQUEST && rows.length > TRIED_PER_REQUEST;
                       return (
                         <li key={id}>
-                          {showCut && (
-                            <div className="flex items-center gap-2 bg-muted/40 px-5 py-1.5 text-[11px] text-muted-foreground">
-                              <CircleSlash className="size-3" />
-                              以下只有上面 {TRIED_PER_REQUEST} 个都失败并被判坏、掉到后面之后才轮得到
-                            </div>
-                          )}
                           <div
                             className={cn(
                               "flex flex-wrap items-center gap-x-3 gap-y-2 px-5 py-3 transition-colors hover:bg-accent/40",
@@ -559,7 +619,24 @@ export function RouteEndpoints() {
                               retryIn={e ? e.retry_in : r.retry_in}
                             />
                             {e ? (
+                              // 三元的每一支只能是一个表达式 —— 加同级徽章必须套片段。
+                              <>
                               <ProbeBadge ok={e.probe_ok} ms={e.probe_ms} note={e.probe_note} />
+                              {/*
+                                降级必须看得见。不标出来的话，一个便宜出口莫名其妙
+                                排在第三位，运维只会以为排序坏了 —— 而它是被判「慢」
+                                往后靠的，理由具体且可核对。
+                              */}
+                              {slow && (
+                                <Badge
+                                  variant="outline"
+                                  className="border-warning/40 text-warning"
+                                  title={`比这条线路最快的出口慢 ${SLOW_FACTOR} 倍以上，而且自己超过 ${SLOW_FLOOR_MS / 1000} 秒 —— 已排到同档的便宜出口之后。两个条件必须同时成立才会降级。`}
+                                >
+                                  <Turtle className="size-3" /> 慢
+                                </Badge>
+                              )}
+                              </>
                             ) : (
                               <Badge variant="outline">直连</Badge>
                             )}
@@ -641,7 +718,13 @@ export function RouteEndpoints() {
           }
         }}
       >
-        <DialogContent>
+        {/*
+          横版。竖着排的时候这个表单有八段，弹窗最高只有 88vh —— 底下的模型表和
+          「保存」按钮要滚下去才看得见，而模型表自己还有一层滚动条，两层套在一起
+          很容易以为已经到底了。左边是「这条出口本身」，右边是「它有哪些模型」，
+          两边各自不长，一屏就装得下。窄屏（lg 以下）自动回到单列。
+        */}
+        <DialogContent className="max-w-5xl gap-4 p-5">
           <DialogHeader>
             <DialogTitle>{draft?.id ? "改一个出口" : "加一个出口"}</DialogTitle>
             <DialogDescription>
@@ -649,7 +732,9 @@ export function RouteEndpoints() {
             </DialogDescription>
           </DialogHeader>
           {draft && (
-            <div className="grid gap-4">
+            <div className="grid gap-5 lg:grid-cols-2 lg:items-start">
+              {/* 左列：这条出口本身怎么连 */}
+              <div className="grid content-start gap-4">
               <div>
                 <Label htmlFor="e-url">中转地址</Label>
                 <Input
@@ -696,7 +781,12 @@ export function RouteEndpoints() {
               </div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <div>
-                  <Label htmlFor="e-ratio">进价倍率</Label>
+                  <Label
+                    htmlFor="e-ratio"
+                    title="照抄中转那边写的倍率本身：0.3 = 按官方价的 0.3 倍进货，1 = 原价，大于 1 也能填（比原价贵的替补，排在直连后面）。它只决定先用哪个出口，不进用户账单。"
+                  >
+                    倍率
+                  </Label>
                   <Input
                     id="e-ratio"
                     value={draft.cost_ratio}
@@ -706,8 +796,11 @@ export function RouteEndpoints() {
                   {/*
                     叫「进价倍率」不叫「折扣」：线路那页那个加价的也叫倍率，同一类东西
                     该用同一族词，否则读起来像两个不相干的设置。用「进价」前缀区分方向 ——
-                    一个是我付出去的，一个是用户付进来的。数值上 0.3 折扣 = 0.3 倍，
-                    换个词不改任何行为。
+                    一个是我付出去的，一个是用户付进来的。
+
+                    而且这不只是换个词：说成折扣就会带出一条「不能大于 1」的上限，
+                    上游那边的分组倍率本来就可以大于 1，比原价贵的替补出口也是合法配置。
+                    服务端那条上限已经跟着一起拆了（见 clean_ratio）。
                   */}
                 </div>
                 <div>
@@ -737,12 +830,11 @@ export function RouteEndpoints() {
                 说明文字通栏放，不塞进三列格子里。塞进去的话每列只有一百来像素宽，
                 一句话被切成六行四个字的豆腐块 —— 字都在，但没人会去读。
                 输入框适合并排，解释性文字不适合。
+
+                「倍率」那一段按用户要求删了，剩下的说明挪进了标签的 title：
+                这个数在中转那边就叫倍率，照抄就行，不需要一整段文字讲它。
               */}
               <p className="-mt-1 text-xs leading-relaxed text-muted-foreground">
-                <b>进价倍率</b>：0.3 = 三折，我按官方价的三成进货。和线路那边的
-                <b>加价倍率是两回事</b> —— 那个决定用户付多少，这个只决定先用哪个出口，
-                <b>不进用户账单</b>。
-                <br />
                 <b>能扛多少</b>：同条线路下用同一把尺（RPM 或随便一个相对值），
                 只在别的出口被限流、要挑替补时才用到，平时留空就行。
               </p>
@@ -756,6 +848,7 @@ export function RouteEndpoints() {
                   <option value="">跟线路一样</option>
                   <option value="anthropic">Anthropic 原生 /v1/messages</option>
                   <option value="openai">OpenAI 兼容 /chat/completions</option>
+                  <option value="xai_responses">xAI Responses /v1/responses（grok 的思考摘要只在这条上给）</option>
                 </Select>
                 {/*
                   协议是「这条线怎么说话」，可以和线路不同 —— 官方直连走 Anthropic 原生，
@@ -765,7 +858,10 @@ export function RouteEndpoints() {
                   便宜的转卖常常只有 OpenAI 兼容口，这里可以和线路不一样。
                 </p>
               </div>
+              </div>
 
+              {/* 右列：它有哪些模型 —— 这一块最高，单独占一列才不用滚 */}
+              <div className="grid content-start gap-4">
               <div>
                 <div className="flex items-center justify-between">
                   <Label htmlFor="e-models">这个出口有哪些模型</Label>
@@ -804,17 +900,32 @@ export function RouteEndpoints() {
                   );
                 })()}
                 <div className="mt-1.5 overflow-hidden rounded-lg border border-border">
-                  {/* 表头：三个空输入框不写标题的话，没人分得出哪个是入价哪个是出价。
-                      列宽和下面的行用同一套 grid，改一处要一起改。 */}
+                  {/*
+                    表头：三个空输入框不写标题的话，没人分得出哪个是什么。
+
+                    叫「输入价 / 输出价」，**绝不能叫「入价 / 出价」**。这个产品里
+                    「进价」到处都指**你付给中转的成本**（对账、模型汇率都是这个意思），
+                    而「入价」和它一字之差、读音也近 —— 而这两个框写进的是
+                    `route.model_prices`，那是**用户付的价**。一个把进价填进来的人
+                    会当场改掉客户账单，而且没有任何地方会提示他。
+                    列宽和下面的行用同一套 grid，改一处要一起改。
+                  */}
                   <div className="grid grid-cols-[auto_minmax(0,1fr)_7rem_4.5rem_4.5rem_auto] items-center gap-2 border-b border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
                     <span className="w-3" />
                     <span>模型</span>
                     <span>显示名</span>
-                    <span>入价</span>
-                    <span>出价</span>
+                    <span>输入价</span>
+                    <span>输出价</span>
                     <span />
                   </div>
-                  <div className="max-h-56 overflow-y-auto">
+                  {/*
+                    高度跟着视口走，不是一个定值。弹窗自己封顶 88vh，而这张表是里面
+                    唯一会长的东西 —— 写死 24rem 的话，1440×900 正好装得下，
+                    换成 1280×800 就超 14px，于是又回到「两层滚动条套在一起」。
+                    88vh 减去表以外那些（实测约 24rem）就是它能占的高度，短屏自动缩。
+                    线上那个 89 款模型的出口就会撞到这个上限 —— 定值在那儿是真会溢出的。
+                  */}
+                  <div className="max-h-[min(24rem,calc(88vh-24rem))] overflow-y-auto">
                   {[
                     ...(routeOf(draft.route_id)?.models ?? []),
                     // 这家有、线路没有的：勾上会新增到 IDE 列表。算不出价的也列出来，
@@ -868,7 +979,7 @@ export function RouteEndpoints() {
                         />
                         <Input
                           className="h-7 w-full text-xs"
-                          placeholder="入价"
+                          placeholder="输入价"
                           value={
                             draft.prices[m]?.in ??
                             (routeOf(draft.route_id)?.model_prices?.[m]?.in
@@ -888,7 +999,7 @@ export function RouteEndpoints() {
                         />
                         <Input
                           className="h-7 w-full text-xs"
-                          placeholder="出价"
+                          placeholder="输出价"
                           value={
                             draft.prices[m]?.out ??
                             (routeOf(draft.route_id)?.model_prices?.[m]?.out
@@ -916,7 +1027,7 @@ export function RouteEndpoints() {
                           <Badge
                             variant="outline"
                             className="shrink-0 border-destructive/40 text-destructive"
-                            title="目录里查不到这个模型的官方价。在左边填上入价/出价（每百万 token 美元）就能开放。不填的话用户一分不付、上游照收你的钱。"
+                            title="目录里查不到这个模型的官方价。在左边填上输入价/输出价（每百万 token 美元）就能开放 —— 那是用户付的价，不是你的进价。不填的话用户一分不付、上游照收你的钱。"
                           >
                             要填价
                           </Badge>
@@ -934,30 +1045,43 @@ export function RouteEndpoints() {
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
                   勾上「线路没有」的那些，它们会<b>新增到 IDE 的模型列表</b>，按这条线路的
-                  倍率计费。入价/出价是每百万 token 美元，<b>填了会存到线路上</b>（同一条线路
-                  的几个出口共用一份价）；目录里有官方价的可以不填。
+                  倍率计费。
+                  <br />
+                  <b className="text-foreground">输入价 / 输出价是「用户付多少」，不是你的进价。</b>
+                  单位每百万 token 美元，最终扣费 = 这个价 × 这条线路的倍率。
+                  <b>填了会存到线路上</b>（同一条线路的几个出口共用一份价），
+                  目录里有官方价的可以不填。
+                  你付给中转的<b>进价</b>在「模型对账」里填，两者不是一回事 ——
+                  把进价填到这儿会当场改掉客户账单。
                   全勾 = 承载这条线路的全部模型（以后线路加了新模型也自动跟着有）。
                   取消勾选的模型不会被派到这个出口——转卖商之间的货不一样，
                   派过去只会撞一个 404，而每个请求只有 2 次机会。
                 </p>
               </div>
 
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={draft.active}
-                  onChange={(ev) => setDraft({ ...draft, active: ev.target.checked })}
-                />
-                投入轮转（取消勾选 = 留着配置但不接任何请求）
-              </label>
+              </div>
 
-              <div className="flex justify-end gap-2">
-                <Button variant="ghost" onClick={() => setDraft(null)}>
-                  取消
-                </Button>
-                <Button disabled={busy || !draft.base_url.trim()} onClick={() => void save()}>
-                  {busy ? "保存并测试…" : "保存并测试"}
-                </Button>
+              {/*
+                页脚通栏。「投入轮转」和两个按钮放同一行：它是一个开关不是一段表单，
+                塞进左列会把左右两列的高度差再拉开一截。
+              */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4 lg:col-span-2">
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={draft.active}
+                    onChange={(ev) => setDraft({ ...draft, active: ev.target.checked })}
+                  />
+                  投入轮转（取消勾选 = 留着配置但不接任何请求）
+                </label>
+                <div className="flex gap-2">
+                  <Button variant="ghost" onClick={() => setDraft(null)}>
+                    取消
+                  </Button>
+                  <Button disabled={busy || !draft.base_url.trim()} onClick={() => void save()}>
+                    {busy ? "保存并测试…" : "保存并测试"}
+                  </Button>
+                </div>
               </div>
             </div>
           )}

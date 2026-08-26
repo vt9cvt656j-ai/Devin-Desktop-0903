@@ -16,6 +16,9 @@ import { Changelog, type ChangelogView } from "@/pages/Changelog";
 import { Docs } from "@/pages/Docs";
 import { Commission, type CommissionView } from "@/pages/Commission";
 import { Reconcile } from "@/pages/Reconcile";
+import { Adapters } from "@/pages/Adapters";
+import { RelayRates } from "@/pages/RelayRates";
+import { RouteOrder } from "@/pages/RouteOrder";
 import { Mail, type MailView } from "@/pages/Mail";
 import { api, auth, endConsoleSession } from "@/lib/api";
 import { loadSettings } from "@/lib/settings";
@@ -30,7 +33,11 @@ const ROUTING_OWN_SCREENS = {
   "routing-health": () => <RouteHealth />,
   "routing-endpoints": () => <RouteEndpoints />,
   "routing-icons": () => <VendorIcons />,
-  "routing-reconcile": () => <Reconcile />,
+  "routing-reconcile": () => <Reconcile view="routing-reconcile" />,
+  "routing-reconcile-accounts": () => <Reconcile view="routing-reconcile-accounts" />,
+  "routing-sort": () => <RouteOrder />,
+  "routing-adapters": () => <Adapters view="routing-adapters" />,
+  "routing-adapters-changes": () => <Adapters view="routing-adapters-changes" />,
 } as const;
 
 export default function App() {
@@ -110,6 +117,7 @@ export default function App() {
       {ROUTING_OWN_SCREENS[page as keyof typeof ROUTING_OWN_SCREENS]?.() ??
         (page.startsWith("routing") ? <Routing view={page as RoutingView} /> : null)}
       {page === "employees" && <Employees />}
+      {page === "relay-rates" && <RelayRates />}
       {page === "pricing" && <Pricing />}
       {page.startsWith("commission") && <Commission view={page as CommissionView} />}
       {page === "releases" && <Releases />}

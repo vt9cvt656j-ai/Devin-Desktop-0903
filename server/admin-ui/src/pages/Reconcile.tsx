@@ -2,8 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   RefreshCw,
   TrendingDown,
   TrendingUp,
@@ -11,6 +9,7 @@ import {
 
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
+import { Pager } from "@/components/Pager";
 import { Stat } from "@/components/Stat";
 import { TableSkeleton } from "@/components/TableSkeleton";
 import { VendorMark } from "@/components/VendorMark";
@@ -37,8 +36,8 @@ import { cn } from "@/lib/utils";
  *
  * # 这一页只有真数，没有估算
  *
- * 上一版有一列「估算成本」，算法是 `收入 × 进价折扣 ÷ 计费倍率`。它的问题不是不准，
- * 是**它的前提不是事实**：进价折扣是多路由用来排序出口的旋钮，不是价格。用户点名
+ * 上一版有一列「估算成本」，算法是 `收入 × 进价倍率 ÷ 计费倍率`。它的问题不是不准，
+ * 是**它的前提不是事实**：进价倍率是多路由用来排序出口的旋钮，不是价格。用户点名
  * 要真实计算，那一列已经整个拿掉，服务端还有一条测试守着它不许回来。
  *
  * 现在的成本 = **真实 token × 真实单价**：
@@ -64,6 +63,8 @@ type ModelRow = {
   prompt_tokens: number;
   completion_tokens: number;
   cached_tokens: number;
+  /** 写进缓存的 token。成本大头，而且以前既没记也没算。 */
+  cache_creation_tokens: number;
   revenue_usd: number;
   cost_usd: number | null;
   margin_usd: number | null;
@@ -71,6 +72,8 @@ type ModelRow = {
   output_per_mtok: number | null;
   cached_per_mtok: number | null;
   price_note: string;
+  /** 这个价是推算的（OpenRouter 官方价 × 倍率），不是抓来的。 */
+  price_derived: boolean;
 };
 
 type Row = {
@@ -87,14 +90,29 @@ type Row = {
   margin_usd: number | null;
   margin_pct: number | null;
   unpriced_models: string[];
+  legacy_only: boolean;
   cost_by_balance_usd: number | null;
   balance_basis: "used" | "remaining" | null;
   balance_note: string;
   models: ModelRow[];
 };
 
+type Account = {
+  base_url: string;
+  routes: string[];
+  spent_usd: number | null;
+  user_tokens: number;
+  probe_tokens: number;
+  implied_per_mtok: number | null;
+  predicted_usd: number | null;
+  listed_per_mtok: number | null;
+  gap_pct: number | null;
+  note: string;
+};
+
 type Payload = {
   days: number;
+  accounts: Account[];
   rows: Row[];
   totals: {
     revenue_usd: number;
@@ -104,6 +122,8 @@ type Payload = {
     counted_rows: number;
     total_rows: number;
     unpriced_models: number;
+    /** 合计成本里有多少是推算的。 */
+    derived_cost_usd: number;
   };
 };
 
@@ -123,10 +143,21 @@ const RANGES = [1, 7, 30] as const;
  */
 const PAGE_SIZE = 12;
 
-export function Reconcile() {
+/**
+ * 两个入口，一个组件。
+ *
+ * 值就是 NavKey 本身，不另起一套 "outlets" / "accounts" —— 多一层映射就多一处
+ * 能对不上的地方。和「网关适配器」那两屏是同一个做法。
+ */
+export type ReconcileView = "routing-reconcile" | "routing-reconcile-accounts";
+
+export function Reconcile({ view }: { view: ReconcileView }) {
+  const accountsView = view === "routing-reconcile-accounts";
   const [data, setData] = useState<Payload | null>(null);
   const [days, setDays] = useState<number>(7);
   const [page, setPage] = useState(1);
+  // 两张表各自翻页。共用一个页码的话，切个入口就跳到一张空表上。
+  const [acctPage, setAcctPage] = useState(1);
   const [open, setOpen] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -159,11 +190,21 @@ export function Reconcile() {
   const totalPct =
     t && t.counted_revenue_usd > 0 ? (t.margin_usd / t.counted_revenue_usd) * 100 : null;
 
+  const accounts = data?.accounts ?? [];
+  const acctPages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE));
+  // 数据变短时夹住，别显示一张空表。
+  const acctCur = Math.min(acctPage, acctPages);
+  const shownAccounts = accounts.slice((acctCur - 1) * PAGE_SIZE, acctCur * PAGE_SIZE);
+
   return (
     <div className="space-y-4">
       <PageHeader
-        title="对账"
-        description="真实 token × 真实单价。没有估算——单价没录就显示未知，不按 0 算。"
+        title={accountsView ? "账单核对" : "出口明细"}
+        description={
+          accountsView
+            ? "按价目表算出来的消耗，和中转余额实际掉的钱，对不对得上。"
+            : "真实 token × 真实单价。抓不到价目的按「OpenRouter 官方价 × 倍率」推算并标出来，仍然算不出的显示未知，不按 0 算。"
+        }
         actions={
           <div className="flex items-center gap-2">
             {RANGES.map((d) => (
@@ -188,16 +229,44 @@ export function Reconcile() {
 
       {t && (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <Stat label="用户付了" value={usd(t.revenue_usd)} hint={`最近 ${data?.days} 天`} />
+          {/*
+            三个钱的数**必须同一个分母**。
+            上一版「用户付了」画的是全量收入，而「中转收了」和「毛利」只统计
+            算得出成本的那几个出口 —— 三个数摆成一排，读起来像一件事，实际是两件。
+            线上实测：全量 $450.44，而算得出成本的只有 $77.90（17%），
+            于是「毛利 79.7%」看着像在赚钱，其实它只描述了六分之一的生意。
+            现在主数字统一用「算得出成本的那一批」，全量放进 hint 当背景。
+          */}
+          <Stat
+            label="用户付了"
+            value={usd(t.counted_revenue_usd)}
+            hint={
+              t.counted_revenue_usd < t.revenue_usd
+                ? `能算成本的那部分 · 最近 ${data?.days} 天共 ${usd(t.revenue_usd)}`
+                : `最近 ${data?.days} 天`
+            }
+          />
           <Stat
             label="中转收了"
             value={usd(t.cost_usd)}
-            hint={`已录价的 ${t.counted_rows}/${t.total_rows} 个出口`}
+            hint={
+              t.derived_cost_usd > 0
+                ? `其中 ${usd(t.derived_cost_usd)} 是推算的 · 已录价 ${t.counted_rows}/${t.total_rows} 个出口`
+                : `同一批出口 · 已录价 ${t.counted_rows}/${t.total_rows} 个`
+            }
           />
           <Stat
             label="毛利"
             value={usd(t.margin_usd)}
-            hint={totalPct === null ? "没有可比的收入" : `${totalPct.toFixed(1)}%`}
+            hint={
+              totalPct === null
+                ? "没有可比的收入"
+                : t.counted_revenue_usd < t.revenue_usd
+                  ? `${totalPct.toFixed(1)}% · 只覆盖 ${Math.round(
+                      (t.counted_revenue_usd / t.revenue_usd) * 100,
+                    )}% 的收入`
+                  : `${totalPct.toFixed(1)}%`
+            }
           />
           <Stat
             label="待录单价"
@@ -207,7 +276,11 @@ export function Reconcile() {
         </div>
       )}
 
-      {!!t && t.unpriced_models > 0 && (
+      {/*
+        这条提示只挂在「出口明细」上：它的操作指引是「点开行末的箭头，在明细里把价填上」，
+        而账单核对那一屏没有那个箭头 —— 一条照做不了的指引比没有指引更糟。
+      */}
+      {!!t && !accountsView && t.unpriced_models > 0 && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[13px]">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <span>
@@ -218,9 +291,99 @@ export function Reconcile() {
         </div>
       )}
 
+      {data && accountsView && data.accounts.length === 0 && (
+        <p className="rounded-lg border border-border bg-muted/30 px-4 py-6 text-center text-sm text-muted-foreground">
+          这段时间没有可核对的账户 —— 要么没有余额读数，要么这几个账户都没跑过。
+        </p>
+      )}
+
+      {data && accountsView && data.accounts.length > 0 && (
+        <SectionReveal>
+          <Card>
+            <CardHeader className="pb-2">
+              <h3 className="text-sm font-medium">账单核对（按账户）</h3>
+              <p className="text-[13px] text-muted-foreground">
+                <b>按价目表算出来的消耗，和余额实际掉的钱，对不对得上。</b>
+                价目表是中转说的，余额差是它实际扣的——两个对不上只有两种可能：
+                中转在按另一份价目收费，或者我们抄来的表过期了。
+                <br />
+                按<b>账户</b>算而不是按线路：同一个中转账户下常常挂着好几把密钥（你的 Claude 和
+                GPT 就是），按线路算会把同一笔扣款重复计进两条。探活烧的 token 也算进消耗——
+                那笔钱同样是从这个余额里出的。
+                <br />
+                最后一列的「混合费率」<b>不是单价，不能拿去乘别的用量</b>：真实计费是
+                输入×输入价 + 输出×输出价，而输出价通常是输入价的 4~5 倍，所以那个数完全取决于
+                这一段的输入输出配比。可比的是前面两列的<b>美元总额</b>。
+              </p>
+            </CardHeader>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>账户</TableHead>
+                    <TableHead className="numeric">价目表算的</TableHead>
+                    <TableHead className="numeric">余额实际掉的</TableHead>
+                    <TableHead>对不对得上</TableHead>
+                    <TableHead className="numeric">用户 token</TableHead>
+                    <TableHead className="numeric">探活 token</TableHead>
+                    <TableHead className="numeric">混合费率（不是单价）</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {shownAccounts.map((a) => {
+                    // 偏差超过一成就点出来 —— 那是「中转按另一份价目收费」最直接的信号。
+                    const off = a.gap_pct !== null && Math.abs(a.gap_pct) > 10;
+                    return (
+                      <TableRow key={a.base_url} className={cn(off && "bg-amber-500/5")}>
+                        <TableCell>
+                          <Truncate title={a.base_url}>{a.base_url}</Truncate>
+                          <p className="text-[11px] text-muted-foreground">
+                            {a.routes.join("、")}
+                          </p>
+                        </TableCell>
+                        <TableCell className="numeric">{usd(a.predicted_usd)}</TableCell>
+                        <TableCell className="numeric font-medium">{usd(a.spent_usd)}</TableCell>
+                        <TableCell>
+                          {a.gap_pct !== null ? (
+                            <span className={cn("text-[12px]", off && "font-medium text-amber-600")}>
+                              {a.gap_pct > 0 ? "+" : ""}
+                              {a.gap_pct.toFixed(0)}%
+                              {off && " ← 中转扣的和它自己的价目表对不上"}
+                            </span>
+                          ) : (
+                            <span className="text-[12px] text-muted-foreground">{a.note}</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="numeric text-[12px]">{num(a.user_tokens)}</TableCell>
+                        <TableCell className="numeric text-[12px] text-muted-foreground">
+                          {num(a.probe_tokens)}
+                        </TableCell>
+                        {/*
+                          混合费率放最后，而且标灰。
+                          它 = 余额差 ÷ 总 token，**只反映这一段的输入输出配比**——
+                          真实计费是 输入×输入价 + 输出×输出价，而输出价通常是输入价的
+                          4~5 倍。拿这个数去乘别的用量会错得离谱，所以它只用来看量级，
+                          不是单价。上面那两列（美元总额）才是可比的。
+                        */}
+                        <TableCell className="numeric text-[12px] text-muted-foreground">
+                          {a.implied_per_mtok === null
+                            ? "—"
+                            : `$${a.implied_per_mtok.toFixed(3)}`}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+            <Pager page={acctCur} pages={acctPages} total={accounts.length} unit="个账户" onPage={setAcctPage} />
+          </Card>
+        </SectionReveal>
+      )}
+
       {!data && !error && <TableSkeleton rows={6} />}
 
-      {data && (
+      {data && !accountsView && (
         <SectionReveal>
           <Card>
             <CardHeader className="pb-2">
@@ -297,7 +460,18 @@ export function Reconcile() {
                                 {r.unpriced_models.length} 个模型待录价
                               </Badge>
                             )}
-                            {r.calls === 0 && (
+                            {/*
+                              「没跑过」和「跑过但那时没按模型记账」是两件事。
+                              第一版把后者也说成「没跑过」—— 而它跑了几千次。
+                              一句听起来正常、实际是假的话，比空白更糟：
+                              它会让人以为这条线路闲着。
+                            */}
+                            {r.legacy_only && (
+                              <span className="text-[12px] text-muted-foreground">
+                                这段调用发生在「按模型记账」上线之前，没有模型维度，成本拆不出来
+                              </span>
+                            )}
+                            {r.calls === 0 && !r.legacy_only && (
                               <span className="text-[12px] text-muted-foreground">
                                 这段时间没跑过
                               </span>
@@ -336,30 +510,7 @@ export function Reconcile() {
                 </TableBody>
               </Table>
             </div>
-            {pages > 1 && (
-              <div className="flex items-center gap-2 border-t border-border px-5 py-3 text-xs text-muted-foreground">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={current <= 1}
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" /> 上一页
-                </Button>
-                <span className="tabular-nums">
-                  第 {current} / {pages} 页 · 共 {allRows.length} 个出口
-                </span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={current >= pages}
-                  onClick={() => setPage((p) => Math.min(pages, p + 1))}
-                >
-                  下一页 <ChevronRight className="h-3.5 w-3.5" />
-                </Button>
-                <span className="ml-auto">按毛利升序 · 亏得最狠的在第 1 页</span>
-              </div>
-            )}
+            <Pager page={current} pages={pages} total={allRows.length} unit="条" onPage={setPage} />
           </Card>
         </SectionReveal>
       )}
@@ -384,6 +535,12 @@ function ModelDetail({ row, onSaved }: { row: Row; onSaved: () => void }) {
             <TableHead>模型</TableHead>
             <TableHead className="numeric">调用</TableHead>
             <TableHead className="numeric">输入 / 其中缓存</TableHead>
+            {/*
+              缓存写单独一列。它是成本大头 —— 实测一次 claude-opus-5 调用
+              新鲜输入 381、写入 61,634，那一笔的钱几乎全在写入上。
+              不画出来的话，「输入才 2 个 token 怎么扣了 46 分」永远问不明白。
+            */}
+            <TableHead className="numeric">缓存写</TableHead>
             <TableHead className="numeric">输出</TableHead>
             <TableHead className="numeric">用户付</TableHead>
             <TableHead className="numeric">中转收</TableHead>
@@ -449,10 +606,33 @@ function PriceRow({
         {num(m.prompt_tokens)}
         <span className="text-muted-foreground"> / {num(m.cached_tokens)}</span>
       </TableCell>
+      <TableCell
+        className={cn(
+          "numeric text-[12px]",
+          // 写入量大到压过新鲜输入时标出来 —— 那种行的成本几乎全来自这一列，
+          // 而它以前既没记也没算。
+          m.cache_creation_tokens > m.prompt_tokens && "font-medium text-warning",
+        )}
+        title="写进缓存的 token。上游按输入价的 1.25 倍收它 —— 常常是这一行成本的大头。"
+      >
+        {num(m.cache_creation_tokens)}
+      </TableCell>
       <TableCell className="numeric text-[12px]">{num(m.completion_tokens)}</TableCell>
       <TableCell className="numeric">{usd(m.revenue_usd)}</TableCell>
       <TableCell className="numeric">
         {usd(m.cost_usd)}
+        {/*
+          推算的价必须一眼分得出来。混在实测数字里，一个假设就变成了事实 ——
+          而这一页的全部价值就在于它说的是真数。
+        */}
+        {m.price_derived && (
+          <span
+            className="ml-1 rounded bg-warning/15 px-1 text-[10px] text-warning"
+            title={m.price_note || "按 OpenRouter 官方价 × 这个出口的倍率推算，不是抓来的真价"}
+          >
+            推算
+          </span>
+        )}
         {m.margin_usd !== null && (
           <span
             className={cn(

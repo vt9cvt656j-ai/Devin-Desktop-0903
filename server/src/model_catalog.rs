@@ -63,6 +63,14 @@ const MAX_ENDPOINT_FETCHES: usize = 60;
 
 #[derive(Clone, Debug, Default)]
 pub struct Entry {
+    /// 目录里这个模型挂在哪个厂商名下（`anthropic/claude-opus-5` 的 `anthropic`）。
+    ///
+    /// **归一化把前缀丢掉了**（`normalize` 取 `rsplit('/')`），而那个前缀正是「这是谁家的
+    /// 模型」最可靠的一份答案 —— 每半小时刷新，覆盖四百多个模型，比手写正则表宽得多。
+    /// 所以这里单独把它留下来，给厂商图标判定用（见 `route_endpoints::vendor_of`）。
+    ///
+    /// 空串 = 目录里那条没有前缀（少见），调用方当作「不知道」。
+    pub vendor: String,
     /// 全部原生上下文档位，升序去重。
     pub contexts: Vec<i64>,
     /// 支持的推理档位。空 = 该模型不吃档位这个概念。
@@ -173,6 +181,18 @@ pub fn normalize(model_id: &str) -> String {
         .collect()
 }
 
+/// 从目录的原始 id 里取厂商前缀。
+///
+/// `anthropic/claude-opus-5` → `anthropic`。OpenRouter 用 `~` 开头表示变体命名空间
+/// （`~anthropic/…`），那仍然是同一家，去掉波浪号。没有斜杠就是没有前缀，回空串 ——
+/// **空串是「不知道」，不是某一家**。
+pub fn catalog_vendor_prefix(source_id: &str) -> String {
+    match source_id.split_once('/') {
+        Some((v, _)) => v.trim_start_matches('~').trim().to_ascii_lowercase(),
+        None => String::new(),
+    }
+}
+
 /// 查一个模型的实时能力。`None` = 目录里没有它，调用方回落硬编码表。
 pub fn lookup(model_id: &str) -> Option<Entry> {
     let key = normalize(model_id);
@@ -237,6 +257,8 @@ pub fn spawn(state: AppState) {
 async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
     type Row = (
         String,
+        // source_id：原始的 `厂商/模型`。前缀是「这是谁家的模型」最可靠的一份答案。
+        String,
         serde_json::Value,
         serde_json::Value,
         Option<String>,
@@ -249,7 +271,7 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
         serde_json::Value,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT norm_id, contexts, efforts, default_effort, max_output,
+        "SELECT norm_id, source_id, contexts, efforts, default_effort, max_output,
                 input_price, output_price, cache_read_price, cache_write_price,
                 input_modalities, output_modalities
          FROM model_catalog",
@@ -259,6 +281,7 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
     let mut map = HashMap::new();
     for (
         norm_id,
+        source_id,
         contexts,
         efforts,
         default_effort,
@@ -274,6 +297,7 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
         map.insert(
             norm_id,
             Entry {
+                vendor: catalog_vendor_prefix(&source_id),
                 contexts: serde_json::from_value(contexts).unwrap_or_default(),
                 efforts: serde_json::from_value(efforts).unwrap_or_default(),
                 default_effort,

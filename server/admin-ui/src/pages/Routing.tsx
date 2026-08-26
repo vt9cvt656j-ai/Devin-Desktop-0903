@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
-import { ChevronDown, Layers, Plus, RefreshCw } from "lucide-react";
+import { ChevronDown, Layers, Plus, RefreshCw, Scale } from "lucide-react";
+import { RatioSync } from "@/components/RatioSync";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
@@ -192,23 +193,57 @@ function unpriced(c: Conn): string[] {
   });
 }
 
-/** What one enabled model actually costs, with the same priority the gateway uses. */
+/**
+ * 这个模型**实际按多少钱扣**，和网关同一个阶梯。
+ *
+ * # 倍率必须乘进来
+ *
+ * 上一版这里只显示单模型价：线上 claude-opus-5 写的是 $15/$25。而扣费是
+ * **单模型价 × 线路倍率**（`compute_cost` 最后一行 `usd * 100.0 * rate`），这条线路
+ * 倍率 2.5 —— 真实扣的是 $37.5/$62.5。两个数分在两列里，没有人会在脑子里乘一遍，
+ * 而这一列的职责恰恰是「这个模型多少钱」。同一个毛病这文件里犯过一次
+ * （卡片写 $3/M、账单按 $5/M 扣），当时的结论就是**展示和扣费必须共用一个阶梯**。
+ *
+ * 括号里把「单价 ×倍率」原样留着：这样这个数是怎么来的当场可核，不用去翻另一列。
+ *
+ * # 按次不乘
+ *
+ * 不是风格选择，是跟着分支走：`cost_for` 里 per_call 那一支直接 `return per_call_cents`，
+ * 根本走不到乘倍率那一行。
+ *
+ * # 免费也要乘
+ *
+ * 「免费」是**付款去向**不是价格：成本照常算（`effective_billing_inner` 把 free 映射回
+ * rate），只是从每日免费点数里扣。所以倍率一样在烧点数 —— 一个 68 倍的单价会让免费额度
+ * 68 倍速见底，说成一句「免费额度」等于把这件事藏了。
+ */
 function modelCost(c: Conn, id: string): string {
   const ov = asMap<BillingOverride>(c.model_billing)[id] || {};
   const mode = billingMode(c, ov);
-  if (mode === "free") return "免费额度";
   if (mode === "per_call") {
     const usd = perCallMicro(c, ov) / 1_000_000;
     return usd > 0 ? `${fee(usd)} / 次` : "未计费";
   }
+  const r = c.rate ?? 1;
+  const mul = `×${Number(r.toFixed(4))}`;
   const p = asMap<PriceOverride>(c.model_prices)[id] || {};
-  if ((p.in || 0) > 0 || (p.out || 0) > 0) return `${per1M(p.in)} / ${per1M(p.out)} 每 1M`;
+  const hasOwn = (p.in || 0) > 0 || (p.out || 0) > 0;
   // The built-in catalogue beats the connection price: compute_cost only falls back to the
   // connection's input/output when the model is NOT catalogued (models.rs:2666-2673).
-  if ((c.input_price || 0) > 0 || (c.output_price || 0) > 0) {
-    return `官方价 · 兜底 ${per1M(c.input_price)}/${per1M(c.output_price)}`;
-  }
-  return "内置官方价";
+  const hasFallback = (c.input_price || 0) > 0 || (c.output_price || 0) > 0;
+  const charged = hasOwn
+    ? `${per1M((p.in || 0) * r)} / ${per1M((p.out || 0) * r)} 每 1M`
+    : hasFallback
+      ? `内置官方价 ${mul} · 兜底 ${per1M((c.input_price || 0) * r)}/${per1M((c.output_price || 0) * r)}`
+      : `内置官方价 ${mul}`;
+  if (mode === "free") return `免费额度 · 点数按 ${charged} 烧`;
+  return hasOwn ? `${charged}（${per1M(p.in)}/${per1M(p.out)} ${mul}）` : charged;
+}
+
+/** 这条线路上有几个开放模型是自己定价的（倍率乘在这个价上，不是乘在官方价上）。 */
+function ownPricedCount(c: Conn, ids: string[]): number {
+  const m = asMap<PriceOverride>(c.model_prices);
+  return ids.filter((id) => ((m[id]?.in || 0) > 0 || (m[id]?.out || 0) > 0)).length;
 }
 
 /**
@@ -232,6 +267,7 @@ function liveLabels(conns: Conn[]): Map<string, string> {
 export type RoutingView = "routing" | "routing-groups";
 
 export function Routing({ view }: { view: RoutingView }) {
+  const [ratioOpen, setRatioOpen] = useState(false);
   const [conns, setConns] = useState<Conn[]>([]);
   const [usage, setUsage] = useState<Usage>({});
   const [err, setErr] = useState("");
@@ -344,11 +380,21 @@ export function Routing({ view }: { view: RoutingView }) {
             <Button variant="ghost" size="sm" onClick={load}>
               <RefreshCw /> 刷新
             </Button>
+            {/*
+              同步倍率放在「新建连接」左边：它是一个**对着已有配置**做的动作，
+              而新建是往里加东西。两个都是主按钮的话，最常用的那个会被挤掉。
+            */}
+            <Button variant="outline" size="sm" onClick={() => setRatioOpen(true)}>
+              <Scale /> 同步倍率
+            </Button>
             <Button size="sm" onClick={() => setDialog({ conn: null })}>
               <Plus /> 新建连接
             </Button>
           </div>
         </header>
+
+        {/* Dialog 挂在按钮旁边就行，Radix 会 portal 到 body。 */}
+        <RatioSync open={ratioOpen} onClose={() => setRatioOpen(false)} onApplied={load} />
 
         {loading && (
           <TableSkeleton
@@ -438,7 +484,24 @@ export function Routing({ view }: { view: RoutingView }) {
                           <span className="tabular-nums">按次 {fee(channelFeeUsd(c))}/次</span>
                         ) : (
                           <span className="tabular-nums">
-                            按 Token ×{c.rate ?? 1}
+                            {/*
+                              这个 ×N **不是最终倍数**。它乘的是「这个模型在这条线路上的单价」，
+                              而那个单价本身常常已经加过价了。只看这一列会把线路排错序：
+                              线上 claude-sonnet-5 在 ×2.5 这条线路上实收 12.5 倍官方价，
+                              比 ×8 那条线路的 8 倍还高。所以这里必须说清楚它乘在谁身上，
+                              并把「有几个模型自己定价」摆出来 —— 那才是真正决定价钱的东西。
+                            */}
+                            <span title="倍率乘在「这个模型在这条线路上的单价」上，不是乘在官方价上。展开左边的「开放模型」看每个模型实际扣多少。">
+                              按 Token ×{c.rate ?? 1}
+                            </span>
+                            {ownPricedCount(c, ids) > 0 && (
+                              <span
+                                className="text-muted-foreground"
+                                title="这些模型有自己的单价，倍率乘在它上面 —— 最终倍数 = 单价倍数 × 这条线路的倍率"
+                              >
+                                {" "}· {ownPricedCount(c, ids)} 个模型自定价
+                              </span>
+                            )}
                             {((c.input_price || 0) > 0 || (c.output_price || 0) > 0) && (
                               <span
                                 className="text-muted-foreground"
@@ -1192,6 +1255,7 @@ function ConnectionDialog({
               <Select id="cd-protocol" value={protocol} onChange={(e) => setProtocol(e.target.value)}>
                 <option value="anthropic">Anthropic 原生 /v1/messages</option>
                 <option value="openai">OpenAI 兼容 /chat/completions</option>
+                <option value="xai_responses">xAI Responses /v1/responses（grok 的思考摘要只在这条上给）</option>
               </Select>
             </div>
           )}

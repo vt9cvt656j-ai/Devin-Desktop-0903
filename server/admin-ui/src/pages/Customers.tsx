@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { EmptyState } from "@/components/EmptyState";
 import { ErrorState } from "@/components/ErrorState";
 import { PageHeader } from "@/components/PageHeader";
+import { Pager, PAGE_SIZE } from "@/components/Pager";
 import { Toolbar } from "@/components/Toolbar";
 import { Stat } from "@/components/Stat";
 import { TableSkeleton } from "@/components/TableSkeleton";
@@ -97,6 +98,11 @@ type UserSummary = {
 };
 type WriteResp = { ok?: boolean; user?: UserSummary };
 
+/** 四个统计卡片算的是**全量**，不是当页也不是筛选后的——服务端一条独立聚合出的。 */
+type Stats = { total: number; members: number; drained: number; recent: number };
+type Paged = { users?: User[]; total?: number; page?: number; page_size?: number; stats?: Stats };
+
+
 const isActive = (u: User) =>
   !!u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at).getTime() > Date.now());
 
@@ -138,8 +144,14 @@ export function Customers() {
   // 订阅面值分母：设置到货后金额要重算一次，否则表格会停在兜底面值上。
   useSettings();
   const [users, setUsers] = useState<User[]>([]);
+  const [total, setTotal] = useState(0);
+  const [stats, setStats] = useState<Stats>({ total: 0, members: 0, drained: 0, recent: 0 });
+  const [page, setPage] = useState(1);
   const [meId, setMeId] = useState("");
   const [q, setQ] = useState("");
+  // 输入框里的字和真正发出去的查询是两回事：每敲一个字母打一次数据库没必要，
+  // 而且回包乱序时列表会闪。300ms 停下来再查。
+  const [debouncedQ, setDebouncedQ] = useState("");
   const [planFilter, setPlanFilter] = useState("");
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -151,11 +163,29 @@ export function Customers() {
     openRef.current = !!editingId;
   }, [editingId]);
 
-  const load = async () => {
-    const list = await api.get<User[]>("/api/admin/users");
-    setUsers(Array.isArray(list) ? list : []);
+  const load = useCallback(async () => {
+    const qs = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
+    if (debouncedQ) qs.set("q", debouncedQ);
+    if (planFilter) qs.set("filter", planFilter);
+    const r = await api.get<Paged>(`/api/admin/customers?${qs}`);
+    setUsers(Array.isArray(r?.users) ? r.users : []);
+    setTotal(Number(r?.total) || 0);
+    if (r?.stats) setStats(r.stats);
+    // 服务端会把越界的页码夹回最后一页（筛窄了、或者别人刚删了人）。它回的才是真实页码，
+    // 不同步回来的话分页控件会一直停在一个不存在的页上，按钮亮着却没反应。
+    if (r?.page && r.page !== page) setPage(r.page);
     setErr("");
-  };
+  }, [page, debouncedQ, planFilter]);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQ(q.trim()), 300);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  // 换了搜索词或筛选项就回第一页。留在第 5 页上是「明明搜到了却是空的」最常见的来源。
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedQ, planFilter]);
 
   useEffect(() => {
     let alive = true;
@@ -169,35 +199,23 @@ export function Customers() {
       }
     };
     tick();
-    // 自己的 id：删号和改角色都不允许作用于自己（auth.rs:695 / auth.rs:718），
-    // 与其等服务端报错，不如提前把按钮关掉并说明原因。
-    api.get<{ id?: string }>("/api/me").then((m) => { if (alive) setMeId(m?.id || ""); }).catch(() => {});
     // 时段额度是这一屏的看点，让它自己走；弹窗开着时不刷，免得脚下的数字乱跳。
     const t = setInterval(() => { if (!openRef.current) tick(); }, 30_000);
     return () => { alive = false; clearInterval(t); };
+  }, [load]);
+
+  useEffect(() => {
+    let alive = true;
+    // 自己的 id：删号和改角色都不允许作用于自己（auth.rs:695 / auth.rs:718），
+    // 与其等服务端报错，不如提前把按钮关掉并说明原因。只跟登录态有关，不跟着翻页重取。
+    api.get<{ id?: string }>("/api/me").then((m) => { if (alive) setMeId(m?.id || ""); }).catch(() => {});
+    return () => { alive = false; };
   }, []);
 
-  const list = useMemo(() => {
-    const kw = q.trim().toLowerCase();
-    return users.filter((u) => {
-      if (planFilter === "member" && !isActive(u)) return false;
-      if (planFilter === "none" && isActive(u)) return false;
-      if (planFilter === "admin" && u.role !== "admin") return false;
-      if (planFilter && !["member", "none", "admin"].includes(planFilter) && u.plan !== planFilter) return false;
-      if (!kw) return true;
-      return (
-        u.email.toLowerCase().includes(kw) ||
-        (u.role || "").toLowerCase().includes(kw) ||
-        (u.plan || "").toLowerCase().includes(kw) ||
-        u.id.toLowerCase().includes(kw)
-      );
-    });
-  }, [users, q, planFilter]);
-
-  const members = users.filter(isActive).length;
-  const drained = users.filter((u) => { const w = windowUse(u); return !!w && w.left <= 0; }).length;
-  const week = Date.now() - 7 * 86_400_000;
-  const recent = users.filter((u) => u.last_login_at && new Date(u.last_login_at).getTime() > week).length;
+  // 这一页的行。筛选、搜索、统计全在服务端做了 —— 客户端手里只有当页那 20 行，
+  // 在这 20 行里再筛一遍不是筛选，是骗人。
+  const list = users;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   const editing = editingId ? users.find((u) => u.id === editingId) : undefined;
 
@@ -209,14 +227,14 @@ export function Customers() {
 
       {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
       <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="客户总数" value={num(users.length)} hint="最多显示最近 500 位" />
-        <Stat label="有效会员" value={num(members)} />
+        <Stat label="客户总数" value={num(stats.total)} />
+        <Stat label="有效会员" value={num(stats.members)} />
         <Stat
           label="时段额度用尽"
-          value={num(drained)}
-          hint={drained ? "这些人现在发不出请求" : "没有人被卡住"}
+          value={num(stats.drained)}
+          hint={stats.drained ? "这些人现在发不出请求" : "没有人被卡住"}
         />
-        <Stat label="7 天内登录" value={num(recent)} />
+        <Stat label="7 天内登录" value={num(stats.recent)} />
       </SectionReveal>
 
       <SectionReveal as="section" delay={140} className="space-y-4">
@@ -224,7 +242,7 @@ export function Customers() {
         query={q}
         onQuery={setQ}
         placeholder="搜索邮箱 / 角色 / 套餐 / ID…"
-        count={list.length === users.length ? `${users.length} 位` : `${list.length} / ${users.length}`}
+        count={q.trim() || planFilter ? `${num(total)} / ${num(stats.total)}` : `${num(total)} 位`}
         onRefresh={() => load().catch(() => {})}
       >
         <Select
@@ -336,14 +354,14 @@ export function Customers() {
         </Table>
         {!list.length && (
           <EmptyState
-            title={users.length ? "没有匹配的客户" : "暂无客户"}
+            title={stats.total ? "没有匹配的客户" : "暂无客户"}
             hint={
-              users.length
+              stats.total
                 ? "关键词匹配邮箱 / 角色 / 套餐 / ID，筛选和它是「且」的关系。"
                 : "有人注册后会出现在这里。"
             }
             action={
-              users.length ? (
+              stats.total ? (
                 <Button
                   variant="outline"
                   size="sm"
@@ -358,6 +376,7 @@ export function Customers() {
             }
           />
         )}
+        <Pager page={page} pages={pages} total={total} unit="位" onPage={setPage} />
           </>
         )}
       </div>
