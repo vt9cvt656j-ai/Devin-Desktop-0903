@@ -30197,11 +30197,27 @@ test("只读模式里也不许建目录顶掉用户的工作区", async () => {
   const { blockedInReadOnlyMode } = await import("../src/agent/tool-policy.js");
   assert.equal(blockedInReadOnlyMode("createproject", { type: "createproject" }), true,
     "Plan/Explorer/Reviewer 标着「只读」，却能在磁盘上建目录并把文件树整个切过去");
-  // 拦截文案不能再把它说成「修改文件」
-  const at = RAW_SRC.indexOf('const what = call.type === "cmd" || call.type === "termtask" ? "运行命令"');
-  const block = SRC.slice(at, at + 500);
-  assert.match(block, /createproject.*新建项目目录/s);
-  assert.match(block, /userhttp.*调用你接入的能力/s, "用户接的 HTTP 接口被说成「修改文件」");
+  // 拦截文案不能再把它说成「修改文件」。
+  //
+  // 这句话现在**从工具自己的声明里读**（readOnlyBlockedVerb）。原来是执行器里一条七分支
+  // 的 `?:` 阶梯，只认得七个类型，而只读模式会挡下的类型一共 27 个——其余 20 个全部落到
+  // 默认分支「修改文件」。于是 Plan 模式下读一眼用户开着哪些标签页、看一眼 GitHub PR，
+  // 收到的都是「禁止修改文件」，模型据此以为自己碰了文件，转头去找别的路子绕。
+  const { toolPolicy, readOnlyBlockedTypes } = await import("../src/agent/tool-policy.js");
+  assert.equal(toolPolicy("createproject").readOnlyBlockedVerb, "新建项目目录");
+  // 留在阶梯里的四项不是「一个 type 一句话」：cmd/termtask 共用一句，userhttp/userfolder 也是。
+  const loop = extractFn("_executeToolStepInner");
+  assert.match(loop, /userhttp[^\n]*userfolder[^\n]*调用你接入的能力/,
+    "用户接的 HTTP 接口被说成「修改文件」");
+  assert.match(loop, /toolPolicy\(call\.type\)\.readOnlyBlockedVerb \|\| "修改文件"/,
+    "话术不再从声明里读了 —— 又会退回「20 个类型全说成修改文件」");
+  // 覆盖闸：每个会被只读模式挡的类型，要么属于文件族（默认话术本来就对），要么配了动词。
+  const FILE_FAMILY = new Set(["write", "edit", "multiedit", "format", "copy", "delete", "move", "mkdir"]);
+  const LADDER = new Set(["cmd", "termtask", "userhttp", "userfolder"]);
+  const noVerb = [...readOnlyBlockedTypes()]
+    .filter((t) => !FILE_FAMILY.has(t) && !LADDER.has(t) && !toolPolicy(t).readOnlyBlockedVerb).sort();
+  assert.deepEqual(noVerb, [],
+    "这些类型只读模式会挡，却没写动词短语，模型会被告知「禁止修改文件」：" + noVerb.join(", "));
 });
 
 test("computer 的合法动作只有一份，schema / 映射 / 报错文案不再各抄一遍", () => {
@@ -31352,9 +31368,20 @@ test("只读子体的人格提示词与它真实的工具集对得上", () => {
   // （只读集合里没有 browser），却从没有一句话说给模型听，于是它只能靠撞 [BLOCKED] 才知道。
   // 断言改成按方向判：不许出现「去用 browser」，必须出现「你没有 browser」。
   assert.doesNotMatch(text, /\buse (?:the )?browser\b|browser\s*\(/i,
-    "提示词还在让它用 browser —— 它没有这个工具，一调就是 [BLOCKED]");
-  assert.match(text, /you do not have the browser tool/,
-    "这条边界从没正面说给模型听，它只能靠撞 [BLOCKED] 才知道");
+    "不许无条件怂恿它用 browser —— 没拿到那个角色的子体一调就是 [BLOCKED]");
+  // 这句 2026-08-26 改过。原文是「full browser automation belongs to the main agent —
+  // you do not have the browser tool」，写的时候是真的，后来**角色矩阵把它变成了假话**：
+  // ROLE_CAPABILITIES_READ 给 frontend / design / test 三个只读角色配了 browser
+  // （只放行观察动作，见 _BROWSER_OBSERVE_ACTIONS 的派发闸）。提示词还在说「你没有」，
+  // 于是那次配工具的改动被自己的提示词整个抵消——工具在窗口里，模型不用。
+  // 断言改成钉「按角色给」这条真判据，两个方向都守：不许说「你没有」，也不许怂恿它乱用。
+  assert.doesNotMatch(text, /you do not have (?:the )?`?browser/i,
+    "角色矩阵给了 frontend / design / test 三个只读角色 browser，这句话已经是假的");
+  // 源码里那对反引号是转义过的（\`）——_SUBAGENT_SYSTEM 本身是模板字符串。
+  assert.match(text, /browser\\` is granted by ROLE/,
+    "得正面说清「按角色给」，否则拿到 browser 的角色也不会用它");
+  assert.match(text, /OBSERVATION only|only for\s+OBSERVATION/,
+    "没说清只放行观察动作，模型会去点按钮然后收一串 [BLOCKED]");
   assert.doesNotMatch(text, /run a command, or spawn a further subagent/,
     "又把它真有的两样能力说成禁止的了");
   assert.match(text, /run_cmd is available/, "没告诉它 run_cmd 可用，它就会绕远路或直接说做不到");

@@ -58,6 +58,20 @@ export const DEFAULT_POLICY = Object.freeze({
   hooked: false,
   /** Refused in the read-only modes (Explorer / Plan / Reviewer). */
   readOnlyModeBlocked: false,
+  /**
+   * 只读模式挡下来时，告诉模型「禁止**什么**」的那个动词短语。
+   *
+   * 空串 = 用默认的「修改文件」。这个字段存在的理由：那句话原来是执行器里一条七分支的
+   * `?:` 阶梯，只认得 cmd / termtask / mcp / userhttp / userfolder / createproject /
+   * worktree，其余 20 个会被只读模式挡下的类型**全部**落到默认分支。于是 Plan 模式下
+   * 读一眼用户开着哪些标签页（browser mytabs）、看一眼 GitHub PR、开个 App 看看，
+   * 收到的都是「Plan 模式下禁止修改文件」——模型据此以为自己碰了文件，然后去改别的路子。
+   *
+   * 放在声明里而不是执行器里，是为了让「加了新的只读禁令却忘了配话术」当场可查：
+   * tool-policy.test.mjs 有一条断言要求 readOnlyBlockedTypes() 里每一个类型，要么属于
+   * 文件族（默认话术就是对的），要么在这里写明动词。
+   */
+  readOnlyBlockedVerb: "",
   /** Which argument carries the path a worker sub-agent's scope is checked against.
    *  Empty string = this tool is not scope-checked. */
   scopeField: "",
@@ -93,6 +107,12 @@ const EXEC = { needsApproval: true, hooked: true };
  * 不存在的动作。ide/test/tool-policy.test.mjs 有断言比对两边。
  */
 export const BROWSER_OBSERVE_ACTIONS = new Set([
+  // mytabs 读的是**用户自己浏览器**已经开着的标签页标题和 URL（macOS，不起自动化窗口）。
+  // 它三条都不沾：不改页面状态、不动会话、不碰本机文件——按上面那条判据它就是观察。
+  // 漏了它的代价恰好落在最需要它的地方：Explorer / Plan / Reviewer 三个只看不动的模式里
+  // 问不出「用户现在开着什么页面」，而那正是这三个模式做判断的起点。
+  // （`open` 不进：它在用户机器上**启动一个外部应用**，工作区没变不等于现实世界没变。）
+  "mytabs",
   "navigate", "observe", "viewport", "screenshot", "design", "network", "inspect",
   "nodes", "assert", "check", "wait", "scroll", "wheel", "swipe", "hover", "focus", "blur", "close",
 ]);
@@ -137,7 +157,7 @@ function seed() {
    * 因为那条路径压根不经过工具执行器。这里的声明是让「这个工具的策略」有一个唯一出处。
    */
   const isWikiWrite = (call) => !!call?._wiki;
-  defineTool("subagent", { needsApproval: isWikiWrite, readOnlyModeBlocked: isWikiWrite });
+  defineTool("subagent", { needsApproval: isWikiWrite, readOnlyModeBlocked: isWikiWrite, readOnlyBlockedVerb: "派会写文件的子智能体" });
   // `format` writes content like the other three, but repository hooks deliberately do NOT
   // fire for it: formatting is a mechanical rewrite of code the hooks already saw, and firing
   // a lint hook on every auto-format was noise.
@@ -157,13 +177,14 @@ function seed() {
    * 不许留下任何持久化写入）。语义上它现在和 mcpconfig 同类：改的是**跨项目的持久化
    * 配置**，不是工作区内容。
    */
-  defineTool("saveskill", { needsApproval: true, readOnlyModeBlocked: true, recoverableBlock: true });
+  defineTool("saveskill", { needsApproval: true, readOnlyModeBlocked: true, recoverableBlock: true, readOnlyBlockedVerb: "把技能写进技能库" });
   // 改 MCP 配置：不是工作区文件改动，但是**持久化配置** + 注册一条可执行命令行。
   // list 是只读的，不该弹框；其余四个动作一律要用户点头。只读模式下一概不许改配置。
   defineTool("mcpconfig", {
     needsApproval: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
     hooked: true,
     readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    readOnlyBlockedVerb: "改 MCP 配置",
     recoverableBlock: true,
   });
   // 定时任务和 mcpconfig 是同一类东西：**它改变的是将来的自主行为**，而不是当下这一步。
@@ -176,6 +197,7 @@ function seed() {
   defineTool("schedule", {
     needsApproval: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
     readOnlyModeBlocked: (call) => String(call?.action || "list").trim().toLowerCase() !== "list",
+    readOnlyBlockedVerb: "建 / 改定时任务",
     recoverableBlock: true,
   });
   // copy 的 scope 字段是 `to`，不是 `path`。
@@ -210,7 +232,7 @@ function seed() {
   // ── other side-effecting tools ────────────────────────────────────────────
   // 只读模式里按**单次调用**判：服务自己声明了 readOnlyHint 的放行，没声明的照挡。
   // 每一次调用仍然过 needsApproval 那道门，所以放行的也不是无人看管。
-  defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.mcpReadOnly });
+  defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.mcpReadOnly, readOnlyBlockedVerb: "执行 MCP 工具" });
   // 用户自己声明接进来的 HTTP 能力。一律要审批，和 MCP 同级——声明可能来自 clone 来的
   // 仓库，而它能往任意 http(s) 地址发请求。只读判定同样**逐次**看这一次调用：声明里写的
   // 方法是 GET/HEAD 就当只读（那是用户自己写下的事实，不是我们猜的），于是 Plan /
@@ -231,6 +253,7 @@ function seed() {
   defineTool("worktree", {
     mutatesWorkspace: true,
     readOnlyModeBlocked: (call) => String(call?.action || "list") !== "list",
+    readOnlyBlockedVerb: "建 / 删工作树",
   });
   /**
    * git / gh 一直**没有登记**，于是这道门对它们从来没生效过。
@@ -261,26 +284,28 @@ function seed() {
     // 里本来就有那条规则。
     needsApproval: gitWrites,
     readOnlyModeBlocked: gitWrites,
+    readOnlyBlockedVerb: "改仓库状态（提交 / 切分支 / 暂存 / 打标签）",
   });
   const GH_READ_OPS = new Set(["pr_view", "pr_checks", "actions_log", "pr_review_comments"]);
   defineTool("gh", {
     // 不是改工作区，是改**外部世界**（GitHub 上的 PR 和评论），而且不可逆。
     needsApproval: true,
     readOnlyModeBlocked: (call) => !GH_READ_OPS.has(String(call?.op || "")),
+    readOnlyBlockedVerb: "改 GitHub 上的东西（建 PR / 回复评论）",
   });
   // learn_design 一直没登记，于是三道门同时哑掉，它在 Plan / Explorer / Reviewer 里
   // **真的往工作区写两个文件**（reference/<slug>-design-system.md 和 <slug>-tokens.css），
   // 还会清掉「空工作区」标记。只读模式的注册表里也留着它（可见性判据是 `=== true`），
   // search_tools 取得回；网关那份拒绝清单里同样没有它。
-  defineTool("learndesign", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true });
-  defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true });
+  defineTool("learndesign", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "学习并落盘设计资产" });
+  defineTool("uiclick", { needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "点用户屏幕上的界面" });
   defineTool("automation", { needsApproval: true });
   defineTool("db", { needsApproval: true });
   defineTool("download", { mutatesWorkspace: true, needsApproval: true });
   // create_project 一直没有声明：它会在用户主目录下真的建出 ~/MrDayOne/<name>，
   // 并把左侧文件树整个切到那个新目录——只读模式里也能干，"改动前审批"也不弹。
   // 用户原来打开的项目就这么被顶掉，而模式标签一直写着「只读」。
-  defineTool("createproject", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true });
+  defineTool("createproject", { mutatesWorkspace: true, needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "新建项目目录" });
   // capture_start：mode='system' / system_proxy=true 会改掉**操作系统级**代理设置，
   // 整台机器的流量（浏览器、邮件、其他 App）一起被切到本地 mitmproxy 上，接着还要
   // 用户 sudo 装一张根证书。这不该是一句「我顺手开了抓包」就发生的事。
@@ -304,13 +329,14 @@ function seed() {
     // 看一眼页面都被拦，审批模式下看一眼也要弹框。名单改成照着 schema 的 action 枚举来。
     needsApproval: (call) => !BROWSER_OBSERVE_ACTIONS.has(String(call?.action || "")),
     readOnlyModeBlocked: (call) => !BROWSER_OBSERVE_ACTIONS.has(String(call?.action || "")),
+    readOnlyBlockedVerb: "驱动浏览器做交互（点击 / 输入 / 读 cookie / 上传 / 跑 JS）",
   });
   // docker_compose_up：直接起一整套容器（`docker compose up -d`），占端口、挂卷、
   //   长期后台运行，停不停得掉不归本轮管。这是执行，不是读。
-  defineTool("docker_compose_up", { ...EXEC, readOnlyModeBlocked: true });
+  defineTool("docker_compose_up", { ...EXEC, readOnlyModeBlocked: true, readOnlyBlockedVerb: "起容器" });
   // capture_replay：可以指定任意 method / url / body 直接发出去，而且**不要求真有一条
   //   抓包记录**——等于绕开 http_request 那道审批门的一条完整旁路。同门同待遇。
-  defineTool("capture_replay", { needsApproval: true, readOnlyModeBlocked: true });
+  defineTool("capture_replay", { needsApproval: true, readOnlyModeBlocked: true, readOnlyBlockedVerb: "重放抓到的请求" });
   // system：开 App、切前台窗口、触发任意 App 的菜单项 —— 那几个确实是副作用。
   //   但 apps / windows / frontmost / menu_items 是**纯读**：它们回答的是"现在开着什么、
   //   哪个在前台、这个 App 有哪些菜单项"。一刀切成"要审批 + 只读模式拦"之后，
@@ -320,6 +346,7 @@ function seed() {
   defineTool("system", {
     needsApproval: (call) => !SYSTEM_READ_OPS.has(String(call?.op || call?.action || "frontmost").toLowerCase()),
     readOnlyModeBlocked: (call) => !SYSTEM_READ_OPS.has(String(call?.op || call?.action || "frontmost").toLowerCase()),
+    readOnlyBlockedVerb: "操作系统里的应用（开 App / 切窗口 / 点菜单）",
   });
 
   // ── generators that land assets in the workspace ──────────────────────────

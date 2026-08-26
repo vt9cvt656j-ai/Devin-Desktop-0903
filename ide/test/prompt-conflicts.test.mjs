@@ -172,8 +172,13 @@ test("subagent 人格补上能力边界与检索纪律", () => {
   const t = inlineOf("subagent_system");
   assert.match(t, /two independent pieces of evidence/, "关键结论只要一条证据就下了");
   assert.match(t, /Do not restate the task/, "没禁复述任务和开场白");
-  assert.match(t, /you do not have the browser tool/,
-    "这条边界一直是真的（只读集合里没有 browser），却从没说给模型听，它只能靠撞 [BLOCKED] 才知道");
+  // 2026-08-26：原来钉的是「you do not have the browser tool」。那句话写的时候是真的，
+  // 后来 ROLE_CAPABILITIES_READ 给 frontend / design / test 三个只读角色配了 browser，
+  // 它就变成假话了——工具在窗口里，提示词说没有，模型于是不用。
+  assert.doesNotMatch(t, /you do not have (?:the )?`?browser/i,
+    "角色矩阵已经给了三个只读角色 browser，这句话是假的");
+  assert.match(t, /when your role brief carries it/,
+    "得说清「按角色给」，否则拿到 browser 的角色也不会用它");
   assert.match(t, /Think, then look/, "缺了「先想清楚缺哪一块再检索」");
   assert.match(t, /Follow the thread/, "缺了「顺着 import/调用/定义逐层追」");
 });
