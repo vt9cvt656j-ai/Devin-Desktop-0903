@@ -1,4 +1,7 @@
 import test from "node:test";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { load, SRC } from "./helpers/source.mjs";
@@ -10,7 +13,7 @@ import { load, SRC } from "./helpers/source.mjs";
  *
  * 两条的判据都是**量出来的**，被否掉的那些也记在下面——免得下次有人再想一遍。
  */
-const split = load("_splitCodeAndComments");
+const split = _splitCC;
 const why = load("_missingWhyInWrite", { _splitCodeAndComments: split });
 const stale = load("_staleCommentFindings", {
   _splitCodeAndComments: split,

@@ -12,6 +12,9 @@
 // 修法全部是：把已经算出（或一次只读查询能算出）的执行事实，经既有的写时通道
 // （_pushNudge 事实类 / 写工具返回值）交回模型；run 级 Set 去重、每处每 run 一次。
 import test from "node:test";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert";
 import { SRC, CODE, fnSource, load } from "./helpers/source.mjs";
 
@@ -74,7 +77,7 @@ test("新增顶层符号命中别的文件里的同名定义时，name @ path:li
     _symbolIndexBuilt: true,
     _symbolIndexRoot: "/w",
     _symbolIndex: idx,
-    _symbolPatternsFor: load("_symbolPatternsFor"),
+    _symbolPatternsFor: _symPat,
   });
   const run = {};
   const out = note(run, "/w/src/b.ts", "", "export function formatDate(x) {\n  return x;\n}\n");
@@ -92,7 +95,7 @@ test("符号索引没建好就一个字不说（降级而不是撒谎）", () =>
     _symbolIndexBuilt: false,
     _symbolIndexRoot: "/w",
     _symbolIndex: new Map([["formatdate", [{ name: "formatDate", path: "a.ts", line: 1, sig: "x" }]]]),
-    _symbolPatternsFor: load("_symbolPatternsFor"),
+    _symbolPatternsFor: _symPat,
   });
   assert.equal(note({}, "/w/b.ts", "", "export function formatDate() {}\n"), "");
 });

@@ -63,7 +63,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_650;
+const MAIN_JS_MAX_LINES = 81_500;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

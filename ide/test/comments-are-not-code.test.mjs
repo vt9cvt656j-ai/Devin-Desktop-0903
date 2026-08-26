@@ -1,4 +1,7 @@
 import test from "node:test";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
 import { load, SRC } from "./helpers/source.mjs";
 
@@ -15,7 +18,7 @@ import { load, SRC } from "./helpers/source.mjs";
  *
  * 判据只看代码部分，所以 ② 天然成立；这个文件把两个方向都钉住。
  */
-const split = load("_splitCodeAndComments");
+const split = _splitCC;
 const sink = load("_sinkRisksInWrite", { _splitCodeAndComments: split });
 const amb = load("_ambiguousFailureInWrite", { _splitCodeAndComments: split });
 const stub = load("_stubDeliveryFindings", {

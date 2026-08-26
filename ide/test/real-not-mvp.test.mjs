@@ -11,12 +11,15 @@
 //   · `return {ok:true}` 1.24/万行 —— 正当代码里遍地都是
 //   · 写死 localhost     0.8/万行 —— 抽样全是正则误匹配到散文里
 import { test } from "node:test";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
 import { CODE as SRC, load, fnSource } from "./helpers/source.mjs";
 
 // 注入清单是手工的：检测器里新引用一个函数，这里不同步就是 ReferenceError
 // （不是断言失败——排查方向完全不同）。
-const splitCC = load("_splitCodeAndComments");
+const splitCC = _splitCC;
 const scan = load("_stubDeliveryFindings", {
   _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i,
   _splitCodeAndComments: splitCC,
