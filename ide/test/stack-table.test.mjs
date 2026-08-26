@@ -9,14 +9,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { load, loadConst, CODE, fnSource as topLevelFn } from "./helpers/source.mjs";
+// 2026-08-25：这一族搬进了 src/agent/stack.js，于是这里从「按名字抠源码 + 手工注入
+// 依赖」换成**真 import**。差别不是写法好看：抠源码验得到行为，验不到「这个函数在
+// 真实调用链上还在不在」——搬出去之前只能那么写，因为它们绑在一个没法 import 的文件里。
+import {
+  stackTable as TABLE, manifestExtra as EXTRA, extractStackHints as extract,
+  isManifestBaseName as isManifest, stackManifestNames, stackManifestExts,
+  formatStackHint as fmt,
+} from "../src/agent/stack.js";
 
-const TABLE = loadConst("_STACK_TABLE");
-const EXTRA = loadConst("_MANIFEST_EXTRA");
-const deps = { _STACK_TABLE: TABLE, _MANIFEST_EXTRA: EXTRA };
-const extract = load("_extractStackHints", { _STACK_TABLE: TABLE });
-const isManifest = load("_isManifestBaseName", deps);
-const names = load("_stackManifestNames", deps)();
-const exts = load("_stackManifestExts", deps)();
+const names = stackManifestNames();
+const exts = stackManifestExts();
 
 // ── 1. 一份名单，三处判据 ────────────────────────────────────────────────
 test("三处判据全部从同一张表派生，源码里不许再有第二份硬编码清单", () => {
@@ -151,7 +154,8 @@ test("声明读不到时安静退回，不能把栈识别整个带崩", () => {
 });
 
 // ── 4. 认不出语言 ≠ 什么都不说 ───────────────────────────────────────────
-const fmt = load("_formatStackHint", { t: (k) => k });
+// fmt 现在从模块直接 import（见文件头）。原来要注入一个 `t` 桩，而 formatStackHint
+// 根本不调 t —— 那是早就失效的陈迹，一起去掉。
 
 test("认不出语言时，已知的事实照样要说出来", () => {
   // 以前一个 `!s.lang` 就把整块提示吞掉：套件位置、用户自己声明的构建命令、
@@ -166,4 +170,28 @@ test("真的什么都不知道时才闭嘴", () => {
   assert.equal(fmt({}), "");
   assert.equal(fmt(null), "");
   assert.equal(fmt({ lang: "", complexity: "small" }), "");
+});
+
+/**
+ * 搬进模块买到的东西：这条测的是**真实调用链上的那份代码**。
+ *
+ * 搬出去之前，这一族只能靠「按名字从 main.js 抠源码 + 手工注入依赖」来测——那验得到
+ * 行为，验不到「这个函数还在不在真实调用链上」。整个文件删掉一半、只要那个函数体
+ * 还在源码里，抠源码那种写法照样绿。现在是 import，删了就报错。
+ */
+test("直接 import 真模块，栈探测在真实的 package.json 上给出可执行的命令", () => {
+  const hints = extract({
+    "package.json": JSON.stringify({
+      scripts: { test: "vitest", build: "vite build" },
+      devDependencies: { vite: "^5.0.0" },
+    }),
+  });
+  assert.equal(hints.testCmd, "npm test", "认出了 vitest 却没给出能跑的命令");
+  assert.equal(hints.buildCmd, "npm run build");
+  assert.equal(hints.lang, "JS/TS");
+  // 提示文本是模型唯一的依据，必须真的把命令带出去。
+  const hint = fmt(hints);
+  assert.match(hint, /npm test|npm run build/, "栈提示里一条可执行命令都没有");
+  // 认不出的栈不许编一个出来。
+  assert.equal(extract({ "随便一个文件.xyz": "" }).lang || "", "");
 });

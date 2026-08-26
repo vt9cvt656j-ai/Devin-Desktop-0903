@@ -8,6 +8,12 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+// 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
+// 不再抠源码注入依赖（抠源码验得到行为，验不到它在真实调用链上还在不在）。
+import { stackTable as STACK_TABLE, extractStackHints as extractStack,
+         isManifestBaseName as isManifestBase, stackManifestNames as stackNames,
+         stackManifestExts as stackExts, formatStackHint as formatStack,
+         manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
 // 不再从 main.js 源码里抠函数文本。
@@ -447,13 +453,12 @@ const AGENT_TOOL_NAME_ALLOWED = load("_agentToolNameAllowedByProfile", {
 // 「这个文件名是依赖清单吗」现在是一条从 _STACK_TABLE 派生的判据，不再是三处各抄一遍的
 // 硬编码 Set。凡是判「读到的是清单还是实现」「改的是不是依赖清单」的函数都会引用它——
 // 注真实现而不是桩：桩会让"同一个 pubspec.yaml 两处判定是否一致"这件事测不出来。
+// 搬进模块之后这三样直接从真模块取，不用再层层注入。"注真实现而不是桩"那条理由
+// 现在由 import 天然满足：这就是产品在跑的那一份，不存在桩和实现漂开的可能。
 Object.assign(AUTO_LOAD_DEPS, {
-  _STACK_TABLE: loadConst("_STACK_TABLE"),
-  _MANIFEST_EXTRA: loadConst("_MANIFEST_EXTRA"),
-  _isManifestBaseName: load("_isManifestBaseName", {
-    _STACK_TABLE: loadConst("_STACK_TABLE"),
-    _MANIFEST_EXTRA: loadConst("_MANIFEST_EXTRA"),
-  }),
+  _STACK_TABLE: STACK_TABLE,
+  _MANIFEST_EXTRA: MANIFEST_EXTRA,
+  _isManifestBaseName: isManifestBase,
 });
 Object.assign(AUTO_LOAD_DEPS, {
   _agentAnswerOnlyInspection: AGENT_ANSWER_ONLY_INSPECTION,
@@ -11618,7 +11623,7 @@ test("automatic engineering references add only stack-relevant official forums",
 });
 
 test("stack extraction honors the declared package manager and project scripts", () => {
-  const extract = load("_extractStackHints", { _STACK_TABLE: loadConst("_STACK_TABLE") });
+  const extract = extractStack;
   const stack = extract({
     "package.json": JSON.stringify({
       packageManager: "pnpm@10.0.0",
@@ -24310,7 +24315,7 @@ test("这一轮留下的一次性脚本要被清点出来——规则早就写�
 });
 
 test("有测试套件就要告诉模型它在哪——只给命令不给位置，它就在根目录另起散文件", () => {
-  const fmt = load("_formatStackHint");
+  const fmt = formatStack;
   const withSuite = fmt({ lang: "Python", testCmd: "pytest", testDir: "tests", testSubs: ["unit", "integration"] });
   assert.match(withSuite, /测试套件在 `tests\/`/, "没告诉模型套件在哪");
   assert.match(withSuite, /unit \/ integration/, "子目录也要说，它才知道往哪一层放");
@@ -27155,7 +27160,7 @@ test("后台监视器盯到了必须真的通知得出去", () => {
 });
 
 test("栈提示要如实说：改完你自己跑，兜底只有一次", () => {
-  const fn = extractFn("_formatStackHint");
+  const fn = extractFn("formatStackHint");
   const code = fn.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
   // 断言语气的承诺必须消失
   assert.doesNotMatch(code, /agent 会每改几个文件自动跑/, "又在承诺一套不存在的自动验证了");
@@ -27179,7 +27184,7 @@ test("那套自动验证机器要么接上、要么别承诺——现在是「�
   const calls = (SRC.match(/_runApprovedVerification\(/g) || []).length;
   if (calls <= 1) {
     // 只有定义、没有调用 → 提示词里不许出现"自动跑/自动注入"这类承诺
-    const hint = extractFn("_formatStackHint");
+    const hint = extractFn("formatStackHint");
     // 剥注释：这个函数的说明里原样引用了那句被删掉的谎话（本轮第六次踩这个坑）。
     // 用和上一条测试同一个过滤器，别再手写一个漏掉缩进的版本。
     const hintCode = hint.split("\n").filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");
@@ -29914,7 +29919,7 @@ test("红测试要把 stdout 和 stderr 都喂回去，失败明细不能被对�
 });
 
 test("Maven / Gradle / .NET 这些项目也要认得出怎么跑测试", () => {
-  const extract = load("_extractStackHints", { _STACK_TABLE: loadConst("_STACK_TABLE") });
+  const extract = extractStack;
   const maven = extract({ "pom.xml": "<project><artifactId>x</artifactId></project>" });
   assert.equal(maven.lang, "Java");
   assert.equal(maven.testCmd, "mvn -q test");
@@ -29931,11 +29936,11 @@ test("Maven / Gradle / .NET 这些项目也要认得出怎么跑测试", () => {
   assert.ok(recognized("./gradlew test"));
   // 读取清单不再是一句字面量，而是从 _STACK_TABLE 派生。对**派生结果**断言比对源码
   // 文本更强：它同时证明了这张表真的是那三份判据的唯一来源。
-  const names = load("_stackManifestNames", { _STACK_TABLE: loadConst("_STACK_TABLE") })();
+  const names = stackNames();
   assert.ok(names.includes("pom.xml"), "关键文件清单里还是没有这些构建描述文件");
   assert.ok(names.includes("build.gradle.kts"));
   // 按扩展名认的那一族（.NET 的工程文件名跟着项目名走，没有固定文件名可读）
-  const exts = load("_stackManifestExts", { _STACK_TABLE: loadConst("_STACK_TABLE") })();
+  const exts = stackExts();
   assert.ok(exts.includes(".csproj"), ".NET 整族仍然一个都识别不出来");
   const dotnet = extract({ ".csproj": "<Project Sdk=\"Microsoft.NET.Sdk\" />" });
   assert.equal(dotnet.lang, "C#");
@@ -30976,7 +30981,7 @@ test("收尾契约对「谁来跑验证」的说法，必须和真实机器一�
     "必须把「兜底在改完那一批、不在收尾腿」说清楚，否则模型会以为收尾会兜");
   assert.match(frame, /自己跑一遍/, "不再要求模型自己跑了");
   // 两侧同源：栈提示和收尾契约必须用同一句描述兜底，别各说各的。
-  const hint = extractFn("_formatStackHint");
+  const hint = extractFn("formatStackHint");
   const SHARED = "IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账";
   assert.ok(frame.includes(SHARED) && hint.includes(SHARED),
     "栈提示和收尾契约对兜底的说法漂了——两份说法会让模型采信更省事的那条");
