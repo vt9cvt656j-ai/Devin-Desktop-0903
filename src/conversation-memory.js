@@ -14,7 +14,6 @@ const SUMMARY_BATCH = 10;
 const PERSISTED_MEDIA_BUDGET = 3_200_000;
 const MAX_ARCHIVE = 400;          // archived (compacted-away) turns kept for recall
 const ARCHIVE_ENTRY_MAX = 1600;   // chars per archived turn
-const MAX_MILESTONES = 60;
 const MERGED_SUMMARY_MAX = 8000;  // merged summary text cap (head+tail keep)
 const MAX_CORRECTIONS = 160;
 const CORRECTION_TEXT_MAX = 420;
@@ -288,7 +287,11 @@ export class ConversationMemory {
     this.totalTurns = 0;
     this.recent = [];
     this.summaries = [];
-    this.milestones = [];
+    // 这里曾经还有一个 milestones 账本 + markMilestone()。它**从来没有写入点**——
+    // 从初始导入起就只有定义，没人调，于是那条「📌 Key milestones from earlier」系统
+    // 消息一次也没发出去过。要接它就得先定义「什么算里程碑」，而纠错账本 / 摘要 /
+    // 文件证据 / 思考结论四条通道已经在做同一件事，第五条只会挤占上下文。旧会话 JSON
+    // 里可能还留着 milestones 键，读回来时忽略即可（它恒为空数组）。
     this.fileEvidence = [];
     // The prompt-facing memory below is intentionally compacted. Keep a separate
     // append-only transcript for durable chat recovery so saving tokens can never
@@ -405,7 +408,6 @@ export class ConversationMemory {
     this._recentChars = this.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
     this.summaries = [];
     this.archive = [];
-    this.milestones = this.milestones.filter((item) => Number(item?.turn) <= this.totalTurns);
     this.fileEvidence = [];
     this.corrections = this.corrections.filter((item) => {
       const sourceTurns = Array.isArray(item?.sourceTurns) ? item.sourceTurns : [];
@@ -471,14 +473,6 @@ export class ConversationMemory {
     this.fileEvidence = [];
     this.totalTurns = Math.max(0, Math.trunc(Number(totalTurns) || 0));
     return this.recent.length;
-  }
-
-  markMilestone(event) {
-    this.milestones.push({ turn: this.totalTurns, event });
-    if (this.milestones.length > MAX_MILESTONES) {
-      // Keep the earliest few (project framing) + the most recent ones.
-      this.milestones = [...this.milestones.slice(0, 8), ...this.milestones.slice(-(MAX_MILESTONES - 8))];
-    }
   }
 
   _archiveBatch(removed, startTurn) {
@@ -716,12 +710,6 @@ export class ConversationMemory {
         content: `[纠错记忆·最高优先级]\n以下是对早期内容的追加纠正。原始历史仅供审计，不得继续把“已作废”内容当成事实或要求；若多条纠正冲突，以列表中更靠前的最新条目为准。\n${text}`,
       });
     }
-    if (this.milestones.length > 0) {
-      const text = this.milestones
-        .map(m => `[Turn ${m.turn}] ${m.event}`)
-        .join('\n');
-      result.push({ role: 'system', content: `📌 Key milestones from earlier:\n${text}` });
-    }
     if (this.summaries.length > 0) {
       const merged = this.summaries.map(s => s.text).join('\n\n');
       const recallHint = this.archive.length
@@ -893,7 +881,7 @@ export class ConversationMemory {
   }
 
   stats() {
-    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, milestoneCount: this.milestones.length, archiveCount: this.archive.length, correctionCount: this._activeCorrections('', MAX_CORRECTIONS).length, recentTokens: this.estimateRecentTokens() };
+    return { totalTurns: this.totalTurns, recentCount: this.recent.length, summaryCount: this.summaries.length, archiveCount: this.archive.length, correctionCount: this._activeCorrections('', MAX_CORRECTIONS).length, recentTokens: this.estimateRecentTokens() };
   }
 
   toJSON(mediaBudget = PERSISTED_MEDIA_BUDGET, options = {}) {
@@ -925,7 +913,6 @@ export class ConversationMemory {
       transcriptOffset: serializedTranscriptOffset || undefined,
       transcriptCheckpoint: options?.externalizeTranscript ? this.transcriptLength() : undefined,
       summaries: this.summaries,
-      milestones: this.milestones,
       fileEvidence: this.fileEvidence,
       archive: this.archive,
       corrections: this.corrections,
@@ -950,7 +937,6 @@ export class ConversationMemory {
       }
       mem._recentChars = mem.recent.reduce((total, message) => total + ConversationMemory._messageChars(message), 0);
       mem.summaries = obj.summaries || [];
-      mem.milestones = obj.milestones || [];
       mem.fileEvidence = Array.isArray(obj.fileEvidence) ? obj.fileEvidence.slice(-80) : [];
       mem.archive = Array.isArray(obj.archive)
         ? obj.archive.slice(-MAX_ARCHIVE)
