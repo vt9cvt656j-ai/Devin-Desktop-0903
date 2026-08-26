@@ -149,7 +149,10 @@ const RETIRED_SHA = {
   design_research_prompt: ["5c13d54eba296a6a", 'ide/src/main.js 里 _P(\"design_research_prompt\", …) 的第二参数'],
   edit_rewrite: ["0bbe60046596aebc", 'ide/src/main.js 里 _P(\"edit_rewrite\", …) 的第二参数'],
   edit_transform: ["94169a59438d84a2", 'ide/src/main.js 里 _P(\"edit_transform\", …) 的第二参数'],
-  subagent_system: ["9d4fa64f6385e833", "ide/src/main.js 的 _SUBAGENT_SYSTEM"],
+  // 2026-08-26 刻意同步：活版本（ide/src/main.js 的 _SUBAGENT_SYSTEM）里那句
+  // 「you do not have the browser tool」已改成「按角色给」，这份死副本一起跟上，
+  // 免得哪天它被复活时带回一句假话。真正上线的是活版本那一处。
+  subagent_system: ["d711c5bd53aa0d2f", "ide/src/main.js 的 _SUBAGENT_SYSTEM"],
   worker_system: ["ac8a85c2d1d0b4d3", "ide/src/main.js 的 _WORKER_SYSTEM"],
 };
 

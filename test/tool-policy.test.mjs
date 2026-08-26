@@ -510,6 +510,23 @@ test("browser 的观察动作名单必须来自 schema 的 action 枚举，不�
   assert.deepEqual(ghosts, [], "观察名单里这些动作 schema 里不存在（写了也永远不会命中）");
 });
 
+test("mytabs 算观察动作 —— 只读模式最需要它", () => {
+  // mytabs 读的是**用户自己浏览器**已经开着的标签页标题和 URL（macOS，不起自动化窗口）。
+  // 按 BROWSER_OBSERVE_ACTIONS 自己的判据——不改页面状态、不动会话、不碰本机文件——
+  // 它三条都不沾。漏了它的代价恰好落在最需要它的地方：Explorer / Plan / Reviewer 三个
+  // 只看不动的模式里问不出「用户现在开着什么页面」，而那正是这三个模式做判断的起点；
+  // 更糟的是被挡下来时的话术会把它说成「禁止修改文件」。
+  assert.ok(BROWSER_OBSERVE_ACTIONS.has("mytabs"),
+    "mytabs 出了观察集 —— 只读模式会挡掉「看一眼用户开着什么」");
+  assert.equal(toolPolicy("browser").readOnlyModeBlocked({ type: "browser", action: "mytabs" }), false,
+    "只读模式挡住了 mytabs");
+  assert.equal(toolPolicy("browser").needsApproval({ type: "browser", action: "mytabs" }), false,
+    "读一眼标签页还要弹框");
+  // `open` 故意不进：它在用户机器上**启动一个外部应用**，工作区没变不等于现实世界没变。
+  assert.ok(!BROWSER_OBSERVE_ACTIONS.has("open"),
+    "open 会在用户机器上起一个外部应用，不是纯观察");
+});
+
 test("会改工作区的工具，开了审批就必须问——豁免只能是有名有姓的那一个", () => {
   // 这条比上面那张字面量清单更耐用：新加一个写盘工具时，清单可以忘了改，这条不会。
   // 它抓到过一整族——出图/出模型/出音/出声/建脚手架/下载素材十个工具都写工作区，
