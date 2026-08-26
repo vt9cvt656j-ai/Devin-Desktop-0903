@@ -8,7 +8,7 @@
 // 一个自动生成的大块最好自己占一个文件，谁也不挡谁。
 //
 // `<use href="#id">` 要求 symbol 在**同一个文档**里，所以不能只是一个 .svg 资源，
-// 必须在启动时注进 DOM。注入点放 body 末尾、display:none 的容器里。
+// 必须在启动时注进 DOM。注入点放 body 末尾一个视觉上隐藏的容器里（隐藏方式见下面 installBrandSprite 的注释——不能用 display:none）。
 //
 // # 单色标和彩色标
 //

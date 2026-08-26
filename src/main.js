@@ -28383,6 +28383,15 @@ function _maybeRenderChoices(sess, src) {
     } else {
       for (let i = (src || []).length - 1; i >= 0; i--) {
         const m = src[i];
+        // harness 自己注入的那些 role:"user" 消息不算「用户轮」——它们带 _ORCH_NOTE 前缀，
+        // 那段字的头一句就是「这不是用户发言」。
+        //
+        // 不跳过的话这个倒扫会当场 break 在它们身上：收尾时补收的子智能体报告
+        // （_pushRunFact，见 run 结束处）推在**最终回复之后**，于是每一个派过后台子体的
+        // run，选项气泡都扫不到答案正文、一个都不出。提醒（_pushNudge）同理。
+        const _harness = m && m.role === "user" && typeof m.content === "string"
+          && m.content.startsWith(_ORCH_NOTE);
+        if (_harness) continue;
         if (m && m.role === "user") break; // don't scan before the latest user turn
         if (m && m.role === "assistant" && typeof m.content === "string" && m.content.trim()) { finalText = m.content; break; }
       }
@@ -29662,7 +29671,12 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       // 叫回来，看到的第一句话就是 harness 自己说的"任务完成"，比模型那句更权威。
       // _runAgenticLoop 收尾时已经把真实结局写进 session._lastRunState.outcome（见那里）。
       try { if (!document.hasFocus() || (typeof _currentSession === "function" && _currentSession() !== sess)) void _notifyTaskDone(sess, text, sess?._lastRunState?.outcome || "success").catch(() => {}); } catch (_e) {}
-      const postRunMessages = Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages;
+      // sess.memory 是 ConversationMemory **实例**，不是数组——这里原来写
+      // `Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages`，
+      // 那个条件恒假，第一条腿从来没走到过。留着它只会让人以为「优先用会话记忆」，
+      // 而实际上一直用的是本轮的 messages。本轮的 messages 恰恰是对的：这两件事
+      // （提选项、给下一步建议）问的都是「刚刚这一轮说了什么」。
+      const postRunMessages = messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
     } catch (e) {
@@ -42463,7 +42477,20 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
         // 亲手写进去的分段标记。在就保、不在就什么都不做——不猜模型接下来用不用得上。
         const _head = m.content.slice(0, mk);
         const _keepBlocks = [];
-        for (const marker of ["--- 项目约定 (", "--- 子目录约定 (", _DEMAND_LEDGER_HEAD]) {
+        //
+        // 名单里后加的三段（2026-08-26）是同一条判据下漏掉的：
+        //   · 全局记忆（跨项目·用户级：身份/偏好/通用经验）
+        //   · 项目记忆（用户用 remember 记的，跨会话保留）——**纠错账本嵌在这两块里面**，
+        //     `[纠错账本·优先于普通记忆]` 是它们的一个子段，跟着一起被丢
+        //   · 项目日志（这个项目最近干过的活 + 返工率）
+        // 三样都不是磁盘上模型能自己去读的文件，替换文案许诺的 list_dir / read_file
+        // 对它们一个字都不成立；模型甚至不知道它们存在过。体积都是有界的
+        //（记忆两块各由 _kgClampLines 钳在 4000 字符，日志最多 6 条 × 220 字符），
+        // 保住它们不会把折叠的收益抵掉——真正的大头是目录树和当前文件转储。
+        for (const marker of [
+          "--- 项目约定 (", "--- 子目录约定 (", _DEMAND_LEDGER_HEAD,
+          "--- 全局记忆（", "--- 项目记忆（", "--- 项目日志（",
+        ]) {
           let from = _head.indexOf(marker);
           while (from >= 0) {
             // 切到下一个分段标记为止（分段一律以行首 "--- " 起头）。
