@@ -1906,7 +1906,9 @@ const KNOWN_UNCALLED = new Set([
   "_agentToolNameAllowedByProfile", "_agentUserIntentText", "_appendToolPlanCard",
   // _writeGateBypass / _readCoverageImpossible / _readBeforeEditCoverageHint 已从这张表
   // 移除（2026-08-22）：三个都被盲写事前拦截 _blindOverwritePrecheck 接活了。
-  "_hasContextOnlyLocationIntent", "_isCompressionPrefixInvalidError",
+  // _isCompressionPrefixInvalidError 已于 2026-08-26 接上（_runModelRequestWithRetry
+  // 的 onPrefixInvalid），从这张表里移除。
+  "_hasContextOnlyLocationIntent",
   "_looksLikeProjectExecutionCommand",
   "_stickToBottom", "_structureReadinessHint", "_thinkTip",
   "_toolRequiresPlanGate", "renderCaptureTool", "renderConflictsTool", "renderDebuggerTool",

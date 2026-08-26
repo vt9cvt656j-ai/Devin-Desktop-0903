@@ -30048,6 +30048,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       await _runModelRequestWithRetry({
         invoke: (cb) => chatFn(cb),
         isLive: _turnLive,
+        onPrefixInvalid: () => { try { _mcPrefixInvalidate(sess); } catch {} },
         onAttempt: () => {
           _plainStreamDiag.attemptStartedAt = Date.now();
           _agentTimelineStartAttempt(_plainTimelineTurn, _plainStreamDiag.attemptStartedAt);
@@ -44685,6 +44686,10 @@ async function _runModelRequestWithRetry({
    * 返回 false 表示"已经压无可压"——那就别再空转，直接收尾报错。
    */
   onContextOverflow = () => false,
+  /**
+   * 网关报「前缀失效」时清掉本地那个令牌。**不重试本轮**——见下面的调用点。
+   */
+  onPrefixInvalid = () => {},
   resumeLimit = _AI_MODEL_RESUME_LIMIT,
   retryLimit = _AI_MODEL_RETRY_LIMIT,
 } = {}) {
@@ -44773,9 +44778,31 @@ async function _runModelRequestWithRetry({
         && typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError(attemptError)) {
       try { squeezedForOverflow = !!onContextOverflow(); } catch { squeezedForOverflow = false; }
     }
+    // 前缀失效（网关 409 `[mc-prefix-invalid]`）是另一种「原样重试必然再爆」，但和溢出
+    // 相反：它连压一压都救不了，而且不处理会把整个会话锁死。
+    //
+    // 网关在 Redis 里找不到前缀记录、PostgreSQL 回捞也失败时发这个 409（淘汰、重部署
+    // 清库、蓝绿切到另一实例都会触发）。此时这一轮要发的 messages 已经在进循环前被
+    // _applyCompressionPrefix 切掉了前 N 条、只留一个令牌，而 turnConfig.mcPrefix 也是
+    // 循环外算好的——重发只能带着同一个死令牌走同一份负载，十次重试十次 409，最后报
+    // 一句假的「重试已达到」。所以这里明确不重试，让本轮如实失败。
+    //
+    // 真正要紧的是清令牌：它**存在 localStorage 里**，跨重启都在。另外三个
+    // _mcPrefixInvalidate 调用点全是「本地改写了历史」触发的，用户光正常聊天一个都走
+    // 不到——不在这里清，这个会话往后每一轮都会再发一次同一个死令牌，永远 409，用户
+    // 只能换会话重来。清掉之后下一次发送自然带完整历史，会话就活了。
+    //
+    // typeof 兜底的理由和上面 _isContextOverflowAiError 那处相同（沙箱只注入显式依赖）。
+    let prefixDied = false;
+    if (typeof _isCompressionPrefixInvalidError === "function"
+        && _isCompressionPrefixInvalidError(attemptError)) {
+      prefixDied = true;
+      try { onPrefixInvalid(); } catch {}
+    }
     const canRetry = !attemptProgress
       && !hadModelProgress
       && retriesUsed < boundedRetryLimit
+      && !prefixDied
       // 压缩成功过就允许重试：负载已经变了，不是"原样重放"。
       && (squeezedForOverflow || _isRetryableAiError(attemptError, attemptStatus));
     if (canRetry) {
@@ -47212,6 +47239,9 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         // 会把该条的 _ideMeta.contextAvailable 置 false，读取覆盖账本据此自纠。
         // （这个作用域里也拿不到 run —— _agentModelTurn 的签名里没有它。）
         onContextOverflow: () => _squeezeMessagesForContext(_l0Msgs),
+        // !_isSub 和上面 _applyCompressionPrefix 那处同一条件：子智能体从不带前缀，
+        // 也就不该有权清掉主会话那一份。
+        onPrefixInvalid: () => { if (!_isSub) { try { _mcPrefixInvalidate(session); } catch {} } },
         onAttempt: () => {
           _activeStreamDiag.attemptStartedAt = Date.now();
           _agentTimelineStartAttempt(_timelineTurn, _activeStreamDiag.attemptStartedAt);
