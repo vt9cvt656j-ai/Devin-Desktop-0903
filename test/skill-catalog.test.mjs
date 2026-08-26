@@ -11,6 +11,9 @@
 //
 // 结果就是用户那句「有时候它记得用技能，有时候完全不认识」。
 import { readFileSync } from "node:fs";
+// 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
+// 注入 parentDir（这个函数的外部依赖实测为零，那个注入早就是陈迹）。
+import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -133,9 +136,21 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
 
   // ② description 就是触发判据。官方技能的「什么时候该用我 / 什么时候别用我」写在
   //    400–900 字符处，解析期砍到 240 等于把触发条件本身切掉。
-  const parse = SRC.slice(RAW_SRC.indexOf("id: `file:${normalizedPath}`"));
-  assert.match(parse.slice(0, 1400), /desc: desc\.replace\(\/\\s\+\/g, " "\)\.trim\(\)\.slice\(0, 1200\)/,
-    "描述又在解析期被砍短了——目录那边自有 6000 字预算和逐级压缩，这里不该提前钉死上限");
+  // 2026-08-26：解析器搬进了 src/agent/skill-doc.js，这条从「切源码」改成**验行为**。
+  //
+  // 原来是 `SRC.slice(RAW_SRC.indexOf(锚点))`，而本函数第 128 行把 SRC 遮蔽成了 main.js
+  // 的原文、indexOf 却用拼接后的 RAW_SRC —— 两套偏移混用。符号还在 main.js 里时恰好
+  // 重合（main.js 排在拼接最前），搬走之后偏移落到 main.js 之外，切出来是别的地方。
+  // 直接喂一份长描述进真解析器，比对着源码正则可靠得多。
+  const longDesc = "触发条件".repeat(200); // 800 字符，远超旧的 240 上限
+  const parsed = _parseSkillDoc(
+    `---\nname: probe\ndescription: ${longDesc}\n---\n\n正文`,
+    "/w/.mrdayone/skills/probe/SKILL.md",
+  );
+  assert.ok(parsed && parsed.desc, "解析器没吐出描述");
+  assert.ok(parsed.desc.length > 700,
+    `描述在解析期被砍到 ${parsed.desc.length} 字符——目录那边自有 6000 字预算和逐级压缩，`
+    + "这里不该提前钉死上限（官方技能的「什么时候该用我」就写在 400–900 字符处）");
 
   // ③ allowed-tools 必须是真约束。原来它唯一的消费点是工具卡片上一枚灰色标签：
   //    一个写着 Read, Grep 的只读技能，启用后模型照样能 write_file、删文件。
@@ -176,10 +191,7 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
     "那条把技能正文填进输入框的死代码又回来了——它和技能是两种语义");
 });
 
-const parseSkill = new Function(
-  "parentDir",
-  topLevelFn("_parseSkillDocument") + "\n;return _parseSkillDocument;",
-)((path) => String(path).slice(0, String(path).lastIndexOf("/")));
+const parseSkill = _parseSkillDoc;
 
 test("技能正文进模型时剥掉 frontmatter，且开关的名字要说实话", () => {
   // ① frontmatter 不该进模型。name / description / allowed-tools 这三样解析期已经取走，
