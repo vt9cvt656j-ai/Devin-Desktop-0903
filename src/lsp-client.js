@@ -597,20 +597,44 @@ function clientCapabilities() {
   };
 }
 
-// The "缺少 X 语言服务器" install prompt should appear AT MOST ONCE per language, ever — never
-// nag on every file-open. Once shown (or the server later resolves via a fixed PATH), we stay
-// silent; the user can still install any server from the 语言服务 panel. Persisted across sessions.
-const _LSP_DISMISS_KEY = "lsp_install_prompted_v1";
-function _lspAlreadyPrompted(langId) {
+// The "缺少 X 语言服务器" install prompt is bounded per language (see _LSP_MAX_PROMPTS) — never
+// nag on every file-open. Counted across sessions.
+//
+// **这句以前写着「用户仍然可以从『语言服务』面板安装任何服务器」——那个面板 2026-08-13
+// 已经整组下掉了**（renderLspTool 现在零调用点，状态栏的 LSP 指示器也不可点）。
+// 留着这句比没有注释更糟：它让人以为「装不上还有别的入口」，于是没人去管这条提示
+// 用光之后会发生什么。事实是这条通知**就是唯一的入口**，所以它必须允许重试。
+/*
+ * 安装提示的记账。**从「一辈子一次」改成「最多三次」（2026-08-25）。**
+ *
+ * 原来是一次：`_lspMarkPrompted` 在 `showNotification` **之前**调，也就是在用户看没看见、
+ * 安装成没成之前就记账了。于是三种情况都会把这门语言的一键入口永久烧掉：
+ * 用户没看见（提示只挂 20 秒）、点了安装但命令是死的（mac 表里实测有两条）、
+ * 或者 brew/pip/winget 因别的原因失败。而注释里承诺的兜底「语言服务面板」已经是死代码。
+ *
+ * 为什么不做成「成功才记账」：这条通知是发完就不管的，没有成功/忽略的回调，
+ * 要接就得把结果从 main.js 的安装进度卡一路传回来。有界重试用一个计数器就能修掉
+ * 「错过一次就永远没有」，又不会每次打开文件都烦人——先把病治了，回调那条以后再说。
+ *
+ * 键名换成 v2：旧键存的是「提示过」的语言名数组，语义变成计数之后必须让它整体失效，
+ * 否则老用户的旧记录会被读成计数 0 → 又回到一辈子一次。
+ */
+const _LSP_DISMISS_KEY = "lsp_install_prompted_v2";
+const _LSP_MAX_PROMPTS = 3;
+function _lspPromptCounts() {
   try {
-    const s = JSON.parse(localStorage.getItem(_LSP_DISMISS_KEY) || "[]");
-    return Array.isArray(s) && s.includes(langId);
-  } catch { return false; }
+    const raw = JSON.parse(localStorage.getItem(_LSP_DISMISS_KEY) || "{}");
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch { return {}; }
+}
+function _lspAlreadyPrompted(langId) {
+  return (Number(_lspPromptCounts()[langId]) || 0) >= _LSP_MAX_PROMPTS;
 }
 function _lspMarkPrompted(langId) {
   try {
-    const s = JSON.parse(localStorage.getItem(_LSP_DISMISS_KEY) || "[]");
-    if (Array.isArray(s) && !s.includes(langId)) { s.push(langId); localStorage.setItem(_LSP_DISMISS_KEY, JSON.stringify(s)); }
+    const counts = _lspPromptCounts();
+    counts[langId] = (Number(counts[langId]) || 0) + 1;
+    localStorage.setItem(_LSP_DISMISS_KEY, JSON.stringify(counts));
   } catch {}
 }
 
