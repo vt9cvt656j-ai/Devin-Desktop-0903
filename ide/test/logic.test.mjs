@@ -306,6 +306,14 @@ const _autoAiStatusFromMessage = load("_aiStatusFromMessage", { _stripAiRetryPre
 const _autoAiFailureKind = load("_aiFailureKind", { _aiStatusFromMessage: _autoAiStatusFromMessage });
 
 AUTO_LOAD_DEPS = {
+  // settings.json 的共用解析器（剥 BOM、真空静默、坏了报出来）。它被两处 absorb 调用，
+  // 所以凡是加载 _refreshUserPermissionRules / _refreshUserCapabilities 的沙箱都要有它。
+  // 放进 AUTO_LOAD_DEPS 而不是逐个注入：这个仓库为「手工注入清单」踩过好几次，
+  // 表现是 ReferenceError，看着像实现坏了。
+  _parseSettingsJson: (() => {
+    const src = extractFn("_parseSettingsJson");
+    return new Function("showToast", `let _settingsParseWarned = "";\n${src}\n;return _parseSettingsJson;`)(() => {});
+  })(),
   _aiStatusFromMessage: _autoAiStatusFromMessage,
   _aiFailureKind: _autoAiFailureKind,
   // 无人值守标志。审批门现在会先看它：定时任务撞上需要确认的操作时不弹框傻等
