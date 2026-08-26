@@ -10389,8 +10389,16 @@ test("agent next-step chips use completed run memory and survive suggestion fail
   assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "打招呼", mutated: false, updatedAt: now } }), []);
   assert.deepEqual(gen({ _lastRunState: { outcome: "success", task: "x", mutated: true, updatedAt: now - 10 * 60_000 } }), []);
   assert.deepEqual(gen({}), []);
-  assert.match(SRC, /const postRunMessages = Array\.isArray\(sess\.memory\)[\s\S]{0,260}_maybeSuggestNext\(sess, postRunMessages, config\)/,
-    "Agent completion suggestions must be grounded in the post-run memory, not the pre-run messages");
+  // 这条原来钉的是 `Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages`，
+  // 说法是「要用运行后的记忆，不是运行前的消息」。可 sess.memory 是 ConversationMemory
+  // **实例**不是数组，那个条件恒假——第一条腿从来没走到过，钉的是一句它自己没做到的话。
+  //
+  // 真判据是**位置**：这两件事在 run 收尾之后调用，那时 messages 已经攒完了整轮，
+  // 它就是「运行后的」。所以钉「传的是 postRunMessages，且它就是 messages」。
+  assert.match(SRC, /const postRunMessages = messages;[\s\S]{0,400}_maybeSuggestNext\(sess, postRunMessages, config\)/,
+    "收尾建议必须读跑完之后的那份消息（run 结束时的 messages），不能换成别的来源");
+  assert.doesNotMatch(SRC, /Array\.isArray\(sess\.memory\)/,
+    "sess.memory 是 ConversationMemory 实例，Array.isArray 恒假");
 });
 
 test("bug fixes require causal reasoning before patching", () => {
@@ -14128,6 +14136,46 @@ test("工具别名归一化要写回 tc.name，不能只用来查注册表", () 
     "未知工具自愈那条路没了");
   // 六个按 tc.name 排除的自绘卡 + 执行器分叉，都是这条写回的下游。
   assert.match(loop, /subagentNames\.has\(it\.tc\.name\)/, "执行器仍按 tc.name 分叉");
+});
+
+test("选项气泡的倒扫要跳过 harness 注入的伪用户消息", () => {
+  // 那个倒扫遇到第一条 role:"user" 就 break（「别扫到上一个用户轮之前去」）。
+  // 而 harness 自己往 messages 里推的消息也是 role:"user"：提醒（_pushNudge）和
+  // 运行事实（_pushRunFact）都是。其中收尾时补收的子智能体报告推在**最终回复之后**，
+  // 于是每一个派过后台子体的 run，倒扫当场 break、finalText 为空，选项气泡一个都不出。
+  //
+  // 判据用 _ORCH_NOTE 前缀，那段字的头一句就写着「这不是用户发言」。
+  const fn = load("_maybeRenderChoices", {
+    _ORCH_NOTE: "〔系统编排提示",
+    _renderSuggestionChips: (sess, list) => { sess._chips = list.map((o) => o.label); },
+    _detectChoiceOptions: (txt) => (/A\)/.test(txt) ? [{ text: "A", send: "A" }, { text: "B", send: "B" }] : null),
+    t: () => "接下来",
+  });
+  const sess = { container: { lastElementChild: null } };
+  const answer = { role: "assistant", content: "两条路：A) 直接改 B) 先加测试" };
+  // ① 干净的一轮：答案在最后，扫得到。
+  fn(sess, [{ role: "user", content: "怎么办" }, answer]);
+  assert.deepEqual(sess._chips, ["A", "B"], "正常一轮就该出气泡");
+  // ② 收尾补收之后：答案后面跟着一条 harness 注入的伪用户消息。
+  sess._chips = null;
+  fn(sess, [{ role: "user", content: "怎么办" }, answer,
+    { role: "user", content: "〔系统编排提示…〕[子智能体 job#1 完成·收尾时补收]\n结论：……" }]);
+  assert.deepEqual(sess._chips, ["A", "B"],
+    "harness 注入的伪用户消息把倒扫 break 掉了 —— 派过后台子体的 run 一个气泡都不出");
+  // ③ 真正的用户消息仍然是边界：不能扫到上一轮去。
+  sess._chips = null;
+  fn(sess, [answer, { role: "user", content: "换个问题" }]);
+  assert.ok(!sess._chips || !sess._chips.length, "扫到上一个用户轮之前去了");
+});
+
+test("收尾时提选项/给建议读的是本轮 messages，不是恒假的那条腿", () => {
+  // 原来写的是 `Array.isArray(sess.memory) && sess.memory.length ? sess.memory : messages`。
+  // sess.memory 是 ConversationMemory **实例**不是数组，那个条件恒假——第一条腿从来
+  // 没走到过，留着只会让人以为「优先用会话记忆」。
+  assert.doesNotMatch(SRC, /Array\.isArray\(sess\.memory\)/,
+    "sess.memory 是 ConversationMemory 实例，Array.isArray 恒假");
+  assert.match(SRC, /const postRunMessages = messages;/,
+    "收尾提选项/给建议问的是「刚刚这一轮说了什么」，就该读本轮 messages");
 });
 
 test("后台派发的子智能体作业要记住自己的角色", () => {
