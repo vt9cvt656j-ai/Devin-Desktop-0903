@@ -4528,7 +4528,14 @@ monacoEditor.addCommand(monaco.KeyCode.F5, () => {
 });
 monacoEditor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F5, () => dapManager?.stop());
 monacoEditor.addCommand(monaco.KeyCode.F10, () => dapManager?.next());
-monacoEditor.addCommand(monaco.KeyCode.F11, () => dapManager?.stepIn());
+// F11 在**非调试态**必须让给全屏。Monaco 的键盘派发挂在编辑器容器上、命中即
+// stopPropagation，所以只要它无条件占着 F11，window 级的键位表就永远收不到——
+// 而编辑器有焦点在 IDE 里是常态。语义和 VS Code 一致（那边 stepIn 也是 inDebugMode 才生效）。
+// 顺带说明：今天按 F11 并不会"跳去单步"，stepIn 在没有暂停中的会话时直接 return，
+// 所以现状是"什么都不发生"。
+monacoEditor.addCommand(monaco.KeyCode.F11, () => {
+  if (dapManager?.isActive?.()) dapManager.stepIn(); else _toggleFullScreen();
+});
 monacoEditor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F11, () => dapManager?.stepOut());
 
 /** path -> { model, name, dirty, viewState } */
@@ -9222,6 +9229,24 @@ let _uiZoom = (() => {
   const v = Number(localStorage.getItem(_UI_ZOOM_KEY));
   return v >= 0.5 && v <= 2 ? v : 1;
 })();
+/**
+ * 切换全屏。
+ *
+ * 失败要说出来：这条走 Tauri 的 ACL，权限没配就会抛——而那正是标题栏那三个按钮
+ * 在 Windows 上「点了报错然后没法用」的成因（见 test/window-permissions.test.mjs）。
+ * 静默 catch 会把同一个坑再挖一遍。
+ */
+async function _toggleFullScreen() {
+  if (!inTauri) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const w = getCurrentWindow();
+    await w.setFullscreen(!(await w.isFullscreen()));
+  } catch (e) {
+    showToast(`切换全屏失败：${String(e && e.message ? e.message : e).slice(0, 120)}`, 5000);
+  }
+}
+
 async function _applyUiZoom(factor, { toast = true } = {}) {
   _uiZoom = Math.min(2, Math.max(0.5, Math.round(factor * 100) / 100));
   try { localStorage.setItem(_UI_ZOOM_KEY, String(_uiZoom)); } catch {}
@@ -71059,6 +71084,7 @@ const ACTION_LABELS = {
   "nav.back": "返回上一个位置",
   "nav.forward": "前进到下一个位置",
   "view.markdownPreview": "切换 Markdown 预览",
+  "view.toggleFullScreen": "切换全屏",
   "view.zoomIn": "界面放大",
   "view.zoomOut": "界面缩小",
   "view.zoomReset": "缩放复位 100%",
@@ -78396,6 +78422,8 @@ function _defaultKeybindings() {
     "mod+=": "view.zoomIn",
     "mod+-": "view.zoomOut",
     "mod+0": "view.zoomReset",
+    // mac 上全屏由系统给（ctrl+cmd+f），不占键位；Windows/Linux 用 F11，和 VS Code 一致。
+    ...(mac ? {} : { f11: "view.toggleFullScreen" }),
     [mac ? "mod+backspace" : "delete"]: "file.deleteSelected",
   };
 }
@@ -78436,6 +78464,9 @@ const KB_ACTIONS = {
   "nav.back": () => navigateBack(),
   "nav.forward": () => navigateForward(),
   "view.markdownPreview": () => _toggleMarkdownPreviewAction(),
+  // 全屏以前**整个产品都没有**：全仓唯一的 fullscreen 代码是只读同步。mac 靠系统绿灯，
+  // 而 Windows 的原生标题栏被 decorations:false 关掉了——那边根本没有任何全屏入口。
+  "view.toggleFullScreen": () => _toggleFullScreen(),
   "view.zoomIn": () => _applyUiZoom(_uiZoom + 0.1),
   "view.zoomOut": () => _applyUiZoom(_uiZoom - 0.1),
   "view.zoomReset": () => _applyUiZoom(1),
@@ -78499,7 +78530,10 @@ window.addEventListener("keydown", (e) => {
   const action = combos.map((combo) => bindings[combo]).find(Boolean);
   if (!action || !KB_ACTIONS[action]) return;
   // 裸键（不含 mod/ctrl/alt/shift）在打字时让路：不拦默认行为，也不触发动作。
-  const bare = !e.metaKey && !e.ctrlKey && !e.altKey;
+  // 功能键（F1~F12）**不算裸键**——它们从来不是「正在打字」，让路给编辑器/终端
+  // 等于这类键位在 IDE 里永远收不到（编辑器有焦点是常态）。上面那条让路规则是为
+  // 裸 delete 之类立的，别把它套到功能键上。
+  const bare = !e.metaKey && !e.ctrlKey && !e.altKey && !/^F\d{1,2}$/.test(e.key || "");
   if (bare && _focusIsTextEntry()) return;
   e.preventDefault();
   e.stopPropagation();
