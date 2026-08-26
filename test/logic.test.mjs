@@ -35365,3 +35365,21 @@ test("预览的复入闸要同时挡住 card-only，不是只挡 rollback", () =
   assert.match(SRC, /if \(_flushLiveEditorWritePreview\(entry\)\) entry\._edSyncAt = nowTs;/,
     "节流盖戳的形状变了——这条闸的失效机制要重新核");
 });
+
+/**
+ * 文件系统变更的分类由**后端**做，前端只负责攒批。
+ *
+ * LSP 的 didChangeWatchedFiles 必须带 Created/Changed/Deleted，而文件监视器
+ * （notify_debouncer_mini）只给 Any，分不出这三者。一次 Path::exists() 是很便宜的
+ * 系统调用，在监视线程里顺手做掉，比让前端为每个路径发一次 IPC 去问强得多。
+ */
+test("fs-change 事件带上「已经不存在的那些」，一路传到 LSP 通知", () => {
+  assert.match(SRC, /const _gone = new Set\(event\.payload\?\.missing \|\| \[\]\)/,
+    "前端没接后端判好的存在性——类型只能瞎猜");
+  assert.match(SRC, /handleFsChanges\(batch, missing\)/, "攒好的 missing 没传下去");
+  assert.match(SRC, /function handleFsChanges\(paths, missing = \[\]\)/, "签名没跟上");
+  assert.match(SRC, /lspManager\?\.notifyWatchedFiles\?\.\(paths, missing\)/,
+    "变更批次没有转成 LSP 通知——外部新建的文件对语言服务器永远不可见");
+  // debounce 结束后必须清空，否则上一批的删除会粘到下一批。
+  assert.match(SRC, /_fsChangeMissing\.clear\(\)/, "missing 集合没清，会跨批粘连");
+});

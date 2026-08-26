@@ -52,6 +52,17 @@ fn is_ignored_path(path: &std::path::Path, roots: &[PathBuf]) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct FsChangeEvent {
     pub paths: Vec<String>,
+    /// 这一批里**已经不存在**的那些（删除、或改名的源路径）。
+    ///
+    /// 为什么后端来分类：LSP 的 `workspace/didChangeWatchedFiles` 必须带 Created/Changed/
+    /// Deleted 三选一，而多数语言服务器只在 **Created / Deleted** 时作废目录与导入缓存，
+    /// 收到 Changed 只把文件标脏。类型发错，这条通知等于没发——pyright 那句
+    /// `Import "x" could not be resolved` 就是这么永远不消失的。
+    ///
+    /// 而 notify_debouncer_mini 只给 `DebouncedEventKind::Any`，本身分不出这三者。
+    /// 一次 `Path::exists()` 是很便宜的系统调用，在监视线程里顺手做掉，
+    /// 比让前端为每个路径发一次 IPC 去问强得多。
+    pub missing: Vec<String>,
 }
 
 pub struct WatcherState {
@@ -123,7 +134,13 @@ pub fn fs_watch(
                         // Bound the batch so a huge legitimate change (e.g. a big
                         // `git checkout`) still can't hand the UI thousands of paths.
                         changed.truncate(500);
-                        let _ = app_handle.emit("fs-change", FsChangeEvent { paths: changed });
+                        // 截断之后再判存在性：只为真的会送出去的那些付系统调用。
+                        let missing: Vec<String> = changed
+                            .iter()
+                            .filter(|p| !std::path::Path::new(p).exists())
+                            .cloned()
+                            .collect();
+                        let _ = app_handle.emit("fs-change", FsChangeEvent { paths: changed, missing });
                     }
                 }
                 Err(e) => {

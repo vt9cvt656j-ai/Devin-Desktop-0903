@@ -1089,10 +1089,40 @@ export function createLspManager(options) {
       }
       try {
         client._send("workspace/didChangeConfiguration", { settings: client._getLangSettings() });
-        client._send("workspace/didChangeWatchedFiles", { changes: [] });
+        // 这里原来还发一条 `didChangeWatchedFiles { changes: [] }` —— 全仓唯一一处发送，
+        // 而且 changes 恒为空，纯 no-op。真正的变更现在走 notifyWatchedFiles。
       } catch {}
     }
     onStatus?.();
+  }
+
+  /**
+   * 把一批文件系统变更告诉所有活着的语言服务器。
+   *
+   * **这条通知不是可选的。** 语言服务器只从 didOpen 认得到「编辑器打开过的文件」；
+   * 项目里被外部创建/删除的文件（智能体用 shell 生成、脚手架命令产出、依赖装完）
+   * 它一无所知。pyright 尤其明显：它把 didOpen 的新模块加进 program，但**导入解析的
+   * 目录缓存只认这条通知**——实测新建 b.py 之后，a.py 里那句
+   * `Import "b" could not be resolved` 靠 didOpen / didChange / didSave 都消不掉，
+   * 只发一条 didChangeWatchedFiles 就在 200ms 内清零。
+   *
+   * 那条假错误会进 markers、进每轮喂给模型的实时诊断块——模型据此反复重改同一行。
+   *
+   * 类型必须分对：多数服务器只在 Created/Deleted 时作废目录缓存，Changed 只标脏。
+   * 而文件监视器分不出这三者（debouncer 只给 Any），所以后端顺手做了一次 exists 判断，
+   * 把不存在的那些放在 missing 里传过来（见 watcher.rs）。存在的一律按 Created(1) 发：
+   * 我们区分不了「新建」和「修改」，而 Created 才是触发缓存作废的那个类型——对一个
+   * 只是被修改的文件发 Created，服务器重读一遍而已；反过来就是这条通知白发。
+   */
+  function notifyWatchedFiles(paths, missing = []) {
+    const list = (paths || []).filter(Boolean);
+    if (!list.length) return;
+    const gone = new Set(missing || []);
+    const changes = list.map((p) => ({ uri: pathToUri(p), type: gone.has(p) ? 3 : 1 }));
+    for (const client of clients.values()) {
+      if (!client?.initialized) continue;
+      try { client._send("workspace/didChangeWatchedFiles", { changes }); } catch { /* 单个失败不影响其余 */ }
+    }
   }
 
   // ---- diagnostics ----
@@ -1999,6 +2029,7 @@ export function createLspManager(options) {
     didSave,
     didClose,
     refreshWorkspace,
+    notifyWatchedFiles,
     ensureServer,
     /// 这个语言的语言服务**当前真的起来了吗**。
     ///
