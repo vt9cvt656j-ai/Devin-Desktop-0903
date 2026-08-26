@@ -589,3 +589,41 @@ test("存在的按 Created 发、不存在的按 Deleted 发，且只发给握�
   // 单个服务器发失败不许影响其余。
   assert.match(fn, /catch \{/, "一个服务器发失败会把整批中断");
 });
+
+/**
+ * Vue：安装的版本和初始化选项必须配套，否则装了也不工作。
+ *
+ * 3.x 是 hybrid：它自己不做 TypeScript 那一半，而是对每个 file: 请求先发一条
+ * `tsserver/request` 通知，然后 await 一个只有客户端回 `tsserver/response` 才兑现的
+ * Promise（无超时、无降级）。本产品不跑 tsserver、也没有这条中继，于是补全/悬停/跳转/
+ * 诊断/大纲**全部**永远挂着——而 initialize 是成功的、capabilities 是齐的、状态栏绿灯。
+ *
+ * 更早一步还有一道坎：不钉 typescript 版本时 npm 按 peer `"*"` 装进 TS 7，
+ * 而 3.x 读 `ts.server`——TS 7 的入口不导出它，第一个 didOpen 就抛异常退出。
+ * 也就是说原来那条安装命令装出来的组合是**必崩**的。
+ *
+ * 2.x 把 @vue/language-service 作为依赖带着，自己做 TS 那一半，是标准 LSP，
+ * 只要给它 typescript.tsdk 就完整可用。
+ */
+test("Vue 的安装命令钉在 2.x —— 3.x 在这个产品里结构上不可用", () => {
+  const code = installTablesCodeOnly();
+  assert.match(code, /vue: "npm i -g @vue\/language-server@2"/,
+    "vue 又装 latest 了：3.x 需要 tsserver 中继，本产品没有，装了也全挂");
+  assert.doesNotMatch(code, /vue: "npm i -g @vue\/language-server"\s*,/,
+    "不钉版本会装进 TS 7，第一个 didOpen 就崩");
+});
+
+test("Vue 拿得到 typescript.tsdk，拿不到时不编一个假路径", () => {
+  const init = source.slice(source.indexOf("_getInitOptions() {"), source.indexOf("_getLangSettings() {"));
+  assert.match(init, /this\.serverLang === "vue"/, "vue 没有自己的初始化选项");
+  assert.match(init, /typescript: \{ tsdk \}/, "没把 tsdk 传给 Volar —— 它只能做模板那一半");
+  assert.match(init, /tsdk \? \{ typescript: \{ tsdk \} \} : \{\}/,
+    "探不到 typescript 时应当不发这个字段，而不是发一个不存在的路径");
+  // 探测用项目自己的 typescript，不是全局那份。
+  const ensure = source.slice(source.indexOf('if (langId === "vue" && manager._vueTsdk === undefined)'),
+                              source.indexOf('if (langId === "python" && !manager._pythonSettings)'));
+  assert.ok(ensure.length > 200, "vue 的 tsdk 探测抠不出来");
+  assert.match(ensure, /node_modules\/typescript\/lib/, "探的不是项目自己的 typescript");
+  assert.match(ensure, /manager\._vueTsdk = "";/,
+    "探测前没有先置空——undefined 是「还没探过」的判据，不置空会每次都重探");
+});

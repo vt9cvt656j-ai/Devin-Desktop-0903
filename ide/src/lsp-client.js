@@ -385,6 +385,13 @@ class LspClient {
     if (this.serverLang === "python") {
       return this.manager._pythonSettings || {};
     }
+    // Volar 2.x 自己不带 TypeScript：拿不到 tsdk 它就只能做模板那一半，
+    // <script setup> 里的补全/悬停/跳转/类型诊断全部没有——而它不会报错，
+    // 表现是「模板里还行、脚本里什么都没有」，用户会描述成时好时坏。
+    if (this.serverLang === "vue") {
+      const tsdk = this.manager._vueTsdk;
+      return tsdk ? { typescript: { tsdk } } : {};
+    }
     return {};
   }
 
@@ -792,6 +799,25 @@ export function createLspManager(options) {
       }
       return clients.get(langId) || null;
     }
+    if (langId === "vue" && manager._vueTsdk === undefined) {
+      /*
+       * 用**项目自己的** typescript，不是全局那份。
+       *
+       * 理由和 lsp.rs 里「用项目自己的 TypeScript / pyright 版本是真实且必要的功能」
+       * 那段一致：Vue 项目的类型来自它自己锁定的那个 TS 版本，全局那份多半对不上。
+       * 探测方式取最便宜的一种——读一下 package.json 读得到就算有，不新增后端命令。
+       * 探不到就留空串：Volar 会退回只做模板那一半（比崩掉好），而 _getInitOptions
+       * 此时不发 typescript 字段，不去编一个不存在的路径。
+       */
+      manager._vueTsdk = "";
+      const root = String(manager.workspaceRoots?.()[0] || "").replace(/\/+$/, "");
+      if (root) {
+        try {
+          await backend.readTextFile(`${root}/node_modules/typescript/package.json`);
+          manager._vueTsdk = `${root}/node_modules/typescript/lib`;
+        } catch { /* 项目没装 typescript：留空，Volar 只做模板那一半 */ }
+      }
+    }
     if (langId === "python" && !manager._pythonSettings) {
       try {
         // Pass the workspace root so the backend prefers the project's .venv interpreter — pyright then
@@ -888,7 +914,24 @@ export function createLspManager(options) {
         yaml: "npm i -g yaml-language-server",
         graphql: "npm i -g graphql-language-service-cli",
         dockerfile: "npm i -g dockerfile-language-server-nodejs",
-        vue: "npm i -g @vue/language-server",
+        /*
+         * **钉在 2.x，不是 latest。** 这不是保守，是 3.x 在这个产品里结构上不可用：
+         *
+         * @vue/language-server 3.x 是 hybrid 模式——它自己不做 TypeScript 那一半，而是
+         * 对每个 file: 请求先发一条 `tsserver/request` 通知，然后 await 一个只有客户端回
+         * `tsserver/response` 才会兑现的 Promise（无超时、无降级）。VS Code 那边是把
+         * @vue/typescript-plugin 塞进 tsserver 来应答的；本产品不跑 tsserver，也没有这条
+         * 中继，于是补全/悬停/跳转/诊断/大纲**全部**永远挂着——而 initialize 是成功的、
+         * capabilities 是齐的，状态栏一路绿灯。
+         *
+         * 更早一步还有一道坎：不钉 typescript 版本时 npm 会按 peer `"*"` 装进 TS 7，
+         * 而 3.x 读 `ts.server` —— TS 7 的入口不导出它，第一个 didOpen 就抛异常退出。
+         * 也就是说照原来这条命令装出来的组合是**必崩**的。
+         *
+         * 2.x 把 @vue/language-service 作为**依赖**带着，自己做 TS 那一半，是标准 LSP，
+         * 只要给它 typescript.tsdk 就完整可用（见 _getInitOptions）。代价是钉死一个旧大版本。
+         */
+        vue: "npm i -g @vue/language-server@2",
       };
       const MAC_ONLY = {
         c: "brew install llvm",
