@@ -1149,6 +1149,46 @@ test("an interrupted turn keeps what the model already wrote", () => {
   assert.doesNotMatch(SRC, /已生成的内容和文件改动都已保留/);
 });
 
+/**
+ * AGENT_LOOP_REBUILD.md 里那张「静默轮续跑门」的表，必须和代码对得上。
+ *
+ * 这条守的不是代码，是**文档**。那份计划文档已经过期成假话过一次：它的表格
+ * 引用 `_missingRequiredEffects`（阶段 2b 早删干净了），阶段 1 的清单列了一条
+ * 阶段 3 删掉的子智能体腿、却漏掉真实存在的计划门。后果不是报错——是下一个人
+ * 照着它做决定，把删掉的东西装回去。仓库里另外两份诊断文档正在犯这个错，
+ * 文档头部专门写了一段警告。
+ *
+ * 判据取「门的标识符在不在静默轮那段里」：文档说有的门，代码里必须真有。
+ */
+test("计划文档写的四条续跑门，代码里必须真的存在", () => {
+  const loop = grab("_runAgenticLoop");
+  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"),
+                           loop.indexOf("// Render every tool step up front"));
+  const doc = fs.readFileSync("AGENT_LOOP_REBUILD.md", "utf8");
+
+  // 文档承诺的四条门 → 代码里的落点
+  const gates = {
+    "用户插话": /session\._steerQueue/,
+    "新增诊断": /run\._diagnosticNudges >= 2/,
+    "构建红了": /buildFixAttempts < 2/,
+    "计划未完": /\(run\._planFinishNudges \|\| 0\) < 2/,
+  };
+  for (const [name, re] of Object.entries(gates)) {
+    assert.ok(doc.includes(name), `文档的门表里没有「${name}」了——表和代码正在分家`);
+    assert.match(quiet, re, `文档说有「${name}」这道门，静默轮里却找不到它的落点`);
+  }
+  // 全局池也在表里承诺了。
+  assert.match(quiet, /run\._quietResumePool/, "文档写了共用 3 轮的全局池，代码里没有");
+
+  // 反向：文档不许再提已经删掉的东西。这正是它上次出错的形状。
+  for (const dead of ["_missingRequiredEffects", "_noWorkNudged"]) {
+    if (!doc.includes(dead)) continue;
+    // 允许出现在「它已经被删了」的更正段落里，不允许被当成现状引用。
+    assert.ok(/删|移除|[Rr]emove[ds]?|不成立/.test(doc.slice(Math.max(0, doc.indexOf(dead) - 400), doc.indexOf(dead) + 400)),
+      `文档还在把 ${dead} 当成现状引用，而 main.js 里它已经不存在了`);
+  }
+});
+
 test("a run does not end while its own plan has open steps", () => {
   const loop = grab("_runAgenticLoop");
 
