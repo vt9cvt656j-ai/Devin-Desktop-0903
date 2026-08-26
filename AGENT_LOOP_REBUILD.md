@@ -9,12 +9,13 @@
 >   **自己零调用点**。两个 Set 从头到尾只写不读，靠一层死函数假装有消费方，
 >   连「只写不读」那道守卫都被骗过去了。四样已于 2026-08-25 全部删除。
 > - **阶段 4 的前提已经反转。** 它假设"machinery gone"之后循环会收敛，而实测
->   main.js 30 天从 52,537 行涨到 83,353 行（+59%）。在按这份计划推进之前，
+>   main.js 30 天从 52,537 行涨到 83,200 行（+58%）。在按这份计划推进之前，
 >   先看 `test/main-size-budget.test.mjs`——尺寸闸和「撞线先搬模块」的规矩在那里。
 > - 阶段 1 那份「静默轮只在这三种情况续跑」的清单与代码对不上；"Where main.js
 >   stands (measured)"表格最后一行引用的是已删函数；阶段 1 引用的 agent_core.txt
->   里那句话 grep 不到。**这三处没有逐条更正**——只在这里标明不可信，
->   要用之前请对着代码重新核。
+>   里那句话 grep 不到。**这三处已于 2026-08-25 逐条对着代码更正**，更正内容就写在
+>   各自出处的下面（真实的四条续跑门连同上限、`_missingRequiredEffects` 的下落、
+>   agent_core.txt 那句英文原文）。
 >
 > 同目录的 `WHY_SINGLE_DISPATCH_DIAGNOSIS.md` 和另一份编排诊断整篇在建议
 > **加回阶段 3 刚被所有者点名删掉的自动派发**。照着做等于把删掉的东西装回去。
@@ -56,7 +57,23 @@ floors.* The loop drifted from it.
 | intent-classifier functions | 0 | 27 |
 | obligation / effect / contract refs | 0 | 51 |
 | nudge / steer / gate functions | 0 | 55 |
-| loop stop condition | "model called no tools" | `_missingRequiredEffects` + 6 branches |
+| loop stop condition | "model called no tools" | "model called no tools"，外加 4 条**执行事实**门 |
+
+> 最后一行 2026-08-25 更正。原文写的 `_missingRequiredEffects` + 6 branches 已经不成立：
+> 那个函数在阶段 2b 删干净了（main.js 里只剩两条记录它被删的注释）。现在的静默轮
+> 决策是「模型没调工具 = 它的收尾决定，默认成立」，只有四条门能推翻它，每条都由
+> 机器产生的事实驱动，且各自有上限、共用一个 3 轮的全局池：
+>
+> | 门 | 触发 | 上限 |
+> |---|---|---|
+> | 用户插话 | `session._steerQueue` 里真有消息 | 无（优先于其余三门，并清空所有计数器） |
+> | 新增诊断 | 诊断相对基线有增量 | `_diagnosticNudges < 2` |
+> | 构建红了 | 模型声明为验证的命令退出码非零 | `buildFixAttempts < 2` |
+> | 计划未完 | 模型自己调 update_plan 留下的未完成步骤 | `_planFinishNudges < 2` |
+>
+> 另有两道全局关闸：非 agent 模式 / 用户拒绝 / 只读拦截（R0），以及连续两轮静默（R2）。
+> 阶段 1 正文里那份「三种情况」的清单同样过期——它列的「付费自动子智能体整合」那条腿
+> 在阶段 3 随自动派发一起删了，而真实存在的**计划门**它从头到尾没提。
 
 ## The line that matters
 
@@ -77,8 +94,11 @@ equal, and the whole rebuild rests on separating them:
 - **Profile / keyword guess** — `_missingRequiredEffects`, `_missingResearchEvidence`,
   the `_noWorkNudged` gate. "The classifier thinks this task should have changed
   something." → **Remove.** The model decides when it is done; the prompt carries the
-  intent (already: `agent_core.txt` now lists 跑/运行 among must-produce-a-result
-  intents and says do it, don't offer to).
+  intent. **2026-08-25 更正**：原文写「`agent_core.txt` now lists 跑/运行 among
+  must-produce-a-result intents」——grep 不到，因为那个文件通篇是英文，从来没有过
+  中文词。它真正的对应句是开头第一句："when they ask you to modify, create, run,
+  or deploy, use tools to actually complete"。意思在，引文是编的；照原文去 grep
+  会得出「这条已经没了」的错误结论。
 - **Observed execution fact** — `_diagnosticBlock` (fresh diagnostics the agent itself
   created), `_freshBuildFailure` (a command the model declared as verification exited
   nonzero). "A real, observed result is red." → **Keep.** This is the "execution facts"
