@@ -198,3 +198,43 @@ test("并集不许把副作用工具漏给只读子体", () => {
     }
   }
 });
+
+/**
+ * 用户声明的角色，必须真的到得了模型的**工具枚举**里。
+ *
+ * 这条修的是一个静态可证的死路：L0（走网关时默认开）把内置工具的 schema 整个丢掉、
+ * 只发名字，由网关按它自己那份 tools.json 回填。而 _applyUserRoleEnums 补角色名补的
+ * 正是客户端这份 schema——也就是被丢掉的那份。网关那份目录用户改不了，实测里面
+ * run_subagent / run_worker / spawn_multiple_agents 的 role 枚举只有 11 个内置角色名。
+ *
+ * 后果不是"少一个选项"：提示词、工具矩阵、轮数、模型全配好了，模型却看不到这个名字，
+ * 于是永远选不中——整套声明是哑的。和本仓库记着的「枚举没判据就恒等于默认值，
+ * 整道门结构性哑掉」是同一个形状。
+ */
+test("声明了角色时，派发工具的 schema 必须随请求体发出去而不是交给网关回填", () => {
+  const turn = extractFn("_agentModelTurn");
+  const at = turn.indexOf("const _stat = _staticToolNames()");
+  assert.ok(at > 0, "L0 那段的落点不见了，这条断言要跟着改");
+  const blk = turn.slice(Math.max(0, at - 900), at + 500);
+  assert.match(blk, /_userCapabilities\(\)\.roles \|\| \[\]\)\.length/,
+    "没有按「用户声明过角色吗」分流——声明的角色到不了模型的枚举里");
+  assert.match(blk, /"run_subagent", "run_worker", "spawn_multiple_agents"/,
+    "三个派发工具没被点名——漏一个，那个入口的用户角色就还是哑的");
+  assert.match(blk, /_dispatchNames && _dispatchNames\.has\(_n\)/,
+    "分流没接进那个循环，等于加了个没人读的变量");
+  // 反向：没声明角色时一个字节都不许多发（那三份 schema 不便宜）。
+  assert.match(blk, /_rolesDeclared\s*\?[\s\S]{0,120}:\s*null/,
+    "没声明角色时也在多发 schema——这条改动的代价必须只落在真用了它的人身上");
+});
+
+test("网关那份目录里确实只有内置角色（这条改动的前提）", () => {
+  // 前提变了就该重新核这条改动还需不需要。判据直接读那份真目录。
+  const doc = JSON.parse(readFileSync(join(HERE, "..", "..", "server", "prompts", "tools.json"), "utf8"));
+  const list = Array.isArray(doc) ? doc : (doc.tools || []);
+  const t = list.find((x) => (x?.function?.name || x?.name) === "run_subagent");
+  assert.ok(t, "网关目录里没有 run_subagent —— 前提变了");
+  const en = t.function?.parameters?.properties?.role?.enum || t.parameters?.properties?.role?.enum;
+  assert.ok(Array.isArray(en) && en.length, "role 枚举读不到");
+  assert.ok(!en.includes("data"),
+    "网关目录里出现了用户自定义角色名——那说明回填路径变了，这条改动的前提要重核");
+});

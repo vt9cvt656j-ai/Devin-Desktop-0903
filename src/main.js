@@ -47245,10 +47245,29 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       const _isSub = stepKind === "subagent";
       const _wantsL0 = (ideMode || _isSub) && _l0On(_turnConfig);
       if (_wantsL0) {
+        /*
+         * 用户声明了角色时，三个派发工具的 schema 必须**随请求体发出去**，不能交给网关回填。
+         *
+         * L0 的做法是：内置工具只发名字，网关按它自己那份 tools.json 回填 schema。
+         * 而 _applyUserRoleEnums 恰恰是把用户声明的角色名补进这三个工具的 `role` 枚举里的
+         * ——补的是客户端这份 schema，也就是这里被丢掉的那份。网关那份目录用户改不了，
+         * 里面只有 11 个内置角色名。
+         *
+         * 后果不是"少一个选项"：用户把角色的提示词、工具矩阵、轮数、模型全配好了，
+         * 模型却在枚举里看不到这个名字，于是永远选不中——整套声明是哑的。
+         * 这和本仓库记着的「枚举没判据就恒等于默认值，整道门结构性哑掉」是同一个形状。
+         *
+         * 代价只落在真的声明了角色的用户身上：多发三份 schema。没声明的一个字节都不多发。
+         */
+        let _rolesDeclared = false;
+        try { _rolesDeclared = !!(_userCapabilities().roles || []).length; } catch {}
+        const _dispatchNames = _rolesDeclared
+          ? new Set(["run_subagent", "run_worker", "spawn_multiple_agents"]) : null;
         const _stat = _staticToolNames(), _names = [], _keep = [];
         for (const _t of toolSchemas) {
           const _n = _t && _t.function && _t.function.name;
-          if (_n && _stat.has(_n)) _names.push(_n); else if (_t) _keep.push(_t);
+          const _delegate = _n && _stat.has(_n) && !(_dispatchNames && _dispatchNames.has(_n));
+          if (_delegate) _names.push(_n); else if (_t) _keep.push(_t);
         }
         _turnConfig.ideMode = _isSub ? "subagent" : ideMode;
         // 用户在卡片上选中的窗口要真的发出去。目录查不到窗口的模型在客户端和网关两边都退回
