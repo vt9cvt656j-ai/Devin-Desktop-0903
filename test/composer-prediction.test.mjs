@@ -465,9 +465,13 @@ test("预测必须显式关思考，否则网关把它升级成 effort=high + ma
   assert.match(gw, /is_some_and\(\|e\| !e\.is_empty\(\) && e != "off"\)/,
     "网关不再把 off 排除在 has_thinking 之外了——那 off 也会触发 32000 地板");
   // 上面「按模型名判该不该发 off」之所以成立，前提是网关按**线路协议**分叉：
-  // 非 anthropic 的线路原样透传 body，客户端塞的枚举会直接落到上游手里。
-  assert.match(gw, /let anthropic = conn\.protocol == "anthropic"/,
+  // 非 anthropic 的线路不会把 body 改成 anthropic 形状，客户端塞的枚举会落到上游手里。
+  // 2026-08-26 起这个分叉从布尔量 `let anthropic = conn.protocol == "anthropic"` 换成了
+  // 三态的 Wire 枚举（新增 xai_responses 那条桥），判据跟着换成枚举本身。
+  assert.match(gw, /let wire = Wire::of\(&conn\.protocol\)/,
     "网关不再按线路协议分叉了——客户端按模型名判该不该发 off 的整套判据都要重新评估");
+  assert.match(gw, /Wire::Anthropic\s*=>/,
+    "Wire 枚举里没有 Anthropic 分支了——上面那条 off 只该发给 anthropic 桥");
 });
 
 test("期限要和预算一起抬，只改一半是把顶满上限换成静默超时", () => {
