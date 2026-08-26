@@ -47622,8 +47622,25 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         ? rejectedToolAttempts
         : [...byIndex.values()].map((entry) => ({ name: entry.name || "", argsRaw: entry.args || "", parsedArgs: _safeJsonLoose(entry.args || "") || {}, issue: fatalToolArgIssue }));
       err = `[tool-args-invalid] ${fatalToolArgIssue}；自动重试已耗尽，IDE 已拒绝执行这次工具调用，未写盘。`;
-    } else if (!acc.trim() && byIndex.size === 0 && reasoningAcc.trim()) {
-      err = "[model-empty-output] 模型只输出了思考过程，没有正文或工具调用。";
+    } else if (!acc.trim() && byIndex.size === 0) {
+      /*
+       * **零产出的一轮不许被当成「模型决定收尾」。**
+       *
+       * 这里原来还有一个 `&& reasoningAcc.trim()` 的前提，于是判据只认「有思考、没正文」。
+       * 而「思考也是空的」——上游干净结束但一个字都没吐——落进下面的 else 拿到 err=null，
+       * 主循环看到 `toolCalls.length === 0` 就当模型自己收尾了，走完三道续跑门 break，
+       * 收尾还把这次运行记成 success。用户看到的就是「干着干着突然吐个空回复就结束了，
+       * 也不报错」，而且偶发（取决于上游这一次吐不吐东西）。
+       *
+       * 同一个产品的 chat 那条路早就判对了：它显式分了「零输出」和「只有思考」两支，
+       * 注释还写着「0ms 空回复：网关上游故障/路由冷却时常见」。agent 这条漏了前一支。
+       *
+       * 打上 [model-empty-output] 之后，下游那段（_emptyOut）会自动重开一轮并告诉模型
+       * 哪些文件已经落盘——本来就是为这种情况准备的路，只是这一支拿不到标记。
+       */
+      err = reasoningAcc.trim()
+        ? "[model-empty-output] 模型只输出了思考过程，没有正文或工具调用。"
+        : "[model-empty-output] 模型这一轮没有返回任何内容（上游波动或线路暂时不可用）。";
     } else {
       err = null;
     }
