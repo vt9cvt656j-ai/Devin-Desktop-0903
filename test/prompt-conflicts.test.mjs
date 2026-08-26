@@ -186,3 +186,51 @@ test("项目摸底子体拿到可执行的判据和输出模板", () => {
   assert.match(t, /## 常见改动入口/, "同上，六段模板不全");
   assert.match(t, /不要只列文件名/, "会交回一份文件名清单");
 });
+
+// ── 注释族 ─────────────────────────────────────────────────────────
+//
+// 2026-08-25：用户报「写代码不写注释」。直接原因不是模型的毛病，是我们自己下的指令——
+// agent_engineering.txt:16 逐字写着 "Do not write comments by default."，而它是网关那
+// 40 份提示词里**唯一**给注释下默认策略的地方，客户端没有兜底副本。
+//
+// 客户端唯一的反向压力（main.js 的 _missingWhyInWrite）是**一条注释的地板**：全文
+// 有任意一条非空注释就永久静音。所以它拉不动默认值。
+//
+// 这一组守两件事：策略本身是「写为什么」，以及客户端那条工程律和网关这条**同向**。
+// 两边同向很重要——自定义端点不走网关，那条路只有客户端这份。
+
+test("网关的注释策略是「写为什么」，不是「默认别写」", () => {
+  const e = P("agent_engineering");
+  assert.doesNotMatch(e, /Do not write comments by default/,
+    "「默认别写注释」回来了——用户报的就是这条的直接后果");
+  assert.match(e, /Every non-trivial function, class, and module gets a short doc comment/,
+    "文档注释的下限没了，回到「看心情写」");
+  // 质量那半条必须留下：翻转默认值不等于要噪音注释。
+  assert.match(e, /do not restate what the next line does/,
+    "复述下一行的禁令被顺手删了——那会换来一堆噪音注释");
+  assert.match(e, /heading-style/, "标题式注释的禁令被顺手删了");
+  // 真正的漏洞是新文件：原文最后一句「密度跟随所在文件的既有风格」在新项目里没有落点，
+  // 于是默认那半句赢。改法必须把这个洞点名堵上。
+  assert.match(e, /In a new file there is no existing style to follow/,
+    "新文件那个洞没堵——那正是「新项目一条注释都没有」的成因");
+});
+
+test("客户端那条工程律和网关同向（自定义端点只有客户端这份）", () => {
+  assert.match(SRC, /可维护升级律：/, "整条律被删了");
+  const law = /lines\.push\("可维护升级律：([^"]*)"\)/.exec(SRC);
+  assert.ok(law, "可维护升级律的形状变了，这条断言失去落点");
+  assert.match(law[1], /注释按「为什么」写/,
+    "客户端这条一个字都没提注释——而自定义端点不走网关，那条路只有它");
+  assert.match(law[1], /不要复述下一行在干什么/, "客户端这份少了质量那半条，会换来噪音注释");
+  assert.match(law[1], /新文件没有既有风格可跟/, "客户端这份没堵新文件那个洞");
+  // 反向：客户端不许出现「默认别写注释」这类和网关反向的措辞。
+  assert.doesNotMatch(SRC, /默认不写注释|不要写注释/,
+    "客户端出现了和网关反向的注释指令");
+});
+
+test("Ctrl-K 转写那条「不要注释」不受影响——它说的是别的事", () => {
+  // edit_transform.txt:1 的 "no comments about changes" 指的是「别输出解释改动的话」，
+  // 不是「别在代码里写注释」。它和上面这组不冲突，删掉反而会让转写结果带一堆说明文字。
+  assert.match(P("edit_transform"), /no comments about changes/,
+    "把 Ctrl-K 的「别输出改动说明」当成注释策略删掉了——那是两件事");
+});
