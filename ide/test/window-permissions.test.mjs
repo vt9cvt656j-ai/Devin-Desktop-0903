@@ -184,3 +184,62 @@ test("全屏动作接齐了：权限、动作表、键位、标签", () => {
   const fn = src.slice(src.indexOf("async function _toggleFullScreen"), src.indexOf("async function _applyUiZoom"));
   assert.match(fn, /showToast\(/, "切换失败时一个字都不说——那正是这次要修掉的形状");
 });
+
+/**
+ * 平台配置是 **RFC 7396 合并**：patch 不是 object 就整体替换。
+ *
+ * `tauri.windows.conf.json` 里写 `app.windows: [{ decorations: false }]` 时，
+ * windows 是**数组**——按 RFC 7396 数组不做元素级合并，而是把基础配置那一整个数组
+ * 顶掉。结果 Windows 上 label / title / width / height / minWidth / minHeight /
+ * resizable **全部丢失**，回落到 Tauri 默认值：800×600、"Tauri App"、**没有最小尺寸约束**。
+ *
+ * 后果不是"观感降级"：.layout 是 flex 且 `overflow: hidden`，
+ * .explorer 250px + .assistant 440px（两者 flex:none，不收缩）+ .editorwrap min-width 200px
+ * = **890px 硬底**。800px 宽时右边 90px 被直接裁掉，裁掉的正是助手栏输入区和发送键那一带
+ * ——**首启即有控件够不着**。而且最小尺寸没了，用户还能把它拖得更小。
+ *
+ * 判据直接跑一遍合并，断言的是**合并结果**。原来那条只断言平台文件自身
+ * `decorations === false`，从不看合并后是什么——正是它漏掉的地方。
+ */
+function mergeRfc7396(target, patch) {
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) return patch;
+  const out = (target && typeof target === "object" && !Array.isArray(target)) ? { ...target } : {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete out[k];
+    else out[k] = mergeRfc7396(out[k], v);
+  }
+  return out;
+}
+
+test("Windows 合并后的窗口配置不许把尺寸和标题丢掉", () => {
+  const base = JSON.parse(readFileSync(join(ROOT, "src-tauri/tauri.conf.json"), "utf8"));
+  const win = JSON.parse(readFileSync(join(ROOT, "src-tauri/tauri.windows.conf.json"), "utf8"));
+  const merged = mergeRfc7396(base, win);
+  const w = merged.app.windows[0];
+
+  assert.equal(w.decorations, false, "Windows 上必须关掉系统装饰（自绘标题栏才是唯一控制）");
+  assert.equal(w.label, "main",
+    "label 丢了——能力清单是按 [\"main\", \"win-*\", \"glow-overlay\"] 授权的，"
+    + "标签对不上就一个窗口命令都调不了");
+  assert.equal(w.title, base.app.windows[0].title, "标题丢了，会显示成 Tauri 的默认名");
+  assert.equal(w.width, base.app.windows[0].width, "初始宽度丢了，会回落到 800");
+  assert.equal(w.height, base.app.windows[0].height, "初始高度丢了，会回落到 600");
+  assert.equal(w.minWidth, base.app.windows[0].minWidth,
+    "最小宽度丢了——三栏布局的硬底是 890px，而 .layout 是 overflow:hidden，"
+    + "窗口再小就直接裁掉助手栏右缘（输入区和发送键）");
+  assert.equal(w.minHeight, base.app.windows[0].minHeight, "最小高度丢了");
+
+  // 反向：mac 专属的两项不该被带进 Windows（那边根本不认，留着只会误导）。
+  assert.ok(!("titleBarStyle" in w), "titleBarStyle 是 macOS 专属，不该出现在 Windows 配置里");
+  assert.ok(!("hiddenTitle" in w), "hiddenTitle 是 macOS 专属，同上");
+});
+
+test("三栏布局的硬底确实高于 Windows 的默认窗口宽度（这条是上面那条的前提）", () => {
+  // 哪天有人把侧栏改成可收缩（flex 不再是 none），上面那条的严重性就变了——
+  // 那时该重新评估，而不是让它继续用一个过时的理由挡着。
+  const css = readFileSync(join(ROOT, "src/styles/app.css"), "utf8");
+  assert.match(css, /\.explorer\s*\{[\s\S]{0,400}flex: none;/, "侧栏不再是 flex:none 了，硬底的算法要重算");
+  assert.match(css, /\.assistant\s*\{[\s\S]{0,400}flex: none;/, "助手栏不再是 flex:none 了，同上");
+  assert.match(css, /\.layout\s*\{[\s\S]{0,200}overflow: hidden;/,
+    "布局不再裁切了——那样窗口过窄只会出横向滚动条，不再是「控件够不着」");
+});
