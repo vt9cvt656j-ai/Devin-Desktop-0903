@@ -34981,6 +34981,142 @@ test("撞过的墙要落盘：情景档案必须记下哪个工具失败了、�
   assert.match(ep, /\.slice\(0, 6\)/, "walls 没有上限，一轮里连撞几十次会把存档撑爆");
 });
 
+function _epForLedger(entries, outcome = "success") {
+  const saved = [];
+  const record = load("_recordEpisode", {
+    _DISPATCH_TOOLS: loadConst("_DISPATCH_TOOLS"),
+    // 用真的 _epApproach，不打桩：approach 的取法是隔壁那条测试守着的东西，
+    // 这里打桩会让两条测试对同一个函数各自成立、合起来却漂开。
+    _epApproach: load("_epApproach"),
+    _epLoad: () => [],
+    _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
+    _markReworkIfAny: () => {},
+    _recurringSuccessCluster: () => null,
+    _worthDistilling: () => false,
+    _billableAiComplete: async () => "",
+    _safeJsonLoose: () => ({}),
+    // 蒸馏那道 race 的另一条腿是 setTimeout(22000)。不桩掉它，这个文件会为两条断言
+    // 空等 22 秒。桩成"永不触发"，race 由上面那个即刻 resolve 的模型桩赢，走的仍是生产路径。
+    setTimeout: () => 0,
+  });
+  const run = {
+    recording: [{ type: "read", label: "读取 a.js", ok: true }, { type: "read", label: "读取 b.js", ok: true }],
+    _toolLedger: { entries, turnIndex: 3 },
+  };
+  return record(run, "改一下登录页", "/r", outcome, {}, null)
+    .then(() => (saved[0] || []).slice(-1)[0] || {});
+}
+
+// 18295 个步骤里只派发了 25 次（0.14%）；172 次超过 30 步的任务里只有 3 次派发过任何
+// 东西，没有一次派发写代码的子体。但账本里 orch 只有 3 条 —— 派发的工具名、角色、成败
+// 一概没落盘，于是「多派发能不能提升成功率」这个问题今天结构上答不了。先把账记上。
+test("情景档案要落派发记账，否则「多派发能不能提升成功率」结构上答不了", async () => {
+  // 不拿 SRC 整份去 match：断言一红就往报告里灌 4.5MB 源码。先用正则**取出这一行**，
+  // 取不到就是"表不存在"，取到了再在这条 ≤400 字的短串上判内容。
+  const decl = /const _DISPATCH_TOOLS = new Set\(\[[^\]]*\]\);/.exec(SRC);
+  assert.ok(decl && decl[0].length < 400, "没有 _DISPATCH_TOOLS 这张表 —— 派发记账无从谈起");
+  assert.match(decl[0], /"run_worker"/,
+    "表里漏了 run_worker —— 近两个月一次都没被派过的正是它，它必须能被数出来");
+  assert.doesNotMatch(decl[0], /"await_subagent"/,
+    "await_subagent 是收结果不是派发，算进去会把「派过几次」翻倍");
+  assert.match(extractFn("_recordEpisode", { code: true }), /_DISPATCH_TOOLS\.has\(/,
+    "派发过滤没走那张表 —— 又一次现场手写字面量数组");
+
+  // 这张表不许和执行器分叉那张漂开：_runAgenticLoop 里的 subagentNames 决定"谁真的会
+  // 派出子体"，这张表决定"谁被记进账"。两张表不等 = 某一族工具会派出去却永远不进档案，
+  // 而且不报错。（别把那边改成引用这张表：wiring.test.mjs 有两条按字面量正则的守卫，
+  // 其中一条还是变异测试。）
+  const _loopSet = /const subagentNames = new Set\(\[([^\]]*)\]\)/.exec(extractFn("_runAgenticLoop", { code: true }));
+  assert.ok(_loopSet && _loopSet[0].length < 400, "执行器的 subagentNames 不见了——记账表失去了参照");
+  assert.deepEqual(
+    [...new Set([..._loopSet[1].matchAll(/"([a-z0-9_]+)"/g)].map((x) => x[1]))].sort(),
+    [...loadConst("_DISPATCH_TOOLS")].sort(),
+    "记账表和执行器分叉表漂开了——有工具会派出子体却记不进账");
+
+  const ep = await _epForLedger([
+    { turn: 0, tool: "read_file", args: '{"path":"a.js"}', ok: true },
+    { turn: 1, tool: "run_subagent", args: '{"description":"查权限","role":"security","tasks":[{"task":"x"},{"task":"y"}]}', ok: true },
+    { turn: 2, tool: "run_worker", args: '{"description":"写页面","role":"frontend","scope":["src/a.tsx"]}', ok: false },
+  ]);
+  assert.deepEqual(ep.dispatch, [
+    { tool: "run_subagent", ok: true, turn: 1, role: "security", fan: 2 },
+    { tool: "run_worker", ok: false, turn: 2, role: "frontend" },
+  ], "dispatch 的形状不对：按台账原样落工具名/成败/回合/角色/扇出，非派发工具不许混进来");
+});
+
+test("没派发的那一轮不落这个键，落盘条数有上界", async () => {
+  const solo = await _epForLedger([{ turn: 0, tool: "read_file", args: "{}", ok: true }]);
+  assert.ok(!("dispatch" in solo),
+    "没派发也写一个空数组，等于给九成档案加一份噪音（同一条理由，见隔壁 orch 只在非 solo 时才记）");
+  const many = await _epForLedger(
+    Array.from({ length: 30 }, (_, i) => ({ turn: i, tool: "run_subagent", args: "{}", ok: true })));
+  assert.ok(many.dispatch.length <= 8,
+    `dispatch 落了 ${many.dispatch.length} 条，没有上限 —— 存档已经 740KB，这条会把它撑爆`);
+  assert.equal(many.dispatch[many.dispatch.length - 1].turn, 29,
+    "上界要留最近的那几条，不是最早的");
+});
+
+// 喂给模型的"本项目经验"一多半是脏的：insight 空掉时 _episodeHintBlock 回退去用
+// approach，而 approach 是 _recLabel 产的动作标签拼起来的——里面是**绝对路径**。
+//
+// 实测账本（~/Library/Application Support/ai.devin.ide/memory-episodes.json，
+// 2026-08-26，52 个项目抽屉合计 1165 条）：
+//   · 693 条（59.5%）的 approach 里带着 /Users/michael/… —— 换台机器、换个项目就是噪音
+//   · 568 条（48.8%）insight 为空，也就是这 568 条注入的全是那串路径流水
+//   · 582 条（50.0%）approach 撞满 280 字上限；396 条（34.0%）步数超过 12
+//     —— 老取法 steps.slice(0, 12) 切掉的恰恰是**验证和收尾**那一段，
+//     也就是"这次是怎么确认做对了的"，只留下了"怎么开工"。
+test("情景档案的动作标签要相对化到 run 根，approach 不能丢掉验证尾巴", () => {
+  const root = "/Users/michael/Desktop/Michael-IDE/Devin-Desktop/ide";
+  const label = load("_recLabel");
+  assert.equal(label({ type: "read", _resolvedPath: root + "/src/main.js" }, root), "读取 src/main.js",
+    "标签没相对化到 run 根 —— 它是 approach 的唯一来源，会被当「本项目经验」注入给模型");
+  assert.doesNotMatch(label({ type: "edit", _resolvedPath: root + "/src/main.js" }, root), /\/Users\//,
+    "标签里还带着绝对路径");
+  const deep = "/somewhere/else/" + "sub/".repeat(40) + "x.ts";
+  assert.ok(label({ type: "read", _resolvedPath: deep }, root).length <= 56,
+    "根外的路径没有长度上限，一条标签就能吃掉整份 approach 预算");
+  assert.equal(label({ type: "think" }, root), "思考", "不带路径的动作不该被改坏");
+
+  const approach = load("_epApproach");
+  const steps = Array.from({ length: 30 }, (_, i) =>
+    ({ label: i === 29 ? "运行  $ node --test test/logic.test.mjs" : `读取 src/f${i}.ts` }));
+  const a = approach(steps);
+  assert.ok(a.includes("运行  $ node --test test/logic.test.mjs"),
+    "approach 只记了开头几步 —— 被切掉的尾巴恰恰是「这次是怎么确认做对了的」");
+  assert.ok(a.includes("读取 src/f0.ts"), "开头几步也要留着");
+  assert.ok(a.length <= 280, `approach 超过 280 字上限（实际 ${a.length}）`);
+  assert.equal(approach([{ label: "读取 a.ts" }, { label: "写入 b.ts" }]), "读取 a.ts → 写入 b.ts",
+    "短记录不该被塞进省略标记");
+
+  // 接线：记录点必须把 run 根传下去，档案必须换成新的取法。
+  assert.match(extractFn("_runAgenticLoop", { code: true }), /label: _recLabel\(it\.call, root\)/,
+    "记录点没把 run 根传给 _recLabel，相对化拿不到基准");
+  const ep = extractFn("_recordEpisode", { code: true });
+  assert.match(ep, /approach: _epApproach\(steps\)/);
+  assert.doesNotMatch(ep, /steps\.slice\(0, 12\)/, "只取前 12 步的老取法还在");
+
+  // 存量的 1165 条改不了，读取侧要把它们的绝对路径压成文件名。
+  const hint = load("_episodeHintBlock", {
+    _retrieveEpisodes: () => ([{ outcome: "success", task: "改登录页", insight: "",
+      approach: "读取 /Users/x/proj/src/App.tsx → 运行  $ npm test" }]),
+  });
+  const out = hint("改登录页", root);
+  assert.doesNotMatch(out, /\/Users\//, "存量档案的绝对路径还在往模型里注入");
+  assert.match(out, /App\.tsx/, "压路径不能把文件名也压掉");
+
+  // 洗路径只该洗家目录下的绝对路径。用"任何多段斜杠 token"那种写法会连带洗坏
+  // 相对路径、URL 和命令行——实测三种形状全中。
+  const hint2 = load("_episodeHintBlock", {
+    _retrieveEpisodes: () => ([{ outcome: "success", task: "改登录页", insight: "",
+      approach: "编辑 src/agent/paths.js → 抓取网页 https://a.io/x/y → 运行  $ cd /tmp/deep/dir && ls" }]),
+  });
+  const out2 = hint2("改登录页", root);
+  assert.match(out2, /src\/agent\/paths\.js/, "洗路径把新写入的相对路径也洗坏了");
+  assert.match(out2, /https:\/\/a\.io\/x\/y/, "洗路径把 URL 洗坏了");
+  assert.match(out2, /cd \/tmp\/deep\/dir/, "洗路径把命令洗坏了");
+});
+
 // 一行代码同时废掉两个高频工具，而且是最坏的那种失效——不报错，只给假料。
 //
 // _walkSourceFiles 原来用 `e.children !== undefined` 判目录，而后端 files.rs 的

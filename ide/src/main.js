@@ -50094,7 +50094,10 @@ function _episodeHintBlock(task, root) {
   if (!rel.length) return "";
   const lines = rel.map((e) => {
     const tag = e.outcome === "failed" ? "⚠️坑" : e.outcome === "partial" ? "△" : "✓";
-    return ("- " + tag + "「" + String(e.task || "").slice(0, 40) + "」：" + (e.insight || e.approach || "")).slice(0, 220);
+    // 存量档案（2026-08-26 实测 1165 条里 693 条）的 approach 带着别人机器的绝对路径。
+    // 写入侧已经修了，读取侧再把历史那批的路径压成文件名——不丢事实，只丢噪音。
+    const fallback = String(e.approach || "").replace(/(?:\/Users|\/home)\/[^\s→\/]+(?:\/[^\s→\/]+)*\/([^\s→\/]+)/g, "$1");
+    return ("- " + tag + "「" + String(e.task || "").slice(0, 40) + "」：" + (e.insight || fallback)).slice(0, 220);
   });
   return "\n\n📚 **这个项目里你做过的类似任务（经验参考，以当前实际为准、别生搬）**：\n" + lines.join("\n");
 }
@@ -50166,6 +50169,22 @@ function _recFailBrief(name, result) {
   return `${String(name || "?").slice(0, 32)}${code ? ` [${code}]` : ""}${first ? " " + first : ""}`.slice(0, 160);
 }
 
+/** approach 的取法：头 8 步 + 尾 4 步，中间标省略，总长仍压在 280 字。
+ *  老取法 `steps.slice(0, 12)` 实测让 1165 条档案里 49.6% 撞满 280 字上限，切掉的恰恰是
+ *  验证和收尾那一段——"这次是怎么确认做对了的"就此丢失，只剩"怎么开工"。 */
+function _epApproach(steps) {
+  const all = (Array.isArray(steps) ? steps : []).map((s) => s && s.label).filter(Boolean);
+  const long = all.length > 12;
+  const tail = long ? all.slice(-4).join(" → ").slice(-160) : "";
+  const sep = tail ? ` → …(略${all.length - 12}步)→ ` : "";
+  const head = (long ? all.slice(0, 8) : all).join(" → ");
+  return head.slice(0, Math.max(0, 280 - sep.length - tail.length)) + sep + tail;
+}
+
+// 派发类工具的记账表（只被 _recordEpisode 读）。await_subagent 不算：它收结果不派发，
+// 算进去会把"派过几次"翻倍。这 7 个名字必须和 _runAgenticLoop 里执行器分叉那张 subagentNames
+// 逐字相同（那张表决定谁真的会派出子体），漂开就会整族漏记而不报错——下面有测试钉着。
+const _DISPATCH_TOOLS = new Set(["run_subagent", "run_worker", "spawn_multiple_agents", "research_project", "design_research", "debate", "generate_wiki"]);
 async function _recordEpisode(run, task, root, outcome, config, session = null) {
   try {
     if (!task || !run || !Array.isArray(run.recording) || run.recording.length < 2) return; // skip trivial
@@ -50178,7 +50197,7 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // partial/failed 的**成因**，不只是结局。没有它，「部分完成」这一档在存档里是
       // 一团没法拆的东西——见算 outcome 那处的注释。
       ...(run._outcomeCause ? { cause: String(run._outcomeCause).slice(0, 60) } : {}),
-      approach: steps.slice(0, 12).map((s) => s.label).filter(Boolean).join(" → ").slice(0, 280), insight: "",
+      approach: _epApproach(steps), insight: "",
       // 这一轮里**撞了哪些墙**。approach 只记动词，成败在那里就丢了——
       // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
       // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
@@ -50188,6 +50207,21 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // 前者要改判据，后者要改可达性；2026-08-22 实测两者同时存在（939 回合 0 次调用）。
       ...(run.engineering?.orchestrationMode && run.engineering.orchestrationMode !== "solo"
         ? { orch: String(run.engineering.orchestrationMode) } : {}),
+      // 派发记账：这条不提升能力，是"多派发能不能提升成功率"唯一的前置。approach 只留前
+      // 12 步且封顶 280 字（实测 1165 条真实档案里 578 条撞顶），派发发生在第 12 步之后就
+      // 整个看不见——那个问题今天结构上答不了。数据全是现成的：_recordToolCall 早把
+      // {tool, ok, args} 记进 run._toolLedger，只是从没落盘。子体写了几个文件、跑了几步不
+      // 在账上，硬编就是编造，所以只落真有的四样，上界 8 条。
+      ...(() => {
+        const d = [];
+        for (const e of (run._toolLedger?.entries || [])) {
+          if (!e || !_DISPATCH_TOOLS.has(e.tool)) continue;
+          let a = {}; try { a = JSON.parse(e.args || "{}") || {}; } catch {}
+          const fan = Array.isArray(a.tasks) ? a.tasks.length : (Array.isArray(a.agents) ? a.agents.length : 1);
+          d.push({ tool: e.tool, ok: !!e.ok, turn: e.turn | 0, ...(a.role ? { role: String(a.role).slice(0, 16) } : {}), ...(fan > 1 ? { fan } : {}) });
+        }
+        return d.length ? { dispatch: d.slice(-8) } : {};
+      })(),
     };
     const eps = _epLoad(root);
     _markReworkIfAny(eps, ep); // 上一条 ✓ 如果被这一轮返工了，就地挂一条并列事实
@@ -50344,8 +50378,14 @@ function _saveInducedWorkflow(obj, cluster, currentEp, root) {
   } catch {}
 }
 
-function _recLabel(call) {
-  const p = call._resolvedPath || call.path || "";
+function _recLabel(call, root) {
+  // 路径要相对化到 run 根、再压长度：这条标签是情景档案 approach 的**唯一**来源，而
+  // insight 空掉时 _episodeHintBlock 会拿 approach 当"本项目经验"注入给模型。实测
+  // 2026-08-26 的档案（52 个抽屉 1165 条）：59.5% 的 approach 带着 /Users/… 绝对路径。
+  let p = String(call._resolvedPath || call.path || "");
+  const base = String(root || "").replace(/\/+$/, "");
+  if (base && (p === base || p.startsWith(base + "/"))) p = p.slice(base.length + 1) || ".";
+  if (p.length > 48) p = "…" + p.slice(-48);
   switch (call.type) {
     case "read": return "读取 " + p;
     case "write": return "写入 " + p;
@@ -54957,7 +54997,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           run.recording.push({
             t: (Date.now ? Date.now() : 0) - run._recStart,
             type: t,
-            label: _recLabel(it.call),
+            label: _recLabel(it.call, root),
             ok: _recOk,
             // 失败时把**回执开头那句**一并记下。
             //
