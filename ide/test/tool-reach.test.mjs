@@ -145,8 +145,14 @@ test("运行中途的窗口重协调同样不带画像", () => {
 test("自愈装载兜住按名直调的未装载工具", () => {
   // 名录承诺"按名就能用"，兑现它的是这段自愈装载。它要是没了，名录就成了空头支票。
   const loop = extractFn("_runAgenticLoop");
-  const heal = loop.slice(loop.indexOf("工具不丢失（自愈加载）"));
-  assert.ok(heal.length > 0, "自愈装载块必须在场——名录的承诺全靠它兑现");
-  assert.match(heal.slice(0, 1200), /_reg\.has\(_canonicalName\)/,
+  const at = loop.indexOf("工具不丢失（自愈加载）");
+  assert.ok(at >= 0, "自愈装载块必须在场——名录的承诺全靠它兑现");
+  // 按**块边界**切，不按字符数。原来写的是 `.slice(0, 1200)`，而这个块里的注释一长就
+  // 会把断言目标推出窗口——2026-08-26 给别名回写补了一段说明，这条当场假红。
+  // 固定窗口的另一半更糟：块变短时窗口会吃进后面别人的代码，那时它是**假绿**。
+  const end = loop.indexOf("_applyToolPayloadWindow(toolSchemas, _requested, run._toolCoreNames);", at);
+  assert.ok(end > at, "自愈装载块的收尾（把补齐的 schema 换进窗口）没了");
+  const heal = loop.slice(at, end);
+  assert.match(heal, /_reg\.has\(_canonicalName\)/,
     "未装载但真实注册的工具必须从完整注册表里补进窗口");
 });

@@ -14111,6 +14111,40 @@ test("probeLoop nudge preloads the tools it names before pushing (task #39 B)", 
  * 原来那条测试只断言三个地标存在、且顺序对——**从不执行它**，所以恒等这件事
  * 一直没人发现。这条改成守「别再加回来」。
  */
+test("工具别名归一化要写回 tc.name，不能只用来查注册表", () => {
+  // _mapToolCall 只在**自己内部**认别名：它把 call.type 定对了，tc.name 却原样留着模型
+  // 写的那个词。而下游按 tc.name 分派的地方有十几处，最要命的是执行器分叉
+  // `subagentNames.has(it.tc.name)`——模型写 `subagent`（run_subagent 的别名）时那句
+  // 是 false，于是落进通用执行器，那里没有 subagent 这个 case，一路走到函数末尾的
+  // 兜底，返回「[ERROR] 未识别的工具类型：subagent」。
+  //
+  // 别名映射是真存在的（_TOOL_ALIASES 里 subagent/runsubagent → run_subagent），所以
+  // 这不是「模型瞎写」，是产品自己宣称支持、实际执行不了。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /if \(_canonicalName !== _requestedName && _reg\.has\(_canonicalName\)\) _it\.tc\.name = _canonicalName;/,
+    "别名归一化没有写回 tc.name —— 六个自绘工具用别名调就会撞上通用执行器的兜底");
+  // 下面那处自愈补不上这个洞：它的前提是「映射失败」，而别名恰恰是映射成功的那一类。
+  assert.match(loop, /if \(it\._unknown \|\| it\.call\?\.type === "unknown"\) \{/,
+    "未知工具自愈那条路没了");
+  // 六个按 tc.name 排除的自绘卡 + 执行器分叉，都是这条写回的下游。
+  assert.match(loop, /subagentNames\.has\(it\.tc\.name\)/, "执行器仍按 tc.name 分叉");
+});
+
+test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
+  // await_subagent 的查找是 `String(j.id) === _want.replace(/^job#?/, "")`，j.id 是 run 内
+  // 的纯数字。批量派发这里原来打的是 storeId（`${_smRunToken(run)}_${jobId}`，形如
+  // r7abc_3），模型照着回执写 await_subagent(job="r7abc_3") 一条都匹配不上。
+  // 同文件里单体那条路打的就是 `job#${jobId}`——两条路的回执格式一直不一致。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /const message = `\[已并发派发 \$\{_smJobIds\.length\} 个子智能体\] \$\{_smJobIds\.map\(\(id\) => `job#\$\{id\}`\)/,
+    "回执打的不是作业号 —— await_subagent 按数字找，找不到带前缀的黑板键");
+  assert.match(loop, /_smJobIds\.push\(jobId\);/, "作业号没被收集");
+  assert.match(loop, /_smJobs\.push\(storeId\);/, "黑板键仍要收集给协同引擎用（两者不是一回事）");
+  const exec = extractFn("_executeToolStepInner");
+  assert.match(exec, /_all\.filter\(\(j\) => String\(j\.id\) === _want\.replace\(\/\^job#\?\/, ""\)\)/,
+    "await_subagent 的查找判据变了，上面那条回执格式要跟着改");
+});
+
 test("弱模型收敛只做 slice，不再套一层恒等变换", () => {
   assert.doesNotMatch(SRC, /_prioritizeNamedTools/,
     "那个恒等变换又回来了——它按 s.function?.name 取名，而传进去的是字符串数组");
