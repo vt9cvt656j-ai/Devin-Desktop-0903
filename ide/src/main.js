@@ -18376,6 +18376,10 @@ async function _openNewWindow() {
       title: "Mr. Day One",
       width: 1180, height: 760, minWidth: 880, minHeight: 560,
       resizable: true, titleBarStyle: "Overlay", hiddenTitle: true,
+      // Windows 上必须和主窗口一样关掉系统装饰，否则第二个窗口会同时有原生标题栏和
+      // 自绘那条，标题显示两遍。（同文件的 glow-overlay 就写了这个键，说明这套代码
+      // 知道它——只是新窗口这一处漏了。）
+      decorations: !document.body.classList.contains("is-win"),
     });
     w.once("tauri://error", (e) => showToast("新窗口打开失败：" + String(e?.payload || "").slice(0, 80)));
   } catch (e) {
@@ -30537,7 +30541,10 @@ async function _agentRunInTerminal(root, command, stepEl, explicitTimeoutSecs) {
     // into the user's interactive terminal — otherwise running another command
     // would interrupt whatever the user already has running there (a dev server,
     // a REPL, etc.). Each call gets a fresh shell at the workspace root.
-    const captureRoot = root || "/tmp";
+    // 没打开文件夹时不能给 "/tmp"：Windows 上那个目录不存在，后端会返回专为
+    // 「工作区被删」写的 [WORKSPACE_GONE] 文案，模型据此让用户去找一个根本不存在的
+    // 丢失目录。仓库里已有正确写法（bmCwd 那一处），照抄。
+    const captureRoot = root || (_detectOS() === "Windows" ? "." : "/tmp");
     // A backgrounded command (nohup / trailing `&`) returns right away, so it's
     // fine even if it starts a server — this is exactly how the agent SHOULD spin
     // up a dev server to test (e.g. `nohup npx vite & sleep 3 && cat log`). Only
@@ -71319,7 +71326,10 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 const _isWin = typeof navigator !== "undefined" && navigator.platform && navigator.platform.startsWith("Win");
-const _clearCmd = _isWin ? "cls" : "clear";
+// 清屏命令按**真实的 shell**取，不按操作系统：`cls` 是 cmd 内建，而 Windows 上优先
+// 跑的是 Git Bash——那里每次注入的第一行会变成 `bash: cls: command not found`，
+// 屏幕也没清。六个注入点共用这一个值。
+const _clearCmd = () => (_shellKind() === "cmd" ? "cls" : "clear");
 // 和后端 augmented_path 里那份必须是同一个目录，否则 npm 装到 A、找的时候查 B。
 const _michaelNpmPrefix = _isWin ? "%USERPROFILE%\\.mrdayone\\npm-global" : "$HOME/.mrdayone/npm-global";
 const _nodeDebugAdapterBin = "js-debug-adapter-stdio";
@@ -71616,9 +71626,9 @@ async function _startDevServer(dir, port, fileName = "") {
   const _py = _isWin ? "py -3" : "python3";
   try {
     const tmpPath = await backend.writeTmpFile("_michael_ide_dev_server.py", scriptContent);
-    writeToActiveTerminal(`\n${_clearCmd}\n${_py} ${shellQuote(tmpPath)}\n`);
+    writeToActiveTerminal(`\n${_clearCmd()}\n${_py} ${shellQuote(tmpPath)}\n`);
   } catch {
-    writeToActiveTerminal(`\n${_clearCmd}\n${_py} -m http.server ${port} --directory ${shellQuote(dir)}\n`);
+    writeToActiveTerminal(`\n${_clearCmd()}\n${_py} -m http.server ${port} --directory ${shellQuote(dir)}\n`);
   }
   _devServerPort = port;
   _devServerRunning = true;
@@ -71640,7 +71650,7 @@ async function _startViteServer(dir) {
     } catch { resolve(false); }
   });
 
-  writeToActiveTerminal(`\n${_clearCmd}\ncd ${q} && npx --yes vite --open\n`);
+  writeToActiveTerminal(`\n${_clearCmd()}\ncd ${q} && npx --yes vite --open\n`);
   showToast("启动 Vite Dev Server...");
 }
 
@@ -71686,7 +71696,7 @@ async function runCurrentFile() {
     await new Promise((r) => setTimeout(r, 1800));
   }
 
-  writeToActiveTerminal(`\n${_clearCmd}\n${command}\n`);
+  writeToActiveTerminal(`\n${_clearCmd()}\n${command}\n`);
 }
 
 async function runTask(task) {
@@ -78046,9 +78056,17 @@ async function showNewProjectDialog() {
     // Scripts\ 底下而不是 bin/；`source` 更不是 cmd 的命令。
     const cmd = tmpl.cmd
       .replace(/\{\{PY\}\}/g, _isWin ? "python" : "python3")
-      .replace(/\{\{ACTIVATE\}\}/g, _isWin ? ".venv\\Scripts\\activate" : "source .venv/bin/activate")
+      // 判据是**真实的 shell**，不是操作系统。`.venv\\Scripts\\activate` 是 cmd 写法，
+      // 而 Windows 上优先跑 Git Bash——bash 在无引号词里把 `\S`、`\a` 当转义，整串塌成
+      // `.venvScriptsactivate` → 127。三个模板全用 `&&` 串联，于是 **pip install 根本
+      // 不会执行**；Django 连 startproject 也一起短路，只剩一个含 .venv 的空目录。
+      // （Windows 的 venv 确实也生成 Scripts/activate 这个 bash 脚本，terminal.rs 自己
+      // 就在检查它，所以 posix 分支在 Windows 上是成立的。）
+      .replace(/\{\{ACTIVATE\}\}/g, _shellKind() === "cmd"
+        ? ".venv\\Scripts\\activate"
+        : `source .venv/${_isWin ? "Scripts" : "bin"}/activate`)
       .replace(/\{\{name\}\}/g, shellQuote(name));
-    writeToActiveTerminal(`\n${_clearCmd}\ncd ${shellQuote(parentDirPath)} && ${cmd}\n`);
+    writeToActiveTerminal(`\n${_clearCmd()}\ncd ${shellQuote(parentDirPath)} && ${cmd}\n`);
     showToast(`正在创建 ${tmpl.name} 项目：${projectPath}`);
     // 轮询项目目录出现（脚手架一建目录就打开，不等依赖装完），最多等 5 分钟。
     const t0 = Date.now();
@@ -79236,7 +79254,7 @@ async function _runTaskInNewTerminal(command, label, cwd = "") {
     entry.recentOut = "";
     entry.exited = false;
     entry.lastCommand = command;
-    try { backend.termWrite(entry.backendId, " " + _clearCmd + "\n"); } catch {}
+    try { backend.termWrite(entry.backendId, " " + _clearCmd() + "\n"); } catch {}
     backend.termWrite(entry.backendId, command + "\n");
     return { ok: true, entry, reused: true };
   }
