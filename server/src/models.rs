@@ -10051,6 +10051,29 @@ pub async fn chat_completions(
                             .unwrap_or_else(|| openai_prompt_cache_key(&body, None));
                         r = r.header("x-grok-conv-id", conv);
                     }
+                    // 出站形状的诊断。**不打内容，只打形状**——排查「思考回没回来」时，
+                    // 「我们到底发了什么」是第一个要回答的问题，而它以前只能靠在本地
+                    // 重跑翻译函数去猜（实测猜了四轮都没猜中）。
+                    tracing::info!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        model = %model_id,
+                        protocol = "xai_responses",
+                        keys = %candidate_upstream_body
+                            .as_object()
+                            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                            .unwrap_or_default(),
+                        reasoning = %candidate_upstream_body
+                            .get("reasoning")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "absent".into()),
+                        input_items = candidate_upstream_body
+                            .get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                        tools = candidate_upstream_body
+                            .get("tools").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                        max_output_tokens = %candidate_upstream_body
+                            .get("max_output_tokens").map(|v| v.to_string()).unwrap_or_else(|| "absent".into()),
+                        "xai responses outgoing shape"
+                    );
                     r.json(&candidate_upstream_body)
                 } else if candidate_anthropic {
                     req0
