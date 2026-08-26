@@ -50838,14 +50838,25 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
 
   // === Streaming output throttling: reuse main conversation's incremental rendering & 500ms throttle ===
   let _lastRenderTime = 0;
-  const _scheduleRender = (content) => {
-    const now = Date.now();
-    if (now - _lastRenderTime < 500) return; // 500ms 节流
-    _lastRenderTime = now;
+  let _renderTail = null;
+  const _paint = (content) => {
+    _lastRenderTime = Date.now();
     // Reuse _clipStreamCode to bound DOM updates to O(窗口)
-    const clamped = _clipStreamCode(content).view;
-    vp.textContent = clamped;
+    vp.textContent = _clipStreamCode(content).view;
     _chatFollow();
+  };
+  // 节流**必须有尾沿**。这里和主对话那条流式节流不是一回事：那边每个 token 都调一次，
+  // 丢掉的中间帧下一帧就补上了；这边是**每一轮**才调一次，两轮在 500ms 内先后结束时
+  // 后一轮的简报被直接丢掉，而 vp.textContent 全文件只有这一处会写——丢掉就是永久丢掉，
+  // 面板停在上一轮的旧文本上，直到这个子体的卡片被销毁。
+  //
+  // 用定时器而不是在收尾处补一次：_runSubAgent 有多条 return 路径（超时、中断、
+  // 轮次用尽、正常收尾），挂在收尾处等于要逐条去接，漏一条就还是旧的。
+  const _scheduleRender = (content) => {
+    if (_renderTail) { clearTimeout(_renderTail); _renderTail = null; }
+    const wait = 500 - (Date.now() - _lastRenderTime);
+    if (wait <= 0) { _paint(content); return; }
+    _renderTail = setTimeout(() => { _renderTail = null; _paint(content); }, wait);
   };
   
   // Worker guards: read-only parent modes can't spawn a writing worker (else it'd

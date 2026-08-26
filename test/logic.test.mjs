@@ -35280,3 +35280,28 @@ test("打开项目：本地有记忆而文件缺失时，要把 memory.md 补出
   await fn2("/proj");
   assert.deepEqual(calls2.write, [], "文件已有内容时不许覆盖——那可能是用户的手改");
 });
+
+/**
+ * 子体面板的流式节流必须有**尾沿**。
+ *
+ * 它和主对话那条节流不是一回事：主对话每个 token 调一次，丢掉的中间帧下一帧就补上了；
+ * 子体这条是**每一轮**才调一次（_scheduleRender(report) 在轮末），两轮在 500ms 内
+ * 先后结束时后一轮的简报被直接丢掉——而 vp.textContent 全文件只有节流分支里那一处会写，
+ * 丢掉就是永久丢掉，面板停在上一轮的旧文本上直到卡片销毁。
+ *
+ * 判据钉在「丢的时候要排一个补渲染」，不钉具体的毫秒数。
+ */
+test("子体面板的节流丢帧之后要补渲染，不能永久停在旧文本", () => {
+  const src = extractFn("_runSubAgent");
+  const at = src.indexOf("const _scheduleRender = (content) => {");
+  assert.ok(at > 0, "子体面板的节流函数不见了，这条断言失去落点");
+  const fn = src.slice(at, src.indexOf("\n  };", at));
+  assert.match(fn, /setTimeout\(/, "节流没有尾沿——被丢掉的那一轮简报再也不会显示");
+  assert.match(fn, /clearTimeout\(/, "尾沿定时器没有被替换掉，会连着画好几次旧内容");
+  // 反向：不许再出现"直接 return 丢掉"的形状。
+  assert.doesNotMatch(fn, /<\s*500\)\s*return;/,
+    "又变回丢帧不补了");
+  // 真正写 DOM 的只该有一处，否则上面这条守不住。
+  const paints = (src.match(/vp\.textContent\s*=/g) || []).length;
+  assert.equal(paints, 1, `vp.textContent 有 ${paints} 处写入，节流判据只覆盖得了一处`);
+});
