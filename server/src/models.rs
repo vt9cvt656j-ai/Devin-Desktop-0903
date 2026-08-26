@@ -8351,8 +8351,12 @@ impl XaiRespSse {
     }
 
     /// 第一件真事是什么（遥测用）。和 AnthSse 一样只记**第一次**。
+    ///
+    /// 哨兵值是 `"absent"`（见 ThinkingStreamTelemetry::default），不是 "none"。
+    /// 写错的代价不是少一个字段，是**诊断在说谎**：实测有一条流转发了 40 条思考增量、
+    /// 173 个字符，而这个字段照样报 "absent"。查「思考回没回来」时第一眼看的就是它。
     fn note_first(&mut self, kind: &'static str) {
-        if self.thinking_telemetry.first_native_event_kind == "none" {
+        if self.thinking_telemetry.first_native_event_kind == "absent" {
             self.thinking_telemetry.first_native_event_kind = kind;
             self.thinking_telemetry.first_native_event_ms = self.elapsed_ms();
         }
@@ -12626,6 +12630,15 @@ mod billing_tests {
         assert!(u["completion_tokens_details"]["reasoning_tokens"].is_i64());
 
         // ⑤ 遥测：思考增量被数上了。这是「思考回没回来」在日志里唯一的判据。
+        //
+        // first_native_event_kind 的哨兵是 "absent"（不是 "none"）。写错的代价不是少
+        // 一个字段，是**诊断在说谎**——实测有一条流转发了 40 条思考增量、173 个字符，
+        // 而这个字段照样报 "absent"，而查这个问题时第一眼看的就是它。
+        assert_ne!(
+            sse.thinking_telemetry().first_native_event_kind,
+            "absent",
+            "首事件类型没被记上 —— 哨兵值又写错了",
+        );
         let t = sse.thinking_telemetry();
         assert!(t.nonempty_thinking_deltas >= 20, "思考增量只数到 {}", t.nonempty_thinking_deltas);
         assert!(t.thinking_utf8_chars > 60);
