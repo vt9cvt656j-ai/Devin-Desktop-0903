@@ -8,6 +8,9 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
 // 不再抠源码注入依赖（抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { stackTable as STACK_TABLE, extractStackHints as extractStack,
@@ -31929,7 +31932,7 @@ test("这一轮新引入的占位要被点名，文件里本来就有的不算�
   // 底座要一起注进来，漏了是 ReferenceError 而不是断言失败。
   const scan = load("_stubDeliveryFindings", {
     _CODE_FILE_RE: /\.(?:tsx?|jsx?|py|rs|go|java|rb|php|cs|swift|kt)$/i,
-    _splitCodeAndComments: load("_splitCodeAndComments"),
+    _splitCodeAndComments: _splitCC,
   });
   const mk = (pairs) => ({ checkpoint: new Map(pairs) });
   // 基线相减：改前就有的 TODO 不算这次交付的账——和「诊断只认新增错误」同一套哲学。

@@ -1,4 +1,7 @@
 import test from "node:test";
+// 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
+// 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
+import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { load } from "./helpers/source.mjs";
@@ -22,7 +25,7 @@ const SRC = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
 // 用仓库自己的 load / fnSource，别再手抄一份「按名字抠函数体」的提取器
 // （有一条元测试专门在拦这个：手抄的那些会在函数改名/加参数时静默失效）。
 // 判据只看代码，所以底座要一起注进来——注释里的 `return null` 不是一条返回路径。
-const detectRaw = load("_ambiguousFailureInWrite", { _splitCodeAndComments: load("_splitCodeAndComments") });
+const detectRaw = load("_ambiguousFailureInWrite", { _splitCodeAndComments: _splitCC });
 const detect = (text, max = 3) => detectRaw(text, max, "a.js");
 
 test("抓得住今天那个真形状：catch 回 null + 正常路径也回 null", () => {
