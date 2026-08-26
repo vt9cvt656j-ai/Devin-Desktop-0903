@@ -8,6 +8,9 @@
 //   · 全部正文加起来          = 105247 字符 ≈ 33k token
 // 差 34 倍。所以目录常驻、正文按需——这正是 Anthropic Agent Skills 的渐进式披露。
 import test from "node:test";
+// 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
+// （抠源码验得到行为，验不到它在真实调用链上还在不在）。
+import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 // 按名字取真源码 + 注入依赖跑起来，只有一份实现：test/helpers/source.mjs。
@@ -245,7 +248,7 @@ test("read_skill 的 schema 取自已构建的目录，不另写一份字面量"
 // 逐行抠 `description:` 后面那截，抠到的是指示符本身 ">-"。它非空，于是被当成描述用了，
 // 连带「没写描述就退回一级标题」也永远不触发。模型看到的清单是 `- docx：>-`——
 // 它据此判断这个技能干什么用，什么也判断不出来。
-const parseSkill = load("_parseSkillDocument");
+const parseSkill = _parseSkillDoc;
 
 test("description: >- 的正文在后面几行，要接着读完", () => {
   const s = parseSkill(`---

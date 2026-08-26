@@ -8,6 +8,9 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+// 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
+// （抠源码验得到行为，验不到它在真实调用链上还在不在）。
+import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
 // 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
@@ -8266,7 +8269,7 @@ test("real-time user steering is marked separately from agent continuation nudge
 });
 
 test("standard SKILL.md frontmatter is parsed with a stable source identity", () => {
-  const parse = load("_parseSkillDocument");
+  const parse = _parseSkillDoc;
   const skill = parse(`---\nname: "Release verifier"\ndescription: 'Runs release checks'\n---\n# Instructions\nRun the full test suite.`, "/repo/.agents/skills/release/SKILL.md");
   assert.equal(skill.id, "file:/repo/.agents/skills/release/SKILL.md");
   assert.equal(skill.name, "Release verifier");
@@ -8286,7 +8289,7 @@ test("standard SKILL.md frontmatter is parsed with a stable source identity", ()
 // 2026-08-22 落点和发现路径一起收敛到家目录技能库，工作区那条整条删了（见
 // test/skills-global.test.mjs 里的完整覆盖）。这里保留的是"真的读一遍磁盘"这一半。
 test("家目录技能库的 SKILL.md 能被真的读出来", async () => {
-  const parse = load("_parseSkillDocument");
+  const parse = _parseSkillDoc;
   const backend = {
     invoke: async (cmd) => (cmd === "skills_dir" ? "/home/tester/.mrdayone/skills" : ""),
     homeDir: async () => "/home/tester",
@@ -35382,4 +35385,58 @@ test("fs-change 事件带上「已经不存在的那些」，一路传到 LSP �
     "变更批次没有转成 LSP 通知——外部新建的文件对语言服务器永远不可见");
   // debounce 结束后必须清空，否则上一批的删除会粘到下一批。
   assert.match(SRC, /_fsChangeMissing\.clear\(\)/, "missing 集合没清，会跨批粘连");
+});
+
+/**
+ * Grok 4 系的思考档位不许再逐个版本写死。
+ *
+ * 2026-08-26 用户报「grok 不发思考模式参数了」。查下来：网关侧一切正常——它从
+ * OpenRouter 抓到的 grok-4.6 档位是 xhigh/high/medium/low，也正确地以
+ * capability_source=live 下发；`_thinkingProfileFor` 的合并逻辑也会拿目录覆盖内置表。
+ *
+ * 断的是**目录不在场**的那几种情况：应用刚启动模型表还没到、走自定义端点、网页版。
+ * 那时只剩内置表，而内置表按版本号逐个写死（4.5 / 4.3），grok-4.6 一条都不匹配，
+ * 直接落到 none() —— 转盘整个是灰的，reasoning_effort 一个字都不发。4.7 会重犯。
+ *
+ * 所以判据钉在**内置表自己**（不喂目录），并且要覆盖未来版本。
+ */
+test("grok 4 系在没有实时目录时也拿得到可调档位", () => {
+  const builtin = new Function("t", "_isImageModel",
+    `${extractFn("_builtinThinkingProfileFor")}\n;return _builtinThinkingProfileFor;`)((k) => k, () => false);
+  for (const id of ["grok-4.6", "grok-4.7", "grok-5", "grok-4.5", "grok-4.3"]) {
+    const p = builtin(id) || {};
+    assert.equal(p.kind, "reasoning_effort", `${id} 的内置档位类型不对（目录不在场时就没有档位可发）`);
+    assert.equal(p.configurable, true, `${id} 在内置表里不可调 —— 转盘会是灰的`);
+    assert.ok((p.levels || []).length >= 3, `${id} 的档位太少：${JSON.stringify(p.levels)}`);
+  }
+  // 4 系推理是强制开的（OpenRouter 的 reasoning.mandatory=true），不许露出 off。
+  for (const id of ["grok-4.6", "grok-4.7", "grok-5"]) {
+    assert.ok(!(builtin(id).levels || []).includes("off"),
+      `${id} 露出了 off —— xAI 的 4 系关不掉推理，那是个按了没反应的按钮`);
+  }
+  // 反向：真的没有推理能力的老型号不许被这条误伤。
+  for (const id of ["grok-2", "grok-3", "grok-code-fast"]) {
+    assert.notEqual(builtin(id).configurable, true, `${id} 被误判成可调推理了`);
+  }
+  // grok-3-mini 走的是另一条（mini），它可以关。
+  assert.equal(builtin("grok-3-mini").configurable, true);
+});
+
+test("内置档位不含 xhigh —— 那一档只在目录说有的时候才补", () => {
+  // 4.5 实测没有 xhigh、4.6 有。内置表分不出来，所以取交集；目录在场时由
+  // _thinkingProfileFor 把 xhigh 合并进来。宁可少一档，也不要让用户选一个上游
+  // 可能不认的档位然后静默降级。
+  const builtin = new Function("t", "_isImageModel",
+    `${extractFn("_builtinThinkingProfileFor")}\n;return _builtinThinkingProfileFor;`)((k) => k, () => false);
+  assert.ok(!(builtin("grok-4.6").levels || []).includes("xhigh"),
+    "内置表擅自给了 xhigh —— 4.5 不支持它，而内置表分不出版本");
+  // 而合并那一层必须能把它补进来（这条守的是两层的接缝）。
+  const merged = new Function("t", "_isImageModel", "_claudeGeneration", "_THINK_LEVELS",
+    "_liveThinkingLevels", "_customModelById",
+    `${extractFn("_builtinThinkingProfileFor")}\n${extractFn("_effortIsSendable")}\n${extractFn("_thinkingProfileFor")}\n;return _thinkingProfileFor;`)(
+    (k) => k, () => false, () => 0,
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    (id) => (id === "grok-4.6" ? ["xhigh", "high", "medium", "low"] : null), () => null);
+  assert.ok((merged("grok-4.6").levels || []).includes("xhigh"),
+    "目录说有 xhigh，合并之后却没有 —— 用户选不到最高档");
 });
