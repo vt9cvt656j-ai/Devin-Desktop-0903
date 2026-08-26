@@ -558,3 +558,34 @@ test("语言服务器无声死掉时也要给出原因，不能什么都不说",
   assert.doesNotMatch(fn, /if \(tail\.length\) \{[\s\S]{0,400}lastStopReason\.set/,
     "又变回「只有 stderr 非空才说」了");
 });
+
+/**
+ * 文件系统变更必须真的告诉语言服务器，而且类型要分对。
+ *
+ * 全仓原来唯一一处 didChangeWatchedFiles 发的是 `{ changes: [] }` —— 纯 no-op。
+ * 语言服务器只从 didOpen 认得到编辑器打开过的文件；外部创建/删除的（shell 生成、
+ * 脚手架产出、装完依赖）它一无所知。pyright 尤其明显：它的导入解析目录缓存**只认
+ * 这条通知**，实测新建 b.py 之后那句 `Import "b" could not be resolved` 靠
+ * didOpen / didChange / didSave 都消不掉，只发一条这个就在 200ms 内清零。
+ *
+ * 类型分不对等于没发：多数服务器只在 Created/Deleted 时作废目录缓存，Changed 只标脏。
+ */
+test("didChangeWatchedFiles 不再发空数组", () => {
+  assert.doesNotMatch(source, /didChangeWatchedFiles",\s*\{\s*changes:\s*\[\]\s*\}/,
+    "又变回发空数组了——那是纯 no-op，服务器什么都收不到");
+  assert.match(source, /function notifyWatchedFiles\(paths, missing = \[\]\)/,
+    "转发函数不见了");
+});
+
+test("存在的按 Created 发、不存在的按 Deleted 发，且只发给握手完成的客户端", () => {
+  const fn = source.slice(source.indexOf("function notifyWatchedFiles"),
+                          source.indexOf("// ---- diagnostics ----"));
+  assert.ok(fn.length > 200, "notifyWatchedFiles 抠不出来");
+  assert.match(fn, /type: gone\.has\(p\) \? 3 : 1/,
+    "类型判错了——Changed(2) 不会让服务器作废目录缓存，这条通知就白发了");
+  assert.match(fn, /if \(!client\?\.initialized\) continue;/,
+    "往还没握手完的客户端发通知，会在 initialize 之前插队");
+  assert.match(fn, /pathToUri\(p\)/, "发的必须是 uri，不是裸路径");
+  // 单个服务器发失败不许影响其余。
+  assert.match(fn, /catch \{/, "一个服务器发失败会把整批中断");
+});

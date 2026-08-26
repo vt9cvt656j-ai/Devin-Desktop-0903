@@ -10665,15 +10665,20 @@ async function _reconcileFileWatcher() {
     _fsWatcherUnlisten = await listen("fs-change", (event) => {
       // notify may still flush a batch queued immediately before fs_unwatch.
       const roots = _desiredFileWatchRoots();
+      const _gone = new Set(event.payload?.missing || []); // 后端判过存在性，见 watcher.rs
       for (const p of event.payload?.paths || []) {
-        if (roots.some((root) => _pathIsAtOrUnder(p, root))) _fsChangeBatch.push(p);
+        if (!roots.some((root) => _pathIsAtOrUnder(p, root))) continue;
+        _fsChangeBatch.push(p);
+        if (_gone.has(p)) _fsChangeMissing.add(p);
       }
       if (!_fsChangeBatch.length) return;
       clearTimeout(_fsChangeDebounce);
       _fsChangeDebounce = setTimeout(() => {
         const batch = _fsChangeBatch;
+        const missing = [..._fsChangeMissing];
         _fsChangeBatch = [];
-        if (batch.length) handleFsChanges(batch);
+        _fsChangeMissing.clear();
+        if (batch.length) handleFsChanges(batch, missing);
       }, 200);
     });
     _fsWatcherActive = true;
@@ -10745,7 +10750,10 @@ function _fsWatchDeltaSince(snap) {
   return { changed: true, paths: _fsWatchRecent.slice(Math.max(0, snap.len)) };
 }
 
-function handleFsChanges(paths) {
+// 这一批里已经不存在的那些。后端在监视线程里判过（一次 exists 系统调用），
+// 前端只负责攒到 debounce 结束——LSP 的变更通知必须带对类型才有用，见 notifyWatchedFiles。
+let _fsChangeMissing = new Set();
+function handleFsChanges(paths, missing = []) {
   const roots = _desiredFileWatchRoots();
   paths = (paths || []).map(_coherentFilePath)
     .filter((path) => roots.some((root) => _pathIsAtOrUnder(path, root)));
@@ -10755,6 +10763,11 @@ function handleFsChanges(paths) {
     _fsWatchRecent.push(...paths);
     if (_fsWatchRecent.length > 400) _fsWatchRecent = _fsWatchRecent.slice(-400);
   }
+  // 语言服务器只从 didOpen 认得到编辑器打开过的文件。外部创建/删除的（shell 生成、
+  // 脚手架产出、装完依赖）它一无所知，而 pyright 的导入解析缓存**只认这条通知**——
+  // 少了它，新建模块之后 `Import "x" could not be resolved` 永远不消失，还会进
+  // 每轮喂给模型的诊断块，让模型反复重改同一行。
+  try { lspManager?.notifyWatchedFiles?.(paths, missing); } catch { /* 通知失败不影响其余刷新 */ }
   const dependencyCacheChanged = paths.some(_isDependencyCachePath);
   _invalidateSessionEvidenceForPaths(paths);
   // A file actually changed (agent write / user edit / external) → the agent context is now stale, so
