@@ -5403,7 +5403,19 @@ function openLivePreview(url = "", { focus = true } = {}) {
     renderTabs();
     syncWelcome(); // 从"一个页签都没有"变成有页签了，欢迎页要让位
   }
-  const target = _previewNormalizeUrl(url) || _preview.url || _previewNormalizeUrl(_previewRestoreUrl());
+  /*
+   * **不带地址打开时，什么都不导航。**
+   *
+   * 这里原来会退回 `_previewRestoreUrl()`——localStorage 里上次用过的地址。于是用户
+   * 什么都没输入、什么都没打开，面板一开就自己去访问一个 localhost 地址。上次那个
+   * dev server 多半已经不在了，看到的是一屏连接失败；更糟的是那个端口现在可能是
+   * 别的东西，面板会去请求一个用户根本没打算访问的服务。
+   *
+   * 记住地址这件事本身是对的，错的是**替用户做导航决定**。现在它降级成候选：
+   * 空状态页把它和探测到的 dev server 并排列出来（见 _previewRenderEmpty），
+   * 点一下才走。`_preview.url` 仍然保留——同一次会话里切走再切回来不该丢当前页面。
+   */
+  const target = _previewNormalizeUrl(url) || _preview.url;
   if (focus) activate(PREVIEW_TAB_PATH);
   if (target && target !== _preview.url) _previewNavigate(target);
   else if (activePath === PREVIEW_TAB_PATH) _previewRender();
@@ -5791,6 +5803,10 @@ function _previewClearStageNote() {
 /** 还没有地址时的落地页：把探到的 dev server 直接列出来，点一下就打开。 */
 function _previewRenderEmpty(stage) {
   const found = _previewDetectDevUrls();
+  // 上次看的地址降级成候选：面板不再替用户自动导航过去，但那个地址仍然是他最可能
+  // 想点的一个，所以摆在这里。已经被探测到（dev server 真的在跑）就不重复列。
+  const last = _previewNormalizeUrl(_previewRestoreUrl());
+  if (last && !found.some((c) => c.url === last)) found.push({ url: last, from: "上次看的" });
   stage.textContent = "";
   const box = document.createElement("div");
   box.className = "lp__empty";
