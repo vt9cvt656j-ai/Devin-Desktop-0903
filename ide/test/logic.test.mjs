@@ -5987,26 +5987,28 @@ test("every streaming chat path applies the final request budget", () => {
 });
 
 test("context pressure may be estimated while billing settles off the model-turn path", () => {
-  const estTokens = load("_estTokens");
-  const estRequest = load("_estRequestTokens", { _estTokens: estTokens });
-  const fullMessages = [
-    { role: "system", content: "STATIC_SYSTEM_PROMPT ".repeat(4000) },
-    { role: "user", content: "fix the bug" },
-  ];
-  const l0Messages = [{ role: "user", content: "fix the bug" }];
-  const staticTools = [{ type: "function", function: { name: "read_file", description: "R".repeat(8000) } }];
-  const tinyTools = [];
-  assert.ok(estRequest(l0Messages, tinyTools) < estRequest(fullMessages, staticTools) / 50);
-  assert.match(SRC, /let _lastRequestEstimateTokens = 0/);
-  assert.match(SRC, /_lastRequestEstimateTokens = _estRequestTokens\(_l0Msgs, _l0Tools\)/);
-  // 这一行原来断言"发请求前把估算画到仪表上"。用户实拍那正是「一发消息上下文就重置回 0」，
-  // 并明确要求「不要估算 全部都走真实的」——所以估算**不再进入仪表**，判据也跟着反过来：
-  // 估算只服务请求预算（上面 _enforceModelRequestBudget 用的就是它），一个像素都不许画。
-  assert.doesNotMatch(
-    SRC.replace(/\/\/[^\n]*/g, ""),
-    /_setContextMeter\(\{ promptTokens: _lastRequestEstimateTokens/,
-    "估算又被画到上下文仪表上了",
-  );
+  // 2026-08-25：`_lastRequestEstimateTokens` 和 `_estRequestTokens` 一起删了。
+  //
+  // 那个变量全文**零读点**（函数局部 let，声明 + 赋值就没了），而旁边那句注释写着
+  // 「预算判定仍然要这个估算，_enforceModelRequestBudget 上面已经用过」——**是假的**：
+  // 那个函数用的是 byteLength，从不调 _estRequestTokens。于是每个模型轮白算一次
+  // 全量 token 估算（实测 3.5MB 请求体 7.43ms）。删掉之后 _estRequestTokens 无人调用，
+  // 一并删。
+  //
+  // 原来这里有三条断言钉着那两样东西，其中两条是**定位锚点**不是行为判据。
+  // 真正该守的不变量只有一条，写在下面：仪表只画上游真实上报的数。
+  const codeOnly = SRC.replace(/\/\/[^\n]*/g, "");
+  assert.doesNotMatch(codeOnly, /_lastRequestEstimateTokens/,
+    "只写不读的估算变量又回来了");
+  assert.doesNotMatch(codeOnly, /_estRequestTokens\s*\(/,
+    "又在请求路径上白算一次全量 token 估算");
+  // 正向：预算判定走的是字节，不是估算——这才是那句假注释本该说的。
+  assert.match(SRC, /_l0Msgs = _enforceModelRequestBudget\(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP\)/,
+    "请求预算那条路没了");
+  const budget = extractFn("_enforceModelRequestBudget");
+  assert.match(budget, /byteLength/, "预算判定必须按字节算");
+  assert.doesNotMatch(budget, /_estRequestTokens/,
+    "预算判定又改回用 token 估算了——那正是那句假注释声称的、而它从来没做过的事");
   assert.match(SRC, /promptTokens: 0, completionTokens: 0, cachedTokens: null, estimated: true, source: "pending"/,
     "一次都没上报过时要如实空着——缓存写 null（未上报），不能渲染成误导排查的「缓存 0」");
   assert.match(SRC, /const settlementTask = \(async \(\) => \{[\s\S]{0,120}await _fetchGatewaySettlement\(_turnConfig, _turnReqId\)/);
@@ -27790,7 +27792,8 @@ test("上下文仪表只吃上游真实上报的数，任何本地估算都不�
 });
 
 test("发请求前不许拿估算盖掉已有的真实读数——那就是「一发消息就重置」", () => {
-  const at = RAW_SRC.indexOf("_lastRequestEstimateTokens = _estRequestTokens(");
+  // 锚点换成真正承重的那一行（原来锚在一个只写不读的死赋值上，那行已删）。
+  const at = RAW_SRC.indexOf("_l0Msgs = _enforceModelRequestBudget(_l0Msgs, _l0Tools, _MODEL_REQUEST_BODY_BYTE_CAP);");
   assert.ok(at > 0, "发送前那段改写了，这条守卫要跟着改");
   const block = SRC.slice(at, at + 1600);
   // 有真实读数 → 原样保持；一次都没上报过 → 如实空着，不拿算出来的数顶上。
@@ -35304,4 +35307,33 @@ test("子体面板的节流丢帧之后要补渲染，不能永久停在旧文�
   // 真正写 DOM 的只该有一处，否则上面这条守不住。
   const paints = (src.match(/vp\.textContent\s*=/g) || []).length;
   assert.equal(paints, 1, `vp.textContent 有 ${paints} 处写入，节流判据只覆盖得了一处`);
+});
+
+/**
+ * 编辑器实时预览：进闸和退闸量的不是同一个东西，所以复入闸必须挡住 card-only。
+ *
+ * 进闸量 `entry._target`（edit_file 的 new_string，几十到几百字符），退闸量拼回去的
+ * **整份文件**。new_string 小、目标文件大的 edit_file 因此每个 delta 都要
+ * 建一遍拆一遍：读盘 IPC → 建模型 → 开标签 → didOpen → 拼整串发现超限 → 回滚，
+ * 而回滚把 `_editorPreview` 清空，句柄那道闸也就拦不住下一轮。
+ *
+ * 500ms 节流救不了：它只在 flush 返回 true 时盖戳，而这条路径恒返回 false。
+ */
+test("预览的复入闸要同时挡住 card-only，不是只挡 rollback", () => {
+  const ensure = extractFn("_ensureLiveEditorWritePreview");
+  const head = ensure.slice(0, ensure.indexOf("const rawPath"));
+  assert.match(head, /_editorPreviewOutcome === "card-only"/,
+    "card-only 没挡——每个 delta 都会重建一次预览再拆掉");
+  assert.match(head, /_editorPreviewOutcome === "rollback"/, "rollback 那道闸不能丢");
+  // 反向：card-only 必须是终态。有人把它清空/重置的话，上面那道闸就等于没加，
+  // 而且会以"偶尔又开始重建了"的形式回来——比一开始就没修更难查。
+  assert.doesNotMatch(SRC, /_editorPreviewOutcome\s*=\s*(?:""|null|undefined)/,
+    "有人把 _editorPreviewOutcome 清空了——card-only 不再是终态，复入闸失效");
+  // 落盘后的最终快照走的是另一条路（_removeWritePreview → handoff），不经过这个入口；
+  // 这条钉住它，免得以后有人把最终快照改成走 _ensureLiveEditorWritePreview 而被新闸挡掉。
+  assert.match(extractFn("_removeWritePreview"), /if \(outcome === "execute"\) _handoffLiveEditorWritePreview\(entry\)/,
+    "最终快照改走别的路了——要重新核复入闸会不会把它挡掉");
+  // 节流那条真实原因也钉上：只在 flush 成功时盖戳，所以它对恒失败的路径无效。
+  assert.match(SRC, /if \(_flushLiveEditorWritePreview\(entry\)\) entry\._edSyncAt = nowTs;/,
+    "节流盖戳的形状变了——这条闸的失效机制要重新核");
 });
