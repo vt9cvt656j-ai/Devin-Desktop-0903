@@ -18744,7 +18744,6 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
               { textBudget: options.textBudget },
             ),
             summaries: Array.isArray(rawMemory.summaries) ? rawMemory.summaries : [],
-            milestones: Array.isArray(rawMemory.milestones) ? rawMemory.milestones : [],
             fileEvidence: Array.isArray(rawMemory.fileEvidence) ? rawMemory.fileEvidence : [],
             archive: Array.isArray(rawMemory.archive) ? rawMemory.archive : [],
             corrections: Array.isArray(rawMemory.corrections) ? rawMemory.corrections : [],
@@ -18860,15 +18859,13 @@ function _flushChatHistorySync() {
 const _PERSIST_SLICE_BUDGET_MS = 50; // 单次保存的同步工作量硬上限，超预算就让路
 const _persistSessionCache = new Map(); // session.id → { mirror, ckpt }
 // O(1) 内容指纹：只读各账本长度 + 尾部标记，不碰消息正文。cap 内原地更新的
-// 账本（fileEvidence/milestones/archive）靠尾部 updatedAt/turn 捕捉变化。
+// 账本（fileEvidence/archive）靠尾部 updatedAt/turn 捕捉变化。
 function _sessionPersistFingerprint(s) {
   try {
     const m = s?.memory || {};
     const recent = Array.isArray(m.recent) ? m.recent : [];
     const last = recent[recent.length - 1] || {};
     const summaries = Array.isArray(m.summaries) ? m.summaries : [];
-    const milestones = Array.isArray(m.milestones) ? m.milestones : [];
-    const lastMilestone = milestones[milestones.length - 1] || {};
     const evidence = Array.isArray(m.fileEvidence) ? m.fileEvidence : [];
     const lastEvidence = evidence[evidence.length - 1] || {};
     const archive = Array.isArray(m.archive) ? m.archive : [];
@@ -18894,7 +18891,6 @@ function _sessionPersistFingerprint(s) {
       Number(m.totalTurns) || 0, recent.length, Number(m._recentChars) || 0,
       Array.isArray(m.transcript) ? m.transcript.length : 0, Number(m.transcriptOffset) || 0,
       summaries.length, (summaries[summaries.length - 1] || {}).range || "",
-      milestones.length, `${lastMilestone.turn ?? ""}:${String(lastMilestone.event || "").length}`,
       evidence.length, `${lastEvidence.path || ""}:${lastEvidence.updatedAt ?? ""}:${String(lastEvidence.digest || "").length}`,
       archive.length, lastArchive.turn ?? "",
       corrections.length, lastCorrection.id || "",
@@ -20877,7 +20873,7 @@ async function _truncateFromUserMessage(sess, wrap) {
       const _drop = new Set(_dropped);
       sess._demandLedger = sess._demandLedger.filter((entry) => !_drop.has(String(entry)));
     }
-    // 2) 思考结论账本：条目自带 turn，和 milestones / corrections 用同一套判据切。
+    // 2) 思考结论账本：条目自带 turn，和 corrections 用同一套判据切。
     if (Array.isArray(sess._thinkLedger)) {
       sess._thinkLedger = sess._thinkLedger.filter((item) => Number(item?.turn) <= cut);
     }
@@ -33779,15 +33775,6 @@ function _updateSkillBadge() {
   } catch {}
 }
 try { _updateSkillBadge(); } catch {}
-// Colorful "real image" skill icons — each a rounded app-icon tile (solid brand color + white glyph).
-// Deliberately NO gradient <defs>/url() refs: shared ids break across removed DOM subtrees in WKWebView.
-// Glyphs are Lucide geometry drawn in a 24-box, centered inside a 40 tile via translate(8,8). KEY is stored per skill.
-const _SIC = (bg, glyph) =>
-  '<svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" class="skill-tile" role="img">' +
-  '<rect width="40" height="40" rx="11" fill="' + bg + '"/>' +
-  '<path d="M0 11A11 11 0 0 1 11 0h18a11 11 0 0 1 11 11v9H0z" fill="#fff" fill-opacity=".16"/>' +
-  '<g transform="translate(8 8)" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">' + glyph + '</g>' +
-  '</svg>';
 // Default skill icon — a game-style skill badge: green tile + embossed white plus. Solid colors only
 // (no gradient <defs>/url() — shared ids break across removed DOM subtrees in WKWebView). The preset
 // icon picker was removed, so every non-uploaded skill shows this; uploaded skills show their image.
@@ -41878,7 +41865,6 @@ function openMemoryPanel() {
         const session = [];
         if (stats?.recentCount) session.push(`最近对话 ${stats.recentCount} 条`);
         if (stats?.summaryCount) session.push(`历史摘要 ${stats.summaryCount} 段`);
-        if (stats?.milestoneCount) session.push(`里程碑 ${stats.milestoneCount} 个`);
         if (stats?.correctionCount) session.push(`有效纠正 ${stats.correctionCount} 条`);
         if (!session.length) session.push("当前会话暂无摘要");
         return {
@@ -53249,9 +53235,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     try { _toolExpRecord(run.engineering, rec.tool, ok, rec.reason); } catch {}
   };
   const _routeAgentTools = async (phase, evidence = "", taskDelta = "") => {
-    // 配额 24：after_tools 检查点每个工具批次都触发，旧上限 8 在长任务前 8 批就烧光，
-    // 之后工具窗口整个冻结——后期阶段（验证/部署/修复）永远拿不到新能力。签名去重
-    // 已经拦住重复请求，配额只防失控，不该成为编排的实际天花板。
+    // 配额 24：长任务里 steering（用户每插一次话）和 unknown_tool（每撞一个没注册的
+    // 工具名）都会来敲门，旧上限 8 在前段就烧光，之后工具窗口整个冻结——后期阶段
+    // （验证/部署/修复）永远拿不到新能力。签名去重已经拦住重复请求，配额只防失控，
+    // 不该成为编排的实际天花板。
+    //（写 24 的当时理由是每个工具批次都触发的 after_tools 检查点，那条路后来拆了。）
     if (!isAgent || !_live() || _toolRoutingState.runs >= 24) return null;
     const loadedBefore = new Set(toolSchemas.map((schema) => String(schema?.function?.name || "")).filter(Boolean));
     const routeTask = [run._originalText, run._steeringText, taskDelta].filter(Boolean).join("\n").slice(-12000);
@@ -53298,16 +53286,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // 期限是**上限不是固定等待**：答得快照样快。三档区别在于谁在等：
       //   · initial     —— `void _routeAgentTools(...)` 发出去就不管（见下方调用点），
       //                    没有任何人在等它，所以给满额，超时纯亏 0。
-      //   · after_tools —— 卡在两个模型回合之间，封顶 30 秒：实测各线路 p95 最大 20.8 秒，
-      //                    30 秒能接住全部，又不至于让循环肉眼可见地停住。
-      //   · 其余（steering / unknown_tool）—— 用户刚插话、正盯着屏幕等，维持 8 秒；
+      //   · steering / unknown_tool —— 用户刚插话、正盯着屏幕等，维持 8 秒；
       //                    这两档偶发，宁可偶尔退化也不让人干等。
-      deadlineMs:
-        phase === "initial"
-          ? _cognitiveLegDeadlineMs(config)
-          : phase === "after_tools"
-            ? Math.min(_cognitiveLegDeadlineMs(config), 30_000)
-            : 8000,
+      // 这里原来还有一档 after_tools（封顶 30 秒）。它**从来没被走到过**：每个工具批次都
+      // 触发一次编排请求，收益抵不上停顿，所以那条路早就拆了，logic.test.mjs 里甚至有一条
+      // doesNotMatch 正面禁止它回来——留着的三元分支只是没人清的残骸。
+      deadlineMs: phase === "initial" ? _cognitiveLegDeadlineMs(config) : 8000,
     });
     if (!decision) {
       // 签名是在**调用之前**登记的（上面 signatures.add），用途是挡住重复请求。但编排器
@@ -53346,48 +53330,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       }
     }
     
-    // P1 helper: prioritize tools explicitly named in orchestration decision.
-    // Extract names from both decision.tools (explicit selection) and decision.instruction text.
-    // Also include probeLoop pre-installed tools to prevent them from being squeezed out
-    // during weak model convergence. This creates a stable partition: named tools first,
-    // then rest maintain original order.
-    const _prioritizeNamedTools = (schemas, decisionArg) => {
-      if (!decisionArg || !Array.isArray(schemas) || schemas.length <= 8) return schemas;
-      const instructionStr = String(decisionArg.instruction || "");
-      const allToolNames = new Set(schemas.map((s) => s.function?.name).filter(Boolean));
-      const namedNames = new Set();
-      // From decision.tools:
-      if (Array.isArray(decisionArg.tools)) {
-        for (const t of decisionArg.tools) {
-          const name = typeof t === 'string' ? t : t?.name;
-          if (name && allToolNames.has(name)) namedNames.add(name);
-        }
-      }
-      // From instruction text (substring match against available tool names):
-      for (const name of allToolNames) {
-        if (instructionStr.includes(name)) namedNames.add(name);
-      }
-      // ProbeLoop pre-installed tools should also be prioritized
-      // Prevents them from being immediately removed by slice(0,8)
-      const probePreloads = ["web_search", "web_fetch"];
-      for (const p of probePreloads) { if (allToolNames.has(p)) namedNames.add(p); }
-      
-      if (!namedNames.size) return schemas;
-      return [...schemas].sort((a, b) => {
-        const nameA = a.function?.name;
-        const nameB = b.function?.name;
-        const aIsNamed = namedNames.has(nameA);
-        const bIsNamed = namedNames.has(nameB);
-        if (aIsNamed && !bIsNamed) return -1;
-        if (!aIsNamed && bIsNamed) return 1;
-        return 0; // Stable: keep original relative order when same priority
-      });
-    };
     
     // Weak model tool window convergence: attention budget limited, only load top 8 from >10;
     // strong models not restricted. Named/preferred tools are preserved via stabilization.
     if (routeToolNames.length > 10 && _isWeakModel(config?.model)) {
-      routeToolNames = _prioritizeNamedTools(routeToolNames, decision).slice(0, 8);
+      // 这里原来先过一遍 _prioritizeNamedTools 再切 8 个。那个函数是**恒等变换**：
+      // 它按 `s.function?.name` 取名，而传进去的 routeToolNames 是**字符串数组**——
+      // 于是 allToolNames 恒为空集，三条加名的路（decision.tools / instruction 子串 /
+      // probePreloads）全都命不中，`if (!namedNames.size) return schemas` 原样返回。
+      // 把类型改对之后对同一批输入跑 slice(0,8) 结果逐字节相同（稳定排序 + named 分区
+      // 覆盖除注入外的全部元素），所以修它没有任何行为差异——删掉。
+      routeToolNames = routeToolNames.slice(0, 8);
       orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
     }
     const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
@@ -76729,7 +76682,6 @@ function _sessionMemoryStats(session) {
     ? memory.recent
     : Array.isArray(session?.history) ? session.history : [];
   const summaries = Array.isArray(memory?.summaries) ? memory.summaries : [];
-  const milestones = Array.isArray(memory?.milestones) ? memory.milestones : [];
   const fileEvidence = Array.isArray(memory?.fileEvidence) ? memory.fileEvidence : [];
   const correctionCount = typeof memory?.activeCorrections === "function"
     ? memory.activeCorrections("", 160).length
@@ -76739,7 +76691,6 @@ function _sessionMemoryStats(session) {
     totalTurns,
     recentCount: recent.length,
     summaryCount: summaries.length,
-    milestoneCount: milestones.length,
     fileEvidenceCount: fileEvidence.length,
     correctionCount,
   };
@@ -76750,14 +76701,13 @@ function _sessionMemoryLabel(stats) {
   const total = Number(s.totalTurns) || Number(s.recentCount) || 0;
   // Terse, like Claude Code's resume list: the counts that tell two sessions apart, and
   // nothing that reads the same on every row. Zero-valued extras are dropped rather than
-  // printed as "0 summaries · 0 milestones", which was most of the old line's width.
+  // printed as "0 summaries · 0 files", which was most of the old line's width.
   const parts = [];
   if (total) parts.push(`${total} turn${total === 1 ? "" : "s"}`);
   const recent = Number(s.recentCount) || 0;
   if (recent) parts.push(`${recent} msg${recent === 1 ? "" : "s"}`);
   const summaries = Number(s.summaryCount) || 0;
   if (summaries) parts.push(`${summaries} summar${summaries === 1 ? "y" : "ies"}`);
-  if (Number(s.milestoneCount) > 0) parts.push(`${Number(s.milestoneCount)} milestones`);
   if (Number(s.fileEvidenceCount) > 0) parts.push(`${Number(s.fileEvidenceCount)} files`);
   if (Number(s.correctionCount) > 0) parts.push(`${Number(s.correctionCount)} corrections`);
   return parts.join(" · ");
@@ -76774,7 +76724,6 @@ function _sessionSearchText(session) {
     : Array.isArray(session?.history) ? session.history : [];
   for (const m of messages || []) parts.push(m?.content);
   for (const s of Array.isArray(memory?.summaries) ? memory.summaries : []) parts.push(s?.range, s?.text);
-  for (const m of Array.isArray(memory?.milestones) ? memory.milestones : []) parts.push(m?.event);
   for (const e of Array.isArray(memory?.fileEvidence) ? memory.fileEvidence : []) parts.push(e?.path, e?.digest);
   return parts.filter(Boolean).join(" ").toLowerCase();
 }
@@ -76836,7 +76785,6 @@ function _sessionHasRecoverableMemory(session) {
     stats.totalTurns ||
     stats.recentCount ||
     stats.summaryCount ||
-    stats.milestoneCount ||
     stats.fileEvidenceCount ||
     stats.correctionCount ||
     pending.length ||

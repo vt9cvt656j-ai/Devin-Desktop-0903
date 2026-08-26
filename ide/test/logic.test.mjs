@@ -4884,19 +4884,32 @@ test("conversation correction memory stays bounded without touching raw turns", 
     "only a small active correction window should enter the prompt");
 });
 
+test("会话记忆里不留没有写入点的账本", () => {
+  // 2026-08-26：删掉了 milestones + markMilestone()。它从初始导入起就只有定义、
+  // 零调用点，于是 `📌 Key milestones from earlier` 那条系统消息一次也没发出去过，
+  // 而 stats/label/搜索/脏检查签名四处都在读它——四个恒零的读点。
+  // 要接回来得先定义「什么算里程碑」；在那之前，纠错账本 / 摘要 / 文件证据 /
+  // 思考结论已经覆盖同一件事，第五条通道只会挤占上下文预算。
+  const MEM_SRC = readFileSync(new URL("../src/conversation-memory.js", import.meta.url), "utf8");
+  assert.doesNotMatch(MEM_SRC.replace(/\/\/[^\n]*/g, ""), /markMilestone|MAX_MILESTONES/,
+    "里程碑账本又回来了——先给它一个写入点，否则又是一个恒空的读点");
+  assert.doesNotMatch(SRC, /milestoneCount/,
+    "main.js 又在读 milestoneCount 了，而写入端并不存在");
+});
+
 test("conversation memory slices large histories without assembling a full copy", () => {
   const memory = new ConversationMemory();
-  memory.markMilestone("project opened");
   memory.summaries.push({ range: "turns 1-2", text: "older context" });
   for (let index = 0; index < 8; index++) {
     memory.push({ role: index % 2 ? "assistant" : "user", content: `message-${index}` });
   }
 
-  assert.equal(memory.assembledLength(), 10);
-  assert.match(memory.assembledAt(0).content, /project opened/);
-  assert.match(memory.assembledAt(1).content, /older context/);
+  // 9 = 1 条摘要前缀 + 8 条 recent。（原来是 10：还有一条 markMilestone 生成的
+  // 里程碑系统消息，那个账本没有写入点，已删。）
+  assert.equal(memory.assembledLength(), 9);
+  assert.match(memory.assembledAt(0).content, /older context/);
   assert.deepEqual(
-    memory.assembledSlice(7, 10).map((message) => message.content),
+    memory.assembledSlice(6, 9).map((message) => message.content),
     ["message-5", "message-6", "message-7"],
   );
   assert.equal(memory.estimateRecentChars(), 8 * "message-0".length);
@@ -5181,7 +5194,6 @@ test("session picker shows true memory stats and searches historical summaries",
       totalTurns: 145,
       recent: [{ role: "assistant", content: "最新回答：已经修好弹窗" }],
       summaries: [{ range: "turns 1-120", text: "老需求：会话记忆不能丢，要继续理解用户偏好" }],
-      milestones: [{ event: "用户要求浅色 Google 风格" }],
       fileEvidence: [{ path: "src/main.js", digest: "session picker implementation" }],
       corrections: [{ id: "old-correction" }, { id: "current-correction" }],
       activeCorrections: () => [{ id: "current-correction" }],
@@ -5198,24 +5210,24 @@ test("session picker shows true memory stats and searches historical summaries",
     totalTurns: 145,
     recentCount: 1,
     summaryCount: 1,
-    milestoneCount: 1,
     fileEvidenceCount: 1,
     correctionCount: 1,
   });
-  assert.equal(label(st), "145 turns · 1 msg · 1 summary · 1 milestones · 1 files · 1 corrections");
-  // Zero-valued extras are dropped rather than printed — "0 summaries · 0 milestones" repeated
+  assert.equal(label(st), "145 turns · 1 msg · 1 summary · 1 files · 1 corrections");
+  // Zero-valued extras are dropped rather than printed — "0 summaries · 0 files" repeated
   // on every row was most of the old line's width and distinguished nothing.
-  assert.equal(label({ totalTurns: 3, recentCount: 3, summaryCount: 0, milestoneCount: 0 }),
+  assert.equal(label({ totalTurns: 3, recentCount: 3, summaryCount: 0, fileEvidenceCount: 0 }),
     "3 turns · 3 msgs");
   assert.match(searchText(session), /会话记忆不能丢/);
-  assert.match(searchText(session), /浅色 google 风格/i);
+  // 这条原来搜的是里程碑文本（账本已删）。改搜文件证据——那是还活着的第二条非 recent 通道。
+  assert.match(searchText(session), /session picker implementation/i);
   assert.equal(preview(session), "最新回答：已经修好弹窗");
   // The picker is now a React island (src/ui/session-picker.jsx) styled with shadcn + Tailwind,
   // so its surface comes from the theme bridge rather than a hardcoded .session-picker rule.
   assert.match(PICKER_SRC, /stay in context as summaries/,
     "picker subtitle must explain that older chat is summarized rather than lost");
   assert.match(SRC, /search: _sessionSearchText\(s\)/,
-    "picker search must cover summaries/milestones/file evidence, not only recent messages");
+    "picker search must cover summaries/file evidence, not only recent messages");
   assert.match(PICKER_SRC, /\(e\.search \|\| ""\)\.includes\(q\)/,
     "the island must filter on that full search text");
   // The count chip became a per-row CURRENT/RESUME tag plus a resumable total in the footer —
@@ -5243,7 +5255,6 @@ test("closed chat tabs stay in the session library and can be restored", () => {
       totalTurns: Number(session?.memory?.totalTurns) || 0,
       recentCount: Array.isArray(session?.memory?.recent) ? session.memory.recent.length : 0,
       summaryCount: Array.isArray(session?.memory?.summaries) ? session.memory.summaries.length : 0,
-      milestoneCount: 0,
       fileEvidenceCount: 0,
       correctionCount: 0,
     },
@@ -8858,7 +8869,7 @@ test("_dynamicChatChips predicts context-aware starters (not a fixed hardcoded l
 test("_flushChatHistorySync writes the shape restoreChatHistory reads (memory object, not history-object) — the '聊天内容全丢' bug", () => {
   const store = {};
   const localStorage = { setItem: (k, v) => { store[k] = v; }, getItem: (k) => (k in store ? store[k] : null) };
-  const memJSON = { totalTurns: 3, recent: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }], summaries: [], milestones: [] };
+  const memJSON = { totalTurns: 3, recent: [{ role: "user", content: "hi" }, { role: "assistant", content: "yo" }], summaries: [] };
   const _chatSessions = [{ id: "s1", name: "Chat 1", mode: "chat", model: "m", project: "", created: 123, memory: { toJSON: () => memJSON } }];
   const pendingForStorage = load("_pendingSendsForStorage", { serializeMessagesForPersistence });
   const sessionDataForStorage = load("_chatSessionDataForStorage", {
@@ -14079,13 +14090,24 @@ test("probeLoop nudge preloads the tools it names before pushing (task #39 B)", 
     "the preloaded schemas must be resolved from the run tool registry, like the researchEvidence gate");
 });
 
-test("weak-model tool convergence keeps explicitly-named tools before slicing to 8 (task #39 B)", () => {
-  const idxPrioritize = RAW_SRC.indexOf("const _prioritizeNamedTools = (schemas, decisionArg) =>");
-  const idxProbePreloads = RAW_SRC.indexOf('const probePreloads = ["web_search", "web_fetch"];');
-  const idxSlice = RAW_SRC.indexOf("_prioritizeNamedTools(routeToolNames, decision).slice(0, 8);");
-  assert.ok(idxPrioritize > 0 && idxProbePreloads > 0 && idxSlice > 0, "named-tool prioritization landmarks must exist");
-  assert.ok(idxProbePreloads < idxSlice,
-    "probeLoop preloaded tools should be prioritized before the slice(0, 8)");
+/**
+ * 2026-08-26：`_prioritizeNamedTools` 删了，因为它是**恒等变换**。
+ *
+ * 它按 `s.function?.name` 取名，而调用点传进去的 routeToolNames 是**字符串数组**
+ * ——allToolNames 恒为空集，三条加名的路（decision.tools / instruction 子串 /
+ * probePreloads）全都命不中，最后 `if (!namedNames.size) return schemas` 原样返回。
+ * 把类型改对之后对同一批输入跑 slice(0,8) 结果逐字节相同（稳定排序 + named 分区覆盖
+ * 除注入外的全部元素），所以「修好它」没有任何行为差异。
+ *
+ * 原来那条测试只断言三个地标存在、且顺序对——**从不执行它**，所以恒等这件事
+ * 一直没人发现。这条改成守「别再加回来」。
+ */
+test("弱模型收敛只做 slice，不再套一层恒等变换", () => {
+  assert.doesNotMatch(SRC, /_prioritizeNamedTools/,
+    "那个恒等变换又回来了——它按 s.function?.name 取名，而传进去的是字符串数组");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
+    "弱模型的工具收敛没了");
 });
 
 test("existing-file edits execute against current disk while exact anchors and CAS stay objective", () => {
@@ -19078,8 +19100,8 @@ test("工具失败记账与弱模型收敛接入编排链路", () => {
   assert.match(loop, /_validateToolOrchestration\(decision\.tools, run\._toolRegistry, run\.engineering\)/,
     "编排结果装载 schema 前必须先过硬性合理性检查");
   assert.match(loop, /_isWeakModel\(config\?\.model\)/, "弱模型才收敛工具窗口，强模型保持现状");
-  assert.match(loop, /_prioritizeNamedTools\(routeToolNames, decision\)\.slice\(0, 8\)/,
-    "弱模型超额时先对点名工具置前再 slice 至 8，probeLoop 预装工具也被优先保留");
+  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
+    "弱模型超额时收敛到 8 个（原来这里还套了一层 _prioritizeNamedTools，实测是恒等变换，已删）");
   assert.match(loop, /编排收敛提示/, "收敛 notes 必须拼进编排 nudge 告知主模型");
   const stats = extractFn("_toolLedgerStats");
   assert.match(stats, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
@@ -23812,8 +23834,11 @@ test("the checkpoint route runs with phase-scoped deadlines", () => {
     "写死的 2800 毫秒比主力线路的首字延迟中位数还短，不许回来");
   assert.match(loop, /phase === "initial"\s*\?\s*_cognitiveLegDeadlineMs\(config\)/,
     "后台那一档没人在等，必须拿和收尾评审同一套按档位算的满额期限");
-  assert.match(loop, /phase === "after_tools"\s*\?\s*Math\.min\(_cognitiveLegDeadlineMs\(config\), 30_000\)/,
-    "批次之间要接住 p95（实测最大 20.8 秒）又不能让循环停太久");
+  // 原来这里还钉着一条 after_tools 的 30 秒档。那一档**从来没被走到过**——上面
+  // 11193 行那条 doesNotMatch 正面禁止 _routeAgentTools("after_tools")，两条测试
+  // 互相矛盾了很久，一条要求分支存在、另一条要求调用不存在，于是分支恒死。已删。
+  assert.doesNotMatch(loop, /phase === "after_tools"/,
+    "after_tools 那一档没有调用点（见上面的 doesNotMatch），别再加回死分支");
   assert.match(loop, /_toolRoutingState\.signatures\.delete\(signature\)/,
     "编排器返回 null 时必须撤掉签名，否则超时的那一档整个 run 再也不会重试");
   assert.match(SRC, /deadlineMs = 20000/,
@@ -27801,7 +27826,7 @@ test("上下文读数要进存盘指纹——否则只有它变时 checkpoint �
   assert.match(fp, /_ctxRealFloor\?\.requestId/);
   // 行为验：只有读数变了，指纹必须跟着变。
   const build = load("_sessionPersistFingerprint");
-  const base = { id: "s1", memory: { recent: [], summaries: [], milestones: [], fileEvidence: [], archive: [], corrections: [] }, history: [] };
+  const base = { id: "s1", memory: { recent: [], summaries: [], fileEvidence: [], archive: [], corrections: [] }, history: [] };
   const a = build({ ...base, _ctxRealFloor: { total: 100, requestId: "r1" } });
   const b = build({ ...base, _ctxRealFloor: { total: 123_567, requestId: "r2" } });
   assert.notEqual(a, b, "只有读数变化时指纹没变 —— checkpoint 会命中缓存，ctxFloor 落不了盘");
@@ -29674,7 +29699,7 @@ test("编辑历史消息后，按轮次累积的台账要跟着作废，不能�
   assert.doesNotMatch(src, /_demandLedger = \[\]/,
     "把需求账本整本清空了——编辑点之前那些仍然有效的要求会一起消失");
 
-  // 思考结论账本：条目自带 turn，按 cut 精确切（和 milestones / corrections 同一套）。
+  // 思考结论账本：条目自带 turn，按 cut 精确切（和 corrections 同一套）。
   assert.match(src, /_thinkLedger = sess\._thinkLedger\.filter\(\(item\) => Number\(item\?\.turn\) <= cut\)/,
     "思考结论账本没按轮次切");
 
