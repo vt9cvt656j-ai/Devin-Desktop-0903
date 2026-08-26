@@ -54,6 +54,34 @@ test("发布构建确实会把描述剥空——这是这条测试存在的前�
     `发布构建只剥空了 ${relEmpty} 条描述——剥除范围变了，这条测试的前提要重核`);
 });
 
+test("三个派发工具的描述不许被剥空 —— 它们的 schema 真会随请求体发出去", () => {
+  // 剥除的安全前提是「客户端只发工具名，网关按自己那份 tools.json 回填 schema」。
+  // 这三个是唯一的例外：用户声明了自定义角色时，_applyUserRoleEnums 要把角色名补进
+  // 它们的 `role` 枚举，补的是客户端这份 schema，于是 L0 那里会把它们从「只发名字」
+  // 里摘出来、连整份 schema 一起发出去（网关那份目录里只有 11 个内置角色名）。
+  //
+  // 剥空的后果是：用户把角色的提示词、工具矩阵、轮数全配好了，模型收到的却是
+  // `{name: "run_subagent", description: ""}` —— 整套自定义角色在**发布版**里是哑的，
+  // 而开发版一切正常，所以本地根本测不出来。
+  //
+  // 这条测试和上面那些不是重复：上面守的是「客户端自己的两条认知路径有 TOOL_METADATA
+  // 兜底」，这条守的是「真发给模型的那份 schema 里有没有字」——兜底到不了那里。
+  const rel = registryFrom(STRIPPED);
+  for (const name of ["run_subagent", "run_worker", "spawn_multiple_agents"]) {
+    const t = rel.find((x) => x.function?.name === name);
+    assert.ok(t, `${name} 不在注册表里了`);
+    assert.ok(String(t.function.description || "").trim().length > 100,
+      `${name} 的描述在发布构建里被剥空了 —— 声明了自定义角色的用户会拿到一个哑工具`);
+  }
+  // 反向：别把豁免开成一张越来越长的白名单。除这三个之外，描述该空还得空。
+  const stillFilled = rel
+    .filter((t) => String(t.function?.description || "").trim())
+    .map((t) => t.function.name)
+    .filter((n) => !["run_subagent", "run_worker", "spawn_multiple_agents"].includes(n));
+  assert.deepEqual(stillFilled, [],
+    "这些工具的描述没被剥掉，而它们的 schema 并不会随请求体发出去：" + stillFilled.join(","));
+});
+
 test("剥空之后，编排器看到的目录行仍然带真内容", () => {
   const rel = registryFrom(STRIPPED);
   const bad = [];

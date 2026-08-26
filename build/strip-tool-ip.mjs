@@ -15,6 +15,28 @@
 
 const FN_MARKER = "function _buildAgentToolSchemas";
 
+/*
+ * 三个派发工具的描述**不剥**。
+ *
+ * 剥除的安全前提是「客户端只发工具名，网关按自己那份 tools.json 回填 schema」。这三个
+ * 是唯一的例外：用户声明了自定义角色时，_applyUserRoleEnums 要把角色名补进它们的 `role`
+ * 枚举，补的是**客户端这份 schema**，所以 L0 那里会把它们从「只发名字」里摘出来、连整份
+ * schema 一起发出去（网关那份目录里只有 11 个内置角色名，用户改不了）。
+ *
+ * 于是发布构建里模型收到的是 `{name: "run_subagent", description: ""}` 加一串同样被剥空
+ * 的参数说明——用户把角色的提示词、工具矩阵、轮数全配好了，模型却看不懂这个工具是干
+ * 什么的。整套自定义角色在发布版里是哑的，而开发版一切正常，所以本地测不出来。
+ *
+ * 泄露代价：141 条里的 3 条。而且性质上不是新增——src/tool-guides.js 的 TOOL_METADATA
+ * （每个工具的场景 + 调用示例）本来就明确不在剥除范围内，release-tool-descriptions
+ * 那条测试正面要求它别被剥。
+ *
+ * 更干净的做法是让网关来打这个补丁（客户端只多发一个「用户声明了哪些角色名」的头，
+ * schema 仍旧由网关回填），那需要改 Rust 那边并单独部署，留作后续。
+ */
+const KEEP_DESCRIPTIONS = ["run_subagent", "run_worker", "spawn_multiple_agents"];
+const keepsDescription = (line) => KEEP_DESCRIPTIONS.some((n) => line.includes(`name: "${n}"`));
+
 // Replace the VALUE of every `description:` key on a single line with "". Handles
 // double/single-quoted strings and template literals, respecting backslash escapes.
 // Operates char-by-char so nested quotes/braces inside a description can't fool it.
@@ -86,6 +108,7 @@ export function stripToolIp(source) {
   for (const [start, end] of regions) {
     for (let i = start; i <= end; i++) {
       if (!lines[i].includes("description:")) continue;
+      if (keepsDescription(lines[i])) continue;   // 见 KEEP_DESCRIPTIONS
       const next = blankDescriptionsInLine(lines[i]);
       if (next !== lines[i]) { changed++; lines[i] = next; }
     }
