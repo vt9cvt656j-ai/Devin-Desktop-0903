@@ -14,12 +14,13 @@ import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js"
 import assert from "node:assert/strict";
 import fs from "node:fs";
 // 按名字取真源码 + 注入依赖跑起来，只有一份实现：test/helpers/source.mjs。
-import { fnSource as extractFn, load } from "./helpers/source.mjs";
+import { fnSource as extractFn, load, SRC } from "./helpers/source.mjs";
 
-// 工具目录字面量已搬到 src/agent/tool-catalog.js —— 两份拼起来读，
-// 否则所有按 schema 文本的断言会以「这条工具不见了」的形式假红。
-const SRC = fs.readFileSync("src/main.js", "utf8")
-  + "\n" + fs.readFileSync("src/agent/tool-catalog.js", "utf8");
+// SRC 来自共享的 helpers/source.mjs：它把 main.js 和 **src/agent/ 下的每一个模块**
+// 拼起来。这里原来手抄了一份「main.js + tool-catalog.js」的拼接，于是每从 main.js
+// 搬出一块新模块，这个文件就会以「这段代码不见了」的形式假红一次——2026-08-26 搬
+// _TOOL_ALIASES 时就是这样：别名表还在，只是搬进了 src/agent/tool-aliases.js。
+// 手抄的拼接名单必须跟着每次搬家改，共享的那份不用。
 
 
 const SKILLS = [

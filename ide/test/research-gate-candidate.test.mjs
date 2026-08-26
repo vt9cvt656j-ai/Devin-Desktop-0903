@@ -62,42 +62,62 @@ test("同一个词不重复", () => {
 });
 
 // ── 代填器：只在模型点头时代填，且一次性消费 ──────────────────────────
-const cand = () => ({ name: "package_search", args: { query: "Stripe webhook" } });
+//
+// **形状很要紧。** 这几条以前构造的 call 是 `{ type: "package_search", args: {} }`，
+// 而 _mapToolCall 产出的真形状是扁的：`{ type, query, ecosystem, max_results }` ——
+// 压根没有 args 这一层，执行器那边 _tauriSearchInvokeArgs 取的也是 `call.query`。
+// 于是代填写进 call.args 写了个没人读的字段，整条预填从来没生效过，而这几条测试
+// 因为自己也用同一个假形状，一路全绿。用真形状构造之后它们才开始有意义。
+const cand = () => ({ name: "package_search", query: "Stripe webhook" });
+const realCall = (over = {}) => ({ type: "package_search", query: "", ecosystem: "npm", ...over });
 
 test("模型对该工具发空参数调用 = 点头，代码替它补上", () => {
   const run = { _researchGateCandidate: cand() };
-  const call = { type: "package_search", args: {} };
-  assert.deepEqual(fill(run, call), { query: "Stripe webhook" });
-  assert.deepEqual(call.args, { query: "Stripe webhook" });
+  const call = realCall();
+  assert.equal(fill(run, call), "Stripe webhook");
+  assert.equal(call.query, "Stripe webhook");
 });
 
 test("模型自己带了参数就一个字不动", () => {
   const run = { _researchGateCandidate: cand() };
-  const call = { type: "package_search", args: { query: "别的东西" } };
+  const call = realCall({ query: "别的东西" });
   assert.equal(fill(run, call), null);
-  assert.deepEqual(call.args, { query: "别的东西" }, "把模型自己想查的东西覆盖掉了");
+  assert.equal(call.query, "别的东西", "把模型自己想查的东西覆盖掉了");
   assert.ok(run._researchGateCandidate, "模型带参数时候选不该被消费掉");
 });
 
 test("调别的工具不触发", () => {
   const run = { _researchGateCandidate: cand() };
-  assert.equal(fill(run, { type: "write_file", args: {} }), null);
-  assert.equal(fill(run, { type: "developer_community_search", args: {} }), null);
+  assert.equal(fill(run, { type: "write_file", path: "" }), null);
+  assert.equal(fill(run, { type: "developer_community_search", query: "" }), null);
 });
 
 test("一次性消费：点过一次头就不再代填", () => {
   const run = { _researchGateCandidate: cand() };
-  fill(run, { type: "package_search", args: {} });
+  fill(run, realCall());
   assert.equal(run._researchGateCandidate, null);
-  const second = { type: "package_search", args: {} };
+  const second = realCall();
   assert.equal(fill(run, second), null);
-  assert.deepEqual(second.args, {}, "第二次还在代填——那就不是「点头」是「代跑」了");
+  assert.equal(second.query, "", "第二次还在代填——那就不是「点头」是「代跑」了");
 });
 
 test("没有候选 / run 为空时安静返回", () => {
-  assert.equal(fill({}, { type: "package_search", args: {} }), null);
-  assert.equal(fill(null, { type: "package_search", args: {} }), null);
+  assert.equal(fill({}, realCall()), null);
+  assert.equal(fill(null, realCall()), null);
   assert.equal(fill({ _researchGateCandidate: cand() }, null), null);
+});
+
+test("候选的形状必须和执行器读的字段对得上", () => {
+  // 这条守的是整类 bug：代填器写的字段和执行器读的字段对不上，两边各自都「对」，
+  // 中间那条线是断的。判据取自源码本身，不靠这个测试台自己编的形状。
+  const invokeArgs = topLevelFn("_tauriSearchInvokeArgs");
+  assert.match(invokeArgs, /const args = \{ query: call\?\.query \|\| "" \};/,
+    "执行器改成从别的字段取查询词了，代填器要跟着改");
+  const fillSrc = topLevelFn("_researchGateCandidateFill");
+  assert.match(fillSrc, /call\.query = String\(cand\.query \|\| ""\);/,
+    "代填器写的不是 call.query —— 写进去也没人读");
+  assert.match(fillSrc, /if \(String\(call\.query \|\| ""\)\.trim\(\)\) return null;/,
+    "「模型自己带了查询就不动」那道检查也得看 call.query，否则会覆盖模型写的词");
 });
 
 // ── 接线：候选必须真的被武装、且在授权检查之前被消费 ────────────────────

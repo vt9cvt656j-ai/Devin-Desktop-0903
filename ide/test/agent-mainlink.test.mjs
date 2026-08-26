@@ -1,5 +1,6 @@
 // 主智能体 ↔ 子智能体的对齐。用 src/main.js 里的真函数 + 真 SharedStore 跑，不复刻逻辑。
 import assert from "node:assert/strict";
+import { SRC as SHARED_SRC } from "./helpers/source.mjs";
 import test from "node:test";
 import fs from "node:fs";
 import { SharedStore } from "../src/agent/shared-store.js";
@@ -80,7 +81,7 @@ test("同伴与主智能体的消息共用一个收件箱，抬头不再谎称�
 });
 
 test("多角色会诊：两份以上有内容的报告才归总，且归总不冒充证据", () => {
-  const SRCX = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const SRCX = SHARED_SRC;   // 共享源（main.js + src/agent/*），别自己读
   const i = SRCX.indexOf("const _settled = _targets.filter");
   assert.ok(i > 0, "await_subagent 里必须有会诊归总这一段");
   const seg = SRCX.slice(i, i + 3000);
@@ -104,7 +105,7 @@ test("多角色会诊：两份以上有内容的报告才归总，且归总不�
 });
 
 test("会诊归总按角色署名，而不是按任务描述", () => {
-  const SRCX = fs.readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const SRCX = SHARED_SRC;   // 共享源（main.js + src/agent/*），别自己读
   assert.match(SRCX, /const job = \{ id: jobId, desc, role: spec\.role,/,
     "作业要记住自己的角色，归总里才能写成「后端说 X、安全说 Y」");
   assert.match(SRCX.slice(SRCX.indexOf("const _settled = _targets.filter")), /j\.role \|\| "专家"/,

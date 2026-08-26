@@ -27,7 +27,7 @@
 //   3. Every check names the real defect it would have caught.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as acorn from "acorn";
@@ -1065,7 +1065,7 @@ test("every semantic flag the client declares is one the gateway accepts and rou
 });
 
 test("思考深度必须真的到达模型：三条链路一条都不能断", () => {
-  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const main = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读 —— 搬模块时会假红
   const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
 
   // 1) gpt-5.6 走的是 protocol="openai" 的透传线路，网关不改 reasoning_effort，
@@ -1096,7 +1096,7 @@ test("思考深度必须真的到达模型：三条链路一条都不能断", ()
 });
 
 test("两条线路的思考档位一真一假，代码里必须分开处理", () => {
-  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const main = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读 —— 搬模块时会假红
   const rs = readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
 
   // 2026-08-13 对真实上游实测：
@@ -1123,7 +1123,7 @@ test("两条线路的思考档位一真一假，代码里必须分开处理", ()
 });
 
 test("思考量在两条线路上都有东西可显示", () => {
-  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const main = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读 —— 搬模块时会假红
   const ai = readFileSync(new URL("../src-tauri/src/ai.rs", import.meta.url), "utf8");
   const rs = readFileSync(new URL("../../server/src/models.rs", import.meta.url), "utf8");
 
@@ -1140,7 +1140,7 @@ test("思考量在两条线路上都有东西可显示", () => {
 });
 
 test("/sessions 必须能看到内存装不下的那部分历史会话", () => {
-  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const main = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读 —— 搬模块时会假红
   const rs = readFileSync(new URL("../src-tauri/src/conversation_store.rs", import.meta.url), "utf8");
   const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
@@ -1181,7 +1181,7 @@ test("/sessions 必须能看到内存装不下的那部分历史会话", () => {
 });
 
 test("「要方案」和「要施工」两条规则必须成对存在，只留一半就是这次的 bug", () => {
-  const main = readFileSync(new URL("../src/main.js", import.meta.url), "utf8");
+  const main = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读 —— 搬模块时会假红
   const core = readFileSync(new URL("../../server/prompts/agent_core.txt", import.meta.url), "utf8");
 
   // 起因：为了治「让他做 X 他却反问」，提示词被推向「直接开工」。但只写了
@@ -2292,4 +2292,49 @@ test("模块顶层调用的函数不许读到更靠后声明的模块级变量",
     "这些调用发生在模块还没求值完的时候，读到的变量还在 TDZ 里——启动时抛 ReferenceError，"
     + "被 void / .catch 吞掉之后表现为「这个功能就是不工作」：\n  " + hits.join("\n  ")
     + "\n把调用点移到那些声明之后。");
+});
+
+// ── 手抄的源码拼接名单 ──────────────────────────────────────────────────
+//
+// helpers/source.mjs 的 SRC / CODE 会把 main.js 和 **src/agent/ 下的每一个模块**拼起来。
+// 有些测试文件不用它，自己 readFileSync("src/main.js")，有的还手抄一份「再拼上
+// tool-catalog.js」的名单。那种名单必须跟着每一次模块搬家改，而它不会自己提醒你。
+//
+// 实测代价（2026-08-26 把 _TOOL_ALIASES 搬进 src/agent/tool-aliases.js）：
+// skills.test.mjs 当场假红一条「缺别名 skill」——别名表一个字没少，只是搬了个位置。
+// 假红还算好的。反方向更糟：断言的是「main.js 里**不许**出现 X」，X 搬进模块之后
+// 那条断言恒绿，禁令悄悄失效。
+//
+// 这道闸把「下次搬模块才发现」变成「现在就看得见」。豁免要写清为什么。
+test("测试文件不该手抄 main.js 的源码拼接名单", () => {
+  const EXEMPT = {
+    "response-budget-header.test.mjs":
+      "刻意分开读 web / desktop / gateway 三份源码做对照，拼起来就没法比了",
+    "release-tool-descriptions.test.mjs":
+      "要对**原始文件文本**跑 stripToolIp 并用剥后结果重建注册表，helpers 那份是拼好且解析过的，用不了",
+  };
+  // 扫描前先剥掉行注释。不剥的话**这条测试自己**会被数进去——它的注释里就写着
+  // 那个调用形状。同一个坑本仓库踩过（一条反漂移断言匹配到了自己的更正说明）。
+  // 剥法粗糙（字符串里的 // 也会被砍），但用途只是一次布尔匹配：砍坏一个 URL
+  // 字面量不可能凭空造出一个 readFileSync("src/main.js")，而被注释掉的调用本来就不算。
+  const codeOnly = (t) => t.replace(/^[^\n]*?\/\/[^\n]*$/gm, "");
+  const HITS = /readFileSync\(\s*(?:"src\/main\.js"|join\([^)]*"\.\.\/src\/main\.js"\)|new URL\("\.\.\/src\/main\.js")/;
+  const dir = join(HERE, ".");
+  const offenders = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith(".test.mjs") || f in EXEMPT) continue;
+    if (HITS.test(codeOnly(readFileSync(join(dir, f), "utf8")))) offenders.push(f);
+  }
+  assert.deepEqual(offenders, [],
+    "这些测试自己读 main.js，而不是用 helpers/source.mjs 的 SRC/CODE。"
+    + "从 main.js 搬出一个模块时它们会假红（或者更糟：反向断言悄悄失效）：\n  "
+    + offenders.join("\n  ")
+    + "\n改用共享的 SRC/CODE；确实需要单独读原始文件的，加进这条测试的 EXEMPT 并写明理由。");
+  // 反向：豁免名单不许变成谎言——列进来的文件必须真的存在、且真的自己读了 main.js。
+  for (const [f, why] of Object.entries(EXEMPT)) {
+    assert.ok(existsSync(join(dir, f)), `EXEMPT 里的 ${f} 已经没有了，删掉这条`);
+    assert.ok(why && why.length >= 10, `EXEMPT.${f} 得写清理由`);
+    assert.match(codeOnly(readFileSync(join(dir, f), "utf8")), HITS,
+      `${f} 已经不自己读 main.js 了，但仍留在 EXEMPT 里——名单和现实对不上`);
+  }
 });

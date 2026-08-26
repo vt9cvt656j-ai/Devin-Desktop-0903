@@ -125,7 +125,8 @@ test("不再存在「按满额说明一条条塞、塞爆就 break」的老写�
 });
 
 test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真的收窄", () => {
-  const SRC = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 这里原来局部 `const SRC = readFileSync(main.js)`，把外层共享的 SRC 遮蔽掉了——
+  // 下面几行注释记着它已经害出过一次「偏移混用」的 bug。遮蔽去掉，用共享那份。
 
   // ① 致命项：read_skill 的返回落在 8000 那一档时会被 _headTailModelText 从**中间**挖空，
   //    而官方技能的 SKILL.md 普遍 10–20KB —— 模型拿到头尾、丢掉中段的分步说明，
