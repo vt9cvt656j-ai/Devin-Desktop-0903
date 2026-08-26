@@ -77,7 +77,25 @@ const CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE: u32 = 1;
 /// ——旁边那条同模型线路一次都没试过。那把失效的 key（`invalid_api_key` → 424）也是同一回事：
 /// 落到它上面的请求直接判死，而循环里那句注释写着「401/403 仍然会换线，那是每条线路各自的
 /// 凭据」——在 MAX_ROUTES=1 之下，这句话从来没成立过。
-const CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED: usize = 2;
+/// 换出口的**兜底**上限 —— 这不是策略，是防跑飞。
+///
+/// 真正的闸一直是**时间**：`route_deadline` 由客户端自己的耐心算出来
+/// （`route_budget_for_headers`），而每一次尝试的表头等待都被 `remaining` 夹在剩余
+/// 预算里。也就是说多试几个出口**不会让用户多等一秒** —— 天花板早就由时间定死了。
+///
+/// 上一版这里是 2，叠在时间闸之上的第二道闸。后果是：一条线路挂十五个出口，
+/// 第 3 个往后**永远轮不到**，配了等于没配。而换线只发生在上游**明确回了错误**的时候，
+/// 那类失败恰恰是最便宜的 —— 401 / 404 / 429 两三百毫秒就回来，十个加起来还不到三秒。
+///
+/// 数字取 24 而不是无穷：候选是「同模型的所有线路 × 各自的出口」，真要跑飞的时候
+/// 有个有限的头总比没有好。它不该在正常配置下被够到。
+const CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP: usize = 24;
+
+/// 剩余预算少于这个数就别再开新的尝试了。
+///
+/// 开了也来不及把答案拿回来 —— 只会把仅剩的时间烧在一个注定被 `remaining` 掐断的
+/// 请求上，然后用户既没拿到答案、又多等了这一下。
+const CHAT_UPSTREAM_MIN_TRY_WINDOW: Duration = Duration::from_secs(2);
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
 /// 「这次失败之后还有没试过的上游出口」这件事告诉客户端时用的响应头。
@@ -1492,6 +1510,32 @@ fn upstream_capacity_wording(low: &str) -> bool {
         || low.contains("try again later")
 }
 
+/// 中转只是**把它自己上游的失败原样转出来**，并不是在说我们的请求写错了。
+///
+/// 实测原文（grok-4.6，2026-08-26）：
+///   `400 {"error":{"message":"upstream returned status 400","type":"invalid_request_error"}}`
+///
+/// 这句话里**没有一个字**是关于请求内容的 —— 它说的是「我找我的上游要，它给了我 400」。
+/// 而外面套着 `invalid_request_error`，于是三项全中那道「400 且 invalid_request_error
+/// → 请求体有问题，换线也没用」的闸：整轮对话当场判死，旁边那条同模型线路**一次都没试**，
+/// 用户只能自己重发。
+///
+/// 判据是**有没有点名**：真正的请求体错误一定说得出是哪儿不对
+/// （`max_tokens`、`unexpected keyword`、`is not supported for this model`、
+/// `extra inputs are not permitted`）。只回一个转发来的状态码、不提任何字段的，
+/// 是中转在说自己那一跳不行 —— 换一家完全可能就好了。
+///
+/// 和 `upstream_capacity_wording` 是同一类例外，只是那条管「它说等一会儿」，
+/// 这条管「它说是它上游的错」。
+fn upstream_relayed_failure_wording(low: &str) -> bool {
+    low.contains("upstream returned status")
+        || low.contains("upstream returned")
+        || low.contains("upstream error")
+        || low.contains("bad response from upstream")
+        || low.contains("上游返回")
+        || low.contains("上游错误")
+}
+
 fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
     let access_failure = matches!(status, 401 | 403)
         || low.contains("forbidden")
@@ -1523,6 +1567,10 @@ fn upstream_failure_status(status: u16, low: &str) -> StatusCode {
             // 唯一的例外：上游把**容量**错误包在 400 里发出来（见 upstream_capacity_wording）。
             // 那是暂时的，照 400 发下去等于告诉客户端「别再试了」——正好和上游的原话相反。
             400 if upstream_capacity_wording(low) => StatusCode::SERVICE_UNAVAILABLE,
+            // 中转把它上游的失败转出来 —— 这是网关那一跳坏了，不是请求写错了。
+            // 照 400 发下去，客户端的 `_isRetryableAiError` 不认 400，于是连客户端
+            // 那层重试也一起关掉，用户只剩手动重发一条路。
+            400 if upstream_relayed_failure_wording(low) => StatusCode::BAD_GATEWAY,
             400 => StatusCode::BAD_REQUEST,
             413 => StatusCode::PAYLOAD_TOO_LARGE,
             422 => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1862,6 +1910,44 @@ fn route_supports_prompt_cache(model: &Model) -> bool {
 /// OpenAI gpt-image / DALL·E, Google gemini *image* (gemini-3.1-flash-image-preview),
 /// gpt-4o-image, etc. Guarantees image calls never fall through to $0 token billing.
 /// Text/vision models never contain these substrings, so it won't misfire on them.
+/// 这次 /responses 的返回里**真的有图吗**。
+///
+/// # 为什么必须单独判，不能只看模型名
+///
+/// `responses_proxy` 里对「是不是画图模型」有两份判据，而且刻意不同：
+///   · 注入 `image_generation` 工具那处（本文件 ~10069）只认 gpt-image / dall-e，
+///     因为那是 OpenAI Responses 的构造，塞给 Gemini 只会把请求打坏；
+///   · 计费那处走 `is_image_gen_model`，它还认 `-image` / `image-preview`。
+///
+/// 于是 `gemini-*-image` 这类模型：**没被注入出图工具**（返回纯文本），
+/// 却**按画图计费**，而计费那里还有一句「数不到就按至少一张收」的兜底 ——
+/// 用户拿到一段文字，被按出图价扣钱。
+///
+/// 兜底本身没错（真出了图但没报 image_generation_call 时该收），错在它的前提
+/// 「这次请求确实在出图」已经被另一半代码否掉了。所以判据换成**响应里有没有图**：
+/// 有图数不清 → 按一张收；**没图 → 根本不走画图那一支**，退回按 token 计费。
+fn responses_output_has_image(data: &serde_json::Value) -> bool {
+    let Some(out) = data.get("output").and_then(|o| o.as_array()) else {
+        return false;
+    };
+    out.iter().any(|item| {
+        if item.get("type").and_then(|x| x.as_str()) == Some("image_generation_call") {
+            return true;
+        }
+        // 非 OpenAI 的实现会把图放在 message 的内容块里，形态各家不同，
+        // 所以认三种常见标记而不是某一个固定字段。
+        item.get("content")
+            .and_then(|c| c.as_array())
+            .is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get("type").and_then(|x| x.as_str()).is_some_and(|t| t.contains("image"))
+                        || p.get("image_url").is_some()
+                        || p.get("b64_json").is_some()
+                })
+            })
+    })
+}
+
 fn is_image_gen_model(model_id: &str) -> bool {
     // 实时优先：目录里的 output_modalities 含 image 就是画图模型，不用从名字猜。
     // 名字表会把 `claude-3-image-analysis` 这类"看图但不画图"的误判成画图模型
@@ -2918,6 +3004,23 @@ pub async fn admin_create(
         Some("per_call") => "per_call",
         _ => "rate",
     };
+    // 新线路排到**最后**，不是最前。
+    //
+    // 这一列长期全是 0，次序实际由 `created_at` 决定 —— 新建的自然在最后。而「排序」
+    // 那一屏把它们写成 10/20/30… 之后，再拿 0 建一条就等于**让每一条新线路跳到第一位**。
+    // 而第一位不只是显示：同一个模型被两条普通线路开放时，排在前面的那条接单、
+    // 按它的倍率计费。于是「我先加一条试试」会当场改掉线上账单，而没有任何地方报错。
+    //
+    // 显式传了 sort 就听调用方的 —— 那是「我知道我在干什么」。
+    let sort = match req.sort {
+        Some(v) => v,
+        None => {
+            let max: Option<i32> = sqlx::query_scalar("SELECT max(sort) FROM models")
+                .fetch_one(&state.db)
+                .await?;
+            max.unwrap_or(0).saturating_add(10)
+        }
+    };
     // per_call_micro_usd 必须一起写进去。这一列是 20260806_conn_per_call_micro 后加的：
     // ModelReq 加了字段、admin_update 也读了，唯独这条 INSERT 漏掉，于是新建连接时填的
     // 每次调用费被**静默丢弃**，落库永远是 0（clippy 报的 "field is never read" 就是它）。
@@ -2938,7 +3041,7 @@ pub async fn admin_create(
     .bind(req.input_price.unwrap_or(0.0).max(0.0))
     .bind(req.output_price.unwrap_or(0.0).max(0.0))
     .bind(req.description.unwrap_or_default().trim())
-    .bind(req.sort.unwrap_or(0))
+    .bind(sort)
     .bind(bmode)
     .bind(req.per_call_cents.unwrap_or(0).max(0))
     .bind(req.cache_read_price.unwrap_or(0.0).max(0.0))
@@ -2988,18 +3091,32 @@ pub async fn admin_available(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| AppError::internal(e.to_string()))?;
+    let key = model_key(&m.api_key);
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", model_key(&m.api_key)))
+        // 两个头一起发。只发 Authorization 的话，认 anthropic 口径（x-api-key）的中转
+        // 在这一页会 401「密钥被拒」，而同一个地址在「出口」窗口里能拉到清单 ——
+        // 运维会以为线路密钥坏了。另外两处实现一直是双头，这里漏了。
+        .header("Authorization", format!("Bearer {key}"))
+        .header("x-api-key", &key)
         .send()
         .await
-        .map_err(|e| AppError::internal(format!("拉取模型列表失败: {e}")))?;
+        // **不回显 reqwest 的错误原文**：它带完整 URL，而有些转卖商要求把密钥
+        // 写在查询串里。另外两处实现把这条当硬纪律并有测试守着，这里之前是漏的。
+        .map_err(|_| AppError::internal("拉取模型列表失败（连不上这个地址）".to_string()))?;
     let status = resp.status();
-    let data: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    let raw = resp.text().await.unwrap_or_default();
+    let data: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
     if !status.is_success() {
         return Err(AppError {
             status: axum::http::StatusCode::BAD_GATEWAY,
-            msg: format!("供应商错误 {}: {}", status.as_u16(), data),
+            // 上游原文里可能有中转商的主机名、请求 URL，有些还会把 Authorization 回显。
+            // 走和别处同一个脱敏函数，别把它整个丢给浏览器。
+            msg: format!(
+                "供应商错误 {}: {}",
+                status.as_u16(),
+                safe_upstream_error_excerpt(&raw.to_lowercase())
+            ),
         });
     }
     let ids: Vec<String> = data
@@ -3211,10 +3328,24 @@ pub async fn admin_update(
         .model_prices
         .filter(|v| v.is_object())
         .unwrap_or(m.model_prices);
-    let protocol = match req.protocol.as_deref() {
-        Some("openai") => "openai".to_string(),
-        Some("anthropic") => "anthropic".to_string(),
-        _ => m.protocol, // unspecified → keep existing
+    // 认不出的值**必须报错**，不能静默保留原值。
+    //
+    // 这里之前是对 "openai" / "anthropic" 的大小写敏感精确匹配，其它一律落到
+    // `_ => m.protocol`：填了 "Anthropic"、" openai" 或者拼错，保存返回成功、
+    // 值一个字没变，而运维以为切过去了。下一步的表现是拼出 /chat/completions
+    // 打给只认 /v1/messages 的上游，报一个看不懂的 404。
+    //
+    // 出口那侧的 `clean_protocol` 一直是这么做的（trim + 小写 + 400），
+    // 同一个字段在两个表单里行为相反，是这次要消掉的东西。
+    let protocol = match req.protocol.as_deref().map(|p| p.trim().to_ascii_lowercase()) {
+        None => m.protocol,                       // 没传 = 不改
+        Some(p) if p.is_empty() => m.protocol,    // 传了空串 = 不改，和没传同义
+        Some(p) if p == "openai" || p == "anthropic" => p,
+        Some(p) => {
+            return Err(AppError::bad(format!(
+                "上游协议只能是 anthropic 或 openai（收到「{p}」）"
+            )))
+        }
     };
     // 没传就保持原值——和上面 protocol 一样的语义，别让一次只改价格的保存把开关关掉。
     let effort_passthrough = req.effort_passthrough.unwrap_or(m.effort_passthrough);
@@ -3737,8 +3868,60 @@ pub async fn chat(
     // model_usage with NULL mode/tool_turn and the routing report silently under-counts.
     tokens.mode = step_mode(&headers);
     tokens.tool_turn = step_is_tool_turn(&body);
-    bill(&state, uid, model.id, cost, use_quota, &tokens, free_pool, free_micro).await;
+    bill(&state, uid, model.health_id(), model.id, cost, use_quota, &tokens, free_pool, free_micro)
+        .await;
     Ok(Json(data))
+}
+
+/// POST /api/admin/models/sort —— 一次把所有线路的先后次序写进去。
+///
+/// # 这个次序不只是显示顺序
+///
+/// `ORDER BY sort, created_at` 同时决定**同一个模型被两条线路开放时谁接单** ——
+/// 也就是用户按谁的倍率付钱。所以这里必须是**一个事务，全写或全不写**：写一半的话，
+/// 库里的次序是两次意图的混合体，而那个混合体完全可能把某条贵线路推到第一位，
+/// 静默改变计费，而界面上没有任何地方看得出来。
+///
+/// 每一条都要求 `rows_affected() == 1`：id 对不上就整批回滚。少写一条就是次序错一格，
+/// 而次序错一格正好是上面那个后果。
+pub async fn admin_sort(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<SortReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    if req.order.is_empty() {
+        return Err(AppError::bad("没有要排的线路"));
+    }
+    if req.order.len() > 500 {
+        return Err(AppError::bad("一次排不了这么多线路"));
+    }
+    let mut tx = state.db.begin().await?;
+    for item in &req.order {
+        let r = sqlx::query("UPDATE models SET sort = $2 WHERE id = $1")
+            .bind(item.id)
+            .bind(item.sort)
+            .execute(&mut *tx)
+            .await?;
+        if r.rows_affected() != 1 {
+            // 事务在这里被丢弃 = 回滚。整批不写，比写一半强得多。
+            return Err(AppError::bad("有一条线路已经不存在了，顺序没保存，请刷新重试"));
+        }
+    }
+    tx.commit().await?;
+    tracing::info!(routes = req.order.len(), "线路次序已更新");
+    Ok(Json(serde_json::json!({ "ok": true, "routes": req.order.len() })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SortReq {
+    pub order: Vec<SortItem>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SortItem {
+    pub id: uuid::Uuid,
+    pub sort: i32,
 }
 
 // ---------- admin: usage stats ----------
@@ -6333,9 +6516,26 @@ pub(crate) enum BillOutcome {
 
 /// 正常计费入口：**保持原签名不变**（4 个调用点与源断言零改动）。每次生成唯一 settlement_id，
 /// 失败则入队后台恢复。返回值在 fire-and-forget 调用点被忽略，但 resettle 会用到。
+/// 结算一次调用。
+///
+/// # 出口用量为什么写在这里面
+///
+/// 它以前挂在 `chat_completions` 的**流式那一支**上，而 `bill` 有四个调用点
+/// （旧接口、流式、非流式、/responses）。后果是对账的成本侧只收到了一部分流量 ——
+/// 实测 2026-08-26，hanhegufei 一天里计费流水 1,333 次 / 7815 万 token，
+/// 而按模型记账只有 132 次 / 776 万：**deepseek、glm、claude 一条都没记进去**，
+/// 只有走流式的 grok 记了一部分。
+///
+/// 于是「账单核对」拿十分之一的成本去比全部的余额下降，报出 +2156%
+/// 「中转扣的和它自己的价目表对不上」—— 一句冤枉人的话，而且没有任何地方会报错。
+///
+/// 搬进来之后，「扣了钱但没记账」在**结构上**不可能发生：钱和账出自同一次调用。
+/// 它仍然是 spawn 出去的火后不管，钱的路径不多等一次写。
 async fn bill(
     state: &AppState,
     uid: uuid::Uuid,
+    // 出口 id（线路自带地址就用线路 id，和 health_id 同一套命名空间）。
+    health_id: uuid::Uuid,
     conn_id: uuid::Uuid,
     cost: i64,
     use_quota: bool,
@@ -6348,6 +6548,19 @@ async fn bill(
         state, uid, conn_id, cost, use_quota, tokens, free_pool, free_micro_usd, settlement_id, false,
     )
     .await;
+    // 模型名取 `tokens.model_name` —— 和写进 model_usage 的**同一个字段**。
+    // 各调用点各传一个的话，两张表会记成两个模型名，而对账按名字对。
+    crate::route_endpoints::note_endpoint_usage(
+        state,
+        health_id,
+        conn_id,
+        &tokens.model_name,
+        cost,
+        tokens.prompt,
+        tokens.completion,
+        tokens.cached,
+        tokens.cache_creation,
+    );
 }
 
 /// 从队列重跑一笔失败结算：**复用**存下的 settlement_id（认领幂等，重跑绝不双扣），
@@ -8593,6 +8806,7 @@ pub async fn chat_completions(
             bill(
                 &state,
                 uid,
+                primary_conn.health_id(),
                 primary_conn.id,
                 0,
                 use_quota,
@@ -8833,12 +9047,39 @@ pub async fn chat_completions(
         }
         ordered_candidates.extend(cooled_candidates);
 
-        // 取到「答复过一次错误」允许的上限；真正能不能走到第二条，由每一轮末尾那句
-        // `upstream_answered_with_error` 决定——卡死和发送出错仍然只发一次就收手。
+        // 「400 就不换线」那道闸要**按协议**判，见下方 break 'routes 处的长注释。
+        // 这里先把即将遍历的协议序列抄一份：循环体里拿不到「后面还剩谁」，而
+        // ordered_candidates 会被 into_iter 消费掉。
+        let candidate_protocols: Vec<String> = ordered_candidates
+            .iter()
+            .take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)
+            .map(|c| c.protocol.clone())
+            .collect();
+        let mut candidate_index: usize = 0;
+
+        // 能换几个出口由**时间**决定，不由次数决定（见 CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP）。
+        // 真正能不能走到下一个，仍然由每一轮末尾那句 `upstream_answered_with_error` 决定
+        // ——卡死和发送出错依旧只发一次就收手，那两种情况下上游可能正在跑这次请求。
         'routes: for candidate in ordered_candidates
             .into_iter()
-            .take(CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED)
+            .take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)
         {
+            let this_index = candidate_index;
+            candidate_index += 1;
+            // 预算不够开下一次尝试就收手。
+            //
+            // 只在**已经发过**至少一次之后才判：一次都没发就因为「时间不够」放弃，
+            // 等于把请求直接打死，而这条链路上到处都写着「全都不可用时照样发第一个」。
+            let left = route_deadline.saturating_duration_since(Instant::now());
+            if attempted_sends > 0 && left < CHAT_UPSTREAM_MIN_TRY_WINDOW {
+                tracing::info!(
+                    model = %model_id,
+                    attempted_sends,
+                    left_ms = left.as_millis() as u64,
+                    "本轮预算用完了，不再换下一个出口"
+                );
+                break 'routes;
+            }
             // 这条线路是不是**完整地回了一个错误响应**。只有它为真时才允许换下一条。
             let mut upstream_answered_with_error = false;
             // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
@@ -9246,17 +9487,47 @@ pub async fn chat_completions(
                         // are per-route credentials, and another route may well be fine.)
                         if err_status == 400
                             && !upstream_capacity_wording(&err_low)
+                            // 中转转发它自己上游的失败 —— 那不是我们请求的问题，
+                            // 换一家很可能就好。见 upstream_relayed_failure_wording。
+                            && !upstream_relayed_failure_wording(&err_low)
                             && (err_low.contains("invalid_request_error")
                                 || err_low.contains("is not supported for this model")
                                 || err_low.contains("extra inputs are not permitted")
                                 || err_low.contains("unexpected keyword"))
                         {
+                            // **只有当后面没试过的候选都和它同协议时，这条推理才成立。**
+                            //
+                            // 上面那句注释的前提是「the same body will be rejected by every
+                            // remaining candidate」。可 body 是**逐候选翻译**的：
+                            // candidate_upstream_body 在循环体内按 candidate.protocol 现算
+                            // （见本函数上方的分派点）。协议一换，发出去的就是另一份形状完全
+                            // 不同的 body —— 一个 openai 出口说「invalid_request_error」，
+                            // 对一条 anthropic 或 xai_responses 出口没有任何预测力。
+                            //
+                            // 今天就已经在过度杀伤：同一个 model id 同时挂 anthropic 和 openai
+                            // 出口是常态，openai 那支因为多带了个字段被 400，整轮就此硬失败，
+                            // 而 anthropic 那支本来会成功。用户看到的是「上游拒绝了请求，
+                            // 原样重发不会变好」——而换一条线其实就好了。
+                            //
+                            // 同协议时行为一个字不变：仍然立刻 break，不把一次坏请求乘以线路数。
+                            let rest_same_protocol = candidate_protocols
+                                .iter()
+                                .skip(this_index + 1)
+                                .all(|p| p == &candidate.protocol);
+                            if rest_same_protocol {
+                                tracing::warn!(
+                                    model = %model_id,
+                                    excerpt = %safe_upstream_error_excerpt(&err_low),
+                                    "upstream rejected the request body; not failing over"
+                                );
+                                break 'routes;
+                            }
                             tracing::warn!(
                                 model = %model_id,
+                                rejected_protocol = %candidate.protocol,
                                 excerpt = %safe_upstream_error_excerpt(&err_low),
-                                "upstream rejected the request body; not failing over"
+                                "upstream rejected the request body; still trying candidates on other protocols"
                             );
-                            break 'routes;
                         }
                         // 上游说「现在不行」的两种：没额度、密钥被拒。
                         //
@@ -9876,12 +10147,10 @@ pub async fn chat_completions(
                     note_response_cache(ResponseCacheEvent::Store, &req_model);
                 }
             }
-            bill(&st, uid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
-            // 出口用量：火后不管，丢几条无所谓。绝不放进结算事务——为了一个报表
-            // 让钱的路径多一次写，不划算。
-            crate::route_endpoints::note_endpoint_usage(
-                &st, hid, cid, &req_model, cost, tokens.prompt, tokens.completion, tokens.cached,
-            );
+            bill(&st, uid, hid, cid, cost, use_quota, &tokens, free_pool, free_micro).await;
+            // 出口用量的写入点**只有一个**，在 `bill` 里面。原来挂在这一支上，
+            // 而 bill 有五个调用点 —— 只有走流式的请求进了对账，其余四条路的
+            // 流量在成本侧凭空消失。见 bill 的文档。
         });
         let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
@@ -10015,7 +10284,8 @@ pub async fn chat_completions(
             tokens.emitted_tool = step_emitted_tool(&serde_json::to_string(&data).unwrap_or_default());
             (cost, tokens)
         };
-        bill(&state, uid, conn.id, cost, use_quota, &tokens, free_pool, free_micro).await;
+        bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro)
+            .await;
         let mut resp = Json(data).into_response();
         if let Some((tok, covered)) = compression_prefix.as_ref() {
             if let Ok(v) = axum::http::HeaderValue::from_str(tok) {
@@ -10233,7 +10503,9 @@ pub async fn responses_proxy(
 
     // Bill: image models = per-image (per_call_cents if set, else 30分×倍率), text = per-token.
     if !has_error {
-        if is_image_gen_model(&model_id) {
+        // 两个条件缺一不可：模型像画图模型，**而且这次返回里真的有图**。
+        // 只看模型名的话，一个没被注入出图工具、返回纯文本的请求会被按图收钱。
+        if is_image_gen_model(&model_id) && responses_output_has_image(&data) {
             let mut n_images = data
                 .get("output")
                 .and_then(|o| o.as_array())
@@ -10243,8 +10515,9 @@ pub async fn responses_proxy(
                         .count() as f64
                 })
                 .unwrap_or(0.0);
-            // Non-OpenAI image models (e.g. gemini-*-image) may not emit `image_generation_call`;
-            // a successful image call still costs → bill at least 1 image, never $0.
+            // 走到这里已经确认**响应里有图**（见 responses_output_has_image）。
+            // 非 OpenAI 的实现可能不报 `image_generation_call`，数不出张数时按一张收。
+            // 这个兜底的前提是「确实出了图」—— 而那正是上面那个条件在保证的事。
             if n_images == 0.0 {
                 n_images = 1.0;
             }
@@ -10256,6 +10529,7 @@ pub async fn responses_proxy(
             bill(
                 &state,
                 uid,
+                conn.health_id(),
                 conn.id,
                 cost,
                 use_quota,
@@ -10293,7 +10567,8 @@ pub async fn responses_proxy(
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
             tokens.request_id = request_id.clone();
-            bill(&state, uid, conn.id, cost, use_quota, &tokens, free_pool, free_micro).await;
+            bill(&state, uid, conn.health_id(), conn.id, cost, use_quota, &tokens, free_pool, free_micro)
+                .await;
         }
     }
 
@@ -10529,6 +10804,7 @@ pub async fn image_generations(
                 bill(
                     &state,
                     uid,
+                    conn.health_id(),
                     conn.id,
                     cost,
                     use_quota,
@@ -10560,6 +10836,101 @@ pub async fn image_generations(
 
 #[cfg(test)]
 mod billing_tests {
+    /// 拉模型列表这条路不许回显上游 URL 或原始错误体。
+    ///
+    /// reqwest 的错误链带完整 URL，而有些转卖商要求把密钥写在查询串里；上游的错误
+    /// JSON 里则常有中转商的主机名，个别还会把 Authorization 原样回显。
+    /// 另外两处同样功能的实现一直守着这条纪律（route_endpoints 那份还有专门的测试），
+    /// **只有这一处漏了** —— 同一件事三份实现，漏的那份没人看得见。
+    #[test]
+    fn the_route_model_list_never_echoes_the_url_or_the_upstream_body() {
+        let src = include_str!("models.rs");
+        let i = src.find("let url = format!(\"{}/models\", api_base(&m.base_url));")
+            .expect("线路页拉模型列表那段不见了");
+        let body = &src[i..i + 2000];
+        assert!(
+            !body.contains("拉取模型列表失败: {e}"),
+            "又把 reqwest 的错误原文回显了 —— 它带完整 URL",
+        );
+        assert!(
+            body.contains("safe_upstream_error_excerpt("),
+            "上游错误体没走脱敏就丢给浏览器了",
+        );
+        // 双头：只发 Authorization 的话，认 x-api-key 的中转在这一页会 401，
+        // 而同一个地址在出口窗口能拉到 —— 运维会以为线路密钥坏了。
+        assert!(
+            body.contains(r#".header("x-api-key", &key)"#),
+            "少发 x-api-key —— anthropic 口径的中转在这一页会假报密钥错误",
+        );
+    }
+
+    /// 线路保存时 protocol 填错必须报错，不能静默保留原值。
+    ///
+    /// 出口那侧的 clean_protocol 一直是 trim + 小写 + 400；线路这侧原来是大小写敏感
+    /// 精确匹配、认不出就 `_ => m.protocol`。同一个字段两个表单行为相反：
+    /// 出口填错当场红，线路填错**保存成功但一个字没变**，而运维以为切过去了。
+    #[test]
+    fn a_bad_protocol_on_a_route_is_rejected_not_silently_kept() {
+        let src = include_str!("models.rs");
+        let i = src.find("let protocol = match req.protocol.as_deref()")
+            .expect("线路 protocol 校验不见了");
+        let body = &src[i..i + 900];
+        assert!(
+            body.contains("trim().to_ascii_lowercase()"),
+            "没有 trim + 小写 —— \" openai\" 和 \"Anthropic\" 会被判成非法值",
+        );
+        assert!(
+            body.contains("AppError::bad(format!("),
+            "认不出的值又被静默吞掉了 —— 保存会显示成功而值没变",
+        );
+        // 「没传」和「传了非法值」必须是两条路。
+        assert!(
+            body.contains("None => m.protocol"),
+            "没传也被当成非法值了 —— 一次只改价格的保存会被拒",
+        );
+    }
+
+    /// 没有图的证据就不许按图收钱。
+    ///
+    /// 修的是一次真实的扣错钱：`responses_proxy` 里对「是不是画图模型」有两份判据 ——
+    /// 注入 image_generation 工具那处只认 gpt-image / dall-e（那是 OpenAI 的构造，
+    /// 塞给别家会把请求打坏），计费那处还认 `-image` / `image-preview`。于是
+    /// `gemini-*-image` 这类模型**没被注入出图工具、返回纯文本**，却走进画图计费，
+    /// 而那里还有一句「数不到就按至少一张收」的兜底 —— 用户拿到一段文字，
+    /// 被按出图价扣了钱。
+    #[test]
+    fn a_text_only_response_is_never_billed_as_an_image() {
+        let text_only = serde_json::json!({
+            "output": [{ "type": "message", "content": [{ "type": "output_text", "text": "hi" }] }]
+        });
+        assert!(
+            !super::responses_output_has_image(&text_only),
+            "纯文本响应被判成有图 —— 会按出图价扣钱",
+        );
+
+        // 三种「真的有图」的形态都要认出来，否则真出了图反而不收钱。
+        for shape in [
+            serde_json::json!({ "output": [{ "type": "image_generation_call" }] }),
+            serde_json::json!({ "output": [{ "type": "message",
+                "content": [{ "type": "output_image", "image_url": "x" }] }] }),
+            serde_json::json!({ "output": [{ "type": "message",
+                "content": [{ "type": "image", "b64_json": "x" }] }] }),
+        ] {
+            assert!(super::responses_output_has_image(&shape), "有图却没认出来：{shape}");
+        }
+
+        // 看不懂的响应（没有 output）按「没有图」处理：宁可少收，
+        // 也不能对着一个我们读不懂的响应按出图价扣钱。
+        assert!(!super::responses_output_has_image(&serde_json::json!({})));
+
+        // 计费判据必须同时要求「像画图模型」和「真的有图」。
+        let src = include_str!("models.rs");
+        assert!(
+            src.contains("is_image_gen_model(&model_id) && responses_output_has_image(&data)"),
+            "计费又只看模型名了 —— 纯文本响应会被按图收钱",
+        );
+    }
+
 
     /// SSE 拼文本 + 捞 usage。usage 丢了这条路径就是按 0 结账。
     #[test]
@@ -10596,7 +10967,7 @@ mod billing_tests {
     use super::{
         anthropic_effort_word, anthropic_thinking,
         anthropic_thinking_with_display, anthropic_to_oai,
-        body_text_bytes, upstream_capacity_wording,
+        body_text_bytes, upstream_capacity_wording, upstream_relayed_failure_wording,
         oai_to_anthropic_with_cache, chat_upstream_attempt_suffix,
         chat_upstream_retry_base_delay_ms, claude_generation, clip_thinking_budget, compute_cost,
         is_image_gen_model, official_max_output, official_contexts, model_caps_override,
@@ -10608,7 +10979,8 @@ mod billing_tests {
         telemetry_thinking_type,
         tool_argument_rules, upstream_failure_status, validate_openai_sse_eof,
         validate_openai_sse_with_rules, AnthSse, FusedCharge, OpenAiSseValidator,
-        CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED,
+        CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP,
+        CHAT_UPSTREAM_MIN_TRY_WINDOW,
         THINKING_CLIP_ROUTES, THINKING_CLIP_SAFE_BUDGET, THINKING_CLIP_SAFE_EFFORT,
     };
 
@@ -11016,17 +11388,77 @@ mod billing_tests {
         );
     }
 
-    /// 上游**明确回了错误**时要换一条同模型线路。
+    /// 换出口的闸是**时间**，不是次数。
     ///
-    /// 这是原来那条规矩被套错了地方的部分：40 小时里 48 次 GPT 502 全都写着
-    /// `route_count=2 attempted_sends=1`，旁边那条线路一次都没试过；那把失效的 key
-    /// （`invalid_api_key` → 424）同理，落到它上面的请求直接判死。
+    /// # 这条守的是什么
+    ///
+    /// 上游明确回了错误时才换线（卡死和发送出错不换，那两种情况上游可能正在跑）。
+    /// 而这类失败恰恰是最便宜的：401 / 404 / 429 两三百毫秒就回来。用次数封顶等于
+    /// 把「便宜的失败」和「昂贵的失败」按同一个价钱计费。
+    ///
+    /// 上一版封在 2。后果很具体：一条线路挂十五个出口，第 3 个往后**永远轮不到** ——
+    /// 配了等于没配，而且没有任何地方会报错，只表现为「那些出口一直没流量」。
+    ///
+    /// 现在的闸是 `route_deadline`：由客户端自己的耐心算出来，而每一次尝试的表头
+    /// 等待都被剩余预算夹住。多试几个不会让用户多等 —— 天花板早就由时间定死了。
+    /// 次数上限留着，但它是防跑飞的兜底，不该在正常配置下被够到。
     #[test]
-    fn an_answered_error_may_fail_over_to_one_more_route() {
-        assert_eq!(CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED, 2);
+    fn failover_is_bounded_by_time_not_by_a_count_of_two() {
         assert!(
-            CHAT_UPSTREAM_MAX_ROUTES_WHEN_ANSWERED > 1,
-            "只取一条候选的话，上面那句换线判定永远走不到",
+            CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP >= 12,
+            "兜底上限低到会挡住正常配置（用户一条线路就挂十五个出口）—— \
+             那它就不是兜底，是策略上限，而策略上限该由时间来定",
+        );
+        assert!(
+            CHAT_UPSTREAM_MIN_TRY_WINDOW >= std::time::Duration::from_secs(1),
+            "留给下一次尝试的窗口太小，开了也拿不回答案",
+        );
+
+        // 按花括号取 `chat_completions` 的函数体。
+        //
+        // 不能用「切到第一个 #[cfg(test)] 为止」—— models.rs 里 `#[cfg(test)]` 是**逐项**
+        // 出现的（第一个在 804 行），那样切会把生产代码腰斩在换线循环之前，于是这条
+        // 测试红在一个根本不存在的问题上。第一版就是这么写的，当场就红了。
+        //
+        // 取函数体同时也解决了自我印证：断言的字面量写在测试模块里，不在这个函数体内。
+        let all = include_str!("models.rs");
+        // 从签名截到**下一个** `pub async fn` 为止 —— 这个文件里已有的做法
+        // （见 fn_body）。不用花括号配平：chat_completions 上千行、满是带花括号的
+        // JSON 字面量和 format! 模板，配平会跑到文件末尾去，第一版就是这么炸的。
+        let at = all
+            .find("pub async fn chat_completions(")
+            .expect("网关主函数不见了");
+        let rest = &all[at..];
+        let end = rest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("'routes: for candidate in ordered_candidates"),
+            "换线那个循环的形状变了 —— 这条测试已经不在看真正的换线逻辑了",
+        );
+        // 常量大不等于真的用上了。把 `.take(2)` 写回去而常量不动，行为照样退回原样，
+        // 而上面那条 `>= 12` 的断言完全看不出来。
+        assert!(
+            body.contains(".take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)"),
+            "循环没在用那个兜底上限 —— 多半是又写死了一个小数字，出口白配",
+        );
+        // 闸必须是时间。
+        assert!(
+            body.contains("if attempted_sends > 0 && left < CHAT_UPSTREAM_MIN_TRY_WINDOW"),
+            "预算判据不见了 —— 只剩次数封顶的话，要么用不满出口，要么烧穿客户端的耐心",
+        );
+        // 第一次尝试**永远**发得出去：一次都没发就因为「时间不够」放弃等于把请求打死。
+        assert!(
+            body.contains("attempted_sends > 0 &&"),
+            "预算判据没有排除「一次都还没发」的情况 —— 那会在预算紧时直接把请求打死",
+        );
+        // 换线仍然只在上游把话说完时发生。这条和上面那条是一对：放开次数的同时
+        // 绝不能放开「什么时候允许换」，否则卡死的请求会被重复发给下一个出口。
+        assert!(
+            body.contains("if !upstream_answered_with_error {"),
+            "换线判定被改了 —— 放开次数之后这条更要紧：卡死重发就是重复跑模型、重复计费",
         );
     }
 
@@ -11234,6 +11666,227 @@ mod billing_tests {
         assert_eq!(
             upstream_failure_status(500, "no available provider account"),
             StatusCode::FAILED_DEPENDENCY,
+        );
+    }
+
+    /// 「400 就不换线」那道闸必须**按协议**判。
+    ///
+    /// 它的推理原文是「the same body will be rejected by every remaining candidate」。
+    /// 可 body 是**逐候选翻译**的：candidate_upstream_body 在循环体内按 candidate.protocol
+    /// 现算。协议一换，发出去的就是另一份形状完全不同的 body——一个 openai 出口说
+    /// 「invalid_request_error」，对一条 anthropic 出口没有任何预测力。
+    ///
+    /// 这不是为新协议预留的：同一个 model id 同时挂 anthropic 和 openai 出口是常态，
+    /// 今天就已经在过度杀伤——openai 那支因为多带了个字段被 400，整轮硬失败，而
+    /// anthropic 那支本来会成功。用户看到「上游拒绝了请求，原样重发不会变好」，
+    /// 而换一条线其实就好了。
+    #[test]
+    fn a_body_rejection_only_stops_failover_within_the_same_protocol() {
+        let all = include_str!("models.rs");
+        let at = all
+            .find("upstream rejected the request body; not failing over")
+            .expect("那道闸的日志不见了 —— 这条断言失去落点");
+        // 往前切到判据开头：`if err_status == 400`。窗口按**锚点**取，不按字符数，
+        // 因为这一段的注释很长（本仓库踩过固定窗口的坑）。
+        let start = all[..at]
+            .rfind("if err_status == 400")
+            .expect("400 判据不见了");
+        let gate = &all[start..at];
+
+        assert!(
+            gate.contains("let rest_same_protocol = candidate_protocols"),
+            "那道闸又变回协议盲的了 —— 混协议候选下会把本来能成功的请求打成硬失败",
+        );
+        assert!(
+            gate.contains(".skip(this_index + 1)") && gate.contains("|p| p == &candidate.protocol"),
+            "判据必须是「后面**没试过**的候选是否都同协议」，不是「全体候选」也不是「前面的」",
+        );
+        // 同协议时行为一个字不变：仍然立刻 break。
+        assert!(
+            all[at..].contains("break \'routes;"),
+            "同协议时不再 break —— 一次坏请求会被乘以线路数",
+        );
+        // 换协议继续时必须留下痕迹，否则「为什么又发了一次」在日志里查不到。
+        assert!(
+            all.contains("still trying candidates on other protocols"),
+            "跨协议继续换线没有日志",
+        );
+
+        // 协议序列必须在循环**外**抄好：循环体里拿不到「后面还剩谁」，
+        // 而 ordered_candidates 会被 into_iter 消费掉。
+        assert!(
+            all.contains("let candidate_protocols: Vec<String> = ordered_candidates"),
+            "协议序列没有在进循环前抄好",
+        );
+        assert!(
+            all.contains(".take(CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP)\n            .map(|c| c.protocol.clone())"),
+            "抄协议序列时没有按同一个上限截断 —— 下标会和真实遍历错位",
+        );
+    }
+
+    /// 改次序必须**全写或全不写**，而且新线路要排到最后。
+    ///
+    /// # 为什么这是钱的事，不是显示的事
+    ///
+    /// 服务端到处是 `ORDER BY sort, created_at`，挑主线路取 `candidates.first()`。
+    /// 同一个模型被两条普通线路开放时，**排在前面的那条接单，用户按它的倍率付钱**。
+    ///
+    /// 所以两条：
+    ///   · 批量写必须在一个事务里，每条都要 `rows_affected() == 1`。写一半的话，
+    ///     库里的次序是两次意图的混合体，而混合体完全可能把一条贵线路顶到第一位。
+    ///   · 新建的线路必须排到**最后**。这一列长期全是 0（次序实际由 created_at 决定），
+    ///     一旦排过序变成 10/20/30…，再用 0 建一条就会让它跳到第一位 ——
+    ///     「我先加一条试试」当场改掉线上账单，而没有任何地方报错。
+    #[test]
+    fn reordering_routes_is_all_or_nothing_and_new_ones_go_last() {
+        let all = include_str!("models.rs");
+        let at = all
+            .find("pub async fn admin_sort(")
+            .expect("排序接口不见了");
+        let body = &all[at..at + all[at..].find("\n// ----------").unwrap_or(3000)];
+
+        assert!(body.contains("state.db.begin()"), "批量改次序没开事务 —— 会写出半套次序");
+        assert!(
+            body.contains("if r.rows_affected() != 1"),
+            "没检查每一条真的写进去了；少写一条就是次序错一格，而次序错一格会改计费",
+        );
+        assert!(
+            body.contains("tx.commit()"),
+            "开了事务却没提交",
+        );
+
+        // 新建那一支：不许再退回 0。
+        let create = all
+            .find("pub async fn admin_create(")
+            .expect("新建接口不见了");
+        let crest = &all[create..];
+        let cend = crest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(crest.len());
+        let cbody = &crest[..cend];
+        assert!(
+            !cbody.contains(".bind(req.sort.unwrap_or(0))"),
+            "新建线路又默认排到第一位了 —— 排过序之后，这会让每条新线路抢走同名模型的流量",
+        );
+        assert!(
+            cbody.contains("SELECT max(sort) FROM models"),
+            "新建线路没有去看当前最大的次序，排不到最后",
+        );
+    }
+
+    /// **扣了钱就一定记了账。** 出口用量的写入点只许有一个，且必须在 `bill` 里面。
+    ///
+    /// # 这条钉的是一次让对账整体失真的漏记
+    ///
+    /// `note_endpoint_usage` 原来挂在 `chat_completions` 的**流式那一支**上，
+    /// 而 `bill` 有九个调用点（旧接口、缓存命中、流式、非流式、画图、/responses、
+    /// 视觉、压缩…）。于是只有走流式的请求进了对账，其余全部在成本侧凭空消失。
+    ///
+    /// 实测 2026-08-26 的 hanhegufei（同一天、同一批线路）：
+    ///
+    /// | | 调用 | token |
+    /// |---|---|---|
+    /// | 计费流水 model_usage | 1,333 | 7,815 万 |
+    /// | 按模型记账 endpoint_model_usage | 132 | 776 万 |
+    ///
+    /// deepseek / glm / claude **一条都没记进去**。账单核对拿十分之一的成本去比
+    /// 全部的余额下降，报出 `+2156% ← 中转扣的和它自己的价目表对不上` ——
+    /// 一句自信、具体、而且冤枉人的话，并且没有任何地方会报错。
+    ///
+    /// 搬进 `bill` 之后，「扣了钱但没记账」在**结构上**不可能发生。
+    #[test]
+    fn every_billed_call_is_also_recorded_for_reconciliation() {
+        let all = include_str!("models.rs");
+        let prod = all
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or(all);
+
+        // 写入点只许有一个，而且在 bill 里。
+        assert_eq!(
+            prod.matches("note_endpoint_usage(").count(),
+            1,
+            "出口用量又有多个写入点了 —— 只要有一个分支漏调，对账的成本侧就少一块，\
+             而它表现为「这家中转在多收钱」，不是报错",
+        );
+        let at = prod.find("\nasync fn bill(").expect("结算函数不见了");
+        let rest = &prod[at..];
+        let end = rest[1..]
+            .find("\n/// ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("note_endpoint_usage("),
+            "出口用量不在 bill 里面了 —— 它会重新退化成「只有某一条路记账」",
+        );
+        // 模型名必须取和 model_usage 同一个字段，否则两张表按不同的名字记，
+        // 而对账是按名字对的。
+        assert!(
+            body.contains("&tokens.model_name"),
+            "记账用的模型名和计费用的不是同一个字段 —— 两张表会对不上",
+        );
+    }
+
+    /// 中转把**它自己上游的失败**转出来时，必须换线，不能当成「请求写错了」。
+    ///
+    /// # 线上实拍
+    ///
+    /// grok-4.6，2026-08-26：
+    /// `400 {"error":{"message":"upstream returned status 400","type":"invalid_request_error"}}`
+    ///
+    /// 三项全中那道闸：状态是 400、含 `invalid_request_error`、不是容量话术。
+    /// 于是 `break 'routes` —— 界面上写着「本次只试了 1 条线路，同模型另有 1 条没试过」。
+    /// 而那句话里没有一个字是关于请求内容的：它说的是它找它的上游要，被给了 400。
+    ///
+    /// 判据是**有没有点名**。真正的请求体错误说得出是哪儿不对；只回一个转发来的
+    /// 状态码的，是中转在说自己那一跳不行。
+    #[test]
+    fn a_relayed_upstream_status_is_not_a_bad_request_body() {
+        let real = r#"{"error":{"message":"upstream returned status 400","type":"invalid_request_error"}}"#
+            .to_lowercase();
+        assert!(
+            upstream_relayed_failure_wording(&real),
+            "认不出这是中转在转发它上游的失败",
+        );
+        // 老的那条例外救不了它 —— 它不是容量话术，所以必须有新的一条。
+        assert!(!upstream_capacity_wording(&real));
+        // 状态码不能照 400 发：客户端的重试判据不认 400，等于把客户端那层重试也关掉。
+        assert_eq!(
+            upstream_failure_status(400, &real),
+            StatusCode::BAD_GATEWAY,
+            "转发来的上游失败照 400 发下去，用户就只剩手动重发一条路",
+        );
+
+        // **真正的请求体错误必须照旧判死。** 放开得太宽的话，一份写错的 body 会被
+        // 挨个喂给所有线路，用户对着转圈等一遍，最后拿到同一个错误。
+        for named in [
+            "extra inputs are not permitted",
+            "\"thinking.type.enabled\" is not supported for this model.",
+            "unexpected keyword argument",
+        ] {
+            assert!(
+                !upstream_relayed_failure_wording(named),
+                "把点了名的请求体错误也当成转发失败了：{named}",
+            );
+            assert_eq!(upstream_failure_status(400, named), StatusCode::BAD_REQUEST);
+        }
+
+        // 闸里必须真的带上这个判据 —— 判据函数写对了但没接进去，行为一个字不变。
+        let all = include_str!("models.rs");
+        let at = all
+            .find("pub async fn chat_completions(")
+            .expect("网关主函数不见了");
+        let rest = &all[at..];
+        let end = rest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("&& !upstream_relayed_failure_wording(&err_low)"),
+            "换线闸里没有这条例外 —— 转发来的 400 还是会把整轮对话判死",
         );
     }
 
@@ -11902,9 +12555,14 @@ mod billing_tests {
             "免费分支和付费分支都得「放行靠哪个池子、结算就扣哪个」——少一处，那一支的会员\
              额度就永远扣不到，钱包被全额扣走",
         );
-        let bill_at = body.find("bill(&state, uid, model.id, cost,").expect("结算调用改名了");
+        // bill 的签名 2026-08-26 多了一个 health_id（出口用量搬进 bill 之后要它）。
+        // 这条守的不变量没变：**use_quota 必须原样传进去，不许写死 false**。
+        let bill_at = body
+            .find("bill(&state, uid, model.health_id(), model.id, cost,")
+            .expect("结算调用改名了");
         assert!(
-            body[bill_at..].starts_with("bill(&state, uid, model.id, cost, use_quota,"),
+            body[bill_at..]
+                .starts_with("bill(&state, uid, model.health_id(), model.id, cost, use_quota,"),
             "结算又写死成 false 了",
         );
         // 同一个坑的另一半：池子空不空要问"这一次付得起吗"。
@@ -12900,6 +13558,72 @@ mod billing_tests {
         }
     }
 
+    /// xAI 同样不收顶层 anyOf / oneOf / allOf —— 而且这条比 Anthropic 那条更难查。
+    ///
+    /// 2026-08-26 用户报「除了 grok 模型都能用」。真实上游错误（客户端看到的
+    /// `openai_error` 是中转盖上去的）：
+    ///   run_subagent: tool parameter root must be an object type
+    ///   (root schema is an anyof/oneof union with a non-object branch)
+    ///
+    /// 难查在于它**时好时坏**：中转在多个上游之间轮询，只有部分严格校验，
+    /// 同一条线路先两次 400、随后又 200，重发一次常常就过了，看着像线路抖动。
+    #[test]
+    fn no_shipped_tool_reaches_xai_with_a_top_level_branch() {
+        // 判据本身：三个带顶层分支的工具，剥完必须既没有分支、也没丢掉意思。
+        for name in ["local_discovery", "live_environment", "run_subagent"] {
+            let mut schema = json!({
+                "type": "object",
+                "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                "anyOf": [{ "required": ["a"] }, { "required": ["b"] }]
+            });
+            let note = strip_top_level_schema_branches(&mut schema)
+                .unwrap_or_else(|| panic!("{name}: 顶层分支没被剥掉"));
+            assert!(
+                schema.get("anyOf").is_none(),
+                "{name}: 剥完顶层还留着 anyOf，xAI 照样 400"
+            );
+            assert!(
+                note.contains("Provide exactly one of:"),
+                "{name}: 剥掉了却没生成二选一说明 —— 那是把约束直接扔了"
+            );
+        }
+        // 线路判据：经中转的 Grok（base_url 不含 x.ai）必须也认得出来。
+        // 线上那条实测是 mhapi.net —— 只看 URL 会漏掉全部经中转的 Grok。
+        assert!(super::_is_xai_route("grok-4.6", "https://mhapi.net"), "经中转的 Grok 没被认出来");
+        assert!(super::_is_xai_route("grok-4.5", "https://api.x.ai/v1"), "直连的 Grok 没被认出来");
+        assert!(super::_is_xai_route("some-alias", "https://api.x.ai/v1"), "别名模型走 x.ai 也要认");
+        assert!(!super::_is_xai_route("claude-opus-4-8", "https://api.anthropic.com"), "误伤了别家线路");
+        assert!(!super::_is_xai_route("gpt-5.6", "https://api.openai.com/v1"), "误伤了别家线路");
+
+        // 上面两组只验了「函数会剥」和「线路认得出」。真正要守的是**它被接在了发送路径上**
+        // ——本仓库为「写了但没人调用」栽过好几次，所以按源码钉住那个调用点。
+        // 剥完还必须把 note 并进 description：剥掉不等于把意思也扔了。
+        let src = include_str!("models.rs");
+        let call = src
+            .split("fn _is_xai_route")
+            .next()
+            .unwrap_or("")
+            .to_string()
+            + src.split("fn _is_xai_route").nth(1).unwrap_or("");
+        assert!(
+            call.contains("if _is_xai_route(&model_id, &candidate.base_url) {"),
+            "OpenAI 兼容那条发送路径上没有 xAI 分支 —— 剥离函数写了却没人调，Grok 照样 400"
+        );
+        assert!(
+            call.contains("strip_top_level_schema_branches(params)"),
+            "xAI 分支里没有真的调剥离函数"
+        );
+        assert!(
+            call.contains(r#"f.insert("description".into(), serde_json::Value::String(merged));"#),
+            "剥了却没把二选一说明并进 description —— 那是把约束直接扔了"
+        );
+        // 粘性路由那处也必须走同一份判据，别再手写第二遍（两份清单必漂）。
+        assert!(
+            call.contains("if _affinity && _is_xai_route(&model_id, &candidate.base_url) {"),
+            "x-grok-conv-id 那处还在手写自己的 grok 判据"
+        );
+    }
+
     // ---- Anthropic protocol bridge ----
     #[test]
     fn oai_to_anthropic_translates_system_tools_and_toolcalls() {
@@ -13142,71 +13866,6 @@ mod billing_tests {
         // disabling thinking for them would be the same bug pointed the other way.
         assert_eq!(anthropic_thinking("claude-opus-5", None), None);
 
-    /// xAI 同样不收顶层 anyOf / oneOf / allOf —— 而且这条比 Anthropic 那条更难查。
-    ///
-    /// 2026-08-26 用户报「除了 grok 模型都能用」。真实上游错误（客户端看到的
-    /// `openai_error` 是中转盖上去的）：
-    ///   run_subagent: tool parameter root must be an object type
-    ///   (root schema is an anyof/oneof union with a non-object branch)
-    ///
-    /// 难查在于它**时好时坏**：中转在多个上游之间轮询，只有部分严格校验，
-    /// 同一条线路先两次 400、随后又 200，重发一次常常就过了，看着像线路抖动。
-    #[test]
-    fn no_shipped_tool_reaches_xai_with_a_top_level_branch() {
-        // 判据本身：三个带顶层分支的工具，剥完必须既没有分支、也没丢掉意思。
-        for name in ["local_discovery", "live_environment", "run_subagent"] {
-            let mut schema = json!({
-                "type": "object",
-                "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
-                "anyOf": [{ "required": ["a"] }, { "required": ["b"] }]
-            });
-            let note = strip_top_level_schema_branches(&mut schema)
-                .unwrap_or_else(|| panic!("{name}: 顶层分支没被剥掉"));
-            assert!(
-                schema.get("anyOf").is_none(),
-                "{name}: 剥完顶层还留着 anyOf，xAI 照样 400"
-            );
-            assert!(
-                note.contains("Provide exactly one of:"),
-                "{name}: 剥掉了却没生成二选一说明 —— 那是把约束直接扔了"
-            );
-        }
-        // 线路判据：经中转的 Grok（base_url 不含 x.ai）必须也认得出来。
-        // 线上那条实测是 mhapi.net —— 只看 URL 会漏掉全部经中转的 Grok。
-        assert!(super::_is_xai_route("grok-4.6", "https://mhapi.net"), "经中转的 Grok 没被认出来");
-        assert!(super::_is_xai_route("grok-4.5", "https://api.x.ai/v1"), "直连的 Grok 没被认出来");
-        assert!(super::_is_xai_route("some-alias", "https://api.x.ai/v1"), "别名模型走 x.ai 也要认");
-        assert!(!super::_is_xai_route("claude-opus-4-8", "https://api.anthropic.com"), "误伤了别家线路");
-        assert!(!super::_is_xai_route("gpt-5.6", "https://api.openai.com/v1"), "误伤了别家线路");
-
-        // 上面两组只验了「函数会剥」和「线路认得出」。真正要守的是**它被接在了发送路径上**
-        // ——本仓库为「写了但没人调用」栽过好几次，所以按源码钉住那个调用点。
-        // 剥完还必须把 note 并进 description：剥掉不等于把意思也扔了。
-        let src = include_str!("models.rs");
-        let call = src
-            .split("fn _is_xai_route")
-            .next()
-            .unwrap_or("")
-            .to_string()
-            + src.split("fn _is_xai_route").nth(1).unwrap_or("");
-        assert!(
-            call.contains("if _is_xai_route(&model_id, &candidate.base_url) {"),
-            "OpenAI 兼容那条发送路径上没有 xAI 分支 —— 剥离函数写了却没人调，Grok 照样 400"
-        );
-        assert!(
-            call.contains("strip_top_level_schema_branches(params)"),
-            "xAI 分支里没有真的调剥离函数"
-        );
-        assert!(
-            call.contains(r#"f.insert("description".into(), serde_json::Value::String(merged));"#),
-            "剥了却没把二选一说明并进 description —— 那是把约束直接扔了"
-        );
-        // 粘性路由那处也必须走同一份判据，别再手写第二遍（两份清单必漂）。
-        assert!(
-            call.contains("if _affinity && _is_xai_route(&model_id, &candidate.base_url) {"),
-            "x-grok-conv-id 那处还在手写自己的 grok 判据"
-        );
-    }
 
         // A disabled turn must not collect the headroom meant for thinking, and the client's
         // explicit disable must read as "off" rather than as the bare-toggle "high".
@@ -16733,7 +17392,7 @@ async fn bill_vision_call(
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
     tokens.request_id = None;
-    bill(state, uid, vconn.id, cost, false, &tokens, false, 0).await;
+    bill(state, uid, vconn.health_id(), vconn.id, cost, false, &tokens, false, 0).await;
 }
 
 async fn bill_compression_call(
@@ -16773,7 +17432,7 @@ async fn bill_compression_call(
     // 零余额的用户扣成负数 —— 他被自己套餐包含的功能扣出了债。压缩省下来的输入
     // token 远多于摘要本身的花费，走额度对用户是净赚；而"额度少了一截"这件事，
     // 正确的解法是在用量页面把压缩单独列出来，不是把账记到钱包上。
-    bill(state, uid, conn.id, cost, true, &tokens, false, 0).await;
+    bill(state, uid, conn.health_id(), conn.id, cost, true, &tokens, false, 0).await;
 }
 
 #[cfg(test)]
@@ -17718,7 +18377,20 @@ mod power_route_tests {
             .split("轮询和计费整块搬进一个 spawn 出去的任务")
             .nth(1)
             .expect("生图轮询没有搬进 spawn —— 客户端一断计费就消失");
-        let region = &region[..region.len().min(6000)];
+        // **按结构边界收，不用固定窗口。**
+        //
+        // 原来是 `&region[..6000]`，两个毛病一次撞上：按字节切 UTF-8 会切在汉字中间
+        // 直接 panic（2026-08-26 就是这么红的），而换成固定字符数之后窗口又太短、
+        // 把要找的 `bill(` 关在外面 —— 两次都是「和它要防的 bug 毫无关系的假失败」。
+        //
+        // 收到**下一个函数定义**为止：那是这一段真正的尽头，函数变长它跟着长，
+        // 而且绝不会越界到别的函数里去误命中另一个 bill。
+        let end = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
+            .iter()
+            .filter_map(|m| region.find(m))
+            .min()
+            .unwrap_or(region.len());
+        let region = &region[..end];
         // **先剥注释再断言。** 上面那段解释里逐字写着 `bill(...)`，不剥的话它的位置比
         // spawn 还靠前，下面那条顺序断言会拿注释当代码、给出一个假的失败。
         // 这个坑在本仓库反复出现，注释里也记了好几次。
@@ -17867,6 +18539,70 @@ mod audit_20260822_tests {
     /// 中间——「只许有一份」这类计数断言必须扫全文，否则第六份副本长在测试模块之后就数不到。
     fn whole_gateway_code() -> String {
         strip_line_comments(&models_rs_source())
+    }
+
+    /// 「这个模型多少钱」这一列，必须**已经乘过线路倍率**。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 扣费是 `compute_cost` 最后一行的 `usd * 100.0 * rate` —— 单模型价 × 线路倍率。
+    /// 而后台「开放模型」展开后的那一列，上一版只画单模型价：线上 claude-opus-5 那格
+    /// 写 $15/$25，实际按 $37.5/$62.5 扣（倍率 2.5）。两个数分在两列里，没有人会在
+    /// 脑子里乘一遍 —— 于是一个专门用来回答「这个模型多少钱」的地方，答案是错的。
+    ///
+    /// 同一个毛病这文件里犯过一次（展示走连接兜底价、扣费走官方目录，卡片 $3/M、
+    /// 账单 $5/M），当时的结论就是**展示和扣费必须共用一个阶梯**。这条把它钉在测试里。
+    ///
+    /// 按次那一支**不该**乘：`cost_for` 里 per_call 直接 `return per_call_cents`，
+    /// 走不到乘倍率那行。所以这里也一起钉住「乘法只在按 token 那一支」。
+    #[test]
+    fn the_console_shows_the_price_after_the_route_multiplier() {
+        let ui = include_str!("../admin-ui/src/pages/Routing.tsx");
+        // 花括号配平取函数体，不切固定窗口 —— 函数一长，固定窗口就不再守着尾部，
+        // 而且还是绿的。
+        let body = {
+            let at = ui.find("function modelCost(").expect("modelCost 不见了");
+            let open = at + ui[at..].find('{').expect("没有函数体");
+            let b = ui.as_bytes();
+            let (mut d, mut i) = (0i32, open);
+            loop {
+                match b[i] {
+                    b'{' => d += 1,
+                    b'}' => {
+                        d -= 1;
+                        if d == 0 {
+                            break ui[open..=i].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        };
+
+        // 扣费那一行还在原样 —— 断言的前提没变。
+        assert!(
+            whole_gateway_code().contains("usd * 100.0 * rate.max(0.0)"),
+            "compute_cost 乘倍率那一行变了 —— 先确认新的形状，再改这条断言",
+        );
+        assert!(
+            body.contains("const r = c.rate ?? 1;"),
+            "modelCost 没取线路倍率 —— 这一列又会显示乘之前的价，和账单差好几倍",
+        );
+        for expr in ["(p.in || 0) * r", "(p.out || 0) * r"] {
+            assert!(
+                body.contains(expr),
+                "单模型价没乘倍率（缺 {expr}）—— 线上 opus-5 会显示 $15 而按 $37.5 扣",
+            );
+        }
+        // 按次那一支必须在取倍率之前就 return 掉。
+        let per_call_at = body.find(r#"mode === "per_call""#).expect("按次分支不见了");
+        let rate_at = body.find("const r = c.rate").expect("取倍率那行不见了");
+        assert!(
+            per_call_at < rate_at,
+            "按次分支跑到取倍率之后了 —— 按次不乘倍率（cost_for 里直接 return），\
+             顺序一反就会给按次的模型也乘一遍",
+        );
     }
 
     /// 从某个函数签名截到下一个 `pub async fn` 为止。
