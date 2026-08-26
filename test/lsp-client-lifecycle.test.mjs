@@ -480,3 +480,54 @@ test("didOpen 的取样在 await 之后，不在之前", () => {
   const iThen = seg.indexOf(".then((client)");
   assert.ok(iThen > 0 && iSample > iThen, "版本号仍在 then 之外取");
 });
+
+/**
+ * 安装命令表里不许有死命令 —— **mac 那半也要查**。
+ *
+ * 上面那条「这个平台上没有一键包时，不给一条注定失败的命令」的测试只切了 WIN_ONLY，
+ * MAC_ONLY 一个断言都没有。于是两条死命令活到了今天（2026-08-25 实测确证）：
+ *   · csharp: `brew install omnisharp` —— formula 和 cask 都不存在
+ *   · scala:  `brew install coursier && cs install metals` —— coursier 产出的命令叫
+ *     `coursier`，没有 `cs`；而 homebrew-core 直接就有 metals
+ *
+ * 代价不是"少一个提示"：用户点了安装，命令 1 秒内报错，进度卡还要转满 180 秒才说
+ * 「安装超时」，而这门语言的一键入口在**弹窗那一刻**就已经记账用掉了。
+ *
+ * **判据必须先剥注释**：这几张表旁边的注释里逐字引用着被修掉的旧命令
+ * （"omnisharp"、"cs install metals" 都在），不剥的话注释会把断言喂饱。
+ */
+function installTablesCodeOnly() {
+  const raw = source.slice(source.indexOf("const CROSS = {"), source.indexOf("const installHints ="));
+  // 行注释和块注释都剥掉，只留代码。
+  return raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}
+
+test("mac 的安装命令表里不许留死命令（和 Windows 那半对称）", () => {
+  const code = installTablesCodeOnly();
+  assert.ok(code.includes("const MAC_ONLY = {"), "找不到 MAC_ONLY 表");
+
+  // 两条实测确证的死命令，一个字都不许再出现在**代码**里。
+  assert.doesNotMatch(code, /brew install omnisharp/,
+    "csharp 的死命令回来了——brew 里没有 omnisharp 这个 formula，点了要等 180 秒才知道失败");
+  assert.doesNotMatch(code, /cs install metals/,
+    "scala 又变回两步了——coursier 产出的命令叫 coursier，没有 cs；homebrew 直接有 metals");
+  assert.match(code, /scala: "brew install metals"/, "scala 该走一步到位那条");
+
+  // mac 上 dart 明明有一键包，不许再落进「这个平台没有一键安装的包」那句假话。
+  assert.match(code, /dart: "brew install dart-sdk"/, "mac 上的 dart 又变回「没有包」了");
+  assert.match(code, /dart: "winget install -e --id Google\.DartSDK"/, "Windows 上的 dart 也该有");
+});
+
+test("每条 brew 命令装出来的东西，必须真的是要启动的那个二进制", () => {
+  // 这条守的是「装完照样报缺少」——本仓自己在 Windows 那半的注释里立过这条规矩
+  // （「包对不上二进制名的一律不加」），但从没套到 mac 这半。
+  const code = installTablesCodeOnly();
+  const mac = code.slice(code.indexOf("const MAC_ONLY = {"), code.indexOf("const WIN_ONLY = {"));
+  const pkgs = [...mac.matchAll(/(\w[\w-]*): "brew install ([^"]+)"/g)].map((m) => [m[1], m[2]]);
+  assert.ok(pkgs.length >= 8, `MAC_ONLY 只解析出 ${pkgs.length} 条，解析判据坏了`);
+  for (const [lang, cmd] of pkgs) {
+    assert.ok(!cmd.includes("&&"),
+      `${lang} 的安装命令是多步的（${cmd}）——多步意味着第二步的命令名没人核实过，scala 就是这么错的`);
+    assert.ok(!/\bcs\b/.test(cmd), `${lang} 的命令里出现了裸的 cs`);
+  }
+});
