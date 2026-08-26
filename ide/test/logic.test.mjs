@@ -35440,3 +35440,43 @@ test("内置档位不含 xhigh —— 那一档只在目录说有的时候才补
   assert.ok((merged("grok-4.6").levels || []).includes("xhigh"),
     "目录说有 xhigh，合并之后却没有 —— 用户选不到最高档");
 });
+
+/**
+ * 零产出的一轮不许被当成「模型决定收尾」。
+ *
+ * 2026-08-26 用户报「任务没做完，它自己就停止运行了，直接停那种，很奇怪；其他时候正常，
+ * 有些人也会遇到」。判据链原来是
+ * `!acc.trim() && byIndex.size === 0 && reasoningAcc.trim()` —— 只认「有思考、没正文」。
+ * 「思考也是空的」（上游干净结束但一个字都没吐）落进 else 拿到 err=null，主循环看到
+ * 零工具调用就当模型收尾，break，还把这次运行记成 success。
+ *
+ * 偶发是因为它取决于上游这一次吐不吐东西——换模型、换线路表现就不同，正好对上
+ * 「有些人也会遇到、其他时候正常」。
+ *
+ * 同一个产品的 chat 路径早就判对了（显式分「零输出」和「只有思考」两支，注释写着
+ * 「0ms 空回复：网关上游故障/路由冷却时常见」）。这条守 agent 那条别再漏。
+ */
+test("零产出的模型回合要打成错误，不能静默当成收尾", () => {
+  const turn = extractFn("_agentModelTurn");
+  assert.doesNotMatch(turn, /byIndex\.size === 0 && reasoningAcc\.trim\(\)/,
+    "空回合的判据又挂上 reasoningAcc 前提了——「思考也是空的」那一支会拿到 err=null，"
+    + "被主循环当成模型自己收尾，而且这次运行还会被记成 success");
+  const at = turn.indexOf("!acc.trim() && byIndex.size === 0)");
+  assert.ok(at > 0, "零产出那条分支不见了");
+  const blk = turn.slice(at, at + 1200);
+  assert.match(blk, /model-empty-output/,
+    "零产出没打 [model-empty-output] —— 下游那段自动重开一轮的处理就永远够不到它");
+  // 两种情形要分得开：光有思考 vs 什么都没有。文案不同，排障时能一眼看出是哪种。
+  assert.match(blk, /reasoningAcc\.trim\(\)\s*\?/,
+    "两种零产出用了同一句话——排障时分不出是「正文被丢了」还是「上游根本没回」");
+  assert.match(blk, /没有返回任何内容/, "「一个字都没吐」那一支没有自己的文案");
+});
+
+test("下游确实有一条为 [model-empty-output] 准备的自动重开", () => {
+  // 上面那条打的标记，必须真的有人接。本仓库为「写了但没人调用」栽过好几次。
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /_emptyOut = \/\^\\\[model-empty-output\\\]\/i\.test\(_turnErrTag\)/,
+    "接收端不见了 —— 那个标记会一路走到 finalErr，白白丢掉一次本可自动恢复的机会");
+  assert.match(loop, /_emptyOut \|\| _isRetryableAiError\(_turnErrRaw\)/,
+    "零产出没有并进自动重试的判据");
+});
