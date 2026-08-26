@@ -7,7 +7,7 @@ function _isExpectedCancellation(reason) {
 }
 window.addEventListener("error", (e) => {
   console.error("[michael-ide] uncaught:", e.error || e.message);
-  try { showToast?.(`Error: ${e.message}`, 5000); } catch { /* too early */ }
+  try { showToast?.(`Error: ${e.message}`, { duration: 5000 }); } catch { /* too early */ }
 });
 window.addEventListener("unhandledrejection", (e) => {
   // Monaco rejects pending word-highlighter work with its documented
@@ -24,10 +24,11 @@ window.addEventListener("unhandledrejection", (e) => {
     return;
   }
   console.error("[michael-ide] unhandled rejection:", e.reason);
-  try { showToast?.(`Unhandled: ${e.reason?.message || e.reason}`, 5000); } catch { /* too early */ }
+  try { showToast?.(`Unhandled: ${e.reason?.message || e.reason}`, { duration: 5000 }); } catch { /* too early */ }
 });
 
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
+import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor, splitCodeAndComments as _splitCodeAndComments } from "./agent/code-text.js";
 import {
@@ -7337,105 +7338,6 @@ let _mpmSqlHostEl = null;      // editor 挂载节点，每次 render 移动进�
 let _mpmSqlOverflowEl = null;  // suggest/hover 浮层的宿主，挂 body 以溢出弹窗边界
 let _mpmSqlProviderReg = false;
 
-// 各数据库方言分开：关键字 / 函数（带说明）/ 常用类型 / 长脚本模板。别把 SQLite 的
-// PRAGMA、MySQL 的 SHOW、PG 的 RETURNING 混着提示。
-const _MPM_DIALECT = {
-  sqlite: {
-    label: "SQLite",
-    keywords: ["SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IS NOT", "IN", "LIKE", "GLOB", "BETWEEN", "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "OFFSET", "DISTINCT", "AS", "ON", "JOIN", "LEFT JOIN", "INNER JOIN", "CROSS JOIN", "UNION", "UNION ALL", "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM", "CREATE TABLE", "ALTER TABLE", "DROP TABLE", "CREATE INDEX", "CREATE VIEW", "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "DEFAULT", "AUTOINCREMENT", "UNIQUE", "PRAGMA", "EXPLAIN", "EXPLAIN QUERY PLAN", "BEGIN", "COMMIT", "ROLLBACK", "CASE", "WHEN", "THEN", "ELSE", "END", "ASC", "DESC", "EXISTS", "CAST", "COLLATE", "WITH", "RETURNING", "VACUUM"],
-    types: ["INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC", "BOOLEAN"],
-    funcs: [
-      ["count", "count(X) — 统计行数/非空值数"], ["sum", "sum(X) — 求和"], ["avg", "avg(X) — 平均值"],
-      ["min", "min(X) — 最小值"], ["max", "max(X) — 最大值"], ["total", "total(X) — 求和（总返回浮点）"],
-      ["abs", "abs(X) — 绝对值"], ["round", "round(X, n) — 四舍五入"], ["length", "length(X) — 字符/字节长度"],
-      ["lower", "lower(X) — 转小写"], ["upper", "upper(X) — 转大写"], ["trim", "trim(X) — 去首尾空白"],
-      ["ltrim", "ltrim(X) — 去左空白"], ["rtrim", "rtrim(X) — 去右空白"],
-      ["coalesce", "coalesce(A, B, …) — 返回第一个非 NULL"], ["ifnull", "ifnull(A, B) — A 为 NULL 时返回 B"],
-      ["nullif", "nullif(A, B) — A=B 时返回 NULL"], ["substr", "substr(X, start, len) — 截取子串"],
-      ["replace", "replace(X, old, new) — 替换"], ["instr", "instr(X, sub) — 子串位置"],
-      ["hex", "hex(X) — 转十六进制"], ["typeof", "typeof(X) — 值类型"], ["random", "random() — 随机整数"],
-      ["date", "date('now') — 日期"], ["time", "time('now') — 时间"], ["datetime", "datetime('now', 'localtime') — 日期时间"],
-      ["strftime", "strftime('%Y-%m-%d', X) — 格式化时间"], ["julianday", "julianday(X) — 儒略日"],
-      ["unixepoch", "unixepoch(X) — Unix 时间戳"], ["group_concat", "group_concat(X, sep) — 拼接分组值"],
-      ["json_extract", "json_extract(X, '$.k') — 取 JSON 字段"], ["last_insert_rowid", "last_insert_rowid() — 最后插入的 rowid"],
-    ],
-    snippets: [
-      ["SELECT … FROM … WHERE", "SELECT ${1:*}\nFROM ${2:table}\nWHERE ${3:condition};"],
-      ["SELECT … JOIN", "SELECT ${1:*}\nFROM ${2:a}\nJOIN ${3:b} ON ${4:a.id} = ${5:b.a_id}\nWHERE ${6:1 = 1};"],
-      ["按列计数", "SELECT ${1:col}, COUNT(*) AS n\nFROM ${2:table}\nGROUP BY ${1:col}\nORDER BY n DESC;"],
-      ["INSERT INTO", "INSERT INTO ${1:table} (${2:col})\nVALUES (${3:value});"],
-      ["UPDATE … SET", "UPDATE ${1:table}\nSET ${2:col} = ${3:value}\nWHERE ${4:condition};"],
-      ["DELETE FROM", "DELETE FROM ${1:table}\nWHERE ${2:condition};"],
-      ["CREATE TABLE", "CREATE TABLE ${1:name} (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  ${2:col} ${3:TEXT}\n);"],
-      ["PRAGMA 表结构", "PRAGMA table_info(${1:table});"],
-    ],
-  },
-  mysql: {
-    label: "MySQL",
-    keywords: ["SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IS NOT", "IN", "LIKE", "BETWEEN", "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "DISTINCT", "AS", "ON", "JOIN", "LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "STRAIGHT_JOIN", "UNION", "UNION ALL", "INSERT INTO", "VALUES", "ON DUPLICATE KEY UPDATE", "REPLACE INTO", "UPDATE", "SET", "DELETE FROM", "CREATE TABLE", "ALTER TABLE", "DROP TABLE", "CREATE INDEX", "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "DEFAULT", "AUTO_INCREMENT", "UNIQUE KEY", "ENGINE", "SHOW", "SHOW TABLES", "SHOW COLUMNS FROM", "SHOW CREATE TABLE", "DESCRIBE", "EXPLAIN", "USE", "CASE", "WHEN", "THEN", "ELSE", "END", "ASC", "DESC", "EXISTS", "CAST", "WITH", "LOCK", "UNSIGNED"],
-    types: ["INT", "BIGINT", "TINYINT", "SMALLINT", "VARCHAR(255)", "CHAR", "TEXT", "LONGTEXT", "DATETIME", "TIMESTAMP", "DATE", "TIME", "DECIMAL(10,2)", "FLOAT", "DOUBLE", "JSON", "ENUM"],
-    funcs: [
-      ["COUNT", "COUNT(*) — 统计行数"], ["SUM", "SUM(X) — 求和"], ["AVG", "AVG(X) — 平均"], ["MIN", "MIN(X)"], ["MAX", "MAX(X)"],
-      ["ABS", "ABS(X)"], ["ROUND", "ROUND(X, n)"], ["LENGTH", "LENGTH(X) — 字节长度"], ["CHAR_LENGTH", "CHAR_LENGTH(X) — 字符数"],
-      ["LOWER", "LOWER(X)"], ["UPPER", "UPPER(X)"], ["TRIM", "TRIM(X)"], ["CONCAT", "CONCAT(A, B, …) — 拼接"],
-      ["CONCAT_WS", "CONCAT_WS(sep, A, B) — 带分隔符拼接"], ["COALESCE", "COALESCE(A, B) — 第一个非 NULL"],
-      ["IFNULL", "IFNULL(A, B)"], ["IF", "IF(cond, a, b) — 条件"], ["NULLIF", "NULLIF(A, B)"],
-      ["SUBSTRING", "SUBSTRING(X, pos, len)"], ["REPLACE", "REPLACE(X, old, new)"], ["LOCATE", "LOCATE(sub, X)"],
-      ["NOW", "NOW() — 当前日期时间"], ["CURDATE", "CURDATE() — 当前日期"], ["CURTIME", "CURTIME()"],
-      ["DATE_FORMAT", "DATE_FORMAT(X, '%Y-%m-%d')"], ["DATE_ADD", "DATE_ADD(X, INTERVAL 1 DAY)"],
-      ["DATEDIFF", "DATEDIFF(A, B) — 天数差"], ["UNIX_TIMESTAMP", "UNIX_TIMESTAMP(X)"],
-      ["GROUP_CONCAT", "GROUP_CONCAT(X SEPARATOR ',')"], ["JSON_EXTRACT", "JSON_EXTRACT(X, '$.k')"],
-    ],
-    snippets: [
-      ["SELECT … FROM … WHERE", "SELECT ${1:*}\nFROM ${2:table}\nWHERE ${3:condition};"],
-      ["SELECT … JOIN", "SELECT ${1:*}\nFROM ${2:a}\nJOIN ${3:b} ON ${4:a.id} = ${5:b.a_id}\nWHERE ${6:1 = 1};"],
-      ["INSERT INTO", "INSERT INTO ${1:table} (${2:col})\nVALUES (${3:value});"],
-      ["INSERT … ON DUPLICATE", "INSERT INTO ${1:table} (${2:col})\nVALUES (${3:value})\nON DUPLICATE KEY UPDATE ${2:col} = VALUES(${2:col});"],
-      ["UPDATE … SET", "UPDATE ${1:table}\nSET ${2:col} = ${3:value}\nWHERE ${4:condition};"],
-      ["DELETE FROM", "DELETE FROM ${1:table}\nWHERE ${2:condition};"],
-      ["CREATE TABLE", "CREATE TABLE ${1:name} (\n  id BIGINT PRIMARY KEY AUTO_INCREMENT,\n  ${2:col} ${3:VARCHAR(255)}\n) ENGINE=InnoDB;"],
-      ["SHOW CREATE TABLE", "SHOW CREATE TABLE ${1:table};"],
-    ],
-  },
-  postgres: {
-    label: "PostgreSQL",
-    keywords: ["SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IS NOT", "IN", "LIKE", "ILIKE", "BETWEEN", "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "OFFSET", "DISTINCT", "DISTINCT ON", "AS", "ON", "JOIN", "LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "FULL JOIN", "LATERAL", "UNION", "UNION ALL", "INSERT INTO", "VALUES", "ON CONFLICT", "DO NOTHING", "DO UPDATE SET", "RETURNING", "UPDATE", "SET", "DELETE FROM", "CREATE TABLE", "ALTER TABLE", "DROP TABLE", "CREATE INDEX", "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "DEFAULT", "SERIAL", "GENERATED ALWAYS AS IDENTITY", "UNIQUE", "CASE", "WHEN", "THEN", "ELSE", "END", "ASC", "DESC", "EXISTS", "CAST", "WITH", "WITH RECURSIVE", "USING"],
-    types: ["INTEGER", "BIGINT", "SERIAL", "BIGSERIAL", "SMALLINT", "VARCHAR(255)", "TEXT", "CHAR", "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "NUMERIC(10,2)", "REAL", "DOUBLE PRECISION", "BOOLEAN", "JSONB", "UUID"],
-    funcs: [
-      ["COUNT", "COUNT(*) — 统计行数"], ["SUM", "SUM(X)"], ["AVG", "AVG(X)"], ["MIN", "MIN(X)"], ["MAX", "MAX(X)"],
-      ["ABS", "ABS(X)"], ["ROUND", "ROUND(X, n)"], ["LENGTH", "LENGTH(X)"], ["LOWER", "LOWER(X)"], ["UPPER", "UPPER(X)"],
-      ["TRIM", "TRIM(X)"], ["CONCAT", "CONCAT(A, B, …)"], ["COALESCE", "COALESCE(A, B) — 第一个非 NULL"],
-      ["NULLIF", "NULLIF(A, B)"], ["SUBSTRING", "SUBSTRING(X FROM a FOR b)"], ["REPLACE", "REPLACE(X, old, new)"],
-      ["POSITION", "POSITION(sub IN X)"], ["NOW", "NOW() — 当前时间戳"], ["CURRENT_DATE", "CURRENT_DATE"],
-      ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"], ["TO_CHAR", "TO_CHAR(X, 'YYYY-MM-DD')"], ["DATE_PART", "DATE_PART('year', X)"],
-      ["AGE", "AGE(X) — 时间差"], ["STRING_AGG", "STRING_AGG(X, ',') — 聚合拼接"], ["ARRAY_AGG", "ARRAY_AGG(X)"],
-      ["JSONB_EXTRACT_PATH", "JSONB_EXTRACT_PATH(X, 'k')"], ["GENERATE_SERIES", "GENERATE_SERIES(1, 10)"],
-    ],
-    snippets: [
-      ["SELECT … FROM … WHERE", "SELECT ${1:*}\nFROM ${2:table}\nWHERE ${3:condition};"],
-      ["SELECT … JOIN", "SELECT ${1:*}\nFROM ${2:a}\nJOIN ${3:b} ON ${4:a.id} = ${5:b.a_id}\nWHERE ${6:true};"],
-      ["INSERT … RETURNING", "INSERT INTO ${1:table} (${2:col})\nVALUES (${3:value})\nRETURNING *;"],
-      ["INSERT … ON CONFLICT", "INSERT INTO ${1:table} (${2:col})\nVALUES (${3:value})\nON CONFLICT (${4:id}) DO NOTHING;"],
-      ["UPDATE … SET", "UPDATE ${1:table}\nSET ${2:col} = ${3:value}\nWHERE ${4:condition};"],
-      ["DELETE FROM", "DELETE FROM ${1:table}\nWHERE ${2:condition};"],
-      ["CREATE TABLE", "CREATE TABLE ${1:name} (\n  id BIGSERIAL PRIMARY KEY,\n  ${2:col} ${3:TEXT}\n);"],
-    ],
-  },
-  redis: {
-    label: "Redis",
-    commands: [
-      ["GET", "GET key — 取字符串值"], ["SET", "SET key value — 设字符串值"], ["DEL", "DEL key — 删除键"],
-      ["EXISTS", "EXISTS key — 键是否存在"], ["EXPIRE", "EXPIRE key seconds — 设过期"], ["TTL", "TTL key — 剩余存活秒"],
-      ["KEYS", "KEYS pattern — 匹配键（生产慎用）"], ["SCAN", "SCAN cursor — 游标遍历"], ["TYPE", "TYPE key — 键类型"],
-      ["INCR", "INCR key — 自增"], ["DECR", "DECR key — 自减"], ["APPEND", "APPEND key value"],
-      ["HGET", "HGET key field"], ["HSET", "HSET key field value"], ["HGETALL", "HGETALL key — 取整个哈希"],
-      ["HDEL", "HDEL key field"], ["LPUSH", "LPUSH key value"], ["RPUSH", "RPUSH key value"],
-      ["LRANGE", "LRANGE key 0 -1 — 取列表"], ["LLEN", "LLEN key — 列表长度"], ["SADD", "SADD key member"],
-      ["SMEMBERS", "SMEMBERS key — 取集合"], ["ZADD", "ZADD key score member"], ["ZRANGE", "ZRANGE key 0 -1"],
-      ["PING", "PING — 测试连接"], ["INFO", "INFO — 服务器信息"], ["DBSIZE", "DBSIZE — 键数量"],
-    ],
-  },
-};
 
 function _mpmDialect(driver) {
   // 补全词典按方言家族回落：MariaDB 走 MySQL；MSSQL/ClickHouse 走通用 SQL（sqlite 基础词）。
@@ -9250,17 +9152,19 @@ async function _toggleFullScreen() {
 async function _applyUiZoom(factor, { toast = true } = {}) {
   _uiZoom = Math.min(2, Math.max(0.5, Math.round(factor * 100) / 100));
   try { localStorage.setItem(_UI_ZOOM_KEY, String(_uiZoom)); } catch {}
-  let applied = false;
-  if (inTauri) {
-    try {
-      const { getCurrentWebview } = await import("@tauri-apps/api/webview");
-      await getCurrentWebview().setZoom(_uiZoom);
-      applied = true;
-    } catch { /* 平台不支持 setZoom → 回退 CSS zoom */ }
-  }
-  if (!applied) {
-    document.documentElement.style.zoom = _uiZoom === 1 ? "" : String(_uiZoom);
-  }
+  /*
+   * 用 CSS 缩放，不用 WebView 的原生 setZoom。
+   *
+   * 这里原来先试 `getCurrentWebview().setZoom()`，失败才回退 CSS，catch 里写着
+   * 「平台不支持 setZoom」——**那句是假的**。真实原因是能力清单里没有
+   * `core:webview:allow-set-webview-zoom`，调用被 ACL 拒掉、被 catch 吞掉，
+   * 于是 applied 恒为 false：**原生缩放这条路在这个产品里一次都没生效过**，
+   * CSS 缩放才是一直在跑、也被用户验证过的那份。
+   *
+   * 留着那条死路等于每次缩放都白发一次注定失败的调用。要改用原生缩放是另一件事：
+   * 那会给每个用户换一条从没跑过的渲染路径，得在 Windows 上真机验过，不能顺手打开。
+   */
+  document.documentElement.style.zoom = _uiZoom === 1 ? "" : String(_uiZoom);
   // 原生红绿灯不随缩放：把缩放系数暴露给 CSS，titlebar 用 calc(84px / var(--ui-zoom))
   // 反向补偿留位，缩小不压红绿灯、放大不留大空白。
   try { document.documentElement.style.setProperty("--ui-zoom", String(_uiZoom)); } catch {}
@@ -71432,7 +71336,18 @@ function _safeRunStem(name) {
 
 function _tmpRunOutputPath(name, suffix = "") {
   const stem = _safeRunStem(name);
-  if (_isWin) return `%TEMP%\\michael-ide-${stem}${suffix}`;
+  /*
+   * 判据是**真实的 shell**，不是操作系统（同 _shellKind 附近那段原则）。
+   *
+   * `%TEMP%` 是 cmd 的展开语法，而 Windows 上 shell_env 优先挑 Git Bash。bash 不认它，
+   * 加上反斜杠在 Windows 上是目录分隔符，于是 `-o "%TEMP%\michael-ide-a"` 变成一个
+   * **相对路径** `<cwd>/%TEMP%\michael-ide-a`——那个父目录不存在，rustc/fpc 也不会
+   * 自己建，编译当场失败、`&&` 短路，后半段根本不执行。所以症状不是「跑出个怪东西」，
+   * 是「按运行没反应，只有一句编译错」。
+   *
+   * Git Bash 有 /tmp（MSYS 映射），所以 posix 那一支两个平台都成立。
+   */
+  if (_shellKind() === "cmd") return `%TEMP%\\michael-ide-${stem}${suffix}`;
   return `/tmp/michael-ide-${stem}${suffix}`;
 }
 
@@ -72801,7 +72716,23 @@ async function resolveDebugPython() {
   for (const rel of candidates) {
     const p = `${root}/${rel}`;
     try {
-      const check = _isWin ? `if exist "${p}" echo ${p}` : `[ -x "${p}" ] && printf %s "${p}"`;
+      /*
+       * 判据是**真实的 shell**，不是操作系统——这条原则本仓库自己写过（见
+       * `_shellKind` 附近那段：装了 Git for Windows 的机器上 run_cmd 跑的是 bash）。
+       *
+       * `if exist` 是 cmd.exe 的内建，而 Windows 上 shell_env 是**优先挑 Git Bash** 的。
+       * bash 里 `if` 是关键字、后面必须跟 `then`，`exist` 也不是命令——四个候选全部
+       * 语法错、全部落空。然后掉到下面那条 `py -3 -c "import sys; print(sys.executable)"`
+       * ——它在 bash 下语法合法、`py` 启动器又在 PATH 里，于是**成功返回系统解释器**。
+       * 结果是调试跑在系统 Python 下，项目依赖 ModuleNotFoundError；而一键安装又把
+       * debugpy 装进系统 Python，装完再跑还是同一个错。
+       *
+       * 上面挑候选路径那一处仍然按 _isWin 分（Scripts/ vs bin/）——那问的是**文件系统
+       * 布局**，不是 shell 语法，是对的。两处问的不是同一个问题，别合并。
+       */
+      const check = _shellKind() === "cmd"
+        ? `if exist "${p}" echo ${p}`
+        : `[ -x "${p}" ] && printf %s "${p}"`;
       const r = await backend.taskRunCapture(root, check);
       if (r && r.code === 0 && r.stdout && r.stdout.trim()) return r.stdout.trim();
     } catch { /* keep looking */ }

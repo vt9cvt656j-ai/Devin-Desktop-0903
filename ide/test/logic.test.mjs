@@ -35498,7 +35498,9 @@ test("showToast 的第二个参数不许是裸数字", () => {
   // 括号配平取真正的第二个实参，不能用正则——`.slice(0, 120))` 长得一模一样，
   // 用行内正则会把它误伤成 `.slice(0, { duration: 120 })`（这个坑当场踩过）。
   const bad = [];
-  for (const m of RAW_SRC.matchAll(/\bshowToast\(/g)) {
+  // 可选链那两处（showToast?.(…)）也要算：它们正是全局错误处理器的显示出口，
+  // Windows 上那条 ACL 拒绝就从那里露面。
+  for (const m of RAW_SRC.matchAll(/\bshowToast\??\.?\(/g)) {
     let i = m.index + m[0].length, depth = 1, args = [], cur = "";
     while (i < RAW_SRC.length && depth) {
       const c = RAW_SRC[i];
@@ -35515,4 +35517,39 @@ test("showToast 的第二个参数不许是裸数字", () => {
   assert.deepEqual(bad, [],
     `这些 showToast 传了裸毫秒数，会被静默忽略、退回 1900ms 默认值：${bad.join("、")}\n`
     + "正确写法是 showToast(msg, { duration: 8000 })。");
+});
+
+/**
+ * 平台相关的**语法**判据必须问「真实的 shell」，不是「操作系统」。
+ *
+ * 这条原则本仓库自己写过（`_shellKind` 附近）：装了 Git for Windows 的机器上
+ * run_cmd 跑的是 bash，按操作系统判会整个判错。2026-08-26 查出还有两处漏网：
+ *
+ * · venv 探测用 `if exist`（cmd 内建）。bash 里 `if` 是关键字、必须跟 `then`，
+ *   四个候选全部语法错、全部落空；然后掉到 `py -3 -c "print(sys.executable)"`
+ *   ——它在 bash 下合法且 py 启动器在 PATH 里，于是**成功返回系统解释器**。
+ *   结果是调试跑在系统 Python 下报 ModuleNotFoundError，而一键安装又把 debugpy
+ *   装进系统 Python，装完再跑还是同一个错。
+ * · 编译产出路径用 `%TEMP%`（cmd 展开语法）。bash 不认，加上反斜杠是目录分隔符，
+ *   整串变成相对路径 `<cwd>/%TEMP%\...`，父目录不存在 → 编译失败、`&&` 短路。
+ *
+ * **不是所有 _isWin 都错**：挑候选路径（Scripts/ vs bin/）问的是文件系统布局，
+ * 那一处按 _isWin 是对的。两类问题别合并成一个判据。
+ */
+test("shell 语法相关的判据走 _shellKind，不走 _isWin", () => {
+  assert.doesNotMatch(SRC, /_isWin \? `if exist/,
+    "venv 探测又按操作系统判了——Windows 上优先跑的是 Git Bash，`if exist` 在那里是语法错");
+  assert.match(SRC, /_shellKind\(\) === "cmd"\s*\n?\s*\? `if exist/,
+    "venv 探测没改成按真实 shell 判");
+  assert.doesNotMatch(SRC, /if \(_isWin\) return `%TEMP%/,
+    "编译产出路径又按操作系统判了——bash 不展开 %TEMP%，会变成一个不存在的相对目录");
+  assert.match(SRC, /_shellKind\(\) === "cmd" return `%TEMP%|_shellKind\(\) === "cmd"\) return `%TEMP%/,
+    "编译产出路径没改成按真实 shell 判");
+});
+
+test("文件系统布局那一处仍然按操作系统判（别合并）", () => {
+  // Scripts/ vs bin/ 问的是 venv 的目录结构，和跑哪个 shell 无关。
+  // 合并成一个判据等于断言这两件事永远同进同退，而它们不是。
+  assert.match(SRC, /const candidates = _isWin[\s\S]{0,120}Scripts\/python\.exe/,
+    "venv 的候选路径不该改成按 shell 判——那问的是文件系统布局");
 });
