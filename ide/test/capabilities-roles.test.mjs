@@ -101,3 +101,69 @@ test("模型编出来的角色名仍然挡住", () => {
   assert.match(SRC, /_AI_AGENT_ROLES\.has\(item\) \|\| _userRoleMap\(\)\.has\(item\)/,
     "角色过滤要么被删了、要么没接上用户声明");
 });
+
+/**
+ * 角色可以声明自己跑在哪个模型上（参照 Claude Code 的 subagent frontmatter `model:`）。
+ *
+ * 这条守的核心是**默认不变**：没声明 model 的角色必须和以前一模一样跑在用户此刻
+ * 选的模型上。harness 替用户挑模型这件事在本仓库是被明令删掉的（_pickCheapModel），
+ * 所以「加了这个能力」绝不能顺带变成「harness 现在会挑模型了」。
+ */
+test("角色没声明模型时，子体拿到的就是父体那份 config 本身", () => {
+  const src = extractFn("_runSubAgent");
+  const at = src.indexOf("let _subConfig = config;");
+  assert.ok(at > 0, "子体配置的落点不见了");
+  // 默认路径是恒等：只有 _roleModel 非空**且**和父体不同才会新建对象。
+  assert.match(src.slice(at, at + 900), /if \(_roleModel && _roleModel !== config\?\.model\) \{/,
+    "没声明模型时必须走恒等路径——新建一份 config 就是在悄悄改计费口径");
+});
+
+test("声明的模型查不到时继承父体，并且说出来", () => {
+  const src = extractFn("_runSubAgent");
+  const at = src.indexOf("let _subConfig = config;");
+  const blk = src.slice(at, at + 1200);
+  assert.match(blk, /MODEL_NAMES && MODEL_NAMES\[_roleModel\]/,
+    "存在性必须查——声明一个不存在的模型会让这个角色的每一次派发都失败");
+  assert.match(blk, /_roleModelNote = `\[role:\$\{role\}\] 声明的模型/,
+    "查不到时要留下可见理由，不能静默继承");
+  // customModelId 必须一并丢掉：推理档位按 `customModelId || model` 查用户偏好，
+  // 留着的话新模型会去读旧连接的档位。
+  assert.match(blk, /customModelId: undefined/,
+    "换模型没清 customModelId——推理档位会去读旧连接的偏好");
+});
+
+test("上下文上限跟着实际跑的那个模型，不是父体的", () => {
+  // 角色声明成小窗口模型时，按父模型的上限裁剪 = 本地以为还装得下、上游直接截断。
+  const src = extractFn("_runSubAgent");
+  assert.match(src, /_effectiveContextLimit\(_subConfig\?\.model\)/,
+    "裁剪用的还是父体的模型");
+});
+
+test("角色声明里的 model 一路带到派发", () => {
+  const declared = normalizeCapabilities({
+    roles: [{ name: "heavy", prompt: "深度分析角色。", model: "claude-opus-5" }],
+  }, "项目配置");
+  assert.equal(declared.errors.length, 0, `声明不该报错：${declared.errors.join("；")}`);
+  assert.equal(declared.roles[0].model, "claude-opus-5", "声明层就把 model 丢了");
+  // 没写 model 的角色拿到空串，不是 undefined —— 派发那边用 String(...) 判空。
+  const plain = normalizeCapabilities({ roles: [{ name: "plainrole", prompt: "普通角色。" }] }, "项目配置");
+  assert.equal(plain.roles[0].model, "", "没声明时必须是空串，让派发侧的判空是恒定的");
+  // 携带层：_userRoleMap 必须把它带过去，否则声明到此为止。
+  assert.match(extractFn("_userRoleMap"), /model: r\.model \|\| ""/,
+    "_userRoleMap 没把声明的模型带给派发侧");
+});
+
+test("没有加角色级 effort —— 那会把刚删掉的静默改档装回来", () => {
+  // 推理档位在本产品里是**按模型存的用户偏好**：角色换了模型，档位自动跟着那个模型走。
+  // 再加一个角色级 effort 就等于「用户在转盘上选了一档、实际发出去另一档」，
+  // 而 _applyThinkingToConfig 的注释里写着那两道自动降档刚刚才被删除。
+  const src = extractFn("_runSubAgent");
+  const at = src.indexOf("let _subConfig = config;");
+  assert.doesNotMatch(src.slice(at, at + 1200), /reasoningEffort|thinkingEffort/,
+    "子体派发处开始改推理档位了——那正是被删掉的那个形状");
+  const caps = normalizeCapabilities({
+    roles: [{ name: "effortrole", prompt: "试图声明档位的角色。", effort: "high" }],
+  }, "项目配置");
+  assert.equal(caps.roles[0].effort, undefined,
+    "角色声明开始接收 effort 了——档位只有一处真相：用户给那个模型选的偏好");
+});

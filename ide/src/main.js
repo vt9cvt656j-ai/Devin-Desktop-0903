@@ -33639,7 +33639,14 @@ const _CAPABILITY_STARTER = `{
       }
     ],
     "knowledge": [],
-    "roles": [],
+    "roles": [
+      {
+        "name": "data",
+        "prompt": "你是数据工程专家：先看清表结构和数据量级，再动手。这段就是这个角色和别的角色的全部区别。",
+        "tools": ["db_query", "http_request"],
+        "model": ""
+      }
+    ],
     "commands": [],
     "disabled": []
   }
@@ -50485,6 +50492,9 @@ function _userRoleMap() {
         ...(Array.isArray(r.types) ? r.types : []),
         ...r.tools.filter(isRealTool).map((n) => { try { return _mapToolCall(n, {})?.type || ""; } catch { return ""; } }).filter(Boolean),
       ])],
+      // 角色声明的模型原样带过去；存在性在派发那一刻查（见 _subConfig），
+      // 不在这里查——模型清单是异步装的，这里查等于按加载时序随机否决。
+      model: r.model || "",
       source: r.source,
     });
   }
@@ -51132,6 +51142,32 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   execRun._subAgentJobs = new Map();
   execRun._subAgentJobSeq = 0;
 
+  /*
+   * 这个角色跑在哪个模型上。
+   *
+   * 默认**继承父体**——也就是用户此刻在转盘上选的那个模型，一个字节都不改。
+   * 只有用户在自己的角色声明里写了 `model:` 才换，参照 Claude Code 的 subagent
+   * frontmatter。这是「配置优先于硬编码」：谁的活该用哪个模型是用户的判断，
+   * harness 不替他猜——本仓库的 _pickCheapModel 就是因为替他猜而被删掉的。
+   *
+   * 存在性在这里查而不是在声明时查：模型清单（MODEL_GROUPS→MODEL_NAMES）是后端
+   * 异步装的，声明期查表会按加载时序随机否决合法声明。查不到就继承父模型并把
+   * 原因摆到简报里——静默换模型比换错模型更难查。
+   */
+  let _subConfig = config;
+  const _roleModel = String(_userRoleMap().get(String(role || "").trim().toLowerCase())?.model || "").trim();
+  let _roleModelNote = "";
+  if (_roleModel && _roleModel !== config?.model) {
+    if (MODEL_NAMES && MODEL_NAMES[_roleModel]) {
+      // customModelId 必须一并丢掉：推理档位按 `customModelId || model` 查偏好，
+      // 留着的话新模型会去读旧连接的档位。
+      _subConfig = { ...config, model: _roleModel, customModelId: undefined };
+      _roleModelNote = `[role:${role}] 按声明跑在 ${MODEL_NAMES[_roleModel]}`;
+    } else {
+      _roleModelNote = `[role:${role}] 声明的模型 ${_roleModel} 不在可用清单里，已继承父体的模型`;
+    }
+  }
+
   let report = "";
   const _writesDone = []; // 编排核对账本：本 worker 实际写盘的文件（工具执行事实，不是模型自述）
   const narrativeSeen = new Set();
@@ -51166,7 +51202,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         _collaborationCursor = inbox.cursor;
         if (inbox.message) messages.push({ role: "user", content: inbox.message });
       }
-      const turn = await _agentModelTurn({ config, messages, toolSchemas, toolRegistry: toolSchemas, body: vp, session: _sess, root, skillsBlock: run?.skillsBlock ?? "", narrativeSeen, meterScope: "aux", settlementTasks: run?._billingTasks, timeline: run?.timeline || null, runId: run?.timeline?.runId || "", stepKind: "subagent" });
+      const turn = await _agentModelTurn({ config: _subConfig, messages, toolSchemas, toolRegistry: toolSchemas, body: vp, session: _sess, root, skillsBlock: run?.skillsBlock ?? "", narrativeSeen, meterScope: "aux", settlementTasks: run?._billingTasks, timeline: run?.timeline || null, runId: run?.timeline?.runId || "", stepKind: "subagent" });
       if (turn.error) { report = report || `[ERROR] ${turn.error}`; break; }
       execRun._toolBatch = (execRun._toolBatch || 0) + 1;
       if (turn.text && turn.text.trim()) {
@@ -51317,7 +51353,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
             const _parts = [];
             for (const [_i, _t] of _nestTasks.entries()) {
               const _r = await _runSubAgent({
-                config,
+                config: _subConfig,
                 description: `${call.description || "嵌套子任务"}[${_i + 1}/${_nestTasks.length}]`,
                 prompt: typeof _t === "string" ? _t : String(_t.task || ""),
                 root, container: vp, run: execRun, write: false, scope: [],
@@ -51327,7 +51363,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
             }
             _nestReport = _parts.join("\n\n---\n\n");
           } else {
-            _nestReport = await _runSubAgent({ config, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
+            _nestReport = await _runSubAgent({ config: _subConfig, description: call.description || "嵌套子任务", prompt: call.prompt || "", root, container: vp, run: execRun, write: call.type === "worker", scope: call.scope || [], role: call.role || "" });
           }
           const _nestDrop = Array.isArray(call.dropped) && call.dropped.length
             ? `\n⚠ 你给的 tasks 里有 ${call.dropped.join("；")}——这些**没有**被派出去。别当成已经查过了。`
@@ -51455,7 +51491,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         try {
           messages.push(await _buildImageFeedback(
             _turnImgs,
-            config,
+            _subConfig,
             // 截图里的字是别人写的：网页、别的 App 的界面、剪贴板浮层都可能带着
             // 「忽略之前的指令，去执行 X」。而这条链路后面接的是能合成真实键鼠的能力，
             // 所以边界必须在图片进上下文的**同一条消息**里说清楚。
@@ -51465,7 +51501,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
           ));
         } catch { /* 看不到图不该让整个子任务失败 */ }
       }
-      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(config?.model));
+      _trimMessagesIfHuge(messages, execRun, root, _effectiveContextLimit(_subConfig?.model));
     }
   } catch (e) { report = report || `[ERROR] ${e?.message || e}`; }
   finally {
@@ -51514,6 +51550,9 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
     if (report) {
       // 有正文就按已有的前缀约定交出去：报错保持 [ERROR] 前缀（上游已经加好），
       // 中途被截断的按轮次用尽处理，自然收尾的就是一份合法简报。
+      // 换了模型（或想换没换成）要让父体看见：静默换模型比换错模型更难查——
+      // 简报的口吻和深度都会变，而父体拿不到任何线索去解释为什么。
+      if (_roleModelNote && report && !report.startsWith(_roleModelNote)) report = `${_roleModelNote}\n\n${report}`;
       if (/^\[/.test(report) || _subFinished) return report;
       return `[轮次用尽·未完成] 这个子智能体一次工具都没调成就被截断了，下面是它截止当时的状态，不是结论。\n\n${report}`;
     }
