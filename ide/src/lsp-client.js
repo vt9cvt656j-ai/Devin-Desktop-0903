@@ -878,12 +878,24 @@ export function createLspManager(options) {
         "objective-c": "brew install llvm",
         java: "brew install jdtls",
         lua: "brew install lua-language-server",
-        csharp: "brew install omnisharp",
+        // csharp 这条删了：`brew install omnisharp` 是**死命令**——formula 和 cask 都不存在
+        // （实测 `brew info omnisharp` → No available formula）。给一条注定失败的命令，
+        // 用户点一下、看它报错、再等 180 秒进度条转完才被告知"安装超时"，而 _lspMarkPrompted
+        // 在弹窗那一刻就记过账了——这门语言的一键入口就此耗尽。宁可不给。
+        // 要重新给命令，必须**同时**改 lsp.rs 里的二进制名和参数：下面 Windows 那段注释
+        // 早就写明 NuGet 上的 csharp-ls 和本产品启动的 `omnisharp -lsp` 对不上。只改一处更糟。
         kotlin: "brew install kotlin-language-server",
         elixir: "brew install elixir-ls",
         clojure: "brew install clojure-lsp",
-        scala: "brew install coursier && cs install metals",
+        // 原来是 `brew install coursier && cs install metals`——第二步的可执行文件不存在：
+        // homebrew-core 的 coursier formula 产出的命令名叫 `coursier`，没有 `cs`（实测
+        // `command -v cs` → not found）。而 homebrew-core **直接就有 metals**（实测 1.6.7），
+        // 装完落进 /opt/homebrew/bin/metals，正是 lsp.rs 要找的那个名字。一步就中。
+        scala: "brew install metals",
         hcl: "brew install hashicorp/tap/terraform-ls",
+        // dart 原来一条都没有，于是落进"这个平台上它没有一键安装的包"那句——**在 mac 上是假话**
+        // （实测 `brew info dart-sdk` → 3.13.1，bin 里符号链接出 `dart`，正是要启动的那个名字）。
+        dart: "brew install dart-sdk",
       };
       // Windows 上只写有把握的：winget 里确实有 LLVM 这个包（clangd 在里面）。
       // 其余几个在 Windows 上只有 GitHub release 或多步安装，与其给一条会失败的命令，
@@ -897,9 +909,14 @@ export function createLspManager(options) {
         // 二进制名的一律不加：装完照样报"缺少"，比不给命令更糟。
         lua: "winget install -e --id LuaLS.lua-language-server",
         hcl: "winget install -e --id Hashicorp.TerraformLanguageServer",
+        // 这条符合上面那句"包对不上二进制名的一律不加"：Google.DartSDK 的
+        // PortableCommandAlias 就是 `dart`，正是 lsp.rs 要启动的名字。
+        dart: "winget install -e --id Google.DartSDK",
       };
-      // 仍然没有 Windows 一键安装的：java(jdtls) / csharp(omnisharp) / kotlin /
-      // elixir / clojure / scala。原因各不相同，但都不是"懒得加"：
+      // 仍然没有 Windows 一键安装的：java(jdtls) / csharp / kotlin / elixir / clojure /
+      // scala / swift。（这份名单以前漏了 swift 和 dart；dart 现在两个平台都有命令了，
+      // swift 的 sourcekit-lsp 跟着 Xcode 走、也确实没有独立包。）
+      // 原因各不相同，但都不是"懒得加"：
       //   · jdtls / kotlin / elixir  —— 只有 GitHub release 压缩包，装完还要自己配 PATH；
       //   · clojure-lsp             —— 要先 `scoop bucket add` 再装，两步且依赖 scoop；
       //   · scala(metals)           —— 要先装 coursier 再 `cs install metals`，同样两步；
