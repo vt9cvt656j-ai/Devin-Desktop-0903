@@ -140,6 +140,7 @@ import {
   toolPolicy,
 } from "./agent/tool-policy.js";
 import { _TOOL_ALIASES, _lev } from "./agent/tool-aliases.js";
+import { TERM_COMMON_CMDS } from "./agent/terminal-commands.js";
 import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
   normalizeCapabilities, userToolShortName,
@@ -19822,6 +19823,25 @@ function _refreshContextMeterFromDraft(options = {}) {
 function _recordStreamUsage(ev, opts = {}) {
   try {
     if (!ev || opts.aux) return;
+    // **思考回执要在这里接住。**
+    //
+    // Rust 传输层（src-tauri/src/ai.rs 约 3053 行）已经把三家的字段名都认了一遍
+    // （completion_tokens_details.reasoning_tokens / output_tokens_details.reasoning_tokens /
+    // 平铺的 reasoning_tokens），连同网关逐帧数出来的 thinking_chars 一起填进 AiEvent::Usage。
+    // 而这里是 kind==="usage" 的**唯一**接收者，原来只读 prompt/completion/cached/cacheCreation
+    // 四个数，两个思考字段在客户端第一站就落地了。
+    //
+    // 后果不是少显示一行，是**没有尺子**：`_lastReasoningTok` 的另一个写入点
+    // （_recordUsage）拿的是网关结算对象，那里面根本没有这两个字段，所以它恒为 0。
+    // 于是状态行永远只印「思考 High」不印「· 推理 N」，而「模型压根没思考」和「思考了、
+    // 但我们在解析那一跳把它丢了」这两件完全不同的事，在界面上长得一模一样——
+    // 查 grok 不出思考卡时，第一件想做的事就是量这个数，而它是个死数。
+    const _rt = Number(ev.reasoningTokens ?? ev.reasoning_tokens
+      ?? (ev.completion_tokens_details && ev.completion_tokens_details.reasoning_tokens)
+      ?? (ev.output_tokens_details && ev.output_tokens_details.reasoning_tokens)) || 0;
+    if (_rt) _lastReasoningTok = _rt;
+    const _tc = Number(ev.thinkingChars ?? ev.thinking_chars) || 0;
+    if (_tc) _lastThinkChars = _tc;
     const changed = _applyContextReading(opts.session, {
       input: _contextInputTokens({
         prompt: ev.promptTokens ?? ev.prompt_tokens ?? 0,
@@ -29803,8 +29823,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     ensureThink();
     if (!_thinkFlushTimer) _thinkFlushTimer = setTimeout(_renderThinkNow, 90);
   };
-  const appendPlainReasoning = (delta, alreadyRoutedBeforeAnswer = false) => {
-    if ((!alreadyRoutedBeforeAnswer && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
+  // `trusted` 的含义和 agent 路那份 appendReasoning 完全一致：来源不是内联标签启发式，
+  // 就不受 answerStarted 那道闸约束。理由见那边的长注释（工具调用会置真它，而
+  // 「想→调工具→再想」是现代模型的常态形状）。
+  const appendPlainReasoning = (delta, trusted = false) => {
+    if ((!trusted && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
     reasoning = _joinReasoningDelta(reasoning, delta);
     reasoningAll = _joinReasoningDelta(reasoningAll, delta);
     if (reasoning.trim()) setThink(reasoning);
@@ -30127,7 +30150,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       if (ev && ev.kind === "compressionPrefix") { _mcPrefixSet(ev.token, ev.covered, _mcSourceMessagesPlain, sess); return false; }
       let accepted = false;
       if (ev.kind === "reasoning") {
-        accepted = appendPlainReasoning(ev.delta || "");
+        // 厂商独立通道 → trusted（同 agent 路）。
+        accepted = appendPlainReasoning(ev.delta || "", true);
       }
       else if (ev.kind === "token") {
         const { th, an, accepted: routedAccepted } = _routeThink(ev.delta);
@@ -46950,8 +46974,27 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
   let reasoningTimer = 0;
   const _turnThinkCards = []; // 本回合创建的所有思考卡（含已 settle 的）——重试时要整批移除，否则失败 attempt 的思考残留并与重来的合并成近似重复
   const _inlineThinkState = { inThink: false, hold: "", answerStarted: false };
-  const appendReasoning = (delta, alreadyRoutedBeforeAnswer = false) => {
-    if ((!alreadyRoutedBeforeAnswer && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
+  /**
+   * 收一段思考文本。
+   *
+   * `trusted` = 这段文本的来源**不是**内联标签启发式，所以不受 answerStarted 那道闸约束。
+   * 两类来源：厂商的独立 reasoning 通道（ev.kind === "reasoning"），以及内联路由器
+   * 自己已经按状态机筛过一遍的产出。
+   *
+   * ── 为什么厂商通道必须免闸 ────────────────────────────────────────────────
+   * answerStarted 是给**内联 `<think>` 标签**那套启发式用的：正文已经开始之后再冒出一个
+   * `<think>`，多半是模型在正文里打了个尖括号，不该当思考收。那条判断对启发式成立。
+   *
+   * 但它原来也套在了厂商通道上，而 answerStarted 会被**工具调用**置真（见下方
+   * ev.kind === "toolCall" 分支）。现代模型是「想一段 → 调工具 → 再想一段 → 再调工具」
+   * 交错着来的，于是第一次工具调用之后的每一段思考都被整段丢弃——注意 return 发生在
+   * 写 reasoningAcc / reasoningAll **之前**，所以它既不上屏、也不进历史消息的 m.reasoning、
+   * 也不进崩溃草稿：三个地方同时没有，和「模型压根没思考」长得一模一样。
+   *
+   * 厂商通道是**独立的字段**，不是从正文里猜出来的，没有「是不是误判」这个问题。
+   */
+  const appendReasoning = (delta, trusted = false) => {
+    if ((!trusted && !_canRenderPreAnswerReasoning(_inlineThinkState)) || !delta) return false;
     reasoningAcc = _joinReasoningDelta(reasoningAcc, delta);
     reasoningAll = _joinReasoningDelta(reasoningAll, delta);
     if (reasoningAcc.trim()) scheduleReasoning();
@@ -47317,7 +47360,10 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         if (!_live()) return false;
         let accepted = false;
         if (ev.kind === "reasoning") {
-          accepted = appendReasoning(ev.delta || "");
+          // 厂商独立通道 → trusted：不受内联标签那道 answerStarted 闸约束。理由见
+          // appendReasoning 的注释——工具调用会置真 answerStarted，而「想→调→再想」
+          // 是现代模型的常态形状。
+          accepted = appendReasoning(ev.delta || "", true);
         }
         else if (ev.kind === "token") {
           const routed = _routeInlineThinkingDelta(_inlineThinkState, ev.delta || "");
@@ -78503,69 +78549,6 @@ const termBody = $("terminalBody");
 const termTabBar = $("termTabBar");
 const editorwrapEl = document.querySelector(".editorwrap");
 
-// ---- terminal command suggestions (history + common commands + paths) ----
-const TERM_COMMON_CMDS = [
-  // git
-  "git status", "git status -s", "git add .", "git add -A", "git add -p",
-  "git commit -m \"\"", "git commit -am \"\"", "git commit --amend",
-  "git push", "git push -u origin ", "git push --force-with-lease", "git push --tags",
-  "git pull", "git pull --rebase", "git fetch", "git fetch --all --prune",
-  "git log", "git log --oneline", "git log --oneline --graph --all", "git log -p",
-  "git checkout ", "git checkout -b ", "git switch ", "git switch -c ", "git switch -",
-  "git branch", "git branch -a", "git branch -d ", "git branch -D ", "git branch -m ",
-  "git merge ", "git merge --abort", "git rebase ", "git rebase -i ", "git rebase --abort", "git rebase --continue",
-  "git diff", "git diff --staged", "git diff HEAD", "git diff --stat",
-  "git stash", "git stash pop", "git stash list", "git stash apply", "git stash drop", "git stash show -p",
-  "git reset ", "git reset --hard ", "git reset --soft HEAD~1", "git restore ", "git restore --staged ",
-  "git clone ", "git remote -v", "git remote add origin ", "git tag ", "git cherry-pick ",
-  "git show ", "git blame ", "git clean -fd", "git revert ", "git config --global ", "git init",
-  // npm
-  "npm install", "npm install ", "npm install -D ", "npm install -g ", "npm uninstall ",
-  "npm run ", "npm run dev", "npm run build", "npm run test", "npm run lint", "npm run start",
-  "npm start", "npm test", "npm ci", "npm update", "npm outdated", "npm audit", "npm audit fix",
-  "npm publish", "npm version patch", "npm list", "npm cache clean --force", "npx ",
-  // pnpm / yarn / bun
-  "pnpm install", "pnpm add ", "pnpm add -D ", "pnpm remove ", "pnpm dev", "pnpm build", "pnpm test", "pnpm run ", "pnpm up",
-  "yarn", "yarn add ", "yarn add -D ", "yarn remove ", "yarn dev", "yarn build", "yarn test", "yarn install",
-  "bun install", "bun add ", "bun run ", "bun dev",
-  // cargo / rust
-  "cargo build", "cargo build --release", "cargo run", "cargo run --release", "cargo test",
-  "cargo check", "cargo clippy", "cargo clippy --all-targets -- -D warnings", "cargo fmt",
-  "cargo add ", "cargo update", "cargo install ", "cargo new ", "cargo doc --open", "rustup update", "rustc ",
-  // python
-  "python3 ", "python3 -m venv venv", "python3 -m pip install ", "pip install ", "pip install -r requirements.txt",
-  "pip freeze > requirements.txt", "pip list", "pip3 install ", "source venv/bin/activate", "pytest", "python -m http.server",
-  // node / go / others
-  "node ", "deno run ", "deno task ", "tsx ", "ts-node ",
-  "go run .", "go build", "go test ./...", "go mod tidy", "go get ", "go install ",
-  "java -jar ", "javac ", "mvn ", "gradle ", "ruby ", "rails ", "php ", "php artisan ", "composer install",
-  "dotnet run", "dotnet build", "dotnet test",
-  // docker / k8s
-  "docker ps", "docker ps -a", "docker images", "docker build -t ", "docker run ", "docker exec -it ",
-  "docker stop ", "docker rm ", "docker rmi ", "docker logs -f ", "docker pull ", "docker push ", "docker system prune",
-  "docker compose up", "docker compose up -d", "docker compose down", "docker compose logs -f", "docker compose build",
-  "kubectl get pods", "kubectl get svc", "kubectl get nodes", "kubectl apply -f ", "kubectl delete -f ",
-  "kubectl logs ", "kubectl describe pod ", "kubectl exec -it ", "helm install ",
-  // filesystem
-  "cd ", "cd ..", "cd ~", "cd -", "ls", "ls -la", "ls -lah", "pwd", "clear",
-  "mkdir ", "mkdir -p ", "rmdir ", "rm ", "rm -rf ", "rm -f ", "cp ", "cp -r ", "mv ",
-  "touch ", "cat ", "less ", "head ", "tail ", "tail -f ", "ln -s ", "stat ", "file ", "tree",
-  "chmod +x ", "chmod 755 ", "chown ", "open ", "open .", "code .", "du -sh ", "df -h",
-  // text / search
-  "grep -r ", "grep -rn ", "grep -i ", "rg ", "rg -i ", "find . -name ", "find . -type f -name ",
-  "sed -i ", "awk ", "sort ", "uniq ", "wc -l ", "xargs ", "diff ", "pbcopy < ", "pbpaste",
-  // net / process
-  "curl ", "curl -O ", "curl -L ", "wget ", "ssh ", "scp ", "rsync -av ", "ping ",
-  "ps aux", "ps aux | grep ", "kill ", "kill -9 ", "killall ", "lsof -i :", "top", "htop",
-  "netstat -an", "ifconfig", "nslookup ", "dig ",
-  // archive / pkg managers
-  "tar -xzf ", "tar -czf ", "zip -r ", "unzip ", "gzip ", "gunzip ",
-  "brew install ", "brew update", "brew upgrade", "brew list", "brew search ", "brew uninstall ",
-  "apt install ", "apt update", "apt upgrade", "sudo apt install ",
-  // misc
-  "echo ", "export ", "source ", "which ", "whereis ", "man ", "history", "alias ", "env",
-  "sudo ", "watch ", "sleep ", "date", "whoami", "uname -a", "say ", "code .",
-];
 
 let termHistory = [];
 function pushTermHistory(cmd) {

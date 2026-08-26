@@ -1114,10 +1114,13 @@ impl StreamProgressDeadline {
 }
 
 fn delta_has_real_progress(delta: &serde_json::Value) -> bool {
-    delta["reasoning_content"]
-        .as_str()
-        .or_else(|| delta["reasoning"].as_str())
-        .is_some_and(|text| !text.is_empty())
+    // 思考形状走同一个取文本函数（见 reasoning_text_from_delta）。
+    //
+    // 这里原来也是「只认两个字符串字段」。它比渲染那处更隐蔽：这个谓词喂的是**停滞
+    // 看门狗**——上游正一段段回思考、但形状是对象或 reasoning_details 数组时，
+    // 这里判成"没有有效内容"，看门狗数着秒把一条**正在正常思考**的流掐掉，
+    // 报给用户的是「模型在 N 秒内没有生成有效内容」。两处必须用同一份判据。
+    reasoning_text_from_delta(delta).is_some_and(|text| !text.is_empty())
         || delta["content"]
             .as_str()
             .is_some_and(|text| !text.is_empty())
@@ -1164,6 +1167,36 @@ fn native_anthropic_event_has_real_progress(event: &serde_json::Value) -> bool {
         _ => false,
     }
 }
+/// 从一个 OpenAI 风格的 `delta` 里取思考文本，认全已知的几种载荷形状。
+///
+/// 返回 `None` = 这一帧没有思考内容（不是"取不出来"）。调用方据此决定发不发事件。
+fn reasoning_text_from_delta(delta: &serde_json::Value) -> Option<String> {
+    /// 一个值里的思考文本：字符串直接用；对象取 text/content/reasoning/summary；
+    /// 数组按元素拼接（分片推理）。递归深度天然有界——载荷就这三层。
+    fn text_of(v: &serde_json::Value) -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(items) => items.iter().map(text_of).collect(),
+            serde_json::Value::Object(map) => ["text", "content", "reasoning", "summary"]
+                .iter()
+                .find_map(|k| map.get(*k).map(text_of).filter(|s| !s.is_empty()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+    for key in ["reasoning_content", "reasoning", "reasoning_details"] {
+        let v = &delta[key];
+        if v.is_null() {
+            continue;
+        }
+        let t = text_of(v);
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    None
+}
+
 
 /// Map each provider's "why generation stopped" vocabulary onto the OpenAI spelling
 /// so the client has exactly one set of values to reason about. Anthropic's native
@@ -2042,6 +2075,50 @@ mod stream_timeout_tests {
             assert!(candidate.record_delta(&real_progress, started + Duration::from_secs(1)));
             assert!(candidate.has_progress);
         }
+    }
+
+    /// 思考载荷不止字符串一种形状。四种都要认，认不出的那一种会**静默**消失：
+    /// 事件不发、卡片不出、日志不留，和「模型压根没思考」完全同形。
+    ///
+    /// reasoning_details 是 OpenRouter 现行的规范载荷，而本仓库的模型目录正是抓
+    /// OpenRouter 的（server/src/model_catalog.rs 的 CATALOG_URL），却一直没认过。
+    #[test]
+    fn reasoning_text_is_read_from_every_known_payload_shape() {
+        use serde_json::json;
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            ("字符串 reasoning_content", json!({"reasoning_content": "想"}), Some("想")),
+            ("字符串 reasoning", json!({"reasoning": "想"}), Some("想")),
+            ("对象 {text}", json!({"reasoning": {"text": "想"}}), Some("想")),
+            ("对象 {content}", json!({"reasoning": {"content": "想"}}), Some("想")),
+            ("对象 {summary}", json!({"reasoning": {"summary": "想"}}), Some("想")),
+            (
+                "OpenRouter 的 reasoning_details 数组",
+                json!({"reasoning_details": [
+                    {"type": "reasoning.text", "text": "想"},
+                    {"type": "reasoning.text", "text": "了"},
+                ]}),
+                Some("想了"),
+            ),
+            ("空字符串不算思考", json!({"reasoning_content": ""}), None),
+            ("没有思考字段", json!({"content": "答案"}), None),
+            ("认不出的形状不 panic", json!({"reasoning": 42}), None),
+        ];
+        for (label, delta, want) in cases {
+            let got = reasoning_text_from_delta(&delta);
+            assert_eq!(got.as_deref(), want, "{label}");
+        }
+    }
+
+    /// 停滞看门狗的进展谓词必须用同一份判据：形状不认 → 判成「没有有效内容」→
+    /// 看门狗把一条正在正常思考的流掐掉，报「模型在 N 秒内没有生成有效内容」。
+    #[test]
+    fn object_shaped_reasoning_counts_as_progress() {
+        use serde_json::json;
+        assert!(delta_has_real_progress(&json!({"reasoning": {"text": "想"}})));
+        assert!(delta_has_real_progress(&json!({
+            "reasoning_details": [{"type": "reasoning.text", "text": "想"}]
+        })));
+        assert!(!delta_has_real_progress(&json!({"reasoning": {"text": ""}})));
     }
 
     #[test]
@@ -3175,15 +3252,23 @@ async fn ai_chat_inner(
                     Some(raw_stream_bytes),
                 );
             }
-            // Thinking / reasoning stream (DeepSeek/MiniMax: reasoning_content; some: reasoning).
-            if let Some(rt) = delta["reasoning_content"]
-                .as_str()
-                .or_else(|| delta["reasoning"].as_str())
-            {
+            // Thinking / reasoning stream. **形状不止一种，字符串只是其中最简单的那种。**
+            //
+            // 原来这里是 `delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str())`
+            // ——两处都是 as_str()、没有 else 分支、不打日志。于是任何非字符串形状都被
+            // 静默丢弃：事件不发、卡片不出、日志不留，和"模型压根没思考"长得一模一样。
+            //
+            // 真实存在的另外三种形状：
+            //   · `reasoning: { text: "…" }` / `{ content: "…" }` —— 部分中转把它包成对象
+            //   · `reasoning_details: [{ type:"reasoning.text", text:"…" }, …]` —— 这是
+            //     **OpenRouter 现行的规范载荷**，而本仓库的模型目录正是抓 OpenRouter 的
+            //     （见 server/src/model_catalog.rs 的 CATALOG_URL），却全仓一个字都没认过
+            //   · 上面两者的数组形式（分片推理）
+            //
+            // 认全它们不需要按厂商分叉：按形状取文本，取不到就当没有。
+            if let Some(rt) = reasoning_text_from_delta(delta) {
                 if !rt.is_empty() {
-                    let _ = on_event.send(AiEvent::Reasoning {
-                        delta: rt.to_string(),
-                    });
+                    let _ = on_event.send(AiEvent::Reasoning { delta: rt });
                 }
             }
             if let Some(text) = delta["content"].as_str() {
