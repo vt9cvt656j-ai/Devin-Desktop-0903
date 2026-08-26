@@ -571,3 +571,37 @@ test("⌘L 聚焦地址栏", () => {
   assert.match(block, /\.lp__url/);
   assert.match(block, /input\.select\(\)/, "聚焦后没选中全文，改地址还得先手动全选");
 });
+
+/**
+ * 面板打开时不许自己去访问一个网站。
+ *
+ * 用户原话：「什么都没输入、没打开呢，你就自己输入 localhost 地址了？」
+ * 成因是 openLivePreview 不带地址时会退回 _previewRestoreUrl()——localStorage 里
+ * 上次用过的那个。上次那个 dev server 多半已经不在了，看到的是一屏连接失败；
+ * 更糟的是那个端口现在可能是别的东西，面板会去请求一个用户根本没打算访问的服务。
+ *
+ * 记住地址本身没错，错的是**替用户做导航决定**。所以：不自动走，降级成候选。
+ */
+test("不带地址打开预览面板时，不许自动导航到上次的地址", () => {
+  const fn = fnSource("openLivePreview");
+  assert.ok(fn, "openLivePreview 不见了，这条断言失去落点");
+  // 目标地址的推导链里不许再出现 _previewRestoreUrl。
+  const target = fn.slice(fn.indexOf("const target ="), fn.indexOf("const target =") + 200);
+  assert.doesNotMatch(target, /_previewRestoreUrl/,
+    "又退回上次的地址了——用户什么都没输入，面板就自己去访问一个 localhost");
+  // 但同一次会话里切走再切回来不该丢当前页面，所以 _preview.url 必须留着。
+  assert.match(target, /_preview\.url/,
+    "连当前页面也不保留了——切到别的页签再切回来会白屏");
+});
+
+test("上次的地址降级成候选，摆在空状态页上点了才走", () => {
+  const empty = fnSource("_previewRenderEmpty");
+  assert.match(empty, /_previewRestoreUrl\(\)/,
+    "上次的地址彻底丢了——它仍然是用户最可能想点的那一个，该摆出来");
+  assert.match(empty, /上次看的/, "候选没有来源标注，用户分不清这条是哪来的");
+  // 已经探测到在跑的不重复列。
+  assert.match(empty, /!found\.some\(\(c\) => c\.url === last\)/,
+    "同一个地址会在候选里出现两次");
+  // 空状态页本来就把真正在跑的 dev server 列出来了，这条保证那半没被改坏。
+  assert.match(empty, /_previewDetectDevUrls\(\)/, "探测在跑的 dev server 那一半没了");
+});
