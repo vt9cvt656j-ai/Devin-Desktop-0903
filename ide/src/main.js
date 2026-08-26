@@ -40886,6 +40886,29 @@ async function _importProjectMemoryFile(root) {
 function _kgAddNote(root, content) {
   return !!_kgAddNoteRecord(root, content);
 }
+// 全局保底位的技术栈作用域闸。判据是**声明式**的：笔记自己的 tags（写入时由 _kgTokens
+// 落下）里出现语言名 = 这条笔记声明了"我属于那个栈"；当前项目的 lang 里没有它，它就不占
+// 无条件保底名额——它仍然能被 tag 命中的相关性检索捞回来。词表只从 stackTable 的 lang
+// 派生（唯一来源，加一门语言 = 加一行），不收 pkgMgr 和命令名：cargo / test / build 这类
+// 词在普通笔记里太常见，收进来会误伤。
+//
+// **只对全局库生效（root === ""）**：项目库已经按项目隔离了，再按语言挡一次实测有害——
+// 一条讲「用 Python 正则从 .jsc 里提字符串常量池」的 Electron 逆向笔记 tags 带 python，
+// 会被挡出它自己那个 package.json 项目。
+//
+// 键的口径比 _gatherAgentContext 里 _projectStacks.set 用的那份**少一个 sessionRoot**
+// （那是它的入参，模块级读不到）：子体指定 sessionRoot 时这里 get 到 undefined，
+// 于是 fail-open 全带，不会错杀。
+const _KG_LANG_TAGS = new Set(_STACK_TABLE.flatMap((r) => String(r.lang || "").toLowerCase().split("/")).filter(Boolean));
+function _kgOffStackFor() {
+  const _scope = new Set(String(_projectStacks.get((rootPath || workspaceRoots[0] || "").replace(/\/+$/, ""))?.lang || "")
+    .toLowerCase().split(/[^a-z0-9#+]+/).filter(Boolean));
+  if (!_scope.size) return () => false; // 栈未知 → 整道闸不生效：宁可多带，不可错杀
+  return (n) => {
+    const _decl = (n.tags || []).filter((t) => _KG_LANG_TAGS.has(t));
+    return _decl.length > 0 && !_decl.some((t) => _scope.has(t));
+  };
+}
 // Link-aware retrieval: top-K notes by tag-overlap with the query, expanded with
 // their 1-hop neighbours (the connected subgraph), plus a few most-recent notes so
 // general knowledge isn't missed. Returns the chosen note objects.
@@ -40920,8 +40943,12 @@ function _kgRetrieve(root, query, K = 6, MAX = 13) {
   // 偏好/规矩/坑 无条件保底：这三类是"每次干活都必须遵守"的长期约束——
   // "别用黄色"和"做个电影网站"的 query 毫无词面交集，按相关性检索永远捞不中，
   // 结果就是记了也白记（用户实测骂"记忆垃圾"）。最新的这三类各留足名额直接带上。
+  // 保底位先过技术栈作用域闸。取不到闸（早期调用 / 测试台未注入依赖）就退回恒 false：
+  // 这道闸只该减少噪音，绝不该在它自己失败时改变检索结果。
+  let _offStack = () => false;
+  if (!root) { try { _offStack = _kgOffStackFor(); } catch {} }
   const _mustCarry = notes
-    .filter((n) => n.type === "preference" || n.type === "convention" || n.type === "pitfall")
+    .filter((n) => (n.type === "preference" || n.type === "convention" || n.type === "pitfall") && !_offStack(n))
     .sort((a, b) => b.created - a.created)
     .slice(0, 8);
   for (const n of _mustCarry) {
