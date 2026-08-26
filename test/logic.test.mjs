@@ -15333,12 +15333,13 @@ test("验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代�
   //      会变成一个绕过空跑检测的新后门。
   assert.doesNotMatch(loopWithoutComments, /_runApprovedVerification\(/,
     "① 收尾门又在代跑了：兜底只许发生在刚落盘那一批，不许在收尾腿");
-  const autoVerify = loopWithoutComments.slice(loopWithoutComments.indexOf("_autoVerifyRan"));
-  assert.ok(loopWithoutComments.includes("_autoVerifyRan"), "兜底自动验证不见了");
+  const _avAt = loopWithoutComments.indexOf("_autoVerifyAtImplOps");
+  assert.ok(_avAt > 0, "兜底自动验证不见了");
+  const autoVerify = loopWithoutComments.slice(_avAt);
   assert.match(autoVerify, /_executeToolStep\(\s*_avStep/,
     "② 兜底必须走 _executeToolStep：绕过它就等于绕过工具卡片和授权检查点");
-  assert.match(loopWithoutComments, /!run\._autoVerifyRan && verifyNudges >= 1/,
-    "③ 兜底抢在模型前面了：必须先提醒过、且每 run 一次");
+  assert.match(loopWithoutComments, /run\._autoVerifyAtImplOps !== _implOps[\s\S]{0,240}?verifyNudges >= 1/,
+    "③ 兜底抢在模型前面了：必须先提醒过；武装位按实现版本记，不是整个 run 一次性烧掉");
   assert.match(autoVerify, /_evidenceCertifies\(_rec, _implOps\)/,
     "④ 兜底另开了授信判据：必须和模型自跑走同一套证据结算");
   assert.doesNotMatch(loopWithoutComments, /\[BLOCKED\][^\n]*验证|codeVerifyNudges[^\n]*continue/);
@@ -15357,6 +15358,42 @@ test("验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代�
     "unverified delivery must still be recorded");
   assert.match(SRC, /run\._incompleteReason \|\|= "ui_verification_missing"/,
     "missing UI verification must still be recorded");
+});
+
+test("兜底自动验证按实现版本重新武装，不是烧在第一批落盘上", () => {
+  // 病：`!run._autoVerifyRan` 是一次性布尔，而且触发条件里根本没有「提醒之后又推进了
+  // 实现」这个判据——紧邻的注释承诺了它（"只有它已经被提醒过、又推进了实现却依然没验时
+  // 才兜底"），代码里没有。后果有两层：兜底在第一次 verifyNow 提醒的**同一批**就烧掉，
+  // 模型连自己跑的机会都没有；烧完之后再改一百行也永远回不来。
+  const loop = stripJsComments(extractFn("_runAgenticLoop"));
+  assert.ok(loop.length > 50_000,
+    `_runAgenticLoop 只取到 ${loop.length} 字节——AST 抽取失败会让下面每一条断言恒真`);
+
+  assert.ok(loop.includes("_autoVerifyAtImplOps"),
+    "兜底武装位仍是一次性布尔 run._autoVerifyRan：置真之后整个 run 再也不会重新武装，兜底烧在第一批落盘上");
+  assert.doesNotMatch(loop, /run\._autoVerifyRan/,
+    "旧的一次性布尔还留着——两套武装位并存，一次性那条会先短路掉版本那条");
+
+  const cond = /if \(run\._autoVerifyAtImplOps !== _implOps[\s\S]{0,400}?\) \{/.exec(loop);
+  assert.ok(cond, "兜底的触发条件不是以「这一版还没兜过」起头");
+  assert.ok(cond[0].length < 400, `触发条件切出了 ${cond[0].length} 字节，锚点漂了`);
+  assert.match(cond[0], /verifyNudges >= 1/, "兜底抢在模型前面了：必须先提醒过");
+  assert.match(cond[0], /_lastVerifyNudgeAtImplOps < _implOps/,
+    "注释承诺的「提醒过、又推进了实现还不验」没有落进代码：提醒的那一批就会兜底，模型没机会先自己跑");
+  assert.match(cond[0], /_verifiedAtImplOps < _implOps/, "少了「这一版还没验过」");
+
+  assert.match(loop, /run\._autoVerifyAtImplOps = _implOps;/,
+    "武装位没有记实现版本号——记布尔量就等于回到「烧一次就没了」");
+  assert.match(loop, /run\._autoVerifyRuns/,
+    "兜底没有全 run 上限：改一次跑一次会让一个 run 里跑出无穷多次验证");
+
+  // 三处承诺兜底次数的模型可见文案必须同时更新：上一版只改了收尾契约和栈提示的
+  // checkCmd 那行，漏掉了 verifyNow 提醒正文和 stack.js 紧邻的 testCmd 那行——
+  // 同一个 hint 块里相邻两行，一个说「最多 3 次」一个说「只有那一次兜底」。
+  assert.doesNotMatch(SRC, /兜底一次——那是兜底/,
+    "verifyNow 提醒仍在对模型说「只兜底一次」，而机器已经每版重新武装");
+  assert.doesNotMatch(SRC, /同样只有那一次兜底/,
+    "栈提示的测试那行仍在说「只有那一次兜底」，和它上一行的说法直接打架");
 });
 
 test("技术栈规则必须真的送达模型——每个 UI 轮次，包括网关设计层在场时", () => {
@@ -31416,7 +31453,7 @@ test("收尾契约对「谁来跑验证」的说法，必须和真实机器一�
   assert.match(frame, /自己跑一遍/, "不再要求模型自己跑了");
   // 两侧同源：栈提示和收尾契约必须用同一句描述兜底，别各说各的。
   const hint = extractFn("formatStackHint");
-  const SHARED = "IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账";
+  const SHARED = "IDE 只会在你被提醒之后仍然不跑时兜底跑一次，每落出新的一版重新算，全程最多 3 次，兜出来的红字同样算你的账";
   assert.ok(frame.includes(SHARED) && hint.includes(SHARED),
     "栈提示和收尾契约对兜底的说法漂了——两份说法会让模型采信更省事的那条");
 });

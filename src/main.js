@@ -49646,7 +49646,7 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
     //
     // 这是"写出来的代码用不了"最直接的一条机器原因。修法只有两条：把机器真接上，
     // 或者别再承诺它。先选后者——承诺一个不存在的能力，比没有这个能力糟得多。
-    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（IDE 只会在你被提醒之后仍然不跑时兜底跑一次，兜出来的红字同样算你的账，收尾门本身不代跑、只记账）——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。确实做不到的项，收尾如实写明未完成及原因。`);
+    lines.push(`🏁 收尾验收契约（harness 收尾**只机械核对两件事**：改过代码有没有真跑过验证、改过界面有没有浏览器验过；取证与运行/外部义务这几项没有任何门会核对、缺了也不会拦你，代价直接落在交付上。所以把它们当作任务的一部分提前做掉，别指望收尾有人提醒）：${_finishChecks.length ? _finishChecks.map((check, index) => `${index + 1}. ${check}`).join("；") + "；" : ""}改过代码就**自己跑一遍**本项目的构建/测试命令（IDE 只会在你被提醒之后仍然不跑时兜底跑一次，每落出新的一版重新算，全程最多 3 次，兜出来的红字同样算你的账，收尾门本身不代跑、只记账）——退出码非 0 就是结论——这条没过；退出码 0 只说明这条检查通过了，不等于用户要的事做成了，还要看真实输出和目标后置状态。确实做不到的项，收尾如实写明未完成及原因。`);
   }
   return lines.join("\n");
 }
@@ -55525,7 +55525,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               ? `本 run 改过的 ${[...run._uncheckedLangs].join("/")} 文件没有任何语言检查器在看（对应语言服务器没在运行），这条命令是那些改动**唯一**的正确性检查。`
               : "")
             + `不跑就交付，等于把没编译过的代码交给用户。`
-            + `IDE 只会在这之后你仍然不跑时兜底一次——那是兜底，不是你的默认路径。`);
+            + `IDE 只会在你被提醒过、又落出新的一版却仍然不跑时兜底——每版最多一次、全程最多 3 次，那是兜底，不是你的默认路径。`);
         }
       }
 
@@ -55554,11 +55554,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
        *     依然没验时才兜底。不抢在模型判断之前。
        *   · **不另开判据**：结算完全复用模型自跑那一套（_executionEvidenceFromTool +
        *     verifierRecognized + _evidenceCertifies）。空跑的绿色照样不算验证。
-       *   · 每个 run 最多一次。
+       *   · 每个实现版本最多兜底一次（记的是版本号不是布尔量：模型再落一版就重新武装），全 run 硬上限 3 次。
        */
-      if (!run._autoVerifyRan && verifyNudges >= 1 && _live() && run.mode === "agent"
-          && _implOps > 0 && _verifiedAtImplOps < _implOps && body) {
-        run._autoVerifyRan = true;   // 先置位：无论成败都只兜底一次
+      if (run._autoVerifyAtImplOps !== _implOps && (run._autoVerifyRuns || 0) < 3
+          && verifyNudges >= 1 && _live() && run.mode === "agent"
+          && _implOps > 0 && _verifiedAtImplOps < _implOps
+          && _lastVerifyNudgeAtImplOps < _implOps && body) {
+        run._autoVerifyAtImplOps = _implOps;   // 先记版本：这一版无论成败都只兜底一次
+        run._autoVerifyRuns = (run._autoVerifyRuns || 0) + 1;   // 全 run 硬上限：改一次跑一次也要有顶
         try {
           const _avCmd = await _detectVerifyCmd(root, _projectStacks.get(root) || null);
           if (_avCmd && _live()) {
