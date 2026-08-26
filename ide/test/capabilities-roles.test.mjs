@@ -9,7 +9,7 @@
 //   2. 声明的工具矩阵真的到了子智能体手里（否则 design 角色打不开浏览器）
 //   3. 模型**知道**这个角色存在（枚举里没有的角色，它永远不会选）
 import { readFileSync } from "node:fs";
-import { roleCapabilities } from "../src/agent/subagent-roles.js";
+import { roleCapabilities, ROLE_CAPABILITIES, ROLE_CAPABILITIES_READ } from "../src/agent/subagent-roles.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -73,7 +73,7 @@ test("声明的工具矩阵真的到了子智能体手里，而写错的工具�
   assert.deepEqual(caps("data", false), { tools: [], types: [] });
   // 内置角色不受影响。
   // 内置角色不受影响（真表里 frontend 是 browser + generate_image）。
-  assert.deepEqual(caps("frontend", true).tools, ["browser", "generate_image"]);
+  assert.deepEqual(caps("frontend", true).tools, ["browser", "visual_compare", "generate_image"]);
 });
 
 test("没有任何声明时，角色行为和以前完全一样", () => {
@@ -81,7 +81,7 @@ test("没有任何声明时，角色行为和以前完全一样", () => {
   // 这条验的是「一条声明都没有时」——所以传的是**空**角色表，不是 DECL。
   const caps = (role, write) => roleCapabilities(role, write, roleMapWith(empty));
   // 内置角色不受影响（真表里 frontend 是 browser + generate_image）。
-  assert.deepEqual(caps("frontend", true).tools, ["browser", "generate_image"]);
+  assert.deepEqual(caps("frontend", true).tools, ["browser", "visual_compare", "generate_image"]);
   assert.deepEqual(caps("data", true), { tools: [], types: [] });
 });
 
@@ -166,4 +166,35 @@ test("没有加角色级 effort —— 那会把刚删掉的静默改档装回�
   }, "项目配置");
   assert.equal(caps.roles[0].effort, undefined,
     "角色声明开始接收 effort 了——档位只有一处真相：用户给那个模型选的偏好");
+});
+
+/**
+ * 可写矩阵必须是只读矩阵的**超集**。
+ *
+ * 这条不是风格问题，它修的是一个反过来的现实：两张角色表分两次写成，只读那张后补、
+ * 补完没并进可写那张，于是「能动手修的那一档反而看不到证据」——前端的可写 worker
+ * 拿不到截图比对，安全的可写 worker 拿不到流量取证，而它们才是真正需要那些证据的人。
+ *
+ * 判据写成不变量而不是逐个角色列清单：以后往只读表加东西、忘了并进可写表，这条会红。
+ */
+test("每个角色的可写工具集，必须包含它的只读工具集", () => {
+  const lost = [];
+  for (const role of new Set([...Object.keys(ROLE_CAPABILITIES), ...Object.keys(ROLE_CAPABILITIES_READ)])) {
+    const ro = roleCapabilities(role, false);
+    const rw = roleCapabilities(role, true);
+    for (const t of ro.tools) if (!rw.tools.includes(t)) lost.push(`${role}.tools 丢了 ${t}`);
+    for (const t of ro.types) if (!rw.types.includes(t)) lost.push(`${role}.types 丢了 ${t}`);
+  }
+  assert.deepEqual(lost, [],
+    `可写档比只读档还少工具——能动手修的那一档反而看不到证据：\n  ${lost.join("\n  ")}`);
+});
+
+test("并集不许把副作用工具漏给只读子体", () => {
+  // 上面那条是"写侧要更多"，这条守反方向：只读侧一件副作用工具都不许多出来。
+  for (const role of Object.keys(ROLE_CAPABILITIES)) {
+    const ro = roleCapabilities(role, false).tools;
+    for (const t of ["generate_image", "http_request", "docker_compose_up"]) {
+      assert.ok(!ro.includes(t), `只读角色 ${role} 拿到了副作用工具 ${t}`);
+    }
+  }
 });

@@ -24943,7 +24943,11 @@ test("_roleCapabilities: write workers get role-matched tools, read-only get non
   const caps = (role, write, userMap = null) => _rolePolicy(role, write, userMap);
 
   assert.deepEqual(caps("database", true), { tools: ["db_query"], types: ["db"] });
-  assert.deepEqual(caps("design", true).tools, ["browser", "generate_image"]);
+  // 可写档是只读档的**超集**：design 的可写 worker 也拿得到 visual_compare。
+  // 两张矩阵分两次写成，只读那张后补、补完没并进可写那张，于是变成「能动手修的
+  // 那一档反而看不到证据」——改完 UI 的正是那个需要比对改前改后截图的人。
+  // 超集这条不变量由 test/capabilities-roles.test.mjs 钉着。
+  assert.deepEqual(caps("design", true).tools, ["browser", "visual_compare", "generate_image"]);
   assert.deepEqual(caps("backend", true).types, ["db", "http"]);
 
   // 只读子体现在也按角色分工具，给的是只读语义下真的用得上的那几件；
