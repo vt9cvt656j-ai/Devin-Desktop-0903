@@ -627,3 +627,29 @@ test("Vue 拿得到 typescript.tsdk，拿不到时不编一个假路径", () => 
   assert.match(ensure, /manager\._vueTsdk = "";/,
     "探测前没有先置空——undefined 是「还没探过」的判据，不置空会每次都重探");
 });
+
+/**
+ * 安装提示允许有界重试，不再是「一辈子一次」。
+ *
+ * 原来 `_lspMarkPrompted` 在 `showNotification` **之前**调——在用户看没看见、安装成没成
+ * 之前就记账了。三种情况都会把这门语言的一键入口永久烧掉：没看见（提示只挂 20 秒）、
+ * 点了但命令是死的（mac 表里实测有两条）、或安装因别的原因失败。
+ *
+ * 而这条通知**就是唯一的入口**——注释里承诺的兜底「语言服务面板」已经是死代码。
+ */
+test("安装提示按语言计数，允许重试而不是一次用光", () => {
+  assert.match(source, /const _LSP_MAX_PROMPTS = \d+;/, "没有上限常量，说明还是布尔式的一次性");
+  assert.match(source, />= _LSP_MAX_PROMPTS/, "判据不是计数");
+  assert.match(source, /counts\[langId\] = \(Number\(counts\[langId\]\) \|\| 0\) \+ 1/,
+    "记账不是累加");
+  // 键名必须换代：旧键存的是语言名数组，按计数读会被当成 0，又回到一辈子一次。
+  assert.match(source, /_LSP_DISMISS_KEY = "lsp_install_prompted_v2"/,
+    "存储键没换代——老用户的旧记录会被读成计数 0");
+  assert.doesNotMatch(source, /Array\.isArray\(s\) && s\.includes\(langId\)/,
+    "还留着旧的数组判据");
+});
+
+test("那条指向已下掉面板的注释不许再说「还能从面板装」", () => {
+  assert.doesNotMatch(source, /the user can still install any server from the 语言服务 panel/,
+    "注释还在指一个已经被删掉的面板——它让人以为装不上还有别的入口");
+});
