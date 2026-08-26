@@ -735,17 +735,35 @@ export function createLspManager(options) {
     // The event belongs to the channel that emitted it. A final stopped event
     // from a manually replaced server must not remove the new client.
     if (!client || (stoppedClient && client !== stoppedClient)) return;
+    /*
+     * **没有 else 的话，一整类死法是零提示的。**
+     *
+     * 这里原来只在 tail 非空、且截得出非空 why 时才说一句。而实测常见的语言服务器里
+     * 多数在死掉时 stderr 是**空的**——被 OOM kill、收到信号、干净退出、或者只往
+     * stdout 写东西，四种死法一个字都不留。于是：markers 被清空、状态栏少一门语言、
+     * clients 里的记录被删掉，界面上没有任何解释。
+     *
+     * 用户看到的是「写着写着红线和补全突然全没了」，然后下次打开同语言文件又会重启
+     * 服务器（因为 clients 已删）——所以他的描述是「时好时坏」，而不是「坏了」。
+     * lsp.rs 里为「说清死因」专门建的那条 stderr 转发通道，终点是一个没人渲染的 Map。
+     *
+     * 所以：有 stderr 就说 stderr，没有也要说「它死了、而且没留下任何原因」——
+     * 后者本身就是有用的信息（它把「服务没起来」和「服务起来了又悄悄死了」分开了）。
+     */
+    let why = "";
     if (tail.length) {
       // 挑最能说明问题的一行：优先看着像错误的那句，没有就用最后一行。
       const bad = tail.filter((l) => /error|exception|fatal|panic|not found|cannot find|traceback/i.test(l));
-      const why = String(bad.length ? bad[bad.length - 1] : tail[tail.length - 1]).trim().slice(0, 180);
-      if (why) {
-        // 留给智能体：语言服务器死了之后，lsp_* 工具只会说「这个语言没有可用的服务」，
-        // 不说为什么。存下来，工具回执里带上——模型才知道该去装什么、修什么。
-        lastStopReason.set(langId, why);
-        showToast(`${langId} 语言服务已停止：${why}`);
-      }
+      why = String(bad.length ? bad[bad.length - 1] : tail[tail.length - 1]).trim().slice(0, 180);
     }
+    if (!why) {
+      // 兜底文案要说清两件事：它确实死过（不是没起来），以及为什么这里给不出原因。
+      why = "进程退出，没有留下任何错误输出（可能是被系统回收内存杀掉、或收到了退出信号）";
+    }
+    // 留给智能体：语言服务器死了之后，lsp_* 工具只会说「这个语言没有可用的服务」，
+    // 不说为什么。存下来，工具回执里带上——模型才知道该去装什么、修什么。
+    lastStopReason.set(langId, why);
+    showToast(`${langId} 语言服务已停止：${why}`);
     client.shutdown();
     clients.delete(langId);
     // Drop any debounced didChange still queued for this language: firing it after
