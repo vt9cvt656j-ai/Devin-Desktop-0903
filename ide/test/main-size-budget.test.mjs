@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import * as acorn from "acorn";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -118,4 +119,97 @@ test("尺寸闸贴着现实，不是一条永远撞不上的线", () => {
     `上限比实际大 ${slack} 行，这条闸基本不起作用了。`
       + `把 MAIN_JS_MAX_LINES 收到 ${lines + 500} 附近——闸的价值在于"下一次新增就会撞上"。`,
   );
+});
+
+/**
+ * 抽出去的模块不许搬回 main.js。
+ *
+ * 上面那条闸的用法是「撞线就抽模块」。抽完之后没有任何东西盯着它别回流 —— 而本仓库
+ * 几乎所有源码断言用的是 helpers/source.mjs 的 SRC（main.js + src/agent/* 拼接），
+ * 代码搬回 main.js 一样全绿，尺寸闸要等到下一次撞线才会哭。
+ *
+ * 判据从**两端**取，两端都是产品代码，没有一端是这个测试自己编的形状：
+ *   · 模块那一端：直接 import() 真模块，问它导没导出这些名字（不抠源码文本）；
+ *   · main.js 那一端：acorn 解析 src/main.js **本身**（不是拼接后的 SRC），
+ *     要求这些名字只以 ImportSpecifier 出现、没有同名顶层声明。
+ * 全程走 AST，不切字符串窗口，也不做正文正则匹配 —— 所以既不需要先剥注释
+ * （注释里提名字不产生 FunctionDeclaration），也不会因为函数变长而失效。
+ * 顶层声明数另有一条下限断言兜着，避免解析坏掉时整条变成恒真。
+ */
+const EXTRACTED_TO_AGENT = {
+  "delivery-scan.js": [
+    "_removedDeclarationsUnchecked", "_sinkRiskAdvice", "_stubDeliveryFindings",
+    "_staleCommentFindings", "_hardcodedDeliveryFindings", "_touchedExportedDecls",
+  ],
+  // _importRegistryUrl 故意不列：它没有块外调用点，留作模块私有。
+  "dep-manifest.js": [
+    "_manifestDepAdditions", "_undeclaredImportAdditions", "_declaredDepsFromFileMap",
+  ],
+  "ai-errors.js": [
+    "_stripAiRetryPrefix", "_aiFailureKind", "_isProviderGatewayStatusError",
+    "_isRateLimitedAiError", "_isRetryableAiError", "_isCompressionPrefixInvalidError",
+    "_isStalledAiError", "_modelEventHasProgress", "_streamResumeMode",
+  ],
+};
+
+test("腾出来的三族必须住在 src/agent/，不许搬回 main.js", async () => {
+  const problems = [];
+
+  for (const [file, names] of Object.entries(EXTRACTED_TO_AGENT)) {
+    let mod = null;
+    try {
+      mod = await import(new URL(`../src/agent/${file}`, import.meta.url).href);
+    } catch (e) {
+      problems.push(`src/agent/${file} 导不进来：${String(e.message).split("\n")[0]}`);
+      continue;
+    }
+    for (const n of names) {
+      if (typeof mod[n] === "undefined") problems.push(`src/agent/${file} 没有导出 ${n}`);
+    }
+  }
+
+  const mainSrc = readFileSync(join(ROOT, "src/main.js"), "utf8");
+  const ast = acorn.parse(mainSrc, {
+    ecmaVersion: "latest", sourceType: "module",
+    allowAwaitOutsideFunction: true, allowHashBang: true,
+  });
+  const declaredAtTop = new Set();
+  const importedFrom = new Map();
+  for (const stmt of ast.body) {
+    if (stmt.type === "ImportDeclaration") {
+      for (const s of stmt.specifiers) {
+        if (s.type === "ImportSpecifier") importedFrom.set(s.local.name, String(stmt.source.value));
+      }
+      continue;
+    }
+    const node = stmt.type === "ExportNamedDeclaration" ? stmt.declaration : stmt;
+    if (!node) continue;
+    if (node.type === "FunctionDeclaration" && node.id) declaredAtTop.add(node.id.name);
+    if (node.type === "VariableDeclaration") {
+      for (const d of node.declarations) {
+        if (d.id?.type === "Identifier") declaredAtTop.add(d.id.name);
+      }
+    }
+  }
+  // 反恒真：解析坏了就直接说，别让上面两个集合空着把判据喂绿。（实测 3141 / 115）
+  assert.ok(declaredAtTop.size > 500,
+    `main.js 只解析出 ${declaredAtTop.size} 个顶层声明——AST 那一端坏了，这条等于没跑`);
+  assert.ok(importedFrom.size > 50,
+    `main.js 只解析出 ${importedFrom.size} 个具名 import——AST 那一端坏了，这条等于没跑`);
+
+  for (const [file, names] of Object.entries(EXTRACTED_TO_AGENT)) {
+    for (const n of names) {
+      if (declaredAtTop.has(n)) problems.push(`${n} 仍然声明在 src/main.js 顶层`);
+      const from = importedFrom.get(n);
+      if (from === undefined) problems.push(`${n} 没有从任何模块 import 进 main.js`);
+      else if (!from.endsWith(`/agent/${file}`)) {
+        problems.push(`${n} 是从 ${from} import 的，应为 ./agent/${file}`);
+      }
+    }
+  }
+
+  assert.deepEqual(problems, [],
+    "src/main.js 的尺寸闸靠「抽模块」腾地方，抽完没人盯着它别搬回来"
+    + "（源码断言用的是 helpers/source.mjs 拼接后的 SRC，搬回 main.js 一样全绿）：\n  "
+    + problems.join("\n  "));
 });

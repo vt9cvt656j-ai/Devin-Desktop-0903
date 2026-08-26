@@ -89,3 +89,11 @@ export function pathIsAtOrUnder(candidate, parent, remote = null) {
 // _openingFiles），那是 main.js 的状态，不是路径逻辑。留在 main.js 里。
 // 判据就是这条：模块里只放"给它字符串就能算出答案"的东西。
 
+// Source-code file extensions for the pre-delivery verification gate: editing one of
+// these carries an implicit "prove it at least parses/builds" obligation. Docs, config
+// and data files (md/json/yaml/txt/…) are intentionally excluded so trivial content
+// edits are never held hostage to a build.
+// 加上 html/css/scss/less/json/yaml/toml：这张表是两道验证门唯一的入口，漏掉就等于
+// **整轮零验证义务**——而这个 IDE 最常做的交付恰恰是界面，改一版 CSS 和一份配置
+// 一个字的源码都不算「改了代码」，收尾门于是完全不看这一轮。
+export const _CODE_FILE_RE = /\.(?:js|jsx|ts|tsx|mjs|cjs|vue|svelte|astro|py|rs|go|java|kt|kts|c|h|cc|cpp|hpp|cs|rb|php|swift|m|mm|scala|sh|bash|zsh|sql|lua|dart|ex|exs|elm|clj|hs|html|htm|css|scss|sass|less|json|jsonc|yaml|yml|toml)$/i;
