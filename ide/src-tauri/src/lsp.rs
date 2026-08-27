@@ -628,8 +628,27 @@ const DEFAULT_PYTHON_NAMES: &[&str] = &["python", "py"];
 #[cfg(not(windows))]
 const DEFAULT_PYTHON_NAMES: &[&str] = &["python3", "python"];
 
-#[tauri::command(async)]
-pub fn lsp_detect_python(
+#[tauri::command]
+/// **必须走 spawn_blocking。**
+///
+/// `#[tauri::command(async)]` 套在**同步** fn 上的语义是「把函数体丢到异步 runtime 上」，
+/// 不是「丢到阻塞线程池上」：tauri 的宏把同步调用直接内联进 async 块交给 tokio::spawn，
+/// 于是它在 worker 线程上**就地阻塞**。而下面这几个都在 fork/exec/wait 外部工具链
+/// （解释器、node、go），一次冷启轻松几秒。
+///
+/// worker 数 = CPU 核数。攒够那么多个卡住的调用，整个 runtime 被饿死 —— 而 git、存盘、
+/// 终端、AI 这些同样是 `command(async)` 的同步 fn（全仓 83 个）共用这一个池，会一起
+/// 停止响应。用户报的「LSP 卡死」实际是「整个 IDE 卡死」，就是从这里放大的。
+pub async fn lsp_detect_python(
+    workspace: Option<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<PythonEnvInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || lsp_detect_python_blocking(workspace, trust_workspace_binaries))
+        .await
+        .map_err(|e| format!("lsp_detect_python 任务被中断：{e}"))?
+}
+
+fn lsp_detect_python_blocking(
     workspace: Option<String>,
     trust_workspace_binaries: Option<bool>,
 ) -> Result<PythonEnvInfo, String> {
@@ -690,6 +709,18 @@ struct PythonModuleCache {
     symbol_cache: HashMap<String, Vec<String>>,
 }
 
+/// 单次 Python 探测脚本的上限。见 run_python_script 里的说明：这条路会执行用户项目里
+/// 任意包的顶层代码，没有上限等于把一把全局锁交给一个陌生的第三方包。
+fn py_script_timeout() -> Duration {
+    // 测试里用短上限：否则守「超时真的会触发」的那条每跑一次就要多等十秒。
+    // 用 cfg!(test) 而不是环境变量 —— 生产路径上不多一个可被外部改掉的旋钮。
+    if cfg!(test) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
 static PY_CACHE: OnceLock<Mutex<Option<PythonModuleCache>>> = OnceLock::new();
 
 fn py_cache() -> &'static Mutex<Option<PythonModuleCache>> {
@@ -715,15 +746,70 @@ fn run_python_script(script: &str, extra_args: &[&str], scope: Option<&str>) -> 
     for a in extra_args {
         cmd.arg(a);
     }
-    let output = cmd.output().ok()?;
+    // **必须有超时。** 这里跑的是用户项目 venv 里的解释器，而第二个脚本会对每个模块名
+    // 做 `importlib.import_module(n)` —— 也就是**执行那个包的顶层代码**。一个 import 时
+    // 连网、等输入、起服务的包（`pip install -e .` 的项目尤其常见），或者
+    // `pkgutil.iter_modules()` 扫到一个失效的 SMB/NFS 挂载点，都会让 `cmd.output()`
+    // 永远不返回。而调用方抱着一把**全进程唯一**的 PY_CACHE 锁 —— 于是所有 Python 补全
+    // 排在它后面，用户觉得补全死了就去切标签页，每切一次再吃掉一个 tokio worker。
+    //
+    // 就算包一切正常，torch / tensorflow 这类冷启也要 5~20 秒，同样把后面全串住。
+    // 10 秒够任何正常的 import，卡住的那种一秒都不该等。
+    cmd.stdin(Stdio::null());
+    // 自成进程组：超时要杀的是整棵子树。解释器可能自己 fork（多进程库的顶层 import 就会），
+    // 只 kill 直接子进程的话孙进程还在跑、还占着我们已经不看的管道。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Safe：pre_exec 里只调 setsid()，异步信号安全，不分配、不加锁。
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = cmd.spawn().ok()?;
+    #[cfg(unix)]
+    let pgid = child.id() as i32;
+    let output = match crate::env_probe::wait_with_timeout_pub(child, py_script_timeout()) {
+        Some(out) => out,
+        None => {
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            return None;
+        }
+    };
     if !output.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-#[tauri::command(async)]
-pub fn lsp_python_env_symbols(
+#[tauri::command]
+/// **必须走 spawn_blocking。**
+///
+/// `#[tauri::command(async)]` 套在**同步** fn 上的语义是「把函数体丢到异步 runtime 上」，
+/// 不是「丢到阻塞线程池上」：tauri 的宏把同步调用直接内联进 async 块交给 tokio::spawn，
+/// 于是它在 worker 线程上**就地阻塞**。而下面这几个都在 fork/exec/wait 外部工具链
+/// （解释器、node、go），一次冷启轻松几秒。
+///
+/// worker 数 = CPU 核数。攒够那么多个卡住的调用，整个 runtime 被饿死 —— 而 git、存盘、
+/// 终端、AI 这些同样是 `command(async)` 的同步 fn（全仓 83 个）共用这一个池，会一起
+/// 停止响应。用户报的「LSP 卡死」实际是「整个 IDE 卡死」，就是从这里放大的。
+pub async fn lsp_python_env_symbols(
+    modules: Vec<String>,
+    workspace: Option<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<PythonModuleSymbols, String> {
+    tauri::async_runtime::spawn_blocking(move || lsp_python_env_symbols_blocking(modules, workspace, trust_workspace_binaries))
+        .await
+        .map_err(|e| format!("lsp_python_env_symbols 任务被中断：{e}"))?
+}
+
+fn lsp_python_env_symbols_blocking(
     modules: Vec<String>,
     workspace: Option<String>,
     trust_workspace_binaries: Option<bool>,
@@ -734,50 +820,59 @@ pub fn lsp_python_env_symbols(
     } else {
         None
     };
-    let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
+    // **锁只圈住 HashMap 的读写，绝不跨越子进程调用。**
+    //
+    // 上一版 guard 从这里一直持到函数结尾，中间跨了两次 run_python_script。PY_CACHE 是
+    // 全进程唯一的一把锁（和工作区、和信任状态都无关），于是：一个慢的解释器（重包冷启
+    // 5~20 秒、或 import 时连网的包）会把**所有** Python 补全串成一队。
+    //
+    // 而这些命令是 `#[tauri::command(async)]` 套在同步 fn 上 —— tauri 的宏把同步函数体
+    // 直接内联进 async 块交给 tokio::spawn，也就是**在 worker 线程上就地阻塞**，不是
+    // spawn_blocking。攒够 CPU 核数个卡住的调用，整个 runtime 被饿死：存盘、git、终端、
+    // AI 这些同样是 command(async) 的命令连开始执行的机会都没有。用户感知到的
+    // 「LSP 卡死」其实是「整个 IDE 卡死」，就是从这里放大的。
     let now = Instant::now();
 
-    let cache_valid = guard
-        .as_ref()
-        .is_some_and(|c| now.duration_since(c.fetched_at).as_secs() < 300);
-
-    let all_modules = if cache_valid {
-        guard.as_ref().unwrap().modules.clone()
-    } else {
-        let script = "import json,pkgutil;print(json.dumps(sorted(set(m.name for m in pkgutil.iter_modules() if not m.name.startswith('_')))))";
-        let mods: Vec<String> = run_python_script(script, &[], scope)
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let c = guard.get_or_insert_with(|| PythonModuleCache {
-            modules: vec![],
-            fetched_at: now,
-            symbol_cache: HashMap::new(),
-        });
-        // **失败不落缓存**。脚本跑挂（解释器不在、venv 刚建还没装好）时 mods 是空的，
-        // 原来照样写 fetched_at —— 于是一张空模块表被当成有效缓存钉住 300 秒，
-        // 这五分钟里补全一个模块名都给不出，而且没有任何迹象说明为什么。
-        if !mods.is_empty() {
-            c.modules = mods.clone();
-            c.fetched_at = now;
+    // ① 锁内：读缓存，决定要不要跑
+    let (cache_valid, cached_modules, mut need_fetch, mut symbols) = {
+        let guard = py_cache().lock().map_err(|e| e.to_string())?;
+        let valid = guard
+            .as_ref()
+            .is_some_and(|c| now.duration_since(c.fetched_at).as_secs() < 300);
+        let mods = if valid {
+            guard.as_ref().unwrap().modules.clone()
+        } else {
+            Vec::new()
+        };
+        let mut need: Vec<String> = Vec::new();
+        let mut syms: HashMap<String, Vec<String>> = HashMap::new();
+        match *guard {
+            Some(ref c) => {
+                for m in &modules {
+                    match c.symbol_cache.get(m) {
+                        Some(cached) => {
+                            syms.insert(m.clone(), cached.clone());
+                        }
+                        None => need.push(m.clone()),
+                    }
+                }
+            }
+            None => need = modules.clone(),
         }
-        mods
+        (valid, mods, need, syms)
     };
 
-    let mut need_fetch: Vec<String> = Vec::new();
-    let mut symbols: HashMap<String, Vec<String>> = HashMap::new();
-    if let Some(ref c) = *guard {
-        for m in &modules {
-            if let Some(cached) = c.symbol_cache.get(m) {
-                symbols.insert(m.clone(), cached.clone());
-            } else {
-                need_fetch.push(m.clone());
-            }
-        }
+    // ② 锁外：跑子进程。慢也只慢自己这一发。
+    let fetched_modules: Option<Vec<String>> = if cache_valid {
+        None
     } else {
-        need_fetch = modules.clone();
-    }
+        let script = "import json,pkgutil;print(json.dumps(sorted(set(m.name for m in pkgutil.iter_modules() if not m.name.startswith('_')))))";
+        run_python_script(script, &[], scope).and_then(|s| serde_json::from_str(&s).ok())
+    };
 
-    if !need_fetch.is_empty() {
+    let fetched_symbols: Option<serde_json::Value> = if need_fetch.is_empty() {
+        None
+    } else {
         let script = r#"import json,sys,importlib
 r={}
 for n in sys.argv[1:]:
@@ -786,24 +881,48 @@ for n in sys.argv[1:]:
  except: pass
 print(json.dumps(r))"#;
         let args: Vec<&str> = need_fetch.iter().map(|s| s.as_str()).collect();
-        if let Some(out) = run_python_script(script, &args, scope) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&out) {
-                if let Some(obj) = parsed.as_object() {
-                    let c = guard.get_or_insert_with(|| PythonModuleCache {
-                        modules: vec![],
-                        fetched_at: now,
-                        symbol_cache: HashMap::new(),
-                    });
-                    for (k, v) in obj {
-                        if let Some(arr) = v.as_array() {
-                            let syms: Vec<String> = arr
-                                .iter()
-                                .filter_map(|s| s.as_str().map(String::from))
-                                .collect();
-                            c.symbol_cache.insert(k.clone(), syms.clone());
-                            symbols.insert(k.clone(), syms);
-                        }
-                    }
+        run_python_script(script, &args, scope)
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(&out).ok())
+    };
+    need_fetch.clear();
+
+    // ③ 锁内：写回。**失败不建条目** —— 上一版用 get_or_insert_with 无条件建了一条
+    // fetched_at=now 的空条目，被跳过的只是后面那次重新赋值。于是一次失败/超时之后，
+    // 接下来 300 秒里每个调用者都拿到 `cached: true` 和 0 个模块：一张空模块表被钉住，
+    // 而注释还写着「失败不落缓存」。
+    let all_modules = if cache_valid {
+        cached_modules
+    } else {
+        let mods = fetched_modules.unwrap_or_default();
+        if !mods.is_empty() {
+            let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
+            let c = guard.get_or_insert_with(|| PythonModuleCache {
+                modules: Vec::new(),
+                fetched_at: now,
+                symbol_cache: HashMap::new(),
+            });
+            c.modules = mods.clone();
+            c.fetched_at = now;
+        }
+        mods
+    };
+
+    if let Some(parsed) = fetched_symbols {
+        if let Some(obj) = parsed.as_object() {
+            let mut guard = py_cache().lock().map_err(|e| e.to_string())?;
+            let c = guard.get_or_insert_with(|| PythonModuleCache {
+                modules: Vec::new(),
+                fetched_at: now,
+                symbol_cache: HashMap::new(),
+            });
+            for (k, v) in obj {
+                if let Some(arr) = v.as_array() {
+                    let syms: Vec<String> = arr
+                        .iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect();
+                    c.symbol_cache.insert(k.clone(), syms.clone());
+                    symbols.insert(k.clone(), syms);
                 }
             }
         }
@@ -823,8 +942,28 @@ pub struct NodeEnvSymbols {
     pub exports: HashMap<String, Vec<String>>,
 }
 
-#[tauri::command(async)]
-pub fn lsp_node_env_symbols(
+#[tauri::command]
+/// **必须走 spawn_blocking。**
+///
+/// `#[tauri::command(async)]` 套在**同步** fn 上的语义是「把函数体丢到异步 runtime 上」，
+/// 不是「丢到阻塞线程池上」：tauri 的宏把同步调用直接内联进 async 块交给 tokio::spawn，
+/// 于是它在 worker 线程上**就地阻塞**。而下面这几个都在 fork/exec/wait 外部工具链
+/// （解释器、node、go），一次冷启轻松几秒。
+///
+/// worker 数 = CPU 核数。攒够那么多个卡住的调用，整个 runtime 被饿死 —— 而 git、存盘、
+/// 终端、AI 这些同样是 `command(async)` 的同步 fn（全仓 83 个）共用这一个池，会一起
+/// 停止响应。用户报的「LSP 卡死」实际是「整个 IDE 卡死」，就是从这里放大的。
+pub async fn lsp_node_env_symbols(
+    project_dir: String,
+    modules: Vec<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<NodeEnvSymbols, String> {
+    tauri::async_runtime::spawn_blocking(move || lsp_node_env_symbols_blocking(project_dir, modules, trust_workspace_binaries))
+        .await
+        .map_err(|e| format!("lsp_node_env_symbols 任务被中断：{e}"))?
+}
+
+fn lsp_node_env_symbols_blocking(
     project_dir: String,
     modules: Vec<String>,
     trust_workspace_binaries: Option<bool>,
@@ -905,8 +1044,27 @@ pub struct GoEnvSymbols {
     pub packages: Vec<String>,
 }
 
-#[tauri::command(async)]
-pub fn lsp_go_env_symbols(
+#[tauri::command]
+/// **必须走 spawn_blocking。**
+///
+/// `#[tauri::command(async)]` 套在**同步** fn 上的语义是「把函数体丢到异步 runtime 上」，
+/// 不是「丢到阻塞线程池上」：tauri 的宏把同步调用直接内联进 async 块交给 tokio::spawn，
+/// 于是它在 worker 线程上**就地阻塞**。而下面这几个都在 fork/exec/wait 外部工具链
+/// （解释器、node、go），一次冷启轻松几秒。
+///
+/// worker 数 = CPU 核数。攒够那么多个卡住的调用，整个 runtime 被饿死 —— 而 git、存盘、
+/// 终端、AI 这些同样是 `command(async)` 的同步 fn（全仓 83 个）共用这一个池，会一起
+/// 停止响应。用户报的「LSP 卡死」实际是「整个 IDE 卡死」，就是从这里放大的。
+pub async fn lsp_go_env_symbols(
+    project_dir: String,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<GoEnvSymbols, String> {
+    tauri::async_runtime::spawn_blocking(move || lsp_go_env_symbols_blocking(project_dir, trust_workspace_binaries))
+        .await
+        .map_err(|e| format!("lsp_go_env_symbols 任务被中断：{e}"))?
+}
+
+fn lsp_go_env_symbols_blocking(
     project_dir: String,
     trust_workspace_binaries: Option<bool>,
 ) -> Result<GoEnvSymbols, String> {
@@ -1028,8 +1186,29 @@ fn run_cmd_collect(cmd_name: &str, args: &[&str], cwd: Option<&str>) -> Vec<Stri
     }
 }
 
-#[tauri::command(async)]
-pub fn lsp_lang_env_symbols(
+#[tauri::command]
+/// **必须走 spawn_blocking。**
+///
+/// `#[tauri::command(async)]` 套在**同步** fn 上的语义是「把函数体丢到异步 runtime 上」，
+/// 不是「丢到阻塞线程池上」：tauri 的宏把同步调用直接内联进 async 块交给 tokio::spawn，
+/// 于是它在 worker 线程上**就地阻塞**。而下面这几个都在 fork/exec/wait 外部工具链
+/// （解释器、node、go），一次冷启轻松几秒。
+///
+/// worker 数 = CPU 核数。攒够那么多个卡住的调用，整个 runtime 被饿死 —— 而 git、存盘、
+/// 终端、AI 这些同样是 `command(async)` 的同步 fn（全仓 83 个）共用这一个池，会一起
+/// 停止响应。用户报的「LSP 卡死」实际是「整个 IDE 卡死」，就是从这里放大的。
+pub async fn lsp_lang_env_symbols(
+    lang: String,
+    project_dir: String,
+    modules: Vec<String>,
+    trust_workspace_binaries: Option<bool>,
+) -> Result<LangEnvSymbols, String> {
+    tauri::async_runtime::spawn_blocking(move || lsp_lang_env_symbols_blocking(lang, project_dir, modules, trust_workspace_binaries))
+        .await
+        .map_err(|e| format!("lsp_lang_env_symbols 任务被中断：{e}"))?
+}
+
+fn lsp_lang_env_symbols_blocking(
     lang: String,
     project_dir: String,
     modules: Vec<String>,
@@ -1328,6 +1507,78 @@ pub fn lsp_list(state: State<LspManager>) -> Result<Vec<LspInfo>, String> {
 }
 #[cfg(test)]
 mod windows_path_tests {
+
+    /// **子进程必须有上限。**
+    ///
+    /// 这条路会执行用户项目里任意包的顶层代码（importlib.import_module），一个 import 时
+    /// 连网/等输入/起服务的包就能让它永不返回。没有上限 = 把一把全局锁交给一个陌生的
+    /// 第三方包。判据是墙钟：假解释器 sleep 10，调用必须在上限附近返回，而不是等满 10 秒。
+    #[test]
+    fn python_probe_gives_up_on_a_hung_interpreter() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("lsp-timeout-probe-{}", std::process::id()));
+        let bin = dir.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let py = bin.join("python3");
+        std::fs::write(&py, "#!/bin/sh\nsleep 10\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let t = Instant::now();
+        let out = run_python_script("print(1)", &[], Some(&dir.to_string_lossy()));
+        let waited = t.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(out.is_none(), "卡住的解释器不该被当成成功");
+        assert!(
+            waited.as_millis() < 6000,
+            "等了 {}ms —— 超时没有生效，一个卡住的解释器会把这把全局锁永久按住",
+            waited.as_millis()
+        );
+    }
+
+    /// **锁不许跨越子进程调用。**
+    ///
+    /// 上一版 guard 从函数开头持到结尾，中间跨了两次无超时的 run_python_script。PY_CACHE
+    /// 是全进程唯一的一把锁，于是一个慢解释器把所有 Python 补全串成一队；而这些命令是
+    /// 在 tokio worker 上就地阻塞的，攒够核数个就把整个 runtime 饿死。
+    ///
+    /// 这条测试造一个 sleep 的假解释器，两个线程用**互不相干**的参数并发调用：第二个
+    /// 必须不被第一个压住。判据是墙钟，不是源码文本 —— 把 drop(guard) 删掉它就会红。
+    #[test]
+    fn python_probe_does_not_serialize_on_the_global_cache_lock() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("lsp-lock-probe-{}", std::process::id()));
+        let bin = dir.join(".venv").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let py = bin.join("python3");
+        std::fs::write(&py, "#!/bin/sh\nsleep 4\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ws = dir.to_string_lossy().to_string();
+
+        let a = std::thread::spawn(move || {
+            let _ = lsp_python_env_symbols_blocking(vec![], Some(ws), Some(true));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let t = Instant::now();
+        // 完全不同的参数：不信任工作区 → 跑系统 python3，正常是毫秒级返回。
+        let _ = lsp_python_env_symbols_blocking(vec![], None, Some(false));
+        let waited = t.elapsed();
+        let _ = a.join();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            waited.as_millis() < 2500,
+            "第二个调用等了 {}ms —— 它被那个 sleep 4 的假解释器串住了，说明锁又跨越了子进程调用",
+            waited.as_millis()
+        );
+    }
     use super::*;
 
     /// Windows 上「打开文件夹之后每个语言服务器都起不来」的根因。
@@ -1426,7 +1677,7 @@ mod trust_gate_tests {
 
         // 不信任，以及老客户端那种「压根不传这个参数」，都不许碰仓库里的解释器。
         for flag in [None, Some(false)] {
-            let info = lsp_detect_python(Some(ws.clone()), flag).unwrap();
+            let info = lsp_detect_python_blocking(Some(ws.clone()), flag).unwrap();
             assert!(
                 !info.python_path.contains("mrday-trustgate"),
                 "未信任的工作区里那个解释器被执行了：{}",
@@ -1440,7 +1691,7 @@ mod trust_gate_tests {
         }
 
         // 信任：功能照旧。这条不能被这次修改弄死。
-        let info = lsp_detect_python(Some(ws.clone()), Some(true)).unwrap();
+        let info = lsp_detect_python_blocking(Some(ws.clone()), Some(true)).unwrap();
         assert!(
             info.python_path.contains("mrday-trustgate"),
             "信任的工作区反而用不上自己的 venv 了 —— 那是把功能修没了：{}",
@@ -1471,7 +1722,7 @@ mod trust_gate_tests {
         .unwrap();
         let ws = dir.to_string_lossy().to_string();
 
-        let out = lsp_node_env_symbols(ws.clone(), vec!["evil".into()], Some(false)).unwrap();
+        let out = lsp_node_env_symbols_blocking(ws.clone(), vec!["evil".into()], Some(false)).unwrap();
         assert!(
             !marker.exists(),
             "未信任的工作区里那个包被 require 了 —— 它的顶层代码跑了"
@@ -1595,7 +1846,7 @@ mod csharp_probe {
 </Project>"#,
         )
         .unwrap();
-        let out = lsp_lang_env_symbols(
+        let out = lsp_lang_env_symbols_blocking(
             "csharp".into(),
             dir.to_string_lossy().to_string(),
             vec![],

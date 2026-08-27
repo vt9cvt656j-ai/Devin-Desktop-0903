@@ -225,8 +225,12 @@ test("四条取环境符号的路都要过工作区信任门，且缺省 fail cl
   assert.match(RS, /fn workspace_trusted\(flag: Option<bool>\) -> bool \{\s*flag\.unwrap_or\(false\)/,
     "缺省不是 false —— 老客户端不传这个参数时就等于门不存在");
 
+  // 跑外部工具链的那五个命令已拆成「`pub async fn <name>` 的 spawn_blocking 壳子」+
+  // 「`fn <name>_blocking` 的同步实现」（见 test/lsp-probe-hang.test.mjs：不拆的话它们
+  // 在 tokio worker 上就地阻塞，攒够核数个整个 IDE 冻住）。逻辑在 _blocking 里。
   const fnBody = (name) => {
-    const i = RS.indexOf(`pub fn ${name}(`);
+    let i = RS.indexOf(`fn ${name}_blocking(`);
+    if (i < 0) i = RS.indexOf(`pub fn ${name}(`);
     assert.ok(i > 0, `${name} 不见了`);
     const j = RS.indexOf("\n}\n", i);
     return RS.slice(i, j);
@@ -372,10 +376,20 @@ test("补全用的 Python 解释器要和 pyright 用的是同一个", () => {
     "同一个编辑器里会出现两套互相矛盾的「这个包存不存在」：pyright 认得项目 venv 里 "
     + "pip 装的 requests，而模块名补全一片空白");
   // 失败不许落缓存。
-  const g = RS.slice(RS.indexOf("pub fn lsp_python_env_symbols("), RS.indexOf("pub struct NodeEnvSymbols"));
-  assert.match(g, /if !mods\.is_empty\(\) \{\s*c\.modules = mods\.clone\(\);\s*c\.fetched_at = now;/,
+  const g = RS.slice(RS.indexOf("fn lsp_python_env_symbols_blocking("), RS.indexOf("pub struct NodeEnvSymbols"));
+  // 形状变强了：上一版用 get_or_insert_with **无条件**建了一条 fetched_at=now 的空条目，
+  // 被 `if !mods.is_empty()` 跳过的只是后面那次重新赋值 —— 于是「失败不落缓存」这句注释
+  // 是假的，一次失败之后 300 秒里每个调用者都拿到 cached:true 和 0 个模块。
+  // 现在是**失败连条目都不建**：lock + get_or_insert_with 整个挪进了 if 里面。
+  assert.match(g, /if !mods\.is_empty\(\) \{[\s\S]{0,260}?get_or_insert_with/,
     "脚本跑挂时那张空模块表被当成有效缓存钉住 300 秒 —— 这五分钟里补全一个模块名都给不出，"
     + "而且没有任何迹象说明为什么");
+  // **先剥注释再做否定断言。** 第一版直接对原文断言，被 lsp.rs 里那句「上一版用
+  // get_or_insert_with 无条件建了一条…」的**说明性注释**打红 —— 注释里引用一段已经改掉的
+  // 旧代码，是这个仓库反复出现的形状（正向断言会被喂绿，否定断言会被假红）。
+  const gCode = g.replace(/\/\/[^\n]*/g, "");
+  assert.doesNotMatch(gCode.slice(0, gCode.indexOf("if !mods.is_empty()")), /get_or_insert_with/,
+    "在 if 之前就建了缓存条目 —— 那正是上一版「注释说不落缓存、实际落了」的形状");
 });
 
 // ── ⑨ 客户端那张 genericLangs 必须和 Rust 的 match 分支一一对应 ──────────────
@@ -388,7 +402,7 @@ test("genericLangs 和 lsp_lang_env_symbols 的分支两边对得上", () => {
   assert.ok(m, "genericLangs 不见了");
   const declared = new Set([...m[1].matchAll(/"([a-z+#]+)"/g)].map((x) => x[1]));
 
-  const body = RS.slice(RS.indexOf("pub fn lsp_lang_env_symbols("), RS.indexOf("pub struct LspInfo"));
+  const body = RS.slice(RS.indexOf("fn lsp_lang_env_symbols_blocking("), RS.indexOf("pub struct LspInfo"));
   const arms = new Set();
   for (const line of body.split("\n")) {
     const a = /^\s*((?:"[a-z+#]+"\s*\|\s*)*"[a-z+#]+")\s*=>/.exec(line);
