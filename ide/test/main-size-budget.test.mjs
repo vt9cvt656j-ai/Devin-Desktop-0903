@@ -213,3 +213,39 @@ test("腾出来的三族必须住在 src/agent/，不许搬回 main.js", async (
     + "（源码断言用的是 helpers/source.mjs 拼接后的 SRC，搬回 main.js 一样全绿）：\n  "
     + problems.join("\n  "));
 });
+
+/**
+ * 测试的**跑法**本身也要被守着。
+ *
+ * 上一版 CI 里那一步写的是 `node --test test/*.test.mjs`。mac/Linux 上它能跑，靠的是
+ * shell 先把通配符展开成 106 个文件名；而 Windows runner 的默认外壳是 pwsh，
+ * pwsh 给原生程序传参**不做通配符展开**，加上仓库钉的 node 20 的 `--test` 不认通配符
+ * （自带 glob 是 node 21 才加的）—— 结果是 `Could not find '…/test/*.test.mjs'`、exit 1，
+ * **一条测试都没跑**。再配上当时那个 continue-on-error，它显示成「带警告的通过」：
+ * 所有人以为 Windows 上跑了 2749 条，实际是 0 条。**一个坏掉的门禁比没有门禁更糟。**
+ *
+ * 所以这条钉三件事：跑法没被改回通配符、收集判据还在、下限哨兵还在。
+ */
+test("测试的跑法必须是跨平台的，且收集不到文件时要报错而不是「全绿」", () => {
+  const runner = readFileSync(join(ROOT, "scripts/run-tests.mjs"), "utf8");
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+
+  assert.equal(pkg.scripts.test, "node scripts/run-tests.mjs",
+    "npm test 改回通配符了 —— Windows 上 cmd.exe 不展开它，会一条测试都不跑");
+
+  // 收集判据：必须在 JS 里自己列文件，不能依赖 shell 或 node 的 glob。
+  assert.match(runner, /readdirSync\(/,
+    "不再自己列文件了 —— 依赖 shell/node 展开通配符的写法在 Windows 上收集不到任何文件");
+  assert.match(runner, /endsWith\("\.test\.mjs"\)/,
+    "收集判据变了；注意别改成整个 test/ 目录 —— 那会把 helpers 和 e2e 脚本也当测试跑");
+
+  // 下限哨兵：收集不到 = 报错，而不是「跑了 0 个、全部通过」。
+  assert.match(runner, /files\.length === 0/, "收集到 0 个文件时没有报错 —— 那会显示成全绿");
+  assert.match(runner, /files\.length < \d+/, "没有下限哨兵 —— 判据被改坏时会静默少跑一大片");
+
+  // 真跑一遍收集逻辑，确认它现在确实能收到全部文件。
+  const files = readdirSync(join(ROOT, "test"), { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".test.mjs"));
+  assert.ok(files.length >= 100,
+    `只收集到 ${files.length} 个测试文件 —— 这条断言本身在守一个空窗口`);
+});

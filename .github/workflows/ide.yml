@@ -130,18 +130,18 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      # 这 2748 条测试**从来没有在 Windows 上跑过一次**：ide-package.yml 里那一步带着
+      # 这 2749 条测试此前**从来没有在 Windows 上跑过一次**：ide-package.yml 里那一步带着
       # `if: runner.os != 'Windows'`，而那条流水线本来就只能手动触发。
       #
-      # ⚠️ 这一步是**故意**允许失败的，而且这是个明确的半步、不是终点：
-      # 没有人知道它今天是红是绿，而把一条状态未知的检查直接设成硬门禁，会让所有 PR
-      # 从明天起全部卡住 —— 那不是「发现问题」，那是「换一种方式坏掉」。
-      # 先让它把真实状态**打印出来**，第一次跑完有人分诊过之后，
-      # **就该把 continue-on-error 删掉、变成硬门禁**。
+      # ⚠️ **不要把这里改回 `node --test test/*.test.mjs`。** 那条命令在 mac/Linux 上能跑
+      # 靠的是 shell 先把通配符展开好；而 windows runner 的默认外壳是 pwsh，
+      # pwsh 给原生程序传参**不做通配符展开**，加上仓库钉的 node 20 的 `--test`
+      # **不认通配符**（自带 glob 是 node 21 才有的）——结果是
+      # `Could not find '…/test/*.test.mjs'`、exit 1，**一条测试都没跑**。
+      # 这个坑上一版真的踩过：配上 continue-on-error 之后它显示成「带警告的通过」，
+      # 于是所有人以为 Windows 上跑了 2749 条，实际是 0 条。
+      # scripts/run-tests.mjs 在 JS 里自己列文件，两个平台走同一条路径（node 20 上实测过）。
       #
-      # 和被本次一并修掉的 release-preflight 那句「静默跳过」的区别在于：
-      # 那一条是**假装通过**（跳过之后照样打印「✅ 全部通过」），
-      # 这一条是**如实标注**（GitHub 上会显示成带警告的通过，日志里是完整的失败清单）。
-      - name: Run frontend logic tests on Windows (informational until triaged)
-        continue-on-error: true
-        run: node --test test/*.test.mjs
+      # continue-on-error 已经删掉：这一步现在是**硬门禁**。
+      - name: Run frontend logic tests on Windows
+        run: node scripts/run-tests.mjs

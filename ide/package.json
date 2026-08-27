@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node --test test/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
     "build:signed": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat ~/.tauri/michael-ide.key)\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}\" tauri build",
     "icons": "node scripts/gen-brand-sprite.mjs",
     "icons:check": "node scripts/gen-brand-sprite.mjs --check"
