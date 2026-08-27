@@ -24712,6 +24712,10 @@ function _commitAiIntentState(session, verdict, text, context = {}) {
 }
 
 async function _aiIntentProfile(text, config, session = null, context = null) {
+  // 这条腿的 system/user 消息里是一整份「语义工程决策器」提示词（约 7 KB，含全部字段
+  // 定义和判据）。走用户自己的端点就是把它抄送给他。调用方已经能接住 null —— 拿不到
+  // 画像时会退回本地的启发式判断，弱一些但成立。
+  if (!_ipSafeRoute(config)) return null;
   const t = String(text || "").trim().replace(/\s+/g, " ");
   // 门槛是「有没有可用的补全通道」，不是「是不是桌面构建」。以前这里写 inTauri，
   // 于是 web 构建上整套画像机器永不启动：run.engineering 恒为 pending 默认值、六道
@@ -28468,6 +28472,12 @@ async function _predictNextAsk(sess) {
       // https://api.anthropic.com/v1/chat/completions）→ 404，而外层是 catch{}，连日志
       // 都没有 —— 表现成「灰字预测在这个模型上不出现」，用户找不到原因。
       // 宁可不预测，也不发一个必然失败的请求。
+      // 预测那一发带着 _ASK_PREDICT_SYSTEM。自定义端点**一律**不发 —— 不分协议：
+      // OpenAI 兼容的中转同样是用户的服务器，日志里一样能看见。
+      if (_cm) {
+        sess._askPredictReject = "custom_endpoint";
+        return;
+      }
       if (_cm && cmProtocol(_cm.protocol) !== "openai") {
         // 记下原因再走。这个字段是「为什么这儿没有预测」的唯一答案来源，而它**没有复位点** ——
         // 不写的话，会话里先前留下的 timeout / too_generic 会一直挂在输入框的 title 上，
@@ -29798,7 +29808,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 它还整段消失——恰恰在最长的 run 里失效。fullPrompt 那一行的组成被多条测试钉着，所以
   // 在装配 system 消息这一步追加。
   const _toolHint = (effectiveMode === "agent") ? _buildToolHint() : "";
-  const messages = [{ role: "system", content: fullPrompt + _toolHint }];
+  // 工具直觉表 + 完整能力名录（约 4.9 KB）不出网关。走网关时它由 clientBlocks 那条路
+  // 送上去、网关自己也会注入；走用户自己的端点时，它会原样落在他的日志里。
+  // 代价：那条路上模型看不到开局窗口之外的工具名录，只能靠 search_tools 精确名查找。
+  const messages = [{ role: "system", content: fullPrompt + (_ipSafeRoute(config) ? _toolHint : "") }];
   // Read THIS turn's session history explicitly (not the active-tab proxy) — the
   // user may have switched tabs during the awaits above.
   // 历史投影单调、不随本轮改写；本轮要回看的旧图在 _history.priorMedia 里，附到本轮消息末尾。
@@ -51165,6 +51178,24 @@ async function _fetchCompletionText(url, headers, payload, signal) {
 /// 而 thinking 字段由网关按模型自己组装（见 models.rs 的 anthropic_thinking，
 /// 它明写了"永远用网关这份、不用客户端的"）。档位是 off 时什么都不加——用户显式关了思考，
 /// 认知腿也该跟着关，而不是背着他偷偷开一份。
+/**
+ * 这一轮**能不能把内置提示词发出去**。
+ *
+ * 判据是「对端是不是我们自己的网关」。走用户自己的中转时，请求体会原样躺在**他的**
+ * 服务器日志里 —— 意图裁决器、工具编排器、收尾评审员这几条腿各带一段完整的系统提示词
+ * （7.1 KB / 2.1 KB / 4.0 KB），加上工具直觉表和完整能力名录。那是这个产品最难复制的
+ * 一层，不该由一次普通的模型调用送出去。
+ *
+ * **这道闸是有代价的**：自定义端点上这几条腿会退化（编排退回默认工具集、收尾不评审、
+ * 意图画像取本地兜底）。这是刻意的取舍 —— 宁可那条路上弱一些，也不把提示词交出去。
+ *
+ * 这只是止血。正解是把这些文本搬到服务端、由网关持有和注入，客户端手里根本没有可发的
+ * 东西；那之后这道闸会变成多余的。
+ */
+function _ipSafeRoute(config) {
+  return !(config && config.customModelId);
+}
+
 function _cognitiveLegEffort(config) {
   const pref = String(config?.reasoningEffort || config?.thinkingEffort || "").toLowerCase();
   return pref && pref !== "off" ? { reasoning_effort: pref } : {};
@@ -51190,6 +51221,10 @@ function _cognitiveLegEffort(config) {
  *    调用方的 setTimeout 仍然会跑，只是不再能提前掐断这一发。
  */
 function _cognitiveLegComplete(config, body, maxTokens, signal) {
+  // 内置提示词不出网关。这三条腿（工具编排 / 收尾评审 / 离线蒸馏）的 system 消息各是一段
+  // 完整的内置提示词，走用户自己的端点等于把它们抄送给他。调用方三处都已经能接住 null
+  // （各自有 catch/兜底分支），所以这里直接不发。
+  if (!_ipSafeRoute(config)) return Promise.resolve(null);
   if (cmProtocol(config?.protocol) === "openai") {
     return _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
       "Content-Type": "application/json",

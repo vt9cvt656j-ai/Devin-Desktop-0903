@@ -207,7 +207,12 @@ test("三条认知腿在非 OpenAI 协议上必须走协议分叉，而不是打
   // 这条是**行为**测试：把真函数取出来跑，看它到底调了谁。源码文本断言在这个仓库栽过
   // 一次（读取侧那条），不再用。
   const calls = [];
+  // 2026-08-27：这个 helper 前面又加了一道 IP 闸（自定义端点上一个字都不发，见
+  // test/ip-does-not-leave-gateway.test.mjs）。这条测试守的是**它下面那一层**——
+  // 「真到了要发的时候，非 openai 协议走不走协议分叉」。所以这里把 IP 闸桩成恒真，
+  // 单独隔离出协议分叉这一层来测；两层各有各的门，不许合成一条。
   const _cognitiveLegComplete = load("_cognitiveLegComplete", {
+    _ipSafeRoute: () => true,
     cmProtocol,
     _fetchCompletionText: (url) => { calls.push(["openai直发", url]); return Promise.resolve("{}"); },
     _chatCompletionsUrl: (b) => String(b).replace(/\/+$/, "") + "/chat/completions",
