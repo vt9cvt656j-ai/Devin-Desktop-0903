@@ -31,7 +31,7 @@ export const CM_PROTOCOL_UI = {
     gaps: [],
   },
   anthropic: {
-    label: "Anthropic 原生",
+    label: "Anthropic 协议",
     ph: "https://api.anthropic.com",
     hint: "自动拼成 /v1/messages，密钥走 x-api-key。工具调用、流式思考、图片、停止序列都支持。",
     desktopOnly: true,

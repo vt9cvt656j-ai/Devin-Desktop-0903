@@ -15798,7 +15798,7 @@ async function showCustomModelsDialog() {
       <button class="cm-close" type="button" aria-label="关闭自定义模型"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="cm-body">
-      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 原生接口或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。会员到期后自定义模型将暂停可用。</p>
+      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 协议或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。<b>走自己的端点时智能体会弱一些</b>：工具描述和完整系统提示词由服务端按需下发，这条路上拿不到；长上下文压缩也会关闭。会员到期后自定义模型将暂停可用。</p>
       <div class="cm-list" role="list" aria-label="已添加的自定义模型"></div>
       <div class="cm-form" role="group" aria-labelledby="cmFormTitle">
         <h3 class="cm-form-title" id="cmFormTitle">新增自定义模型</h3>
@@ -15816,7 +15816,7 @@ async function showCustomModelsDialog() {
           <span class="cm-field__label" id="cmProtoLabel">接口协议</span>
           <div class="cm-seg" role="radiogroup" aria-labelledby="cmProtoLabel" aria-describedby="cmHintProto cmGapsProto">
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="openai" checked><span>OpenAI 兼容</span></label>
-            <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="anthropic"><span>Anthropic 原生</span></label>
+            <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="anthropic"><span>Anthropic 协议</span></label>
             <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="xai_responses"><span>xAI Responses</span></label>
           </div>
           <p class="cm-field__hint" id="cmHintProto"></p>
@@ -44183,7 +44183,27 @@ async function _runModelRequestWithRetry({
  *
  * 返回是否真的做了动作，供调用方决定文案。
  */
-function _recoverFromAiFailure(kind) {
+function _recoverFromAiFailure(kind, { custom = false } = {}) {
+  // **走用户自己端点的那一轮，这里一步都不能做。**
+  //
+  // 401/402 的来源是他自己的中转站（key 写错了、余额空了、被限流），和他在本产品的
+  // 账号毫无关系。而下面这两条动作都是冲着本产品的账号去的：清 michael_token、弹登录框、
+  // 打开充值页。在自定义端点上做，等于用一次「别人家的 401」把用户从自己家里踢出去 ——
+  // 而且是**连锁**的：token 一清，网关模型、智能体、工具全线失效，用户看到的是
+  // 「选了自定义模型之后整个软件都用不了了」，找不到任何因果。
+  //
+  // 只提示，不动凭据。文案要指向真正该改的地方（那条模型的 key / 那个中转的余额）。
+  if (custom) {
+    if (kind === "auth") {
+      showToast("你自己那个端点拒绝了这次请求（401）。请到模型设置里检查这条自定义模型的 API key —— 你在 Mr. Day One 的登录没有问题，也没有被登出。", { duration: 9000 });
+      return true;
+    }
+    if (kind === "payment") {
+      showToast("你自己那个端点说额度不足（402）。这是那个中转站的余额，不是 Mr. Day One 的额度。", { duration: 9000 });
+      return true;
+    }
+    return false;
+  }
   if (kind === "auth") {
     // 和 michaelAccessGate 里那条 401 分支做同样的事，不多不少：清凭据、刷新登录态、
     // 把登录框摆到人面前。少做一步（比如只弹框不清 token），下一轮还会拿着同一个
@@ -51088,7 +51108,7 @@ function _cognitiveLegEffort(config) {
  * 三条认知腿（工具编排 / 收尾评审 / 离线蒸馏）唯一的发送口。
  *
  * 它们此前各自拼 `_chatCompletionsUrl(config.baseUrl)` + `Authorization: Bearer`，
- * **绕过 Rust 的协议分叉**。用户一旦把自定义模型选成 Anthropic 原生或 xAI Responses，
+ * **绕过 Rust 的协议分叉**。用户一旦把自定义模型选成 Anthropic 协议或 xAI Responses，
  * 这三样就 100% 打到一个不存在的端点（例如 https://api.anthropic.com/v1/chat/completions）
  * → 404，而三处都是 `catch { return null; }`，界面上零提示。表现是「工具选得莫名其妙、
  * 收尾不评审、记忆不蒸馏」，用户找不到原因 —— 主发送路径明明是好的。
@@ -56831,7 +56851,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (finalErr) {
       // 先把能自动做的做掉（401 弹登录、402 弹账户页），再把文案渲染出来——文案里
       // 写着"已经为你打开…"，动作必须真的发生过。
-      try { _recoverFromAiFailure(_aiFailureKind(_stripAiRetryPrefix(String(finalErr)))); } catch {}
+      // customModelId 只有 _readyAiConfig 在识别出自定义条目时才写，所以它就是「本轮走的
+      // 是用户自己的端点」这件事的判据。漏掉它，别人家的 401 会把用户登出本产品。
+      try { _recoverFromAiFailure(_aiFailureKind(_stripAiRetryPrefix(String(finalErr))), { custom: !!config?.customModelId }); } catch {}
       const note = document.createElement("div");
       note.className = "msg__error";
       note.textContent = "⚠️ " + _formatAgentFinalError(finalErr);

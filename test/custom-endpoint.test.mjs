@@ -77,12 +77,16 @@ test("辅助调用仍然钉在网关上，不拿用户的额度去烧", () => {
 test("必须如实告诉用户「走自己的端点会变弱」，否则这就是个陷阱", () => {
   // 工具描述由服务端按名回填、完整系统提示词也在服务端。第三方端点两头落空，
   // 智能体明显变弱，而界面上完全看不出来。不说清楚，放开这个开关等于交付一个坏功能。
-  assert.match(SRC, /function _warnCustomEndpointOnce\(/, "没有任何知情提示");
-  const warn = extractFn("_warnCustomEndpointOnce");
-  assert.match(warn, /工具描述/, "提示里没说工具描述这件事");
-  assert.match(warn, /系统提示词/, "提示里没说系统提示词这件事");
-  assert.match(warn, /localStorage/, "提示没有去重，会变成每轮骚扰");
-  assert.match(READY, /_warnCustomEndpointOnce\(_custom\)/, "提示函数写了却没被调用");
+  // 这句话原先是一条切端点时弹的 toast。用户要求去掉那条 toast（九秒的横幅、切一次弹
+  // 一次），**但披露本身不能跟着消失** —— 那样就真成了「悄悄变弱」。它搬进了弹窗顶部的
+  // 说明里：那是**填之前**就看得到的位置，比切完之后飘一条更早、也更该在那儿。
+  //
+  // 判据跟着搬到弹窗 markup 上。这里不验 _warnCustomEndpointOnce 了：它现在是个空壳。
+  const dlg = extractFn("showCustomModelsDialog", { code: true });
+  assert.match(dlg, /工具描述/, "弹窗里没说工具描述这件事");
+  assert.match(dlg, /系统提示词/, "弹窗里没说系统提示词这件事");
+  assert.match(dlg, /长上下文压缩/, "弹窗里没说长上下文压缩会关闭");
+  assert.match(dlg, /弱一些/, "没说清「会变弱」这件事本身");
 });
 
 // ---- 线协议：六条真实调用链上的门 -----------------------------------------
@@ -245,4 +249,50 @@ test("三条腿都必须**经过**那个 helper —— 上一条只测 helper �
     assert.doesNotMatch(src, /_chatCompletionsUrl\(/,
       `${fn} 又自己拼 /chat/completions 了 —— Anthropic 端点上这是必然 404，而外层是 catch{}`);
   }
+});
+
+test("自己端点的 401 不许把用户从本产品登出——这条会连锁掐掉网关、智能体和工具", async () => {
+  // 用户报的真实症状：「用自定义模型 → 自动闪退登录 → 接着就是用不了 → 智能体、工具
+  // 那些也用不了」。根因是 _recoverFromAiFailure 无条件把 401 当成**本产品**的登录过期：
+  // 清 michael_token、弹登录框。而 401 来自他自己的中转站（key 写错/余额空/被限流），
+  // 和他在 Mr. Day One 的账号毫无关系。token 一清，网关模型、智能体、工具全线失效 ——
+  // 用户看到的是「选了自定义模型之后整个软件都用不了了」，找不到任何因果。
+  const removed = [];
+  const toasts = [];
+  let loginOpened = 0, billingOpened = 0;
+  const mk = () => load("_recoverFromAiFailure", {
+    localStorage: { removeItem: (k) => removed.push(k) },
+    _loggedInEmail: null,
+    _setMichaelUserProfile: () => {},
+    _updateLoginUI: () => {},
+    openLoginDialog: () => { loginOpened++; },
+    _showBillingPanel: () => { billingOpened++; },
+    showToast: (t) => toasts.push(String(t)),
+  });
+
+  // 自定义端点：一步都不许动账号
+  const r1 = mk()("auth", { custom: true });
+  assert.equal(r1, true, "自定义端点上也要有反馈，不能一声不吭");
+  assert.deepEqual(removed, [], "清掉了 michael_token —— 这一步就是「闪退登录」，而且会连锁");
+  assert.equal(loginOpened, 0, "弹了登录框 —— 用户的登录根本没问题");
+  assert.ok(toasts.some((t) => t.includes("401")), "没告诉用户 401 是他自己端点给的");
+
+  const r2 = mk()("payment", { custom: true });
+  assert.equal(r2, true);
+  assert.equal(billingOpened, 0, "打开了本产品的充值页 —— 空的是那个中转站的余额");
+
+  // 网关线路：老行为一个字节不变（清 token + 弹登录，这是对的）
+  removed.length = 0; toasts.length = 0; loginOpened = 0; billingOpened = 0;
+  assert.equal(mk()("auth"), true);
+  assert.deepEqual(removed, ["michael_token"], "网关 401 不清 token 的话，下一轮还拿同一个过期 token 再撞一次");
+  assert.equal(loginOpened, 1, "网关 401 必须把登录框摆到人面前");
+  assert.equal(mk()("payment"), true);
+  assert.equal(billingOpened, 1, "网关 402 必须打开充值页");
+});
+
+test("调用点要把「本轮是不是自己的端点」传下去——不传的话上面那条门等于没有", () => {
+  // 行为测试测的是 _recoverFromAiFailure 本身；调用点漏传 custom 它抓不到（变异实测）。
+  const loop = extractFn("_runAgenticLoop", { code: true });
+  assert.match(loop, /_recoverFromAiFailure\([\s\S]{0,200}?customModelId/,
+    "调用点没传 custom —— 自己端点的 401 照样会把用户登出，这条门形同虚设");
 });
