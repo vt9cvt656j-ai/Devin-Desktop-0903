@@ -823,12 +823,100 @@ test("the percentage measures the window the model reads, so it can actually mov
   assert.match(SRC, /const tierLimit = Math\.max\(0, Number\(_effectiveContextLimit\(model\)\) \|\| 0\);/);
   assert.match(SRC, /if \(tierLimit > state\.limit\) lines\.push\(`档位 可留存/);
 
-  // The ring carries the percentage; the amount is on hover, first line, stated exactly.
+  // The ring carries the percentage; the amount is on hover, first line.
+  //
+  // 曾经这一行钉的是 _tokenExact —— 「hover 上给精确值」是当初有意的选择。用户实拍推翻了它：
+  // 「上下文 25,851 / 500.0k」同一行两种写法，前半截一串数字后半截 k，看着懵。
+  // 面向用户的 token 量一律 k。
   assert.match(SRC, /label\.textContent = pct >= 100 \? "满" : String\(pct\)/);
-  assert.match(SRC, /const lines = \[`上下文 \$\{_tokenExact\(state\.total\)\} \/ \$\{k\(state\.limit\)\} · \$\{pct\}%`\];/);
+  assert.match(SRC, /const lines = \[`上下文 \$\{k\(state\.total\)\} \/ \$\{k\(state\.limit\)\} · \$\{pct\}%`\];/);
   assert.match(APP_CSS, /\.cache-ring::after \{[^}]*content: attr\(data-tooltip\);/);
   assert.match(APP_CSS, /\.cache-ring::after \{[^}]*white-space: pre-line;/,
     "the tooltip is multi-line; without this it collapses into one unreadable run");
+});
+
+test("token 数字一律 k/M，界面上不再有 25,851 这种原数", () => {
+  // 用户实拍：悬停面板第一行「上下文 25,851 / 500.0k · 5%」。同一行、同一类量、两种写法。
+  // 「一律」这条不变量只有一个可查的形状：那个精确值通道整个不存在。
+  assert.equal((SRC.match(/_tokenExact/g) || []).length, 0,
+    "还有出口在用 toLocaleString 印 25,851 这种数——用户要求一律 k");
+  // 按 AST 取函数体、且剥掉注释再断言：固定字符窗口会随注释变长而静默失效，
+  // 原文断言会被注释里引用的旧代码喂绿。
+  const meter = grab("_renderTokenMeter", { code: true });
+  assert.ok(meter.length > 1200 && meter.length < 20000,
+    `_renderTokenMeter 取到 ${meter.length} 字节，提取器锚点失效，下面的断言全是空的`);
+  assert.doesNotMatch(meter, /toLocaleString/);
+  assert.doesNotMatch(grab("_turnStatsTitle", { code: true }), /toLocaleString/,
+    "行内那一行的 title tooltip 也是用户悬停就能看见的，同样一律 k");
+  // 同一个量两个出口（aria-label 的 text、悬停第一行）必须同形状，否则读屏和肉眼两种写法。
+  assert.ok((meter.match(/k\(state\.total\)/g) || []).length >= 2,
+    "计上文字和悬停第一行是同一个 state.total，写法必须一致");
+});
+
+test("行内那一格和悬停面板说的是同一个「输入」", () => {
+  // 实测（grok-4.6，2026-08-26 用户截图）：行内 ↕ 24.8k/847，面板「本轮 输入 25.0k
+  // （缓存 192 · 未缓存 24.8k）」。两个 24.8k 一字不差不是巧合：网关结算存的是上游
+  // **原样**的 prompt_tokens，而 Anthropic 形状的 prompt_tokens 不含缓存读取；面板那
+  // 一侧走的是 src-tauri/src/ai.rs 归一过的读数（把缓存加回去了）。于是行内印的恒等于
+  // 「未缓存」那一半，而没有任何标签这么说。
+  const tokenShort = load("_tokenShort");
+  const addRunSettlement = load("_addRunSettlement");
+  const liveRunSettlement = load("_liveRunSettlement");
+  const statsText = load("_turnStatsText", {
+    _fmtElapsed: () => "25s", _tokenShort: tokenShort, _dispUsd: () => "$0.00" });
+  const snapshot = load("_contextMeterSnapshot", {
+    loadConfig: () => ({ model: "grok-4.6" }), _contextMeterLimit: () => 500_000,
+    _modelCatalogEntry: () => ({ contextLimit: 500_000 }), _effectiveContextLimit: () => 1_500_000 });
+  const ctxInput = load("_contextInputTokens");
+
+  const RAW_PROMPT = 24_812, CACHED = 192, OUT = 847;   // 一次请求，Anthropic 形状的回执
+  const ru = { in: 0, out: 0, cacheRead: 0, cacheCreation: 0, costCents: 0,
+               turns: 0, settledTurns: 0, reportedTurns: 0, allSettled: true, allReported: true };
+  addRunSettlement(ru, { usageReported: true, costCents: 0, attemptCount: 1,
+    promptTokens: RAW_PROMPT, completionTokens: OUT, cachedTokens: CACHED,
+    cacheCreationTokens: 0, promptIncludesCached: false });
+  const inline = statsText({ elapsedMs: 25_000, settlement: liveRunSettlement(ru) })
+    .html.replace(/<[^>]+>/g, "");
+
+  // 面板那一侧：ai.rs 已把缓存加回 prompt，_contextInputTokens 以 normalized 透传
+  const state = snapshot({
+    promptTokens: ctxInput({ prompt: RAW_PROMPT + CACHED, cacheRead: CACHED, cacheWrite: 0, normalized: true }),
+    completionTokens: OUT, cachedTokens: CACHED, cacheCreationTokens: 0, estimated: false });
+  const store = {};
+  const el = { dataset: {}, style: { setProperty() {} }, classList: { toggle() {} },
+    setAttribute() {}, removeAttribute() {}, querySelector: () => ({ textContent: "" }),
+    appendChild() {}, parentElement: null };
+  load("_renderTokenMeter", {
+    _tokenShort: tokenShort, _ctxMeter: state,
+    // load() 不自动补依赖。这个桩只在「_renderTokenMeter 还在用精确值通道」的那一刻用得上——
+    // 有它，这条测试今天红在口径不一致上；没有它，红在 ReferenceError 上，被守的断言一次都不执行。
+    _tokenExact: (n) => String(Math.round(Number(n) || 0)),
+    _tok: { in: 0, out: 0, cached: 0, inWithCacheInfo: 0, anyReal: false, anyCacheInfo: false },
+    _activeThinkEffort: "off", _lastReasoningTok: 0, _lastThinkChars: 0,
+    _CONTEXT_RING_WARN_PCT: 65, _CONTEXT_RING_DANGER_PCT: 85,
+    document: { getElementById: (id) => store[id] || null,
+      createElement: () => { store.tokenMeter = el; return el; }, body: { appendChild() {} } },
+  })();
+  const tip = el.dataset.tooltip;
+
+  const panelIn = /(?:本轮|最近一次请求) 输入 (\S+)（/.exec(tip)?.[1];
+  const panelUncached = /未缓存 (\S+)）/.exec(tip)?.[1];
+  const inlineIn = /([\d.]+[kM]?)\/847/.exec(inline)?.[1];
+  assert.ok(panelIn && panelUncached && inlineIn,
+    `没抓到数：${JSON.stringify({ panelIn, panelUncached, inlineIn, tip, inline })}`);
+  assert.equal(`行内 ${inlineIn}`, `行内 ${panelIn}`,
+    `同一次请求的「输入」两个出口不一致：行内 ${inlineIn}，面板 ${panelIn}（面板「未缓存」${panelUncached}）`);
+  assert.notEqual(inlineIn, panelUncached,
+    "行内印的还是「未缓存」那一半，却没有任何标签这么说");
+  // 分项必须加得起来：括号里「缓存 + 未缓存」之和 = 面板的「输入」= 行内那个数。
+  const panelCached = /缓存 (\S+) ·/.exec(tip)?.[1];
+  assert.equal(panelCached, tokenShort(CACHED));
+  assert.equal(panelUncached, tokenShort(RAW_PROMPT), "「未缓存」应当是上游原样的 prompt");
+  assert.equal(panelIn, tokenShort(CACHED + RAW_PROMPT), "面板括号里的分项加起来不等于它自己的「输入」");
+  // 面板的标签必须说清它的统计范围是「最近一次请求」——行内是整条回复的合计，
+  // agent 多轮时两个都是对的数却会互相打脸，靠标签说清，不靠抹平。
+  assert.match(tip, /最近一次请求 输入/,
+    "面板还叫「本轮」——它说的其实是最近一次模型请求，而行内是整条回复的合计");
 });
 
 test("the hover panel says only what it has to say, on top of the conversation", () => {

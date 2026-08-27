@@ -6918,6 +6918,15 @@ test("缓存仪表不许把「这家没有这个概念」显示成「这家没�
   // 服务端那一位要真的被接下来，否则上面那条读到的永远是 undefined。
   assert.match(SRC, /promptIncludesCached: data\?\.prompt_includes_cached !== false/,
     "结算映射没把服务端的形状位接下来");
+  // 上面那条只证明**解析**了它。两个喂料点原来都没往下传，于是 ev.promptIncludesCached
+  // 运行时恒为 undefined、恒走「含缓存」那一支——判据在代码里活着、路径永远走不到，
+  // 分母被结构性缩小、命中率虚高。「调用点存在 ≠ 路径会被走到」。
+  assert.equal((SRC.match(/promptIncludesCached: (?:_plainSettlement|settlement)\.promptIncludesCached/g) || []).length, 2,
+    "纯聊天 / agent 两条路都必须把服务端的形状位交给 _recordUsage");
+  // 累计账也要带着它走，否则行内那一格拿不到，只能按缺省当成 OpenAI 形状。
+  assert.match(extractFn("_addRunSettlement"), /if \(settlement\.promptIncludesCached === false\) runUsage\.promptIncludesCached = false;/);
+  assert.match(extractFn("_liveRunSettlement"), /promptIncludesCached: runUsage\.promptIncludesCached !== false/,
+    "方向必须是 !== false：写成 === true 会把所有老回执当成 Anthropic 形状，反向弄坏一批对的路线");
 });
 
 test("历史只进不摆——从消息中段抠东西会把上游前缀缓存整段作废", () => {
@@ -17333,6 +17342,10 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
     settledTurns: 1,
     reportedTurns: 1,
     tokenUnreportedTurns: 0,
+    // 缺省 true = OpenAI 形状（prompt 已含缓存），和 _fetchGatewaySettlement 那边
+    // `data?.prompt_includes_cached !== false` 的缺省逐字一致。行内那一格靠这一位决定
+    // 要不要把缓存加回输入；没有它就只能按缺省猜，Anthropic 形状上少显示一个缓存量。
+    promptIncludesCached: true,
   });
   addSettlement(runUsage, { costCents: 3, usageReported: false, promptTokens: null, completionTokens: null, attemptCount: 2 });
   const partial = liveSettlement(runUsage);
@@ -17348,8 +17361,11 @@ test("reply stats footer uses exact server settlements on both chat paths", () =
   assert.equal(finalSettlement(runUsage), null, "final completeness gate still rejects a missing settlement");
   assert.equal(liveSettlement(runUsage).costCents, 10, "a missing settlement never invents additional cost");
   const statsFnSource = SRC.slice(RAW_SRC.indexOf("function _turnStatsText"), RAW_SRC.indexOf("function _turnStatsTitle"));
-  const tokenExact = load("_tokenExact");
-  assert.equal(tokenExact(44739), "44,739", "the detailed tooltip keeps exact settlement counts");
+  // 这里原来钉的是 `tokenExact(44739) === "44,739"`——「详细 tooltip 保留精确数」曾是
+  // 有意的选择，被用户实拍推翻（「一堆数字，看着懵」）。精确值通道整个删掉了，
+  // 「一律 k」那条不变量由 test/prefix-cache.test.mjs 里的计数断言守着。
+  assert.equal((SRC.match(/_tokenExact/g) || []).length, 0,
+    "精确值通道又回来了——面向用户的 token 量一律 k");
   const statsText = new Function("_fmtElapsed", "_tokenShort", "_dispUsd", `${statsFnSource}; return _turnStatsText;`)(
     fmt,
     (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n),

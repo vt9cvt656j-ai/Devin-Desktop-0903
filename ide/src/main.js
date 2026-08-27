@@ -19621,9 +19621,6 @@ function _tokenShort(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
   return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 }
-function _tokenExact(n) {
-  return Math.max(0, Math.round(Number(n) || 0)).toLocaleString("en-US");
-}
 /**
  * The window the ring measures against: how much the model will actually read this turn.
  *
@@ -19909,7 +19906,14 @@ function _recordUsage(ev, opts = {}) {
     if (_rt) _lastReasoningTok = _rt;
     const _tc = Number(ev.thinking_chars ?? ev.thinkingChars) || 0;
     if (_tc) _lastThinkChars = _tc;
-    _tok.in += pin; _tok.out += out;
+    // 会话累计的「输入」必须和上下文面板「最近一次请求 输入」是同一个量：这一次总共读进去
+    // 多少提示 token，缓存命中的那部分算在内。原来这里加的是上游原样的 pin —— Anthropic 形状
+    // 的 pin 不含缓存读取，于是同一个悬停面板上下两行一个含缓存、一个不含，读起来像在说两次
+    // 不同的对话。_writeTok 从下面的 hasCacheInfo 块里提上来，块内那句 inWithCacheInfo 照样
+    // 看得见它（同一个 try 块作用域）。
+    const _writeTok = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens ?? ev.cache_creation_input_tokens) || 0;
+    _tok.in += ev.promptIncludesCached === false ? (pin + cached + _writeTok) : pin;
+    _tok.out += out;
     if (hasCacheInfo) {
     _tok.cached += cached;
     // 分母要**归一到同一个含义**：「这一轮总共读进去多少提示 token」。
@@ -19926,7 +19930,6 @@ function _recordUsage(ev, opts = {}) {
     // 修复里服务端开始给 GPT 填缓存写入了（GPT-5.6 起 OpenAI 也报也收），那条判据当场
     // 就会把 GPT 认成 Anthropic，分母再多加一次 cached，命中率反向虚高——等于把刚修好的
     // 分母重新弄坏。形状只有收回执的那一刻知道，事后从数字反推不出来。
-    const _writeTok = Number(ev.cacheCreationTokens ?? ev.cache_creation_tokens ?? ev.cache_creation_input_tokens) || 0;
     _tok.inWithCacheInfo += ev.promptIncludesCached === false ? (pin + cached + _writeTok) : pin;
     _tok.anyCacheInfo = true;
   }
@@ -20179,11 +20182,35 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
     }
     // 有轮次但都已结束 = 正在跑工具，不加标签：工具卡自己在转。
   }
-  if (firstProgressMs != null) bits.push(`模型 ${_fmtElapsed(firstProgressMs)}`);
-  if (firstVisibleMs != null) bits.push(`首显 ${_fmtElapsed(firstVisibleMs)}`);
+  // 「模型 / 首显」两项 2026-08-26 按用户要求从行内撤下。碰上不做流式转发的中转（截图里
+  // 的 grok-4.6 就是），首字节到达时整段已经生成完，这两个数必然贴着总耗时 ——
+  // 一行里三个几乎一样的秒数只是噪音。
+  //
+  // 换出口，不是丢数据：tooltip（_turnStatsTitle）里仍有任务级两行加逐轮明细，
+  // 且信息严格多于这里（多了 kind、多了逐轮、多了物理尝试）。
+  // firstProgressMs / firstVisibleMs 两个 const 不能删：上面 live 分支「一轮都还没开过」
+  // 那条退路还拿它们当判据，删了首轮开跑前的等待标签会静默消失。
   if (settlement) {
     if (settlement.usageReported) {
-      const inTok = Math.max(0, Math.round(Number(settlement.promptTokens) || 0));
+      // 这一格必须和悬停面板「最近一次请求 输入」是**同一个量**：这次真正读进模型的
+      // 提示 token，缓存命中的那部分算在内（它占窗口，也照样计费）。
+      //
+      // 原来直接印 settlement.promptTokens——网关按上游原样存下的数，而两家形状不同：
+      // Anthropic 的 prompt_tokens **不含**缓存读取（单列 cache_read_input_tokens），
+      // OpenAI/xAI 的**含**。面板那一侧走的是 Rust 传输层归一过的读数（src-tauri/src/ai.rs
+      // 约 3121 行把缓存加了回去），于是同一次请求在两个出口差出整整一个缓存量：实测
+      // grok-4.6 行内 24.8k、面板 25.0k，而面板里的「未缓存 24.8k」和行内一字不差 ——
+      // 那不是巧合，是恒等式：行内印的就是「未缓存」那一半，只是没有任何标签这么说。
+      //
+      // 形状位由服务端下发（prompt_includes_cached），缺省按 OpenAI 形状 —— 和
+      // _fetchGatewaySettlement 里 `data?.prompt_includes_cached !== false` 的缺省一致，
+      // 老服务端不发这个键时行为一个字不变。这个函数必须保持自包含（测试只注入
+      // _fmtElapsed / _tokenShort / _dispUsd 三个函数就把它 new Function 跑起来），所以就地算，
+      // 不引 _contextInputTokens。
+      const cacheReadTok = Math.max(0, Math.round(Number(settlement.cachedTokens) || 0));
+      const cacheWriteTok = Math.max(0, Math.round(Number(settlement.cacheCreationTokens) || 0));
+      const rawInTok = Math.max(0, Math.round(Number(settlement.promptTokens) || 0));
+      const inTok = settlement.promptIncludesCached === false ? rawInTok + cacheReadTok + cacheWriteTok : rawInTok;
       const outTok = Math.max(0, Math.round(Number(settlement.completionTokens) || 0));
       bits.push(`${_icTokens}${_tokenShort(inTok)}/${_tokenShort(outTok)}`);
     } else {
@@ -20199,6 +20226,14 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
   const unreported = Math.max(0, Math.round(Number(settlement?.tokenUnreportedTurns) || 0));
   const cacheReadTok = Math.max(0, Math.round(Number(settlement?.cachedTokens) || 0));
   const cacheWriteTok = Math.max(0, Math.round(Number(settlement?.cacheCreationTokens) || 0));
+  // 行内那一格自己的 tooltip 必须和它显示的数同口径，否则修好一处又在隔壁开一个新的不一致。
+  // 口径的由来见 _turnStatsText 里那段长注释。
+  const rawInTok = Math.max(0, Math.round(Number(settlement?.promptTokens) || 0));
+  const inTok = settlement?.promptIncludesCached === false ? rawInTok + cacheReadTok + cacheWriteTok : rawInTok;
+  // 「行内那个数在这里能被指认出来」：input 就是行内那个数，后面括号里写明它由哪几项加成。
+  const uncachedTok = Math.max(0, inTok - cacheReadTok - cacheWriteTok);
+  const outTok = Math.max(0, Math.round(Number(settlement?.completionTokens) || 0));
+  const settledTurns = Math.max(1, Math.round(Number(settlement?.settledTurns) || 1));
   const tokenTitle = !settlement ? "Tokens: waiting for the first server settlement"
     : settlement.usageReported
       // 「cache write」只有 Anthropic 这类**显式缓存**的厂商才会报。
@@ -20207,7 +20242,7 @@ function _turnStatsTitle({ elapsedMs = 0, settlement = null, live = false, timel
       // 之前无条件打印，于是每个非 Claude 模型都显示 "cache write 0"，读起来像
       // 「这个模型不会建缓存」——用户看到的正是这句话，而它是假的：同一行的
       // cache read 明明是几千万。没有这个概念就别印这一位。
-      ? `Tokens: input ${_tokenExact(settlement.promptTokens)} · output ${_tokenExact(settlement.completionTokens)} · cache read ${_tokenExact(cacheReadTok)}${cacheWriteTok > 0 ? ` · cache write ${_tokenExact(cacheWriteTok)}` : ""} (server-reported usage${unreported ? `; ${_tokenExact(unreported)} calls unreported` : ""})`
+      ? `Tokens: input ${_tokenShort(inTok)} (uncached ${_tokenShort(uncachedTok)} · cache read ${_tokenShort(cacheReadTok)}${cacheWriteTok > 0 ? ` · cache write ${_tokenShort(cacheWriteTok)}` : ""}) · output ${_tokenShort(outTok)} · this whole reply: ${settledTurns} model request${settledTurns === 1 ? "" : "s"} (server-reported usage${unreported ? `; ${unreported} calls unreported` : ""})`
       : "Tokens: provider usage unavailable";
   const costTitle = settlement && Number.isInteger(settlement.costCents)
     ? `Credit cost: ${_dispUsd(settlement.costCents)} (${_MICHAEL_RAW_CENTS_PER_CREDIT_USD} raw cents = $1.00 credit; includes model, cache, and route pricing)`
@@ -20463,6 +20498,11 @@ function _addRunSettlement(runUsage, settlement) {
     runUsage.out += settlement.completionTokens || 0;
     runUsage.cacheRead += settlement.cachedTokens || 0;
     runUsage.cacheCreation += settlement.cacheCreationTokens || 0;
+    // 形状位要跟着累计账走，否则行内那一格拿不到它、只能按缺省当成 OpenAI 形状，
+    // Anthropic 形状的路线上就会少显示整整一个缓存量。一次 run 只跑一个模型，但重试和
+    // 多轮之间只要有一份回执说「不含缓存」，整笔就按不含算 —— 和服务端 usage_settlement
+    // 里 `COALESCE(bool_and(prompt_includes_cached), true)` 同口径。
+    if (settlement.promptIncludesCached === false) runUsage.promptIncludesCached = false;
   } else {
     runUsage.allReported = false;
   }
@@ -20491,6 +20531,11 @@ function _liveRunSettlement(runUsage) {
     settledTurns,
     reportedTurns,
     tokenUnreportedTurns: settledTurns - reportedTurns,
+    // 缺省 true = OpenAI 形状（prompt 已含缓存），和 _fetchGatewaySettlement 那边
+    // `data?.prompt_includes_cached !== false` 的缺省逐字一致：没有这一位的老回执走的
+    // 还是加这一位之前的那条路。方向必须是 !== false：写成 === true 会把所有老回执
+    // 当成 Anthropic 形状，行内数凭空多加一个 cached，反向弄坏一批本来对的路线。
+    promptIncludesCached: runUsage.promptIncludesCached !== false,
   };
 }
 
@@ -20518,7 +20563,7 @@ function _renderTokenMeter() {
   // six unconditionally — the same figure restated in three vocabularies, a note repeating what
   // the 来源 line already said, and a box wide enough to cover the conversation behind it.
   // Line one is the whole answer; everything below it is detail for someone who wants it.
-  const lines = [`上下文 ${_tokenExact(state.total)} / ${k(state.limit)} · ${pct}%`];
+  const lines = [`上下文 ${k(state.total)} / ${k(state.limit)} · ${pct}%`];
   // 分母是猜的就得说出来，否则 91% 看上去和真实读数一样确定。后台把 model_caps_override
   // 填上（或目录收录了这个模型），这一行自动消失。
   if (state.windowReported === false && state.total > 0) {
@@ -20531,7 +20576,10 @@ function _renderTokenMeter() {
     if (state.cached) split.push(`缓存 ${k(state.cached)}`);
     if (cacheWrite) split.push(`新写 ${k(cacheWrite)}`);
     if (uncached) split.push(`未缓存 ${k(uncached)}`);
-    lines.push(`本轮 输入 ${k(state.prompt || 0)}${split.length ? `（${split.join(" · ")}）` : ""} · 输出 ${k(state.completion || 0)}`);
+    // 「本轮」会骗人：这一行说的是**最近一次模型请求**，而行内那一格是**整条回复**
+    // 所有模型请求的合计。agent 跑 4 轮时前者 25.0k、后者 64.2k，两个都是对的数、
+    // 却在同一屏上互相打脸。数不能抹平（它们本来就是两个东西），标签必须说清。
+    lines.push(`最近一次请求 输入 ${k(state.prompt || 0)}${split.length ? `（${split.join(" · ")}）` : ""} · 输出 ${k(state.completion || 0)}`);
   }
   if (_tok.anyReal) {
     lines.push(`会话 输入 ${k(_tok.in)} · 输出 ${k(_tok.out)}${_tok.anyCacheInfo ? ` · 缓存命中 ${cumHit}%` : ""}`);
@@ -30282,6 +30330,11 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         completion_tokens: _plainSettlement.completionTokens,
         cached_tokens: _plainSettlement.cachedTokens,
         cache_creation_tokens: _plainSettlement.cacheCreationTokens,
+        // 服务端下发的形状位必须真的传进来。_recordUsage 里那两处
+        // `ev.promptIncludesCached === false ? …` 靠它决定分母和累计口径，而两个喂料点
+        // 原来都没传 —— 它运行时恒为 undefined、恒走「含缓存」那一支，于是 Anthropic
+        // 形状的路线上分母被结构性缩小、缓存命中率虚高。判据在代码里活着、路径走不到。
+        promptIncludesCached: _plainSettlement.promptIncludesCached,
         model: _plainSettlement.model,
         estimated: false,
       }, { session: sess, requestId: sess._reqId });
@@ -46539,6 +46592,8 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
         completion_tokens: settlement.completionTokens,
         cached_tokens: settlement.cachedTokens,
         cache_creation_tokens: settlement.cacheCreationTokens,
+        // 同上：形状位不传进来，_recordUsage 里的判据就是死的。
+        promptIncludesCached: settlement.promptIncludesCached,
         model: settlement.model,
         estimated: false,
       }, { aux: meterScope !== "main", session, requestId: _turnReqId });
