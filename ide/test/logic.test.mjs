@@ -11,6 +11,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 // 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
 // （抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
+import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/agent/plan-target.js";
 // 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
@@ -10713,8 +10714,11 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
   // 19.8 秒，第一轮通常没有——而"该派哪些角色"恰恰是第一轮就要决定的事，等到第二轮，活已经
   // 按 solo 干起来了。边界是死的：信息可以走快通道，闸门仍然只认完整裁决，所以
   // _fastRouteProfile 只进这个参数，不写 _uiTurnEngineering。
-  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\)\s*\n?\s*\? _agentDecisionFrameBlock\(text, _uiTurnEngineering, _fastRouteProfile\)/,
-    "Agent send path must add the decision frame to the per-turn preamble");
+  // 第四个参数是**上一轮已经收敛的契约**。理由同样是时序：那道等待窗口按会话只付一次
+  // （sess._intentWaitPaid），所以第 2 轮起本轮裁决必然赶不上第一次模型调用，契约要等
+  // 循环边界的 late-adopt 才有——而「要不要动手、动哪儿、算不算做完」就在第一发决定完了。
+  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\)\s*\n?\s*\? _agentDecisionFrameBlock\(text, _uiTurnEngineering, _fastRouteProfile, sess\?\._intentState\?\.semantic \|\| null\)/,
+    "Agent send path must add the decision frame to the per-turn preamble，并把上一轮的契约带上");
   assert.doesNotMatch(SRC, /_uiTurnEngineering = _fastRouteProfile|run\.engineering = _fastRouteProfile/,
     "快通道的判断不许写进驱动闸门的那份画像——它只负责给模型指路");
   // 工具直觉表/能力名录已搬进 system 前缀（字节稳定才有缓存收益），当轮前导里只剩动态块。
@@ -11490,7 +11494,13 @@ test("ending a run settles in-progress plan spinners without discarding resumabl
 
 test("plan steps advance from real tool evidence instead of waiting for another update_plan", () => {
   const planActionKind = load("_planStepActionKind");
-  const planStepMatchesEvidence = load("_planStepMatchesEvidence", { _planStepActionKind: planActionKind });
+  const planStepMatchesEvidence = load("_planStepMatchesEvidence", {
+    _planStepActionKind: planActionKind,
+    // 交付物判据在 src/agent/plan-target.js，按真实实现注入（手写等价物＝测试台自编形状）。
+    _planStepTargets: planStepTargets,
+    _toolTouchedTargets: toolTouchedTargets,
+    _planTargetsConflict: targetsConflict,
+  });
   const planEvidenceKinds = load("_planEvidenceKindsForTool", {
     _toolExecutionSucceeded: (call, result) => !String(result?.content || "").includes("[ERROR]")
       && (call.type !== "cmd" || Number(result?.code) === 0),
@@ -14625,9 +14635,9 @@ test("implementation grounding is advisory and only a real prior failure stops a
   const loop = extractFn("_runAgenticLoop");
   assert.doesNotMatch(loop, /await run\._emptyRootProbe/,
     "a background empty-root probe must never delay an ordered mutation");
-  assert.match(loop, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)[\s\S]{0,120}entry\._eagerDone = true/,
+  assert.match(loop, /entry\._mutationAdvice = _afterWriteAdvice\(run, call, root\)[\s\S]{0,120}entry\._eagerDone = true/,
     "the eager write path records advice and still commits");
-  assert.match(loop, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)[\s\S]{0,220}message \+= it\._mutationAdvice/,
+  assert.match(loop, /it\._mutationAdvice = _afterWriteAdvice\(run, it\.call, root\)[\s\S]{0,220}message \+= it\._mutationAdvice/,
     "the ordered path appends advice to the real tool result instead of replacing it");
 });
 
@@ -14947,9 +14957,9 @@ test("debug evidence stays target-aware while mutation execution only receives a
   assert.equal(candidateChecks({ type: "cmd", command: "rewrite", purpose: "explore" }), true);
   assert.equal(candidateChecks({ type: "read", path: "src/app.js" }), false);
   const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)/,
+  assert.match(loop, /entry\._mutationAdvice = _afterWriteAdvice\(run, call, root\)/,
     "the eager write hook must carry evidence advice alongside the real result");
-  assert.match(loop, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)/,
+  assert.match(loop, /it\._mutationAdvice = _afterWriteAdvice\(run, it\.call, root\)/,
     "the ordered mutation path must use the same advisory ledger");
   const ordered = loop.indexOf("await _runOrderedToolSegments");
   const settled = loop.indexOf("_settleDebugToolBatch(run, items, root)");
@@ -19578,7 +19588,12 @@ test("计划假完成门禁：install/mkdir 只算 execute 证据，implement �
     // 错配记账要读这个（把"刚做的和当前步对不上"这个已算出的事实留给每轮的计划位置行）
     _planStepActionKind: load("_planStepActionKind"),
     _planEvidenceKindsForTool: kindsFor,
-    _planStepMatchesEvidence: load("_planStepMatchesEvidence", { _planStepActionKind: planActionKind }),
+    _planStepMatchesEvidence: load("_planStepMatchesEvidence", {
+      _planStepActionKind: planActionKind,
+      _planStepTargets: planStepTargets,
+      _toolTouchedTargets: toolTouchedTargets,
+      _planTargetsConflict: targetsConflict,
+    }),
     _renderPlan: (_container, steps, _existingEl, run) => { run._planSteps = steps; },
     _syncPlanChip: (run, steps) => { run._planSteps = steps; },
   });
@@ -28979,6 +28994,48 @@ test("记忆卫生·纠错前缀按本轮问题挑，且最新两条保底", () 
   assert.doesNotMatch(text, /读取 src\/main\.js/);
 });
 
+test("纠错记忆块在同一段对话里必须逐字节不变，否则每换个话题就打穿整段缓存", () => {
+  // 这个块是 system 消息，坐在整段对话历史的**最前面**。它原来按「最新一条用户消息」
+  // 打分挑选要列哪几条纠错 —— 用户换个话题 → 选中的集合变 → 块的文字变 →
+  // 它后面所有内容的自动前缀缓存整段作废。
+  //
+  // 线上实测这一刀（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k token）：
+  //   claude-fable-5  92.7% / 93.9%   落差 1.1 点  ← 显式断点，不受影响
+  //   grok-4.6        23.7% / 40.9%   落差 17.2 点
+  //   qwen3.8-max     18.4% / 45.0%   落差 26.6 点
+  // 掉的那一刀正好落在「每轮的第一发」上，也就是用户按下回车之后那一停。
+  const mem = new ConversationMemory();
+  for (const [bad, good] of [
+    ["用 npm 装", "用 pnpm 装"],
+    ["页脚居左", "页脚居中"],
+    ["字号 12px", "字号 14px"],
+  ]) {
+    mem.recordCorrection({ kind: "user", incorrect: bad, corrected: good, confidence: 1 });
+  }
+  const pick = () => (mem.prefixMessages().find((m) => String(m.content).includes("纠错记忆")) || {}).content || "";
+
+  mem.push({ role: "user", content: "帮我把依赖用 npm 装一下" });
+  const first = pick();
+  assert.ok(first, "纠错前缀不见了");
+
+  // **换个完全不同的话题，块必须一个字节都不变。**
+  mem.push({ role: "assistant", content: "好的" });
+  mem.push({ role: "user", content: "顺便把页脚和字号也调一下" });
+  assert.equal(pick(), first, "换个话题就把纠错块改了 —— 它后面整段历史的缓存全废");
+  mem.push({ role: "user", content: "再帮我看看按钮和图标" });
+  assert.equal(pick(), first, "同上：块必须在同一段对话里钉住");
+
+  // **新增一条纠错时才允许变。** 那一次未命中是应该付的 —— 内容本来就该更新了。
+  mem.recordCorrection({ kind: "user", incorrect: "按钮直角", corrected: "按钮圆角", confidence: 1 });
+  const after = pick();
+  assert.notEqual(after, first, "新增纠错之后块还没更新 —— 那是把新学到的东西丢了");
+  assert.match(after, /按钮圆角/, "新纠错没进块");
+
+  // 相关性没丢：重新取那句话的时机正是「刚学到新东西」那一刻。
+  mem.push({ role: "user", content: "再看看按钮" });
+  assert.equal(pick(), after, "集合没变却又改了一次");
+});
+
 // ── 模式标签不能被 i18n 重刷改回 Agent ──────────────────────────────────────
 test("模式标签跟当前模式走，整页重刷改不动它", () => {
   const painted = [];
@@ -30557,8 +30614,15 @@ test("每轮重扫整个项目要按工作区变更缓存，别每步都愣一�
   assert.ok(keyExpr, "找不到缓存键的赋值");
   assert.match(keyExpr[1], /run\._fsMutTick/, "缓存键丢了文件变更信号");
   assert.match(keyExpr[1], /_termTick/, "缓存键没有终端活动——服务崩了整轮不刷新");
+  // 这一段原来切的是 `SRC.slice(at, at + 600)` —— **固定窗口**。
+  // 往那个 if 块里加两行（这轮加的是界面阶段提示）就把块尾推出了 600 字，
+  // 于是下面那个剥离正则找不到结尾、什么都没剥掉，断言当场误报。
+  // 更糟的是反过来：块要是变短了，窗口会把**后面别的代码**也框进来，
+  // 那时候它就变成恒真，而且一声不吭。改成结构边界：切到 if 块之后那条语句为止。
+  const _endAnchor = SRC.indexOf("const _runtimeStateBlock = ", at);
+  assert.ok(_endAnchor > at, "运行状态块后面那条语句不见了 —— 这条断言的边界没了");
   assert.doesNotMatch(
-    stripJsComments(SRC.slice(at, at + 600)).replace(/if \(run\._rtStateTick[\s\S]*?\n      \}/, ""),
+    stripJsComments(SRC.slice(at, _endAnchor)).replace(/if \(run\._rtStateTick[\s\S]*\n      \}/, ""),
     /await _promiseOrFallbackWithin\(_agentRuntimeStateBlock/,
     "缓存外面还留着一次无条件调用",
   );
@@ -31616,7 +31680,16 @@ test("阻断性诊断门要覆盖有语言服务的语言，而不是只认 JS/T
   // LSP 冷启动远超 900ms，固定等待等于"还没出结果就读成无错误"。
   assert.doesNotMatch(fn, /setTimeout\(r, 900\)/, "又退回固定 900ms 等待了");
   assert.match(fn, /_INTERLEAVED_DIAG_MAX_WAIT_MS/, "没有改成轮询等诊断");
-  assert.match(fn, /slice\(0, _INTERLEAVED_DIAG_MAX_FILES\)/, "一轮能检查的文件数仍然写死");
+  // 上限必须有，**而且要从尾部取**。
+  //
+  // 调用方传的是 run 级只增不减的集合。从**头**截断的话，第 17 个之后被改的文件
+  // 在这个 run 里永远拿不到诊断，最早那 16 个每轮重查一遍还要为它们白等 ——
+  // 铺 30 个文件的任务后半截写坏什么都不响，收尾门看到 0 错误直接放行。
+  // 任务越大越静默。
+  assert.match(fn, /slice\(-_INTERLEAVED_DIAG_MAX_FILES\)/,
+    "诊断集不是从尾部取 —— 大任务的后半截文件永远查不到");
+  assert.doesNotMatch(fn, /slice\(0, _INTERLEAVED_DIAG_MAX_FILES\)/,
+    "又退回从头截断了 —— 那会让后写的文件永远拿不到诊断");
 });
 
 test("模型要能看到崩掉的终端说了什么，以及 git 现场", () => {

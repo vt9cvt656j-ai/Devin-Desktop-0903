@@ -688,10 +688,28 @@ export class ConversationMemory {
     const result = [];
     // Was `_activeCorrections('', MAX)` — an empty query means "no filter", so this block
     // was a newest-first dump of every correction regardless of what the user just asked.
-    // Score against the latest user message instead, with the newest 2 always carried so a
+    // Score against a user message instead, with the newest 2 always carried so a
     // fresh correction can never be filtered out by a topic change.
-    const q = [...this.recent].reverse()
-      .find((m) => m?.role === 'user' && typeof m.content === 'string')?.content || '';
+    //
+    // # 打分用的那句话必须**在同一段对话里钉住**
+    //
+    // 原来取的是「最新一条用户消息」。它每一轮都变 → 选中的纠错集合变 → 这个 system
+    // 块的文字变。而这个块坐在整段对话历史的**最前面**，于是它后面所有内容的
+    // 自动前缀缓存每换一个话题就整段作废。
+    //
+    // 线上实测这一刀（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k token）：
+    // grok-4.6 23.7% / 40.9%，qwen3.8-max 18.4% / 45.0% —— 掉的正好是每轮第一发。
+    //
+    // 现在的判据：**只在纠错集合真的变了的时候才重新取这句话。**
+    // 集合没变 → 块逐字节不变 → 缓存一路命中；集合变了 → 块本来就得变，
+    // 那一次未命中是应该付的。相关性也不丢：重新取的时机正是「刚学到新东西」那一刻。
+    const _sig = this.corrections.map((item) => item && item.id).join(',');
+    if (this._prefixQuerySig !== _sig) {
+      this._prefixQuerySig = _sig;
+      this._prefixQuery = [...this.recent].reverse()
+        .find((m) => m?.role === 'user' && typeof m.content === 'string')?.content || '';
+    }
+    const q = this._prefixQuery || '';
     const pool = new Map();
     for (const item of this._activeCorrections('', 2)) pool.set(item.id, item);
     for (const item of (q ? this._activeCorrections(q, CORRECTION_PREFIX_MAX) : [])) pool.set(item.id, item);

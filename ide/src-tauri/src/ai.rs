@@ -201,6 +201,8 @@ pub struct AiConfig {
     /// becoming HTTP headers.
     #[serde(default)]
     pub ide_run_id: Option<String>,
+    /// 会话级亲和键，见发头处的注释。
+    pub ide_session_id: Option<String>,
     #[serde(default)]
     pub ide_step_index: Option<i64>,
     #[serde(default)]
@@ -235,6 +237,12 @@ pub struct AiConfig {
     /// 普通线路 —— 用户点了强力版还给他普通线路，等于把他的选择改掉了。
     #[serde(default)]
     pub ide_power_route: Option<bool>,
+    /// 用户在模型列表里点的是哪一组 —— 即那条线路的 id。
+    ///
+    /// 同一个模型挂在两条线路上时，IDE 里是两个分组、显示的价还不一样，而在这之前
+    /// 两组点下去发出去的请求逐字相同，网关只能按 sort 取第一条。于是用户看到便宜的那个价、
+    /// 按贵的那条扣。和 ide_power_route 走同一条通道。
+    pub ide_route_id: Option<String>,
     /// michael-compression 的档位（"1m"/"2m"/"5m"），由 /api/me 下发、客户端原样回传。
     ///
     /// 这个字段此前**不存在**：JS 侧设了 `config.michaelCompression`，serde 默认忽略
@@ -752,6 +760,16 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }) {
         rb = rb.header("x-ide-run-id", run_id);
     }
+    // 会话级亲和键。网关拿它把同一段对话路由回同一台上游机器 —— run id 是每条用户
+    // 消息新造的，只有它稳得住整段会话。校验和 run id 逐字一致。
+    if let Some(session_id) = config.ide_session_id.as_deref().filter(|value| {
+        (8..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }) {
+        rb = rb.header("x-ide-session-id", session_id);
+    }
     if let Some(step_index) = config
         .ide_step_index
         .filter(|value| (0..=10_000).contains(value))
@@ -768,6 +786,14 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }
     if config.ide_power_route == Some(true) {
         rb = rb.header("x-ide-power-route", "1");
+    }
+    if let Some(rid) = config
+        .ide_route_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+    {
+        rb = rb.header("x-ide-route", rid);
     }
     if let Some(w) = config
         .ide_context_window
@@ -1303,6 +1329,7 @@ mod ide_header_tests {
             protocol: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
+            ide_session_id: None,
             reasoning_effort: None,
             thinking_budget: None,
             thinking_effort: None,
@@ -1311,6 +1338,7 @@ mod ide_header_tests {
             request_id: None,
             cancel_id: None,
             ide_power_route: None,
+            ide_route_id: None,
             ide_run_id: None,
             ide_step_index: None,
             ide_step_kind: None,
@@ -1683,6 +1711,7 @@ mod stream_timeout_tests {
             protocol: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
+            ide_session_id: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
             thinking_budget,
             thinking_effort: None,
@@ -1691,6 +1720,7 @@ mod stream_timeout_tests {
             request_id: None,
             cancel_id: None,
             ide_power_route: None,
+            ide_route_id: None,
             ide_run_id: None,
             ide_step_index: None,
             ide_step_kind: None,

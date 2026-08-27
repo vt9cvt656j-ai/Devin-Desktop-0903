@@ -293,18 +293,64 @@ function _missingWhyInWrite(text, path = "", maxItems = 4) {
 }
 
 // 把上面那些做成挂在**这一次写入**上的一段话。没有命中就一个字都不发。
+/**
+ * 一次写入的正文，**三种形状都要取到**。
+ *
+ * `write_file` 在 content，`edit_file` 的字段叫 `newString`（驼峰，见 main.js 的 mapCall），
+ * `multi_edit` 的正文散在 `edits[].new_string` 里。只读前一种的话，下面那几条安全规则
+ * 在「改存量代码」的两条主路上恒为空 —— 而那恰恰是命中率本该最高的场景。
+ */
+export function _writeBodyOf(call) {
+  return String(
+    call?.content
+      ?? call?.newString
+      ?? call?.new_string
+      ?? (Array.isArray(call?.edits)
+        ? call.edits.map((e) => String(e?.new_string ?? e?.newString ?? "")).join("\n")
+        : "")
+      ?? "",
+  );
+}
+
+/**
+ * 这次写入**实际碰到的**危险汇聚点类别（`["SQL 拼接", "命令注入", …]`）。
+ *
+ * 存在的理由是一条时序错位：网关那份缺陷分类清单挂在 `securityRisk` 旗标上，而那个
+ * 旗标来自**意图裁决**——也就是模型对「用户这句话」的判断。用户说「做个待办列表」，
+ * 旗标不亮；模型接着写了一段拼 SQL 的查询、一个文件上传 handler —— 清单一个字都不发。
+ * 判据得跟着**写出来的代码**走，不跟着用户的措辞走。
+ *
+ * 这里不新开检测器，复用 `_sinkRisksInWrite`：它的判据只看代码、不看注释，
+ * 而且已经在这条路上按每次写入跑着了。
+ */
+export function _securitySinkKinds(call) {
+  const body = _writeBodyOf(call);
+  if (!body) return [];
+  return [...new Set(_sinkRisksInWrite(body, null, call?.path || "").map((r) => r.kind))];
+}
+
 export function _sinkRiskAdvice(call) {
   // 名字是历史的：最早这里只有「危险汇聚点」。现在它是**这一次写入的质量提醒**的唯一
   // 出口——多一个出口就多一处要手工保持同步的接线，而这个仓库已经因为"手工维护的清单"
   // 栽过好几次。新增的检测器挂进来，不要另开调用点。
-  const body = String(call?.content ?? call?.new_string ?? "");
+  // **三种写入形状都要取到正文。**
+  //
+  // 原来只读 `content ?? new_string`：`write_file` 命中（content），而
+  // `edit_file` 的字段其实叫 `newString`（驼峰，见 main.js 的 mapCall）、
+  // `multi_edit` 的正文在 `edits[].new_string` 里 —— 两条都取到空串，
+  // 于是下面**六条安全规则在改存量代码的两条主路上恒为空**。
+  // 而这是全系统唯一的实时安全检测器，改老项目时命中率本该最高。
+  const _fromFragment = call?.content == null;
+  const body = _writeBodyOf(call);
   const path = String(call?.path || "").split("/").slice(-2).join("/");
   let out = "";
 
   const risks = _sinkRisksInWrite(body, null, call?.path || "");
   if (risks.length) {
     out += "\n\n⚠ 这次写入碰到了危险汇聚点，趁还在这一步先堵上（下面每条都指到了行号和原文，不是泛泛提醒）：\n"
-      + risks.map((r) => `· ${path}:${r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
+      // 片段的行号是**片段内**的行号，不是文件里的行号。照 `path:line` 报出去
+      // 会指向一个错的位置，而模型会照着那个位置去看 —— 报错的行号比不报更糟。
+      + risks.map((r) => `· ${path}${_fromFragment ? "（本次改动片段内第 " + r.line + " 行）" : ":" + r.line} ${r.kind} — \`${r.text}\`\n  ${r.ask}`).join("\n");
   }
 
   const why = _missingWhyInWrite(body, call?.path || "");

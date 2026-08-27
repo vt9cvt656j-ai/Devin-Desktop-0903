@@ -344,9 +344,19 @@ test("预览页签的伪路径不会被当成「当前文件」交出去", () =>
   const chips = fnSource("_dynamicChatChips", { code: true });
   assert.match(chips, /const path = _realFilePath\(activePath\);/,
     "对话起手提示还在直接用 activePath——会渲染出「解释 mrdayone:live-preview」");
-  const intent = (CODE.match(/activePath: _realFilePath\(activePath\) &&/g) || []).length;
-  assert.equal(intent, 3,
-    "意图分类的上下文有三处、必须逐字段一致（不一致会导致指纹对不上、预取白跑），现在只有 " + intent + " 处走了闸");
+  // 意图上下文那几处**已经合并成一份判据**了（`_intentActivePath`）。
+  //
+  // 原来是三处各写一遍带 `_realFilePath` 的表达式，而**发送路径那一处没带** ——
+  // 于是「预览页签开着 + 没绑工作区」时预热的指纹和真正发送的必然不同，
+  // 预取确实发过也确实落了缓存，只是键对不上没人取，第一发照样空画像。
+  // 现在钉的是「只有一份实现，而且每一处都在用它」。
+  assert.match(fnSource("_intentActivePath", { code: true }), /_realFilePath\(activePath\)/,
+    "那份共用判据里没有走 _realFilePath —— 预览页签的伪路径会被当成当前文件");
+  const uses = (CODE.match(/_intentActivePath\(/g) || []).length;
+  assert.ok(uses >= 5,
+    "意图上下文没有都走那份共用判据（定义 1 + 至少 4 个调用点），现在只有 " + uses + " 处");
+  assert.equal((CODE.match(/activePath: _realFilePath\(activePath\) &&/g) || []).length, 0,
+    "还有地方在各写一遍那个表达式 —— 这正是当初指纹对不上的原因");
 });
 
 test("重新加载不依赖 requestAnimationFrame", () => {

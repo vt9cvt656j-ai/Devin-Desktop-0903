@@ -38,7 +38,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, load } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, load, fnSource } from "./helpers/source.mjs";
 
 // Deliberately NOT comment-stripped. A naive stripper is unsafe here: this file contains
 // regex literals holding `/*` and `//`, and a stripper that mis-parses one silently deletes a
@@ -768,10 +768,20 @@ test("the linker catches the defects it was written for", () => {
       check: (s) => /await _approveToolCall\(/.test(bodyOf(s, "_executeToolStep")),
     },
     {
+      // 判据从「非空赋值比空赋值多」改成「报告本身到底有没有被赋进去」。
+      // 计数那种写法是个代理指标：阻断门现在有两条腿（类型/语法诊断 + 项目自己的
+      // linter），随便哪条腿留着一个非空赋值，另一条腿被改成恒空也照样"多"，
+      // 于是这个 case 就不再抓得住它本来要抓的那件事（实测漏网）。
       why: "B1 — the diagnostics gate becomes write-only again",
       src: mutate('run._diagnosticBlock = _noProgressVerify < 2 ? _d.report : "";', 'run._diagnosticBlock = "";'),
-      check: (s) => (s.match(/run\._diagnosticBlock\s*=(?!=)/g) || []).length
-        > (s.match(/run\._diagnosticBlock\s*=\s*""/g) || []).length,
+      check: (s) => /run\._diagnosticBlock\s*=\s*_noProgressVerify\s*<\s*2\s*\?\s*_d\.report/.test(s),
+    },
+    {
+      // 同一道门的第二条腿：语法和类型干净、项目自己的规则报错的那条路。
+      // 它是"业务逻辑错误实时知道"唯一的机械来源，断了不会有任何报错。
+      why: "B1b — the project-linter leg stops reaching the same gate",
+      src: mutate('run._diagnosticBlock = _noProgressVerify < 2 ? _lintReportText : "";', 'run._diagnosticBlock = "";'),
+      check: (s) => /run\._diagnosticBlock\s*=\s*_noProgressVerify\s*<\s*2\s*\?\s*_lintReportText/.test(s),
     },
     {
       why: "S3 — a decision verdict is computed and discarded",
@@ -1321,7 +1331,7 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
   //
   // 三态是关键：网关明确说 false 才藏；拿不到（离线、目录没拉到、网关旧版）是"不知道"，
   // 这时候必须退回旧行为。压成布尔的话按钮会在离线时集体消失，而那不是"没有强力线路"。
-  const mapAt = RAW_SRC.indexOf("(byGroup[label] ||= []).push({");
+  const mapAt = RAW_SRC.indexOf("byGroup.get(label).push({");
   assert.notEqual(mapAt, -1, "目录映射那个对象字面量没了");
   assert.match(SRC.slice(mapAt, mapAt + 2600), /powerRouteAvailable:/,
     "映射层没接这个字段——那个 push 是逐字段列举的白名单，不在里面就到不了按钮那儿");
@@ -2355,4 +2365,203 @@ test("测试文件不该手抄 main.js 的源码拼接名单", () => {
     assert.match(codeOnly(readFileSync(join(dir, f), "utf8")), HITS,
       `${f} 已经不自己读 main.js 了，但仍留在 EXEMPT 里——名单和现实对不上`);
   }
+});
+
+test("模型分组的次序，必须原样是后台「排序」页设的那个", () => {
+  // 链路：后台排序写 models.sort → /api/models 是 ORDER BY sort → 客户端只负责**保持**它。
+  //
+  // 客户端这一头原来用普通对象攒分组，而 JS 会把「整数样」的键提到最前面：
+  // 一条线路取名叫「2025」，Object.keys 就把它排在 Claude 前面，静默盖掉后台设的次序 ——
+  // 两边都不报错，只是顺序莫名其妙。Map 对所有键都按插入序。
+  // **钉在目录映射那一处。** 同一个文件里自定义模型那段也有 `const byGroup = new Map();`
+  // （16810 行一带），只断言"文件里有 new Map"的话，把目录这一处改回对象照样绿 ——
+  // 变异测试当场翻出来的。
+  const pushAt = RAW_SRC.indexOf("byGroup.get(label).push({");
+  assert.notEqual(pushAt, -1, "目录分组的 push 点没了");
+  const decl = RAW_SRC.slice(Math.max(0, pushAt - 1600), pushAt);
+  assert.match(decl, /const byGroup = new Map\(\);/,
+    "目录分组又换回普通对象了——纯数字的线路名会被提到最前面，盖掉后台排的序");
+  assert.ok(!RAW_SRC.includes("(byGroup[label] ||= [])"),
+    "还留着对象写法");
+  assert.match(RAW_SRC, /const nextGroups = \[\.\.\.byGroup\]/,
+    "取分组时又走了 Object.entries——那会重新引入整数键提前的问题");
+
+  // 服务端那一头也得按 sort 出，否则客户端保持得再好也是保持了一个错的顺序。
+  const rustList = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
+  const at = rustList.indexOf("pub async fn list_for_client");
+  assert.notEqual(at, -1, "list_for_client 改名了");
+  assert.match(rustList.slice(at, at + 900), /ORDER BY sort, created_at/,
+    "IDE 那份模型列表不再按 sort 出——后台排序就不起作用了");
+
+  // 真跑一遍：拿一个含纯数字标签的输入，确认次序不被打乱。
+  const groups = new Map();
+  for (const [label] of [["Claude"], ["2025 特惠"], ["GPT"], ["2026"]]) {
+    if (!groups.has(label)) groups.set(label, []);
+  }
+  assert.deepEqual([...groups.keys()], ["Claude", "2025 特惠", "GPT", "2026"],
+    "Map 都保不住插入序的话，上面那些断言就没有意义了");
+});
+
+test("会话级亲和键：三处都要接上，缺一处提示词缓存就每轮重算", () => {
+  // 网关拿这个头把同一段对话路由回**同一台**上游机器（OpenAI / xAI 系的自动前缀缓存
+  // 存在具体某台机器上）。原来它只有 run id 可用，而 run id 是**每条用户消息**新造的
+  // —— 于是每问一句就换一台机器，几万 token 的前缀整份重算。
+  //
+  // 线上实测这一刀（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k token）：
+  //   claude-fable-5  92.7% / 93.9%   落差 1.1 点  ← 走显式断点，不靠机器亲和
+  //   grok-4.6        23.7% / 40.9%   落差 17.2 点
+  //   qwen3.8-max     18.4% / 45.0%   落差 26.6 点
+  // 掉的那一刀正好落在「每一轮的第一发」上，也就是用户按下回车之后那一停。
+
+  // ① 网页端：sendPrompt 里从 sess.id 取值
+  assert.match(RAW_SRC, /config\.ideSessionId = sess && sess\.id \? String\(sess\.id\) : "";/,
+    "sendPrompt 没把会话 id 挂到 config 上 —— 后面那两处发不出去");
+  // ② 网页端：发成头，校验和 run id 逐字一致
+  assert.match(RAW_SRC, /_h\["x-ide-session-id"\] = String\(config\.ideSessionId\);/,
+    "网页端没发 x-ide-session-id");
+  assert.ok(
+    RAW_SRC.includes('/^[-_A-Za-z0-9]{8,128}$/.test(String(config.ideSessionId || ""))'),
+    "会话 id 的校验和 run id 不一致 —— 松一点点都会让网关静默丢弃它，而表现只是「缓存又不命中了」",
+  );
+
+  // ③ 桌面端：Tauri 那一侧同一个头
+  const tauri = readFileSync(join(HERE, "../src-tauri/src/ai.rs"), "utf8");
+  assert.match(tauri, /rb\.header\("x-ide-session-id", session_id\)/,
+    "桌面端没发这个头 —— 桌面端用户拿不到这个改进，而那是主力客户端");
+  assert.match(tauri, /pub ide_session_id: Option<String>,/,
+    "桌面端的配置结构里没有这一位");
+
+  // ④ 网关：会话优先、run 兜底，而且两条协议分支共用同一处判据
+  const gw = readFileSync(join(HERE, "../../server/src/models.rs"), "utf8");
+  assert.match(gw, /pick\("x-ide-session-id"\)\.or_else\(\|\| pick\("x-ide-run-id"\)\)/,
+    "网关没有「会话优先、run 兜底」这条阶梯");
+  const prod = gw.split("\n#[cfg(test)]\nmod ")[0];
+  assert.equal(
+    (prod.match(/let _run_id = affinity_scope\(&headers\);/g) || []).length, 2,
+    "不是两条协议分支都在用同一处判据 —— 各写一遍的表现是「某个协议的缓存突然不命中」",
+  );
+});
+
+test("MCP 只读调用要能并行 —— 判据用服务自己声明的 readOnlyHint", () => {
+  // 这一支原来整个不在并行表里，于是所有 MCP 调用一律当硬屏障串行：一轮里查四次文档
+  // 就是四次网络往返一个接一个。而 mcpReadOnly 这个字段早就挂在调用对象上
+  // （来自 tool.annotations.readOnlyHint），另外两道门也在读它。
+  const at = RAW_SRC.indexOf("function _isReadOnlyParallel(");
+  assert.notEqual(at, -1, "并行判据函数改名了");
+  const body = RAW_SRC.slice(at, at + RAW_SRC.slice(at).indexOf("\n}\n"));
+  assert.match(body, /if \(t === "mcp"\) return !!call\.mcpReadOnly;/,
+    "MCP 那一支不在并行判据里 —— 只读调用会一个接一个串行跑");
+  // 没声明 readOnlyHint 的必须**仍然串行**：不肯说自己只读的工具，我们没有依据放行。
+  assert.ok(!/if \(t === "mcp"\) return true/.test(body),
+    "MCP 被无条件当成只读了 —— 那会让会改东西的工具和读并发跑");
+  // 这个字段确实是从服务声明来的，不是我们自己拍的。
+  assert.match(RAW_SRC, /readOnly: tool\.annotations\?\.readOnlyHint === true/,
+    "mcpReadOnly 不再来自服务声明的 readOnlyHint —— 判据的依据没了");
+});
+
+test("工具跑完到下一轮之间，界面上要有东西在动", () => {
+  // 这一批工具全部落定之后，harness 自己还要等诊断（干净 JS/TS 必然等满 1.2 秒、
+  // 其它语言 4 秒）、重扫运行状态（最长 1.6 秒）。这段时间里思考卡早被摘掉、
+  // 工具卡都变成了「完成」、状态标签走的正是那个空分支 —— 屏幕上一个动的东西都没有。
+  // 「在干活」和「卡住了」长得一模一样，这就是「卡一小会不动」里「不动」两个字的来源。
+  assert.match(RAW_SRC, /else if \(turns\.length && timeline && timeline\.harnessPhase\) \{/,
+    "状态标签那个空分支还是空的 —— 工具跑完之后界面上没有任何指示");
+  assert.match(RAW_SRC, /bits\.push\(String\(timeline\.harnessPhase\)\);/,
+    "阶段文字没被画出来");
+  // 两处阻塞点都要置位，而且都要清掉 —— 不清的话跑完了还挂着一句话，那比不显示更糟。
+  assert.match(RAW_SRC, /run\.timeline\.harnessPhase = "检查这次改动有没有引入新问题"/,
+    "诊断等待那一段没有阶段提示");
+  assert.match(RAW_SRC, /run\.timeline\.harnessPhase = "读取项目当前状态"/,
+    "运行状态重扫那一段没有阶段提示");
+  assert.equal(
+    (RAW_SRC.match(/run\.timeline\.harnessPhase = "";/g) || []).length, 2,
+    "阶段提示没有成对清掉 —— 跑完了还挂着一句话比不显示更糟",
+  );
+});
+
+test("干净的 JS/TS 文件不该等满诊断期限 —— 要问 worker「答完没有」", () => {
+  // 轮询的退出条件是「有 marker || 到点」，而一个**干净**的 JS/TS 文件永远不产生
+  // marker —— 于是它必然等满，每个包含编辑的回合固定白付 1.2 秒。改十次文件的
+  // 任务就是十几秒纯等待，而且是用户完全看不出在干什么的那种等待。
+  const at = RAW_SRC.indexOf("async function _interleavedDiagnostics(");
+  assert.notEqual(at, -1, "诊断函数改名了");
+  // 结构边界，不用固定窗口：这个函数变长一点就会让固定窗口的断言静默失效。
+  const end = RAW_SRC.indexOf("\n}\n", at);
+  assert.ok(end > at, "诊断函数的结尾找不到了");
+  const body = RAW_SRC.slice(at, end);
+
+  assert.match(body, /getSemanticDiagnostics\?\.\(_u\)/,
+    "没在问 TS worker 要完成信号 —— 干净文件只能等满");
+  assert.match(body, /t\._workerDoneAt = Date\.now\(\);/, "worker 答完的时刻没记下来");
+  // 定义也要钉。只钉用它的那一行的话，把定义改成 `= false` 照样绿 —— 变异测出来的。
+  assert.match(
+    body,
+    /const _workerReady = t\._workerDoneAt != null && now >= t\._workerDoneAt \+ _TS_PUBLISH_GRACE_MS;/,
+    "worker 完成信号被架空了（定义恒假）—— 那还是等满",
+  );
+  assert.match(body, /if \(has \|\| _workerReady \|\| now >= own\(t\)\) t\._diagSettled = true;/,
+    "退出条件里没有 worker 完成这一支 —— 那这条改动等于没接上");
+  // 期限那一支必须留着：worker 可能拿不到（Monaco 版本差异 / 被裁剪的构建），
+  // 也可能挂住。去掉兜底就会变成永远等不完。
+  assert.match(body, /now >= own\(t\)/, "等满那条兜底被删了 —— worker 挂住时会永远等下去");
+  // 只对 JS 家族做：其余语言的诊断来自 LSP，没有这个 worker。
+  assert.match(body, /if \(!t\.jsFamily\) continue;/,
+    "对非 JS 家族也去要 TS worker —— 那条路上根本没有这个 worker");
+});
+
+test("安全扫描要覆盖 edit / multi_edit —— 那是改存量代码的两条主路", () => {
+  // 全系统唯一的实时安全检测器（SQL 注入 / XSS / eval / 命令注入 / 不安全反序列化 /
+  // 批量赋值越权）原来只读 `content ?? new_string`：write_file 命中（content），
+  // 而 edit_file 的字段其实叫 `newString`（驼峰）、multi_edit 的正文在 edits[].new_string 里
+  // —— 两条都取到空串，六条规则在改老项目时**恒不触发**，而那正是命中率最高的场景。
+  const scan = readFileSync(join(HERE, "../src/agent/delivery-scan.js"), "utf8");
+  assert.match(scan, /call\?\.newString/, "edit_file 的正文取不到（字段是驼峰 newString）");
+  assert.match(scan, /call\.edits\.map\(\(e\) => String\(e\?\.new_string \?\? e\?\.newString \?\? ""\)\)/,
+    "multi_edit 的正文取不到（在 edits\\[\\].new_string 里）");
+  // 字段名必须和 mapCall 真的产出的形状对得上。
+  // **从源码里把字段名取出来比对**，不手抄那两行 —— 手抄的名单会和实现悄悄分家，
+  // 这个仓库有一条元测试专门禁止这件事，而它当场抓住过我。
+  // 用 helpers 那份 RAW_SRC，**不自己读 main.js** —— 这个文件里有一条元测试
+  // 专门禁止测试自己去读它（从 main.js 搬走一个模块时那种读法会假红，
+  // 或者更糟：反向断言悄悄失效）。它当场抓住过我。
+  const editLine = (RAW_SRC.match(/case "edit_file": return \{[^}]*\}/) || [""])[0];
+  assert.ok(editLine, "找不到 edit_file 的映射");
+  const editField = (editLine.match(/(\w+): args\.new_string/) || [])[1];
+  assert.ok(editField, "edit_file 的映射里找不到新内容字段");
+  assert.ok(scan.includes(`call?.${editField}`),
+    `安全扫描没读 edit_file 真正的新内容字段（实现里叫 ${editField}）`);
+  // 片段的行号是**片段内**的行号。照 path:line 报出去会指向错的位置，
+  // 而模型会照着那个位置去看 —— 报错的行号比不报更糟。
+  assert.match(scan, /本次改动片段内第 " \+ r\.line \+ " 行/,
+    "片段的行号被当成文件行号报出去了 —— 那会把模型指到错的位置");
+});
+
+test("说得越不清楚，画像越不该是空的 —— 预热判「有没有内容」，不判长度", () => {
+  // 预热的触发条件本来就是「打字停顿 1.2 秒」，所以一句稳定的短话是**说完了的短话**。
+  // 原来的 `t.length < 12` 恰好把「表达不清楚」的那批全排除：「改一下登录」6 字、
+  // 「做个网站」4 字、「这个不行」4 字 —— 一条都进不来。
+  //
+  // 方向和需求正好相反：写得长、说得清的用户能在打字停顿时把裁决跑起来、第一发就带
+  // 完整画像；随口说一句的用户必然落进 6 秒窗口，而两条模型腿都赢不了它（实测完整
+  // 裁决 6.9~7.6 秒、拥堵 19.8 秒）。画像空掉时丢的恰恰是 restatedTask
+  // （唯一那条「把你的话补全成可执行版本」）和 agent_core 之外的全部工程纪律。
+  const fn = fnSource("_prefetchIntentFromComposer", { code: true });
+  assert.doesNotMatch(fn, /t\.length < 12/,
+    "预热又按长度卡了 —— 说不清楚的那批必然拿不到画像，而那正是最需要它的一批");
+  assert.match(fn, /_isFillerUtterance\(t\)/,
+    "预热没在判「有没有内容」");
+
+  // 判据必须**只有一份**：需求账本那边和这边共用，两份各自演化的话，
+  // 同一句话在两处会给出不同答案。
+  const filler = load("_isFillerUtterance");
+  assert.equal(filler("好的"), true, "寒暄该被判成没内容");
+  assert.equal(filler("继续"), true, "接续词该被判成没内容");
+  assert.equal(filler("嗯嗯"), true);
+  assert.equal(filler("改一下登录"), false, "六个字的真需求被判成没内容了");
+  assert.equal(filler("做个网站"), false, "四个字的真需求被判成没内容了");
+  assert.equal(filler("这个不行"), false, "四个字的真反馈被判成没内容了");
+  assert.equal(filler(""), true);
+  // 入账那一段必须用的是同一份，不是自己再写一遍。
+  assert.match(SRC, /const _isFiller = _isFillerUtterance\(_lt\) \|\| _lt\.length < 6;/,
+    "需求账本那边又自己写了一份判据 —— 两处会对同一句话给出不同答案");
 });

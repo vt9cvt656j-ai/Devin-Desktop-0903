@@ -81,6 +81,7 @@ import "./styles/app.css";
 // 靠源码顺序（而不是 !important）取胜，颠倒顺序就整层失效。
 import "./styles/shadcn.css";
 import "./styles/custom-models.css";
+
 // React 岛：真正的 shadcn 组件（Radix 行为 + Tailwind）。这一行同时把 Tailwind 的
 // 样式带进来。控制台敲 showUIGallery() 看全部组件在当前配色下的样子。
 import "./ui/mount-gallery.jsx";
@@ -156,8 +157,13 @@ import {
   pathIsAtOrUnder as _pathIsAtOrUnderRaw,
   _CODE_FILE_RE,
 } from "./agent/paths.js";
-import { _removedDeclarationsUnchecked, _sinkRiskAdvice, _stubDeliveryFindings, _staleCommentFindings, _hardcodedDeliveryFindings, _touchedExportedDecls } from "./agent/delivery-scan.js";
+import { _removedDeclarationsUnchecked, _sinkRiskAdvice, _securitySinkKinds, _stubDeliveryFindings, _staleCommentFindings, _hardcodedDeliveryFindings, _touchedExportedDecls } from "./agent/delivery-scan.js";
 import { _manifestDepAdditions, _undeclaredImportAdditions, _declaredDepsFromFileMap } from "./agent/dep-manifest.js";
+import { planStepTargets as _planStepTargets, toolTouchedTargets as _toolTouchedTargets, targetsConflict as _planTargetsConflict } from "./agent/plan-target.js";
+import {
+  detectLinter as _detectLinter, lintCommand as _lintCommand, lintRan as _lintRan,
+  lintFindings as _lintFindings, newFindings as _newLintFindings, lintReport as _lintReport,
+} from "./agent/project-lint.js";
 import { _stripAiRetryPrefix, _aiFailureKind, _isProviderGatewayStatusError, _isRateLimitedAiError, _isRetryableAiError, _isCompressionPrefixInvalidError, _isStalledAiError, _modelEventHasProgress, _streamResumeMode } from "./agent/ai-errors.js";
 
 // 两个薄壳：把 main.js 这边的连接状态传进去，近 100 个调用点一个都不用改。
@@ -989,6 +995,11 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     if (config.ideSemanticProfile) _h["x-ide-semantic-profile"] = String(config.ideSemanticProfile).slice(0, 1024);
     if (config.requestId) _h["x-ide-request-id"] = String(config.requestId).slice(0, 128);
     if (/^[-_A-Za-z0-9]{8,128}$/.test(String(config.ideRunId || ""))) _h["x-ide-run-id"] = String(config.ideRunId);
+    // 会话级亲和键。校验和 run id 逐字一致 —— 网关那边两级用的是同一道判据，
+    // 这边放宽一点点都会让那个值被静默丢弃，而表现只是「缓存又不命中了」。
+    if (/^[-_A-Za-z0-9]{8,128}$/.test(String(config.ideSessionId || ""))) {
+      _h["x-ide-session-id"] = String(config.ideSessionId);
+    }
     if (Number.isInteger(config.ideStepIndex) && config.ideStepIndex >= 0 && config.ideStepIndex <= 10_000) _h["x-ide-step-index"] = String(config.ideStepIndex);
     if (_IDE_TIMELINE_STEP_KINDS.has(String(config.ideStepKind || ""))) _h["x-ide-step-kind"] = String(config.ideStepKind);
     if (config.ideTimezone) _h["x-ide-timezone"] = String(config.ideTimezone).slice(0, 64);
@@ -997,6 +1008,8 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     if (config.michaelCompression) _h["x-michael-compression"] = String(config.michaelCompression);
     if (Number.isInteger(config.ideUtcOffsetMinutes)) _h["x-ide-utc-offset-minutes"] = String(config.ideUtcOffsetMinutes);
     const endpoint = _chatCompletionsUrl(config.baseUrl);
+    // 和桌面端同一个头。网页端不经过 Tauri，所以在这儿直接加。
+    const _routeId = String(config.ideRouteId || config.gatewayRouteId || "").trim();
     const _post = async (body) => {
       activeAttemptController = typeof AbortController !== "undefined" ? new AbortController() : null;
       const deadlineAt = Date.now() + _AI_RESPONSE_HEADERS_DEADLINE_MS;
@@ -1012,6 +1025,9 @@ async function _realAiFetch(config, messages, tools, onEvent) {
       // 同一个常量），所以时钟准不准都不影响它。网关优先采信这一个，绝对时间戳只用来
       // 收紧（它的价值是把上传耗时也算进去了），且只在两个时钟对得上时才收紧。
       _h["x-ide-response-budget-ms"] = String(_AI_RESPONSE_HEADERS_DEADLINE_MS);
+      // 用户点的是哪一组。网关只在**它已经算出来的候选**里认这个 id，
+      // 所以它至多让用户在自己本来就能从列表里点到的那几条线路之间选一条。
+      if (_routeId) _h["x-ide-route"] = _routeId;
       let timer = null;
       if (activeAttemptController) timer = setTimeout(() => activeAttemptController.abort(), _AI_RESPONSE_HEADERS_DEADLINE_MS);
       try {
@@ -4491,7 +4507,7 @@ function renderBreakpointDecorations() {
 
 function showDebugLocation(path, line) {
   // 调试适配器回的是**原生格式**的路径：Windows 上是 `C:\proj\app.js`，debugpy 还会
-  // 把盘符小写。而 IDE 内部的路径全是正斜杠、大小写按磁盘真实拼法 —— 下面那句
+  // 把盘符小写。而 IDE 内部的路径全是正斜杠、大小写按磁盘真实拼法 —— 4491 行那句
   // `activePath === debugStopLocation.path` 是**严格字符串相等**，原样存下就永远不成立：
   // Windows 上停在断点时黄色当前行高亮一次都不会出现，标签页标题还会变成整条绝对路径。
   // _coherentFilePath 会把它归一到已打开文件的那份拼法（正是为这种场景写的）。
@@ -14521,7 +14537,7 @@ function _modelContextRows(m) {
   return _micSliderHtml({ kind: "ctx", title: "上下文", options: opts, index: idx });
 }
 
-function _modelCatalogEntry(id = "") {
+function _modelCatalogEntry(id = "", group = "") {
   // **自定义模型要按真实模型名去查目录。**
   //
   // 自定义模型的选择器 id 是 `custom:<随机>` 这种内部键，拿它去目录里找必然找不到 ——
@@ -14545,12 +14561,28 @@ function _modelCatalogEntry(id = "") {
   }
   if (!target) return null;
   const targetLc = target.toLowerCase();
-  for (const group of MODEL_GROUPS || []) {
-    for (const model of group.models || []) {
-      if (String(model?.id || "").toLowerCase() === targetLc) return model;
+  // **要带分组。** 同一个模型 id 可以出现在两个分组里（两条线路都开放它），而两份条目的
+  // 价格、上下文、思考档位都可能不一样 —— 只按 id 找会永远返回**第一条线路**的那份。
+  // 于是用户选了「优惠 Claude」，卡片上的价、上下文上限、强力版按钮全解析到「Claude」那条上。
+  // 实测两份的价差 5 倍（claude-sonnet-5：$10/$15 vs $2/$10）。
+  // 不传分组时，默认用**当前选中的那一组**。五个调用点（上下文上限、思考档位、
+  // 强力版按钮、原生窗口列表）解析的都是"正在用的这个模型"，逐个改调用点容易漏，
+  // 而漏掉的那个就会继续读到另一条线路的参数。
+  let wantGroup = String(group || "").trim();
+  if (!wantGroup) {
+    try { wantGroup = String(loadConfig()?.modelGroup || "").trim(); } catch { wantGroup = ""; }
+  }
+  let fallback = null;
+  for (const g of MODEL_GROUPS || []) {
+    for (const model of g.models || []) {
+      if (String(model?.id || "").toLowerCase() !== targetLc) continue;
+      if (wantGroup && g.label === wantGroup) return model;
+      if (!fallback) fallback = model;
     }
   }
-  return null;
+  // 没指定分组、或者那个分组已经没了（线路被停用/改名）时退回第一条 —— 那是旧行为，
+  // 比返回 null 让整块信息消失强。
+  return fallback;
 }
 
 // LAST RESORT ONLY. The real number comes from the gateway: /api/models emits
@@ -14600,7 +14632,11 @@ async function loadBackendModels() {
     if (!res.ok) return;
     const list = await res.json();
     if (!Array.isArray(list) || !list.length) return;
-    const byGroup = {};
+    // **Map 不是对象。** 分组次序就是服务端的线路排序（/api/models 是 ORDER BY sort），
+    // 客户端只负责保持它。而普通对象会把「整数样」的键提到最前面：一条线路取名叫
+    // 「2025」的话，Object.keys 会把它排在 Claude 前面，静默盖掉后台设的次序，
+    // 而且两边都不会报错。同一个文件里自定义模型那段（_customs）用的就是 Map。
+    const byGroup = new Map();
     for (const it of list) {
       const label = it.group || it.provider || "Models";
       const pricing = _catalogModelPricing(it);
@@ -14612,8 +14648,14 @@ async function loadBackendModels() {
             .map((w) => ({ tokens: Math.round(Number(w?.tokens) || 0), beta: w?.beta || null }))
             .filter((w) => w.tokens > 0)
         : [];
-      (byGroup[label] ||= []).push({
+      if (!byGroup.has(label)) byGroup.set(label, []);
+      byGroup.get(label).push({
         id: it.model_id, name: it.name || it.model_id, brand: it.provider, meta: "",
+        // 这一条来自哪条线路。服务端一直在下发（models.rs 的 "conn_id"），客户端一直没读，
+        // 于是同一个模型挂在两条线路上时，两个分组点下去发出去的请求**逐字相同** ——
+        // 派单只能按 sort 取第一条。而两组显示的价是不一样的（实测 claude-sonnet-5：
+        // 这一组 $10/$15、另一组 $2/$10），用户看到便宜的那个、按贵的那个扣。
+        connId: String(it.conn_id || ""),
         // 网关判定的厂商（"anthropic" / "deepseek" / …）。判据在服务端：先看模型 id，
         // 认不出再看线路地址的域名。放服务端是因为客户端那份是硬编码正则，
         // 加一家就要发一版桌面端，而服务端加一行第二天就生效。空 = 网关也认不出来。
@@ -14668,7 +14710,7 @@ async function loadBackendModels() {
         desc: it.description || "", group: label,
       });
     }
-    const nextGroups = Object.entries(byGroup).map(([label, models]) => ({ label, models }));
+    const nextGroups = [...byGroup].map(([label, models]) => ({ label, models }));
     const changed = JSON.stringify(nextGroups) !== JSON.stringify(MODEL_GROUPS);
     MODEL_GROUPS = nextGroups;
     rebuildModelNames();
@@ -15701,7 +15743,7 @@ async function showCustomModelsDialog() {
 
   const ov = document.createElement("div");
   ov.className = "cm-ov";
-  // 只动结构，不动逻辑。**所有 querySelector 目标的类名一个没改**，下面的
+    // 只动结构，不动逻辑。**所有 querySelector 目标的类名一个没改**，下面的
   // .cm-list / .cm-in-* / .cm-save / .cm-cancel / .cm-form-title / .cm-close 全部原样命中。
   // 四处结构改动，每一处都有原因：
   //   ① .cm-close 从 <span> 变成 <button type="button" aria-label>：span 不可聚焦、
@@ -15994,6 +16036,17 @@ let _modelInfoCurrent = null;
 function _stampPowerRoute(config) {
   if (config && typeof config === "object" && _powerRouteOn(config.model)) {
     config.idePowerRoute = true;
+  }
+  // 用户点的是哪一组，就把那条线路的 id 带上。
+  //
+  // 走和强力版**同一条通道**（config 字段 → Tauri → x-ide-route 头），因为那条已经验证过
+  // 能把每请求的选路意图送到网关。在这之前，两个分组点下去发出去的东西逐字相同，
+  // 网关只能按 sort 取第一条 —— 于是显示 $2 的那一组，实际按 $10 扣。
+  if (config && typeof config === "object") {
+    try {
+      const rid = String(loadConfig()?.gatewayRouteId || "").trim();
+      if (rid) config.ideRouteId = rid;
+    } catch {}
   }
   return config;
 }
@@ -16978,7 +17031,13 @@ function buildModelMenu() {
 
 async function selectModel(model, modelGroup) {
   const c = await loadConfigAsync();
-  await saveConfig({ ...c, providerMode: AI_PROVIDER_GATEWAY, gatewayModel: model, model, modelGroup: modelGroup || "" });
+  // 连线路 id 一起存：请求时要靠它告诉网关"用户点的是这一组"。
+  // 存 id 而不是分组名，是因为分组名会被后台改（改完这个偏好就悄悄失效了）。
+  const _picked = _modelCatalogEntry(model, modelGroup);
+  await saveConfig({
+    ...c, providerMode: AI_PROVIDER_GATEWAY, gatewayModel: model, model,
+    modelGroup: modelGroup || "", gatewayRouteId: String(_picked?.connId || ""),
+  });
   refreshModelBadge();
   const session = _currentSession();
   if (session) {
@@ -20303,7 +20362,18 @@ function _turnStatsText({ elapsedMs = 0, settlement = null, timeline = null, liv
       if (firstProgressMs == null) bits.push("等待上游首字节");
       else if (firstVisibleMs == null) bits.push("接收中");
     }
-    // 有轮次但都已结束 = 正在跑工具，不加标签：工具卡自己在转。
+    // 有轮次但都已结束 = 正在跑工具，工具卡自己在转，不用加标签。
+    //
+    // **但工具卡结算完之后还有一段。** 这一批工具全部落定之后，harness 自己还要做
+    // 两件事才发下一轮：等诊断（干净的 JS/TS 文件必然等满 1.2 秒，其它语言 4 秒）、
+    // 重扫运行状态（最长 1.6 秒）。这段时间里屏幕上**一个动的东西都没有** ——
+    // 思考卡早被摘掉、工具卡都变成了「完成」、状态标签走的正是这一支。
+    // 用户看到的只有一个每秒跳一次的秒表，「在干活」和「卡住了」长得一模一样。
+    //
+    // 这一条不省任何真实时间，它只回答「它到底还在不在动」。
+    else if (turns.length && timeline && timeline.harnessPhase) {
+      bits.push(String(timeline.harnessPhase));
+    }
   }
   // 「模型 / 首显」两项 2026-08-26 按用户要求从行内撤下。碰上不做流式转发的中转（截图里
   // 的 grok-4.6 就是），首字节到达时整段已经生成完，这两个数必然贴着总耗时 ——
@@ -24235,10 +24305,19 @@ function _aiIntentKnowledgeDomain(value) {
 
 function _aiIntentWorkspaceEvidence(root) {
   const workspace = _normalizeFsPath(String(root || "")).replace(/\/+$/, "");
-  // 工作区取证依赖桌面端的项目扫描（_agentContextCache / _projectStacks 由 Tauri 侧预热
-  // 填充）。web 构建拿不到就如实降级成「没有工作区证据」，而不是拦掉整条画像腿——
-  // _normalizeAiIntentVerdict 里 inferredProjectState 对 hasWorkspace:false 已有分支。
-  if (!inTauri || !workspace) return { hasWorkspace: false, snapshotReady: false, topLevel: [], stack: {} };
+  // 判据是「这个工作区扫过没有」，不是「是不是桌面端」。
+  //
+  // 上一版写的是 `!inTauri || !workspace`，注释说 web 拿不到项目扫描。那句话对
+  // `_agentContextCache` / `_projectStacks` 不成立：填它们的是 `_gatherAgentContext`，
+  // 那个函数里一个 `inTauri` 都没有，走的是 `backend.readDir` / `backend.readTextFile`
+  // ——而 mockBackend 把这两个都实现了（网页版是一整套模拟工程，不是「少几个功能」）。
+  // 于是网页版每一轮的画像里 hasWorkspace 恒为 false、topLevel 恒为空、stack 恒为空：
+  // 分类器看不见语言、框架、包管理器、测试命令，只能从一句话里猜项目是什么样。
+  // 这条腿是「把用户目标推理准」的输入之一，在网页版上它结构性地是空的。
+  //
+  // 真的没打开文件夹时（两端都可能）照旧如实降级 —— `_normalizeAiIntentVerdict` 的
+  // inferredProjectState 对 hasWorkspace:false 有专门分支，那条路不动。
+  if (!workspace) return { hasWorkspace: false, snapshotReady: false, topLevel: [], stack: {} };
   const ready = _agentContextCache?.root === workspace && _agentContextCache?.ts
     && Date.now() - _agentContextCache.ts < 300000;
   const stack = _projectStacks.get(workspace) || {};
@@ -24267,6 +24346,31 @@ function _aiIntentContextFingerprint(context) {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+/// 意图上下文里那个「当前文件」到底取不取，**判据只此一处**。
+///
+/// 这个表达式原来在四个地方各写各的：三处带 `_realFilePath`（它只在预览标签页时回空串），
+/// 发送路径那一处没带。于是「预览标签页开着 + 没绑工作区」时，预热算出来的指纹和
+/// 真正发送时的**必然不同** —— 预取确实发过、也确实落了缓存，只是键对不上没人取，
+/// 第一发照样是空画像，而且日志里和「没预热」一模一样看不出区别。
+///
+/// 这种「同一个概念在 N 处各写一遍」的漂移，这个仓库已经栽过好几次，所以合并成一份。
+function _intentActivePath(root) {
+  return _realFilePath(activePath) && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "";
+}
+
+/// 这句话是不是「没有内容」的话 —— 寒暄、接续词、单个语气词。
+///
+/// **这里只判语义，不判长度。** 两个调用方对长度的要求本来就不同：
+///   · 需求账本问的是「值不值得记成一条要求」，它自己另加一条 `< 6` 的下限；
+///   · 打字预热问的是「有没有东西可推理」，而「改一下登录」五个字显然有。
+/// 把长度门塞进共用判据的话，预热就会把最需要它的那批短需求全排除掉 ——
+/// 那正是这次要修的毛病，不能在共用的时候又原样带回来。
+function _isFillerUtterance(text) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  return /^(?:请|麻烦|那|就|快|你)?(?:继续|接着|接下来|然后呢|别停|恢复|快点|开始吧?|动手吧?|开干|做吧|干吧|好的|好嘞|嗯+|哦|噢|行|可以|明白|懂了|收到|谢谢|多谢|辛苦了|ok|okay|goon|continue|resume)[啊呀呢嘛吧~！!。.\s]*$/i.test(t.replace(/[，,、\s]+/g, ""));
 }
 
 function _aiIntentContextForTurn(session, text, options = {}) {
@@ -28665,7 +28769,7 @@ function _steerRunningAgent(sess, text, attachments = []) {
       const root = String(sess.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
       intentContext = _aiIntentContextForTurn(sess, t, {
         root,
-        activePath: _realFilePath(activePath) && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "",
+        activePath: _intentActivePath(root),
         attachments: attachments.map((item) => `${item?.kind || "media"}:${item?.name || item?.path || "attachment"}`),
         workspaceEvidence: _aiIntentWorkspaceEvidence(root),
       });
@@ -29036,6 +29140,21 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   const _turnBillingTasks = [];
   config.requestId = _billingScopeId;
   config.ideRunId = _turnRunId;
+  // **会话级标识 —— 提示词缓存的机器亲和键靠它。**
+  //
+  // 网关拿这个值把同一段对话路由回**同一台**上游机器（OpenAI / xAI 系的自动前缀缓存
+  // 存在具体某台机器上）。原来它只有 run id 可用，而 run id 是**每条用户消息**新造的
+  // （就在上面那行）—— 于是每问一句就换一台机器，几万 token 的前缀整份重算。
+  //
+  // 线上实测这一刀的形状（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k）：
+  //   claude-fable-5  92.7% / 93.9%   落差 1.1 点（它走显式缓存断点，不靠机器亲和）
+  //   grok-4.6        23.7% / 40.9%   落差 17.2 点
+  //   qwen3.8-max     18.4% / 45.0%   落差 26.6 点
+  // 掉下去的那一刀正好落在「每一轮的第一发」上，也就是用户按下回车之后那一停。
+  //
+  // 用 sess.id 而不是别的：它的粒度就是一个聊天会话，正是提示词前缀稳定的那个范围；
+  // 格式是 base36 时间戳 + 4 位随机 = 12 位字母数字，正好过下面那道头部校验。
+  config.ideSessionId = sess && sess.id ? String(sess.id) : "";
   sess._reqId = _billingScopeId;
   // 挂在会话上是给**别的代码路径**取当前这一轮时间线用的（本函数体内一律用局部
   // _turnTimeline）。目前没有任何读者——留着它本身没有害处，但守卫会把它算成只写不读，
@@ -29045,7 +29164,8 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 本轮最终画像由语义工程决策覆盖；本地只保留精确 URL 等非意图事实。
   let _turnEngineeringResolved = _turnEngineeringEarly;
   const _earlyRoot = String(sess?.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
-  const _earlyActiveForSession = activePath && (!_earlyRoot || _pathIsAtOrUnder(activePath, _earlyRoot)) ? activePath : "";
+  // 判据和预热那边共用一份（`_intentActivePath`）—— 不共用的话指纹对不上，预取白跑。
+  const _earlyActiveForSession = _intentActivePath(_earlyRoot);
   const effectiveMode = _normalizeAiMode(_currentAiMode);
   _turnEngineeringEarly._isAgentMode = (effectiveMode === "agent");
   config.ideStepIndex = 0;
@@ -29729,9 +29849,26 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 这块把它们捞回来。还在历史里的一条都不该重复。差集为空时连表头一起不发。
   // 差集两侧必须走同一个归一化（_ledgerNorm）：账本入账时压过空白，历史原文没有，
   // 直接拿原文 includes 会让任何一条多行消息永远「不在历史里」。
+  // 「还在历史里」这个判据必须按**模型真正会逐字看到的那段**算，不是按客户端存了什么。
+  //
+  // 网关档位下 memory.recent 从不收缩 —— _compactHistoryIfNeeded 在那条路上第一行就
+  // return（压缩发生在服务端）。于是差集恒为空，这块反健忘的前导在**唯一会失忆的那条
+  // 路上从来没触发过**：会话被网关压掉之后，用户最早提的那些要求既不在逐字历史里、
+  // 也不在这块里，只剩一份被便宜模型改写过的摘要。
+  //
+  // 网关每轮回报 covered（前 N 条已折进摘要、本轮不再逐字发送），按它裁掉头部即可 ——
+  // 这是服务端自己给的事实，不是客户端的估计。
+  const _visibleRecent = (() => {
+    const all = (sess?.memory?.recent || []);
+    if (!_gatewayHandlesCompression(config)) return all;
+    try {
+      const covered = Number(_mcPrefixGet(sess)?.covered) || 0;
+      return covered > 0 ? all.slice(covered) : all;
+    } catch { return all; }
+  })();
   const _recentText = (() => {
     try {
-      return (sess?.memory?.recent || []).filter((m) => m?.role === "user")
+      return _visibleRecent.filter((m) => m?.role === "user")
         .map((m) => _ledgerNorm(m.content)).join("\n");
     } catch { return ""; }
   })();
@@ -29765,7 +29902,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 发车时快通道多半还没落定，这里仍用同步画像；落定后的受限行为副本由循环边界的
   // _applyFastRouteBehaviorIfLanded 收，方向边界见那边。
   const _decisionFrame = (effectiveMode === "agent")
-    ? _agentDecisionFrameBlock(text, _uiTurnEngineering, _fastRouteProfile)
+    ? _agentDecisionFrameBlock(text, _uiTurnEngineering, _fastRouteProfile, sess?._intentState?.semantic || null)
     : "";
   const _uiDesignCraft = (effectiveMode === "agent")
     ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _serverDesignLayersRouted(config) })
@@ -29805,8 +29942,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 稀释/折叠后，模型注意力捞不回来；账本把历次要求压缩成清单常驻眼前。
   {
     const _lt = text.trim();
-    const _isFiller = _lt.length < 6
-      || /^(?:请|麻烦|那|就|快|你)?(?:继续|接着|接下来|然后呢|别停|恢复|快点|开始吧?|动手吧?|开干|做吧|干吧|好的|好嘞|嗯+|哦|噢|行|可以|明白|懂了|收到|谢谢|多谢|辛苦了|ok|okay|goon|continue|resume)[啊呀呢嘛吧~！!。.\s]*$/i.test(_lt.replace(/[，,、\s]+/g, ""));
+    // 语义那一半抽走了（`_isFillerUtterance`），**长度那一半留在这里** ——
+    // 账本要的是「值不值得记成一条要求」，六个字以下的先不记；
+    // 而预热要的是「有没有东西可推理」，那边不能带这条下限。行为和以前一字不变。
+    const _isFiller = _isFillerUtterance(_lt) || _lt.length < 6;
     if (!_isFiller) {
       sess._demandLedger = Array.isArray(sess._demandLedger) ? sess._demandLedger : [];
       sess._demandLedger.push(_ledgerNorm(_lt).slice(0, 240));
@@ -37675,7 +37814,16 @@ function _planEvidenceKindsForTool(call, result) {
   return [...kinds];
 }
 
-function _planStepMatchesEvidence(step, evidenceKinds) {
+function _planStepMatchesEvidence(step, evidenceKinds, call = null) {
+  // **交付物这一关排在动作类别之前。**
+  //
+  // 类别判据只回答「刚才干的是不是同一类活」，回答不了「干的是不是这一步要交的东西」。
+  // 一步写着「实现 src/pages/login.tsx 的表单校验」，模型去改了 src/utils/date.ts，
+  // 类别照样是 implement，于是这一步被打成完成 —— 进度条在走、活没干。
+  //
+  // 只在**两边都点了名**时才表态（步骤写出了具体文件/路径，且这次调用带着结构化目标），
+  // 其余一律沉默交回给类别判据。所以它只能拒绝一个勾，永远不会新增一个勾。
+  if (call && _planTargetsConflict(_planStepTargets(step), _toolTouchedTargets(call))) return false;
   const kind = _planStepActionKind(step);
   // 分不出这一步要做什么，就**不要**自动打勾。
   //
@@ -37711,7 +37859,7 @@ function _advancePlanFromTool(run, call, result) {
   let idx = steps.findIndex((step) => step?.status === "in_progress");
   let changed = steps !== run._planSteps;
   if (idx < 0) return false;
-  if (!_planStepMatchesEvidence(steps[idx], evidenceKinds)) {
+  if (!_planStepMatchesEvidence(steps[idx], evidenceKinds, call)) {
     // 「刚做的事和当前这一步对不上」是这里**当场算出来的**事实，此前算完就扔。
     // 用户实拍：9 步计划的第 1 步是"调研"，模型直接去写 package.json（第 3 步的活），
     // 进度条停在 0/9——他看到的是"计划列得挺准，就是不照着走"。
@@ -37730,7 +37878,7 @@ function _advancePlanFromTool(run, call, result) {
     for (let k = idx + 1; k < steps.length; k++) {
       const st = steps[k];
       if (st?.status === "completed" || st?.status === "cancelled") continue;
-      if (_planStepMatchesEvidence(st, evidenceKinds)) { _matchIdx = k; break; }
+      if (_planStepMatchesEvidence(st, evidenceKinds, call)) { _matchIdx = k; break; }
     }
     run._planStepMismatch = {
       step: String(steps[idx]?.content || "").slice(0, 80),
@@ -45800,6 +45948,17 @@ function _isReadOnlyParallel(call) {
   // 不可逆动作绝不能。判据复用 _GH_READ_OPS，不另抄一份。
   if (t === "gh") return _GH_READ_OPS.includes(String(call.op || ""));
   if (t === "http") return /^(get|head)$/i.test((call.method || "GET").trim());
+  // MCP：按**服务自己声明的** readOnlyHint 逐个判。
+  //
+  // 这一支原来整个不在表里，于是所有 MCP 调用一律当硬屏障串行 —— 一轮里查四次文档
+  // 就是四次网络往返一个接一个（实测量级 1–3 秒一次）。而 `mcpReadOnly` 这个字段
+  // 早就挂在调用对象上了（来自 tool.annotations.readOnlyHint），另外两道门也在读它：
+  // 只读模式的拦截、以及 strict 判定。这里用的是同一个信号，不新开判据。
+  //
+  // 没声明 readOnlyHint 的**仍然串行**。那是对的：一个不肯说自己只读的工具，
+  // 我们没有任何依据认为它不动东西 —— 和这个文件里其它地方一样，
+  // 「没有证据」不构成放行的理由。
+  if (t === "mcp") return !!call.mcpReadOnly;
   // WITH/PRAGMA/EXPLAIN are not provably read-only: writable CTEs, assignment
   // pragmas, and EXPLAIN ANALYZE can all execute mutations.
   if (t === "db") return !_dbCallMayMutate(call);
@@ -49660,7 +49819,7 @@ function _agentIntentExecutionBlock(profile, contractCarriesRequirements = false
 // 第一轮通常没有——而"该派哪些角色"恰恰是第一轮就要决定的事，等到第二轮，活已经按 solo 干起来了。
 // 所以让模型第一轮就看到角色计划，但 run.engineering（计划门槛、写入义务、角色派发的准入）
 // 仍然只认完整裁决：精简判断可以指路，不该管闸门。
-function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiIntent(text), provisional = null) {
+function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiIntent(text), provisional = null, priorSemantic = null) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
   const p = profile || {};
@@ -49678,6 +49837,32 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   if (intentContract) lines.splice(1, 0, intentContract);
   // 完整契约不在场时，用快通道那份顶上——并且**明说它是临时的**：模型据此开工，
   // 完整裁决落定后（循环边界的 late-adopt）会补全或纠正，不要把它当成最终结论。
+  // 第 2 轮起，**本轮第一发根本没有契约**。
+  //
+  // 那道等待窗口按会话只付一次（`sess._intentWaitPaid`，理由在 sendPrompt 里），
+  // 所以从第二轮开始，本轮的裁决必然赶不上第一次模型调用；契约要等循环边界的
+  // late-adopt 补，也就是**第二个模型回合**才有。而一轮里最关键的判断——要不要动手、
+  // 动哪儿、算不算做完——恰恰在第一发就做完了。用户那边的观感是「越聊越不知道我要干嘛」。
+  //
+  // 上一轮收敛出来的契约就在会话里躺着（`sess._intentState.semantic`），零延迟、零成本。
+  // 它不是本轮的裁决，所以**只带耐久的那几维**（目标 / 对象 / 约束 / 成功判据），
+  // 并且明说是上一轮的、用户这一轮的原话优先：
+  //   · restatedTask / continuation 是对**上一句话**的判断，带过来就是张冠李戴；
+  //   · ambiguities 的空数组是「上一句没有歧义」的申报，对这一句不成立（见上面那段）。
+  else if (priorSemantic && typeof priorSemantic === "object"
+    && (priorSemantic.goal || priorSemantic.target || priorSemantic.constraints?.length)) {
+    const _carry = [];
+    if (priorSemantic.goal) _carry.push(`目标：${String(priorSemantic.goal).slice(0, 420)}`);
+    if (priorSemantic.action || priorSemantic.target) {
+      _carry.push(`动作/对象：${priorSemantic.action || "处理"}${priorSemantic.target ? ` → ${String(priorSemantic.target).slice(0, 320)}` : ""}`);
+    }
+    if (priorSemantic.constraints?.length) _carry.push(`约束：${priorSemantic.constraints.slice(0, 8).join("；")}`);
+    if (priorSemantic.successCriteria?.length) _carry.push(`成功判据：${priorSemantic.successCriteria.slice(0, 8).join("；")}`);
+    lines.splice(1, 0,
+      "🎯 **上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）**\n" + _carry.join("\n")
+      + "\n这是**上一轮**的判断，不是对你刚收到这句话的判断：用户这一轮的原话优先，"
+      + "他要是改了主意、撤回或换了目标，以他说的为准。本轮裁决落定后会自动补全或纠正。");
+  }
   else if (provisional && provisional.orchestrationMode && provisional.orchestrationMode !== "solo") {
     const _label = provisional.orchestrationMode === "parallel_roles"
       ? "并行多角色：契约已明确的实现块可以同时开工，范围不许重叠"
@@ -52837,7 +53022,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             // stale iteration from using the previous task's database/design/tool decisions.
             const _steerIntentContext = (typeof queued === "object" && queued?.intentContext) || _aiIntentContextForTurn(session, _steerSemanticText, {
               root,
-              activePath: _realFilePath(activePath) && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "",
+              activePath: _intentActivePath(root),
               attachments: steerAttachments.map((item) => `${item?.kind || "media"}:${item?.name || item?.path || "attachment"}`),
               workspaceEvidence: _aiIntentWorkspaceEvidence(root),
             });
@@ -52914,7 +53099,10 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 超时兜底不能写进缓存。原来超时回 "" 并连同新键一起存下，于是这一整轮模型手上
         // 没有执行状态块，下一轮键再变又重扫——模型看到的环境事实在「完整」和「空」
         // 之间来回翻。超时就保留上一份快照、且不推进键，下一轮自然重试。
+        // 同上：这一段最长 1.6 秒，期间界面上没有任何东西在动。
+        if (run.timeline) run.timeline.harnessPhase = "读取项目当前状态";
         const _rtFresh = await _promiseOrFallbackWithin(_agentRuntimeStateBlock(root), 1600, null);
+        if (run.timeline) run.timeline.harnessPhase = "";
         if (_rtFresh != null) {
           run._rtState = _rtFresh;
           run._rtStateTick = _fsTickNow;
@@ -53023,7 +53211,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // Evidence quality is advisory, not an execution permission. Streaming writes
         // still land immediately; any missing grounding is attached to the real result.
         run._eagerTurnBias = 1;
-        entry._mutationAdvice = String(_debugMutationBlockResult(run, call, root) || "") + _sinkRiskAdvice(call);
+        entry._mutationAdvice = _afterWriteAdvice(run, call, root);
         entry._eagerDone = true;
         // An eager write belongs to the IN-FLIGHT model turn, but run._toolBatch is not
         // incremented until the turn returns — so the read-gate's "read must be from a
@@ -54725,7 +54913,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               _preExecutionBlockedEarlier(items, index) ? "前项被门拦下 · 后续已停止" : "前项真实失败 · 后续已停止");
             return _toolMsgForModel(it.call, batchBlock);
           }
-          it._mutationAdvice = String(_debugMutationBlockResult(run, it.call, root) || "") + _sinkRiskAdvice(it.call);
+          it._mutationAdvice = _afterWriteAdvice(run, it.call, root);
         }
         let message = subagentNames.has(it.tc.name) ? await runSubagentItem(it) : await runOne(it);
         if (it._mutationAdvice) {
@@ -54762,6 +54950,16 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         if (!run._diagLangTried) run._diagLangTried = new Set();
         const baseline = await _interleavedDiagnostics(_newBaselinePaths, root, null, run._diagLangTried);
         for (const [key, count] of baseline.counts) run._diagnosticBaselineCounts.set(key, count);
+        // 项目 linter 的 baseline 也要在**改动之前**抓，理由和诊断那条一模一样：
+        // 仓库里本来就有的问题不能算到模型头上，否则门一开就永远关不上，模型会被推去
+        // 改一堆跟本轮任务无关的代码。抓不到（没配 linter / 没装）就留空，
+        // 下面 `ran:false` 那一支会让整道门安静跳过。
+        try {
+          const _lintBase = await _projectLintFindings(_newBaselinePaths, root, null);
+          if (_lintBase.ran) {
+            run._lintBaseline = (run._lintBaseline || []).concat(_lintBase.findings);
+          }
+        } catch {}
       }
 
       // Preserve model call order. A contiguous run of provably read-only calls runs in
@@ -55016,12 +55214,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           if (_LINTABLE_EXT.has(ext)) run._diagnosticCheckPaths.add(path);
         }
         if (!run._diagLangTried) run._diagLangTried = new Set();
+        // 这一段是**纯等待**（干净的 JS/TS 必然等满 1.2 秒，其它语言 4 秒），
+        // 而这时候工具卡已经全部结算、思考卡早被摘掉 —— 不说一句的话，
+        // 屏幕上完全静止，用户没法区分「在检查」和「卡死了」。
+        if (run.timeline) run.timeline.harnessPhase = "检查这次改动有没有引入新问题";
         const _d = await _interleavedDiagnostics(
           [...run._diagnosticCheckPaths],
           root,
           run._diagnosticBaselineCounts,
           run._diagLangTried,
         );
+        if (run.timeline) run.timeline.harnessPhase = "";
         // 「没有检查器看过」是事实，不是「干净」。这里只登记（run 级去重），
         // 说出去统一走下面写入质量事实那条通道；verifyNow 也读 run._uncheckedLangs，
         // 在没有语言检查器的语言上把「这条命令是唯一的正确性检查」这半句事实补上。
@@ -55060,11 +55263,41 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
           else _noProgressVerify = 0; // errors are dropping
           _prevVerifyErrs = _errNow;
         }
+        // ── 项目自己那份 linter ────────────────────────────────────────────
+        // 上面那条腿认的是语法和类型。业务逻辑上的错（漏 await、== 比较、hook 依赖
+        // 不全、catch 了又吞掉）在语法上全对、类型也全过，只有项目自己配的规则认得。
+        // 走同一道阻断门、同一条「不再收敛就停止阻断」的收敛计数：多开一道门就多一处
+        // 会打转的地方，而这两条腿说的是同一件事——「你刚写的这版有新问题」。
+        let _lintReportText = "";
+        try {
+          const _lint = await _projectLintFindings([...run._diagnosticCheckPaths], root, run._lintBaseline || []);
+          if (_lint.ran && _lint.findings.length) {
+            _lintReportText = _lintReport(_lint.findings[0].linter, _lint.findings);
+          }
+          // 「配了 linter 却跑不起来」是事实，说一次就够（run 级去重），
+          // 而且只陈述、不阻断——没装依赖不是模型这一轮写坏了什么。
+          if (_lint.unavailable.length) {
+            const _wf = run._writeFactsSaid || (run._writeFactsSaid = new Set());
+            for (const u of _lint.unavailable) {
+              if (_wf.has("lintless:" + u.id)) continue;
+              _wf.add("lintless:" + u.id);
+              (run._writeFactsPending = run._writeFactsPending || []).push(
+                `这个项目配了 ${u.id}，但这一轮没能跑起来（${u.why}）——它管的那一类问题（漏 await、== 比较、未处理的异常…）本轮没有任何检查看过`);
+            }
+          }
+        } catch {}
         if (_d.report && _live()) {
           interleaveVerifies++;
           runHadTrouble = true;
           run._diagnosticBlock = _noProgressVerify < 2 ? _d.report : "";
-          _pushNudge("diag", "[BLOCKING_NEW_DIAGNOSTICS] 你刚才的修改引入了新增错误。先修复并重新验证；这些错误清零前不要继续无关功能，也不能用“LSP 误报 / 应该能过”收尾：\n\n" + _d.report);
+          _pushNudge("diag", "[BLOCKING_NEW_DIAGNOSTICS] 你刚才的修改引入了新增错误。先修复并重新验证；这些错误清零前不要继续无关功能，也不能用“LSP 误报 / 应该能过”收尾：\n\n" + _d.report
+            + (_lintReportText ? "\n\n" + _lintReportText : ""));
+        } else if (_lintReportText && _live()) {
+          // 类型/语法干净、但项目规则报了错：这条路此前整个不存在。
+          interleaveVerifies++;
+          runHadTrouble = true;
+          run._diagnosticBlock = _noProgressVerify < 2 ? _lintReportText : "";
+          _pushNudge("diag", "[BLOCKING_NEW_DIAGNOSTICS] 你刚才的修改在**项目自己的规则**下报错了（语法和类型是干净的，所以上面那条腿看不见）。先修复并重新验证；不要改项目的 lint 配置来绕过它：\n\n" + _lintReportText);
         } else if (_d.ran) {
           run._diagnosticBlock = "";
         }
@@ -70955,6 +71188,134 @@ function _lintableLangId(rel) {
   return id && id !== "plaintext" ? id : null;
 }
 const _TS_EXT = new Set(["ts", "tsx", "mts", "cts"]);
+/*
+ * 项目自己那份 linter，跑在每批改动之后。
+ *
+ * 隔壁 `_interleavedDiagnostics` 认的是**语法和类型**（Monaco worker + LSP）。而用户真正
+ * 吃亏的一类 bug 在语法上全对、类型也全过：漏 await 的 promise、该用 === 用了 ==、
+ * React hook 依赖不全、catch 了又吞掉、未使用变量背后藏着拼错的名字。这些只有项目自己
+ * 配的 linter 认得 —— 而那份配置就躺在仓库里没人读。纯 JS 项目最极端：没有类型检查，
+ * 那条腿只剩语法，等于唯一的写时正确性门几乎是空的。
+ *
+ * 三条纪律写在 src/agent/project-lint.js 的文件头：只按项目自己的配置认、只报 error、
+ * 「没跑成」和「跑了没问题」必须可分。这里只负责**执行**和接进那道已有的阻断门。
+ *
+ * 有界：`project_lint_run` 在 Rust 侧 8 秒硬超时、程序名走白名单、不经过 shell。
+ */
+/**
+ * 一次写入之后要做的两件事：给模型的质量提醒，以及**按写出来的代码**点亮安全旗标。
+ *
+ * 收成一个函数是因为它有两个调用点（普通工具执行、有序分段执行），而"手工保持两处
+ * 同步"在这个仓库栽过好几次 —— 漏掉一处不会报错，只会让那条路上这道机制不存在。
+ *
+ * 安全旗标此前只来自**意图裁决**，也就是模型对「用户这句话」的判断：用户说
+ * 「做个待办列表」，`securityRisk` 不亮；模型接着写了一段拼 SQL 的查询、一个上传
+ * handler —— 网关那份缺陷分类清单一个字都不发。判据得跟着写出来的代码走。
+ *
+ * 画像是会话粘性的单调并集，所以点亮一次就够，之后每一轮都带着；代价是本轮之后的
+ * 第一次请求会作废一次前缀缓存 —— 一次性的，换的是"真写了危险代码时清单在场"。
+ */
+function _afterWriteAdvice(run, call, root) {
+  const advice = String(_debugMutationBlockResult(run, call, root) || "") + _sinkRiskAdvice(call);
+  try {
+    const kinds = _securitySinkKinds(call);
+    if (kinds.length) {
+      const sess = run?.session || (typeof _currentSession === "function" ? _currentSession() : null);
+      const flags = sess && (Array.isArray(sess._semanticProfileFlags) ? sess._semanticProfileFlags : (sess._semanticProfileFlags = []));
+      if (flags && !flags.includes("defects_write")) {
+        flags.push("defects_write");
+        // 记成执行事实，供本轮的质量事实通道说一句：模型自己往哪个面上写了东西。
+        (run._writeFactsPending = run._writeFactsPending || []).push(
+          `这一轮写进去的代码碰到了${kinds.join("、")} —— 已经把对应的缺陷分类清单挂上，后面几轮按它自查`);
+      }
+    }
+  } catch {}
+  return advice;
+}
+
+const _LINT_MAX_FILES = 12;
+
+/** 这个仓库配了哪些 linter。按根缓存 —— 配置文件不会在一个 run 里变。 */
+const _lintersByRoot = new Map();
+async function _projectLinters(root) {
+  const key = String(root || "");
+  if (!key || !inTauri) return [];
+  if (_lintersByRoot.has(key)) return _lintersByRoot.get(key);
+  let found = [];
+  try {
+    const entries = await backend.readDir(key);
+    const names = new Set((entries || []).map((e) => String(e?.name || "")).filter(Boolean));
+    let manifest = null;
+    if (names.has("package.json")) {
+      try { manifest = JSON.parse(await backend.readTextFile(`${key}/package.json`)); } catch {}
+    }
+    // pyproject 的 [tool.ruff] 不写 TOML 解析器，一行正则够了：这个判据只回答
+    // 「这个仓库配没配 ruff」，配错了最坏是白跑一次 8 秒上限的进程。
+    if (names.has("pyproject.toml")) {
+      try {
+        const py = await backend.readTextFile(`${key}/pyproject.toml`);
+        if (/^\s*\[tool\.ruff[\].]/m.test(String(py || ""))) {
+          manifest = { ...(manifest || {}), pyprojectHasRuff: true };
+        }
+      } catch {}
+    }
+    found = _detectLinter(names, manifest);
+  } catch {}
+  _lintersByRoot.set(key, found);
+  return found;
+}
+
+/**
+ * 跑一遍项目 linter，返回**这次改动新引入的** error。
+ *
+ * `baseline` 是同一批文件在改动前跑出来的那份（调用方在首次触碰这些文件时抓）。
+ * 传 null 表示「这次跑的就是 baseline」。
+ *
+ * 返回 `{ ran, findings, unavailable }`：`ran:false` 说明这个仓库没配 linter 或者
+ * 根本没跑成 —— 那和「跑了、干干净净」是两回事，调用方必须能分开（混为一谈的话，
+ * 一个没装 eslint 的项目会得到「零错误」，而那恰恰最该说一句）。
+ */
+async function _projectLintFindings(editedRelPaths, root, baseline = null) {
+  const files = (Array.isArray(editedRelPaths) ? editedRelPaths : []).slice(-_LINT_MAX_FILES);
+  if (!files.length || !root || !inTauri) return { ran: false, findings: [], unavailable: [] };
+  const linters = await _projectLinters(root);
+  if (!linters.length) return { ran: false, findings: [], unavailable: [] };
+  const all = [];
+  const unavailable = [];
+  let ranAny = false;
+  for (const linter of linters) {
+    const cmd = _lintCommand(linter, files);
+    if (!cmd) continue;   // 这一批里没有它管得着的文件
+    let out;
+    try {
+      out = await _invokeCapped("project_lint_run",
+        { program: cmd.program, args: cmd.args, cwd: root }, 12_000, `${linter.id} 检查`);
+    } catch { out = null; }
+    // 没跑成就如实记下来，绝不当成「零问题」。
+    //
+    // 两层判据缺一不可：Rust 那边的 note 只覆盖「没启动/超时」，而
+    // `npx --no-install eslint` 在项目没装 eslint 时会**正常启动、非零退出、stdout 空**
+    // —— 进程跑起来了，所以没有 note；解析器拿到空串返回空数组，于是「这个项目没装
+    // lint」被读成「零错误、干干净净」。`_lintRan` 就是为这一层存在的。
+    if (!out || (out.note && String(out.note).trim())) {
+      unavailable.push({ id: linter.id, why: String(out?.note || "调用失败").slice(0, 120) });
+      continue;
+    }
+    if (!_lintRan(linter.id, out)) {
+      unavailable.push({
+        id: linter.id,
+        why: String(out.stderr || out.stdout || `退出码 ${out.code}`).replace(/\s+/g, " ").trim().slice(0, 120),
+      });
+      continue;
+    }
+    ranAny = true;
+    // 诊断可能在 stdout 也可能在 stderr（go vet 只写 stderr）。
+    for (const f of _lintFindings(linter.id, out)) all.push({ ...f, linter: linter.id });
+  }
+  if (!ranAny) return { ran: false, findings: [], unavailable };
+  return { ran: true, findings: baseline ? _newLintFindings(baseline, all) : all, unavailable };
+}
+
 const _INTERLEAVED_DIAG_MAX_FILES = 16;
 const _INTERLEAVED_DIAG_MAX_WAIT_MS = 4000;
 // TS/JS 由 Monaco 自带 worker 出诊断，几百毫秒的事——给它一个短得多的期限，
@@ -70979,7 +71340,14 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
   // 白等 _INTERLEAVED_DIAG_MAX_WAIT_MS。判据是现成的一个布尔查询：lspManager.isRunning。
   // 服务器没在跑的文件不建 model、不进等待循环，改记进 unchecked 让调用方当事实说出去。
   const unchecked = []; // [{ rel, lang }] —— 没有任何检查器看过的目标文件
-  for (const rel of editedRelPaths.slice(0, _INTERLEAVED_DIAG_MAX_FILES)) {
+  // **取最近改的那批，不是最早的。**
+  //
+  // 调用方传进来的是 run 级**只增不减**的集合（run._diagnosticCheckPaths）。
+  // 从头截断的话，第 17 个之后被改的文件在这个 run 里**永远拿不到诊断**，
+  // 而最早改的那 16 个每一轮重查一遍（还要为它们白等）。
+  // 铺 30 个文件的任务里，后半截写坏什么都不响，收尾门看到 newErrorCount=0 直接放行。
+  // 任务越大越静默 —— 这正是「大项目就开始乱」的形状。
+  for (const rel of editedRelPaths.slice(-_INTERLEAVED_DIAG_MAX_FILES)) {
     const ext = (rel.split(".").pop() || "").toLowerCase();
     if (!_LINTABLE_EXT.has(ext)) continue;
     let abs = rel;
@@ -71051,6 +71419,42 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
      */
     const started = Date.now();
     const hardDeadline = started + _INTERLEAVED_DIAG_MAX_WAIT_MS;
+    /*
+     * **JS/TS 走「问它答完没有」，不是「等满就算」。**
+     *
+     * 下面那个轮询的退出条件是 `有 marker || 到点`。而一个**干净**的 JS/TS 文件
+     * 永远不会产生 marker —— 于是它必然等满 _INTERLEAVED_DIAG_TS_WAIT_MS，
+     * 每个包含编辑的回合固定白付这一段。改十次文件的任务就是十几秒纯等待。
+     *
+     * Monaco 自带的 TS worker 有一个真正的完成信号：`getSemanticDiagnostics` 是个
+     * Promise，分析完就 resolve，干净文件 resolve 成空数组。拿它当判据，
+     * 干净文件几百毫秒就能收工，而不是等满。
+     *
+     * worker 答完 ≠ marker 已经挂上去（Monaco 还要把结果 publish 成 marker），
+     * 所以这里不直接判 settled，而是把这个目标的期限缩短到「再等一小段」——
+     * 底下那套读 marker 的逻辑一个字不用改。
+     *
+     * 拿不到 worker（Monaco 版本差异、被裁剪的构建）就什么都不做，退回原来的等满。
+     */
+    const _TS_PUBLISH_GRACE_MS = 200;
+    for (const t of targets) {
+      if (!t.jsFamily) continue;
+      (async () => {
+        try {
+          const _ts = monaco.languages?.typescript;
+          const _get = t.isTs ? _ts?.getTypeScriptWorker : _ts?.getJavaScriptWorker;
+          if (typeof _get !== "function") return;
+          const _client = await _get();
+          const _worker = await _client(t.model.uri);
+          const _u = t.model.uri.toString();
+          await Promise.all([
+            Promise.resolve(_worker.getSyntacticDiagnostics?.(_u)).catch(() => null),
+            Promise.resolve(_worker.getSemanticDiagnostics?.(_u)).catch(() => null),
+          ]);
+          t._workerDoneAt = Date.now();
+        } catch {}
+      })();
+    }
     // 判 jsFamily 不判 isTs。上面那句注释（"TS/JS 由 Monaco 自带 worker 出诊断"）
     // 从一开始就把 JS 算在内，只是 targets 里当时没带这个字段，于是每一个干净的
     // .js/.jsx/.mjs/.cjs 都在这里等满 4 秒——而且是**必然**等满：tsconfig 那边
@@ -71065,7 +71469,9 @@ async function _interleavedDiagnostics(editedRelPaths, root = "", baselineCounts
         if (t._diagSettled) continue;
         let has = false;
         try { has = monaco.editor.getModelMarkers({ resource: t.model.uri }).length > 0; } catch {}
-        if (has || now >= own(t)) t._diagSettled = true;
+        // worker 答完之后再给一小段让 marker 挂上去，就不必等满整个期限了。
+        const _workerReady = t._workerDoneAt != null && now >= t._workerDoneAt + _TS_PUBLISH_GRACE_MS;
+        if (has || _workerReady || now >= own(t)) t._diagSettled = true;
         else settled = false;
       }
       if (settled || now >= hardDeadline) break;
@@ -74236,13 +74642,27 @@ function _prefetchIntentFromComposer() {
   if ((typeof _droppedRefs !== "undefined" && _droppedRefs && _droppedRefs.length)
       || (typeof _pastedImages !== "undefined" && _pastedImages && _pastedImages.length)) return;
   const t = String(_ceSerialize(promptEl) || "").trim().replace(/\s+/g, " ");
-  if (t.length < 12 || t.length > 800) return;              // 太短还在打，太长发送路径自己会截
+  // **短不等于还在打字。**
+  //
+  // 触发条件本来就是「打字停顿 1.2 秒」，所以一句稳定的短话是**说完了的短话**。
+  // 原来的 `t.length < 12` 恰好把「表达不清楚」的那批全排除在外：
+  // 「改一下登录」6 字、「做个网站」4 字、「这个不行」4 字 —— 一条都进不来。
+  //
+  // 方向和需求正好相反：写得长、说得清的用户能在打字停顿时把裁决跑起来、第一发就带
+  // 完整画像；随口说一句的用户必然落进 6 秒窗口，而两条模型腿都赢不了它
+  // （实测完整裁决 6.9~7.6 秒、拥堵 19.8 秒）。也就是**用户越说不清，画像越确定为空**，
+  // 而画像空掉时丢的恰恰是 restatedTask（唯一那条「把你的话补全成可执行版本」）
+  // 和 agent_core 之外的全部工程纪律。用户的感受就是「它时好时坏」。
+  //
+  // 换成判「有没有内容」：寒暄和接续词照旧不预热（那些本来也没什么可裁决的），
+  // 一句真的需求不管多短都预热。判据和需求账本那边共用一份。
+  if (_isFillerUtterance(t) || t.length > 800) return;      // 没内容的不预热，太长发送路径自己会截
   if (t === _intentPrefetchedText) return;                  // 同一句话只预取一次
   const root = String(sess.project || _knownWorkspaceRoots()[0] || "").replace(/\/+$/, "");
   // 上下文必须和 sendPrompt 里那份**逐字段一致**，否则指纹不同、键对不上，预取白跑。
   const ctx = _aiIntentContextForTurn(sess, t, {
     root,
-    activePath: _realFilePath(activePath) && (!root || _pathIsAtOrUnder(activePath, root)) ? activePath : "",
+    activePath: _intentActivePath(root),
     attachments: [],
     workspaceEvidence: _aiIntentWorkspaceEvidence(root),
   });

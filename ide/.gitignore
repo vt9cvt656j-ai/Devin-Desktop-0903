@@ -46,3 +46,6 @@ __pycache__/
 # IDE dogfood 时自己写的**本机**项目记忆（文件头也写着本地为空时会从它读回）。
 # 属于这台机器的状态，不是源码——进了库会让每台机器互相覆盖对方的记忆。
 .mrdayone/
+
+# Tauri WebView 的运行时 localStorage（可能含登录令牌，绝不该进仓库）
+localstorage.sqlite3*
