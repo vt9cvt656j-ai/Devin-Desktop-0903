@@ -380,3 +380,26 @@ test("已经存在磁盘上的坏密钥要在列表里当场看得见——保�
   assert.doesNotMatch(SRC, /cm-row__meta"\)\.innerHTML/,
     "改用 innerHTML 了 —— .cm-row__* 是不能塞子元素的三处之一");
 });
+
+test("自定义模型悬停要弹出悬浮卡——那是调思考深度和上下文档位的唯一入口", () => {
+  // buildModelMenu 里网关模型那支挂的是 showModelInfoCard(m, item)，自定义那支挂的却是
+  // hideModelInfoCard —— **主动把卡片藏掉**。于是这一整组模型没有任何地方能调思考深度
+  // 和上下文档位，而同一个菜单里网关模型悬停就有。用户看到的是「自定义模型少了半个功能」。
+  const build = extractFn("buildModelMenu", { code: true });
+  assert.match(build, /showModelInfoCard\(cm, item\)/,
+    "自定义模型悬停不弹卡片 —— 思考深度和上下文档位没有入口");
+  assert.doesNotMatch(build, /addEventListener\("mouseenter", hideModelInfoCard\);\s*\n\s*item\.addEventListener\("click", \(\) => \{\s*\n[\s\S]{0,120}?selectModel\(cm\.id/,
+    "自定义模型那一项还挂着 hideModelInfoCard");
+});
+
+test("卡片要的数据在 custom: 前缀上都取得到——否则弹出来也是空的", () => {
+  // 这条验的是**行为**：三个助手必须都认 custom: 前缀，卡片才有内容可画。
+  // 只断言「挂上了 showModelInfoCard」是不够的 —— 挂上但取不到数据，弹出来是个空壳。
+  const ctxLimit = extractFn("_modelContextLimit", { code: true });
+  assert.match(ctxLimit, /_customModelById\(/, "上下文上限不认 custom: —— 卡片里那根滑块整条不出现");
+  const think = extractFn("_builtinThinkingProfileFor", { code: true });
+  assert.match(think, /startsWith\("custom:"\)/, "思考档位不认 custom: —— 深度滑块没有档位可选");
+  const brand = extractFn("brandFor", { code: true });
+  assert.match(brand, /_CUSTOM_MODEL_PREFIX/,
+    "brandFor 不认 custom: —— 卡片头上是通用图标，和菜单里同一条模型显示的牌子对不上");
+});
