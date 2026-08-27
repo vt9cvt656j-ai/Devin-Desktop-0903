@@ -10097,7 +10097,16 @@ function _onFileOpened(model) {
   _idleRun(() => _extractFileIdentifiers(model));
   const langId = model.getLanguageId();
 
-  const importedMods = _extractImportedModules(model);
+  // 这条探针跑的是 **Python 解释器**（lsp_python_env_symbols → importlib.import_module）。
+  // 上一版没有语言门：打开一个带 import 的 .js/.ts/.rs/.java，同样会 fork 一个 python 去
+  // `import react`。那必然失败 → 模块名不进 _loadedModuleApis → **去重永远不生效**，
+  // 于是每打开一次同样的文件就再发一次，每一发都在抢那把全进程唯一的 PY_CACHE 锁。
+  //
+  // 非 Python 语言**没有被落下**：下面 onDidChangeModel 那条（打开文件同样会触发）
+  // 2 秒后跑 _refreshModuleApis，那个函数本来就按 langId 分派到 node / go / lang 各自
+  // 的探针。这里保留 200ms 这条快路只为 Python —— 它是唯一由 _loadModuleApisOnly 服务的。
+  const _pyLike = langId === "python";
+  const importedMods = _pyLike ? _extractImportedModules(model) : [];
   if (importedMods.length > 0) {
     setTimeout(() => _loadModuleApisOnly(importedMods), 200);
   }
