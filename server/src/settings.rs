@@ -46,6 +46,13 @@ pub const MAX_USD_PER_CNY_BPS: i64 = 10_000;
 pub struct Settings {
     pub raw_cents_per_credit_usd: i64,
     pub free_points_daily: i64,
+    /// 会员那一档的每日赠送点数。`None` = **没单独配**，跟随 `free_points_daily`。
+    ///
+    /// 这里是 `Option` 而不是「另给一个默认数」：线上非会员档已经是 100，给会员一个
+    /// 独立的默认值（比如 40）等于在迁移那一刻把会员降到 40 —— 没人要求过，也不报错。
+    /// `None` 让「没配」逐字等于今天的行为，同时盖住「列还没加 / 这一列读不到」两个窗口。
+    /// 解析成实际点数只走 [`free_points_daily_member`] 一个出口，调用处不许各自 unwrap_or。
+    pub free_points_daily_member: Option<i64>,
     /// 1 人民币分 折合多少美元分，万分比。佣金账本以美元计量，人民币销售在记账时折一次。
     pub usd_per_cny_bps: i64,
 }
@@ -55,6 +62,9 @@ impl Default for Settings {
         Self {
             raw_cents_per_credit_usd: DEFAULT_RAW_CENTS_PER_CREDIT_USD,
             free_points_daily: DEFAULT_FREE_POINTS_DAILY,
+            // 没有 DEFAULT_..._MEMBER 常量：默认就是「跟随非会员档」，多一个数字常量
+            // 只会多一份会和它漂开的真相。
+            free_points_daily_member: None,
             usd_per_cny_bps: DEFAULT_USD_PER_CNY_BPS,
         }
     }
@@ -240,6 +250,27 @@ pub fn free_milli_points_daily() -> i64 {
     free_points_daily() * crate::models::MILLI
 }
 
+/// 会员档配了没有，以及配的是多少（整点）。`None` = 没单独配。
+///
+/// 只有后台展示需要区分「没配」和「配了个恰好相等的数」；发放和展示分母一律走
+/// [`free_points_daily_member`]。
+pub fn free_points_daily_member_raw() -> Option<i64> {
+    current()
+        .free_points_daily_member
+        .map(|v| v.clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY))
+}
+
+/// 会员今天实际拿多少点（整点）。**没单独配就等于非会员档** —— 「新设置项缺省时行为
+/// 一个字不变」这条铁律就落在这一行，别在调用处各自 `unwrap_or`，那是让它分叉的写法。
+pub fn free_points_daily_member() -> i64 {
+    free_points_daily_member_raw().unwrap_or_else(free_points_daily)
+}
+
+/// 会员那一档的每日赠送毫点。没配时逐字等于 [`free_milli_points_daily`]。
+pub fn free_milli_points_daily_member() -> i64 {
+    free_points_daily_member() * crate::models::MILLI
+}
+
 pub fn plans() -> Vec<PlanQuota> {
     PLANS
         .read()
@@ -290,6 +321,28 @@ pub async fn load(db: &sqlx::PgPool) {
         Err(e) => tracing::warn!("default_model 读取失败，沿用「取列表第一个」的旧行为: {e}"),
     }
 
+    // 会员那一档是后加的列，所以**单独一条 SELECT**，理由和 default_model 一模一样：
+    // 并进下面那条 3 列 SELECT 的话，老库（还没跑 20260869）读它会让整条 SELECT 报错，
+    // 于是**非会员档也**一起退回默认 40 —— 线上是 100，那是一次全员静默降级。
+    //
+    // 读进局部变量、由下面那一次写锁**一起**落进 CACHE，而不是读完先写一次：
+    // load() 不只在启动时跑，admin_put 每次保存末尾都会再跑一次，那时网关正在对外服务。
+    // 若先把这一格清成 None 再回填，中间隔着一次数据库往返；任何会员的当日首次调用落进
+    // 这个窗口就按普通档发放，而懒发放当天只写一次 —— 他这一整天都停在普通档，不报错。
+    let member_daily: Option<i64> = match sqlx::query_as::<_, (Option<i32>,)>(
+        "SELECT free_points_daily_member FROM app_settings WHERE id = 1",
+    )
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some((v,))) => v.map(|n| (n as i64).clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("free_points_daily_member 读取失败，会员档跟随普通档: {e}");
+            None
+        }
+    };
+
     match sqlx::query_as::<_, (i32, i32, i32)>(
         "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps \
          FROM app_settings WHERE id = 1",
@@ -303,6 +356,7 @@ pub async fn load(db: &sqlx::PgPool) {
                     .clamp(MIN_RAW_CENTS_PER_CREDIT_USD, MAX_RAW_CENTS_PER_CREDIT_USD),
                 free_points_daily: (free as i64)
                     .clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY),
+                free_points_daily_member: member_daily,
                 usd_per_cny_bps: (fx as i64).clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS),
                 };
             if let Ok(mut g) = CACHE.write() {
@@ -396,6 +450,15 @@ pub struct PlanPatch {
 pub struct SettingsPatch {
     pub raw_cents_per_credit_usd: Option<i64>,
     pub free_points_daily: Option<i64>,
+    /// 会员那一档每天赠送多少点。不传 = 这一项不改。
+    pub free_points_daily_member: Option<i64>,
+    /// true = **清掉**会员档，回到「跟随普通用户」。
+    ///
+    /// 为什么要这个额外的布尔：「没传这一项」和「传了个清除」在 JSON 和 SQL 里都是
+    /// null，而两者意思相反。裸的 `Option<Option<i64>>` 解不出这个区别（本仓库没有
+    /// serde_with，显式 null 会被解成 `None`，和「没传」撞车）。
+    #[serde(default)]
+    pub free_points_daily_member_clear: bool,
     /// 新装客户端开箱选哪个模型。空串 = 不指定（客户端沿用「取列表第一个」）。
     pub default_model: Option<String>,
     pub plans: Option<Vec<PlanPatch>>,
@@ -423,6 +486,20 @@ pub async fn admin_put(
             )));
         }
     }
+    if let Some(v) = req.free_points_daily_member {
+        if !(MIN_FREE_POINTS_DAILY..=MAX_FREE_POINTS_DAILY).contains(&v) {
+            return Err(AppError::bad(format!(
+                "会员每日赠送需在 {MIN_FREE_POINTS_DAILY}~{MAX_FREE_POINTS_DAILY} 之间"
+            )));
+        }
+    }
+    // 同时「清除」和「设成某个值」是自相矛盾的。默默让其中一个赢，就是让后台上看到的
+    // 和库里存的对不上。
+    if req.free_points_daily_member_clear && req.free_points_daily_member.is_some() {
+        return Err(AppError::bad("会员档不能同时「清除」和「设为某个值」，二选一"));
+    }
+    // 故意**不**校验「会员档必须 >= 普通档」：运营可能就是想「普通 0、会员 300」，
+    // 也可能反过来拿免费额度当拉新钩子（会员本来就有套餐额度）。那是产品决定，不是错误。
     if let Some(v) = &req.default_model {
         let v = v.trim();
         // 模型 id 的字符集就这些（目录里 52 个用过的名字全部符合）。收紧不是为了防注入
@@ -466,12 +543,19 @@ pub async fn admin_put(
     if req.raw_cents_per_credit_usd.is_some()
         || req.free_points_daily.is_some()
         || req.default_model.is_some()
+        // 新增的两条必须在这里。前端按「只提交改过的那一档」发请求，「只改会员档」是
+        // 运营最常见的动作，body 里只有新字段；漏这两行 = UPDATE 整条不执行、接口返回
+        // 200、后台绿横幅照出，而库里一个字没写。
+        || req.free_points_daily_member.is_some()
+        || req.free_points_daily_member_clear
     {
         sqlx::query(
             "UPDATE app_settings SET \
                raw_cents_per_credit_usd = COALESCE($1, raw_cents_per_credit_usd), \
                free_points_daily = COALESCE($2, free_points_daily), \
                default_model = COALESCE($4, default_model), \
+               free_points_daily_member = CASE WHEN $5 THEN NULL \
+                                               ELSE COALESCE($6, free_points_daily_member) END, \
                updated_at = now(), updated_by = $3 \
              WHERE id = 1",
         )
@@ -479,6 +563,10 @@ pub async fn admin_put(
         .bind(req.free_points_daily.map(|v| v as i32))
         .bind(&claims.sub)
         .bind(req.default_model.as_ref().map(|v| v.trim().to_owned()))
+        // $5 清除标志、$6 新值。三态：清除 → NULL（跟随普通档）；给了值 → 用它；
+        // 都没有 → COALESCE 保持原样。
+        .bind(req.free_points_daily_member_clear)
+        .bind(req.free_points_daily_member.map(|v| v as i32))
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::internal(format!("写入设置失败: {e}")))?;
@@ -645,6 +733,8 @@ mod tests {
             let _swap = swap_settings_for_test(Settings {
                 raw_cents_per_credit_usd: MAX_RAW_CENTS_PER_CREDIT_USD,
                 free_points_daily: MAX_FREE_POINTS_DAILY,
+                // 会员档：测试里显式给 None = 「跟随普通档」，也就是今天的行为。
+                free_points_daily_member: None,
                 usd_per_cny_bps: MAX_USD_PER_CNY_BPS,
             });
             assert_eq!(
@@ -728,5 +818,240 @@ mod tests {
         // 第三位是周上限，0 表示不限；basic 是 5_000。codes.rs 的 0 == 不限那条规则，
         // 意味着把它写回 0 不会让测试失败，只会悄悄给所有 basic 用户解除周上限。
         assert_eq!(plan_spec("basic"), Some((33_000, 3_000, 5_000, 30)));
+    }
+
+    /// 会员档**没配**时必须逐字等于普通档。
+    ///
+    /// 这是「新设置项缺省时行为一个字不变」那条铁律的落点。写成一个独立的默认数字
+    /// （比如 40）就会在迁移跑完的那一刻，把线上已经是 100 的会员降到 40 —— 没人
+    /// 「保存了但一个字没写」——写入条件漏掉新字段的经典症状。
+    ///
+    /// `admin_put` 只有在「至少一个字段被传了」时才执行那条 UPDATE。前端按
+    /// 「只提交改过的那一档」发请求，而**只改会员档**是运营最常见的动作 ——
+    /// body 里只有会员那两个键。写入条件漏掉它们的后果不是报错：
+    /// UPDATE 整条不执行、接口返回 200、后台绿横幅照出，而库里一个字没写。
+    ///
+    /// 判据从源文本取，因为这是个纯粹的「有没有写进去」问题，跑不出来。
+    /// 用 `include_str!` 而不是运行时读文件：这条断言的目标就在本文件里，
+    /// 编译期嵌入和它是同一份字节。
+    #[test]
+    fn the_save_gate_covers_the_member_tier() {
+        let src = include_str!("settings.rs");
+        let cut = src.find("\nmod tests").unwrap_or(src.len());
+        let code = &src[..cut];
+        let at = code
+            .find("if req.raw_cents_per_credit_usd.is_some()")
+            .expect("找不到写入条件 —— 判据失效了");
+        let gate = &code[at..at + 600.min(code.len() - at)];
+        assert!(
+            gate.contains("req.free_points_daily_member.is_some()"),
+            "写入条件漏了会员档：只改会员档时 UPDATE 不会执行，而接口照样返回 200",
+        );
+        assert!(
+            gate.contains("req.free_points_daily_member_clear"),
+            "写入条件漏了「清除」标志：把会员档改回「跟随」会静默失败",
+        );
+        // 反恒真：切片真的切到那段条件了，不是空串。
+        assert!(gate.len() > 200, "切出来只有 {} 字节，锚点漂了", gate.len());
+    }
+    /// 要求过，也不报错。同一个不变量还盖住「列还没加 / 这一列读不到」两个窗口。
+    #[test]
+    fn an_unset_member_tier_follows_the_ordinary_one() {
+        assert!(
+            Settings::default().free_points_daily_member.is_none(),
+            "会员档有了独立默认值 —— 迁移那一刻会静默改变会员拿到的额度",
+        );
+        let _swap = swap_settings_for_test(Settings {
+            free_points_daily: 100,
+            free_points_daily_member: None,
+            ..Settings::default()
+        });
+        assert_eq!(free_points_daily(), 100);
+        assert_eq!(free_points_daily_member(), 100, "没配就该跟随普通档");
+        assert_eq!(free_milli_points_daily_member(), free_milli_points_daily());
+        assert!(free_points_daily_member_raw().is_none(), "「没配」这件事本身要留得住");
+    }
+
+    /// 把普通档改成 0（＝关掉免费额度）**不会**把会员那档一起带走。
+    ///
+    /// 这正是会员档做成绝对值而不是倍数的理由：倍数下 `0 × K = 0`，运营一关免费额度
+    /// 就把会员福利也静默关掉，而后台上会员那格还写着「×3」，看不出来。
+    #[test]
+    fn turning_the_ordinary_tier_off_does_not_take_the_member_tier_with_it() {
+        let _swap = swap_settings_for_test(Settings {
+            free_points_daily: 0,
+            free_points_daily_member: Some(300),
+            ..Settings::default()
+        });
+        assert_eq!(free_points_daily(), 0);
+        assert_eq!(free_points_daily_member(), 300);
+        assert_eq!(free_milli_points_daily(), 0);
+        assert_eq!(free_milli_points_daily_member(), 300 * crate::models::MILLI);
+    }
+
+}
+
+
+#[cfg(test)]
+mod console_reads_the_server_tests {
+    /// 控制台不许自己写一份套餐清单。
+    ///
+    /// 运营能在后台新建套餐 —— 线上 `plan_quotas` 现在有 6 个（trial/basic/pro/power/ultra/ceshi），
+    /// 而三个页面里各自写死的那份数组只有 5 个，漏的正是运营自己建的那个。
+    /// 症状不是报错，是**下拉框里没有那一档**：邮件群发筛不到那批用户、客户页筛选看不到、
+    /// 收款页发不出那一档的兑换码。运营会以为「这个套餐坏了」。
+    ///
+    /// 服务端一直在 `plans_json()` 里下发这份清单，前端只是没用。
+    #[test]
+    fn no_page_writes_its_own_plan_list() {
+        for (name, src) in [
+            ("客户", include_str!("../admin-ui/src/pages/Customers.tsx")),
+            ("邮件", include_str!("../admin-ui/src/pages/Mail.tsx")),
+            ("收款", include_str!("../admin-ui/src/pages/Billing.tsx")),
+        ] {
+            let code: String = src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // 写死清单的形状：把两个以上的等级 key 并排写在一处。
+            let hardcoded = code.contains("\"trial\"") && code.contains("\"ultra\"");
+            assert!(
+                !hardcoded,
+                "{name}页又把套餐清单写死了 —— 运营新建的套餐会从下拉框里消失",
+            );
+            assert!(
+                code.contains("planKeys"),
+                "{name}页没有从服务端取套餐清单",
+            );
+        }
+    }
+
+    /// 控制台不许自己抄服务端的枚举值、阈值和窗口。
+    ///
+    /// 这一类漂移的共同点是**不报错**：服务端把 `official_catalog` 改成 `catalog`，
+    /// 页面就把英文原词显示出来；窗口从 7 天改成 14 天，页面继续宣称是 7 天。
+    /// 两边都不会红，只有看的人被误导。
+    #[test]
+    fn the_console_never_copies_a_server_enum_or_window() {
+        // 价格来源：服务端 effective_token_prices 回这三个值。
+        let models = include_str!("models.rs");
+        for key in ["\"model_override\"", "\"catalog\"", "\"backend\""] {
+            assert!(models.contains(key), "服务端的价格来源枚举变了：{key}");
+        }
+        // 剥注释：解释这次修复的那段注释里就写着旧枚举名，不剥的话这条断言永远红
+        // （变异测试之前，我自己先被它绊了一次）。
+        let strip = |src: &str| -> String {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let pricing = strip(include_str!("../admin-ui/src/pages/Pricing.tsx"));
+        let pricing = pricing.as_str();
+        for key in ["model_override:", "catalog:", "backend:"] {
+            assert!(pricing.contains(key), "控制台的价格来源对照表没跟上：{key}");
+        }
+        assert!(
+            !pricing.contains("official_catalog") && !pricing.contains("connection_fallback"),
+            "控制台还留着 2026-08-20 之前的旧枚举名",
+        );
+
+        // 两个统计窗口：服务端提了常量，页面必须读下发的字段而不是自己写数字。
+        let sync = include_str!("relay_sync.rs");
+        assert!(sync.contains("const MARGIN_WINDOW_DAYS"), "亏本看守的窗口没提成常量");
+        let rates = include_str!("relay_rates.rs");
+        assert!(rates.contains("const MIX_WINDOW_DAYS"), "混合配比的窗口没提成常量");
+        let adapters = strip(include_str!("../admin-ui/src/pages/Adapters.tsx"));
+        let adapters = adapters.as_str();
+        // 判据是**渲染出来的那句话**里不许出现写死的天数 —— 只断言字段名出现过是没用的，
+        // 类型声明里那一行就含它，把渲染处改回 7 照样绿（变异测试翻出来的）。
+        let relay_ui = strip(include_str!("../admin-ui/src/pages/RelayRates.tsx"));
+        let relay_ui = relay_ui.as_str();
+        assert!(
+            adapters.contains("margin_window_days") && !adapters.contains("最近 7 天"),
+            "适配器页还在自己写 7 天",
+        );
+        assert!(
+            relay_ui.contains("mix_window_days") && !relay_ui.contains("最近 30 天"),
+            "模型汇率页还在自己写 30 天",
+        );
+
+        // 「认出来了没有」「差不差一个令牌」都由服务端判，不许拿中文字面量去比。
+        assert!(
+            !adapters.contains("!== \"未知\"") && !adapters.contains("=== \"未知\""),
+            "适配器页还在拿中文字面量比家族名",
+        );
+        assert!(adapters.contains("family_known") && adapters.contains("topup_needs_token"));
+    }
+
+    /// 分母没读到时，**不许写钱**。
+    ///
+    /// 显示路径用兜底值是对的（否则每个金额都变成 Infinity），但写路径不是：
+    /// 运营输入的美元 × 分母 = 存库的真实分，而分母是运营可改的（服务端允许 1~100000）。
+    /// 改过之后一旦这次设置拉取失败，「发放 $50」会按 663 折算 —— 发出去的额度直接是错的，
+    /// 而页面上没有任何痕迹（loadSettings 的 .catch 把错误整个吞掉，App 那边又是 fire-and-forget）。
+    #[test]
+    fn money_is_never_written_with_a_fallback_denominator() {
+        let lib = include_str!("../admin-ui/src/lib/settings.ts");
+        assert!(
+            lib.contains("export function settingsLoaded()"),
+            "没有「设置到货了没有」这个判据，写路径就分不清兜底和真值",
+        );
+        let ui = include_str!("../admin-ui/src/pages/Customers.tsx");
+        let code: String = ui
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("settingsLoaded()"), "客户页没问过设置到货没有");
+        // 两个写钱的按钮都得挂上这道闸：充值（发放额度）和改写余额。
+        assert_eq!(
+            code.matches("denomReady").count(),
+            3,
+            "写钱的按钮少挂了这道闸（定义 1 处 + 充值和改余额各 1 处）",
+        );
+    }
+
+    /// 面值分母只能有一处。
+    ///
+    /// 它曾经在四个文件里各有一份副本，其中三份在**写路径**上（运营输入的美元乘分母存库）。
+    /// 收进 `lib/settings.ts` 之后，`Settings.tsx` 里又冒出来一句 `savedDenom || 663` ——
+    /// 修完之后自己添了第四份。分母不一致的直接后果是发出去的额度就是错的。
+    #[test]
+    fn the_denominator_literal_lives_in_exactly_one_place() {
+        for (name, src) in [
+            ("设置", include_str!("../admin-ui/src/pages/Settings.tsx")),
+            ("客户", include_str!("../admin-ui/src/pages/Customers.tsx")),
+            ("收款", include_str!("../admin-ui/src/pages/Billing.tsx")),
+        ] {
+            let code: String = src
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("663"),
+                "{name}页把面值分母又抄了一份 —— 它只该出现在 lib/settings.ts 的 FALLBACK 里",
+            );
+        }
+        // 唯一那一份还在。
+        let lib = include_str!("../admin-ui/src/lib/settings.ts");
+        assert!(
+            lib.contains("raw_cents_per_credit_usd: 663"),
+            "lib/settings.ts 里那份兜底没了，页面拿不到分母时会除以 0",
+        );
     }
 }

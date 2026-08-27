@@ -6220,6 +6220,16 @@ pub fn free_milli_points_daily() -> i64 {
     crate::settings::free_milli_points_daily()
 }
 
+/// 会员那一档的每日赠送点数（`app_settings.free_points_daily_member`）。
+/// **没单独配时等于上面那一档** —— 见 `settings::free_points_daily_member` 的注释。
+pub fn free_points_daily_member() -> i64 {
+    crate::settings::free_points_daily_member()
+}
+
+pub fn free_milli_points_daily_member() -> i64 {
+    crate::settings::free_milli_points_daily_member()
+}
+
 /// Micro-USD per raw cent (1 cent = 10 000 micro-USD). Per-model fees are stored in micro-USD
 /// so a $0.003 fee survives; whole cents floored it to zero and the model became free.
 pub const MICRO_USD_PER_CENT: i64 = 10_000;
@@ -6262,15 +6272,20 @@ pub fn points_for_raw_cents(raw_cents: i64) -> i64 {
 /// never call cost nothing, and "resets to zero daily" is automatic — yesterday's remainder
 /// is overwritten, never carried.
 async fn free_points_balance(state: &AppState, uid: uuid::Uuid) -> i64 {
-    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+    let (member_grant, base_grant) = crate::auth::daily_grant_binds();
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(&format!(
         "UPDATE users SET \
            free_points = CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
-                              THEN $2 ELSE free_points END, \
+                              THEN {grant} ELSE free_points END, \
            free_points_date = CURRENT_DATE \
          WHERE id = $1 RETURNING free_points",
-    )
+        // 每日赠送分两档。判据和档位选择共用 auth.rs 那一份，不在这里另写。
+        // 非会员恒走 $3 = free_milli_points_daily()，与改动前同一个值。
+        grant = crate::auth::daily_grant_sql("$2", "$3"),
+    ))
     .bind(uid)
-    .bind(free_milli_points_daily())
+    .bind(member_grant)
+    .bind(base_grant)
     .fetch_optional(&state.db)
     .await;
     row.ok().flatten().map(|(n,)| n).unwrap_or(0)
@@ -6297,11 +6312,12 @@ async fn spend_free_points(state: &AppState, uid: uuid::Uuid, micro_usd: i64) ->
     if points <= 0 {
         return 0;
     }
-    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+    let (member_grant, base_grant) = crate::auth::daily_grant_binds();
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(&format!(
         "WITH cur AS ( \
              SELECT id, \
                     CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
-                         THEN $3 ELSE free_points END AS avail \
+                         THEN {grant} ELSE free_points END AS avail \
              FROM users WHERE id = $1 FOR UPDATE \
          ) \
          UPDATE users u \
@@ -6310,10 +6326,15 @@ async fn spend_free_points(state: &AppState, uid: uuid::Uuid, micro_usd: i64) ->
            FROM cur \
           WHERE u.id = cur.id \
          RETURNING LEAST(cur.avail, $2)",
-    )
+        // 档位选择跟着补发一起留在 CTE 里：plan / plan_expires_at 就在这一行上，读和写
+        // 仍然是同一条原子语句 —— 没有多一次往返，也没有「查完会员状态之后、发放之前
+        // 刚好过期」这个窗口。
+        grant = crate::auth::daily_grant_sql("$3", "$4"),
+    ))
     .bind(uid)
     .bind(points)
-    .bind(free_milli_points_daily())
+    .bind(member_grant)
+    .bind(base_grant)
     .fetch_optional(&state.db)
     .await;
     match row.ok().flatten() {
@@ -6343,11 +6364,12 @@ async fn try_spend_free_points(state: &AppState, uid: uuid::Uuid, points: i64) -
     if points <= 0 {
         return 0;
     }
-    let row: Result<Option<(i64,)>, _> = sqlx::query_as(
+    let (member_grant, base_grant) = crate::auth::daily_grant_binds();
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(&format!(
         "WITH cur AS ( \
              SELECT id, \
                     CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
-                         THEN $3 ELSE free_points END AS avail \
+                         THEN {grant} ELSE free_points END AS avail \
              FROM users WHERE id = $1 FOR UPDATE \
          ) \
          UPDATE users u \
@@ -6356,10 +6378,13 @@ async fn try_spend_free_points(state: &AppState, uid: uuid::Uuid, points: i64) -
            FROM cur \
           WHERE u.id = cur.id \
          RETURNING (CASE WHEN cur.avail >= $2 THEN $2 ELSE 0 END)::bigint",
-    )
+        // 同 spend_free_points：档位选择和补发在同一条原子语句里，FOR UPDATE 之下。
+        grant = crate::auth::daily_grant_sql("$3", "$4"),
+    ))
     .bind(uid)
     .bind(points)
-    .bind(free_milli_points_daily())
+    .bind(member_grant)
+    .bind(base_grant)
     .fetch_optional(&state.db)
     .await;
     match row.ok().flatten() {

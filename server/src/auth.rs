@@ -1021,12 +1021,18 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
     // 顺序也换了：以前是 UPDATE ... RETURNING 排在 SELECT 之后，用返回值当余额。加了
     // WHERE 之后不该发放时不会有行返回（RETURNING 给不出值），所以改成先执行、再由下面
     // 那条 SELECT 读出结果——`User` 结构体本来就有 free_points 字段，读到的是同一个值。
-    let _ = sqlx::query(
-        "UPDATE users SET free_points = $2, free_points_date = CURRENT_DATE \
+    let (member_grant, base_grant) = daily_grant_binds();
+    let _ = sqlx::query(&format!(
+        "UPDATE users SET free_points = {grant}, free_points_date = CURRENT_DATE \
          WHERE id = $1 AND free_points_date IS DISTINCT FROM CURRENT_DATE",
-    )
+        // 每日赠送分两档。判据和档位选择都在 daily_grant_sql 里，四个发放点共用一份 ——
+        // 漏一处的症状是那条路径上的会员静默拿回旧额度，不报错。
+        // 非会员恒走 $3，也就是今天的 free_milli_points_daily()，一个字都没变。
+        grant = daily_grant_sql("$2", "$3"),
+    ))
     .bind(id)
-    .bind(crate::models::free_milli_points_daily())
+    .bind(member_grant)
+    .bind(base_grant)
     .execute(&state.db)
     .await;
 
@@ -1062,10 +1068,11 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
             "free_points".into(),
             json!(free_points as f64 / crate::models::MILLI as f64),
         );
-        obj.insert(
-            "free_points_daily".into(),
-            json!(crate::models::free_points_daily()),
-        );
+        // 每日赠送分两档之后，这里报的必须是**这个人自己那一档**，否则会员的进度条会
+        // 显示成 300%（桌面端 ide/src/main.js 的 `_freePointsMetric` 拿它当分母，
+        // account-ui 的 Dashboard / Billing 显示 free_points / free_points_daily）。
+        // 会员判据不在 Rust 里重写第二份 —— 由下面那条 SELECT 用 ACTIVE_MEMBER_SQL 判，
+        // 和四个发放点是同一个字符串。取值因此挪到那条查询之后。
         // 免费池扣完之后会不会接着扣钱包/会员额度。客户端必须知道这一条才能把话说对：
         // 池子见底那句原来写的是「今日已用完 · 明天 0 点重置（付费模型不受影响）」——
         // 只说了付费模型不受影响，一个字都没提免费模型此刻正在扣余额。开关在服务端
@@ -1082,14 +1089,42 @@ pub async fn me(State(state): State<AppState>, claims: Claims) -> ApiResult<Json
             json!(crate::settings::raw_cents_per_credit_usd()),
         );
         // Fetched on its own rather than as a `User` field: see the note on the struct.
-        let avatar: Option<String> = sqlx::query_scalar("SELECT avatar FROM users WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .flatten();
+        // avatar 和「是不是有效会员」并成一条：`me` 是客户端轮询的接口，为一个布尔再开
+        // 一次往返不值得，而这两件事本来就在查同一行。
+        // Fetched on its own rather than as a `User` field: see the note on the struct.
+        //
+        // 注意：本函数上面还有一个 `plan_active`，那是**另一件事**（喂 compression 分级，
+        // 判据少了 `plan <> ''`）。钱的那一侧只认 ACTIVE_MEMBER_SQL，两者不许互相替用。
+        //
+        // 这个布尔永不为 NULL：users.plan 是 NOT NULL DEFAULT 'none'，而 plan_expires_at
+        // 为空时走的是 `IS NULL OR …` 的 TRUE 分支，所以能直接 decode 成 bool。
+        let (avatar, is_member) = sqlx::query_as::<_, (Option<String>, bool)>(&format!(
+            "SELECT avatar, ({ACTIVE_MEMBER_SQL}) FROM users WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or((None, false));
         obj.insert("avatar".into(), json!(avatar));
+        // 进度条的分母：会员看自己那一档。查不到就按非会员报 —— 和「查不到 avatar 就报
+        // null」同一个取向：宁可少报，也别给非会员报一个他根本拿不到的额度。
+        obj.insert(
+            "free_points_daily".into(),
+            json!(if is_member {
+                crate::models::free_points_daily_member()
+            } else {
+                crate::models::free_points_daily()
+            }),
+        );
+        // 会员那一档**无条件**下发，与本人是不是会员无关：套餐页要用它写「开通会员每天
+        // N 点」，而看那一屏的恰恰是非会员。加字段，老客户端忽略它（和 free_fallback_to_paid、
+        // raw_cents_per_credit_usd 是同一类下发）。
+        obj.insert(
+            "free_points_daily_member".into(),
+            json!(crate::models::free_points_daily_member()),
+        );
         obj.insert(
             "michael_compression".into(),
             match tier {
@@ -1242,8 +1277,38 @@ pub async fn admin_users(
 ///
 /// `plan_expires_at IS NULL` 算**有效**而不是过期：那是「永久」，和前端的
 /// `!u.plan_expires_at || …` 一致。
-const ACTIVE_MEMBER_SQL: &str =
+pub(crate) const ACTIVE_MEMBER_SQL: &str =
     "plan <> '' AND plan <> 'none' AND (plan_expires_at IS NULL OR plan_expires_at > now())";
+
+/// 「今天该发多少毫点」——**全站只有这一处定义**，四个懒发放点 + /api/me 的展示分母共用。
+///
+/// 每日赠送分两档之后，档位选择必须和发放写在**同一条 SQL** 里：先查一次会员状态再发，
+/// 中间隔着一次往返，会员刚好在这中间过期就会发错档；而多一次往返在结算路径上是每次
+/// 调用都要付的成本。判据直接读 `users` 那一行的 plan / plan_expires_at，四个发放点
+/// 本来就都以 uid 定位这一行，所以是零成本。
+///
+/// 两个参数按顺序是「会员档」「非会员档」，取值用 [`daily_grant_binds`]，别在调用处
+/// 各自手写两个函数 —— 绑反了非会员会拿到会员档，而「非会员行为一个字不变」这条没有
+/// 任何报错会提醒你，只能靠对账发现。
+///
+/// `::bigint` 不是必需的（sqlx 的 `.bind(i64)` 在 Parse 里带 INT8 的 OID，参数不是
+/// unknown），但零代价且防住「将来有人把某一侧换成字面量」——留着。
+pub fn daily_grant_sql(member_param: &str, base_param: &str) -> String {
+    format!(
+        "(CASE WHEN {ACTIVE_MEMBER_SQL} THEN {member_param}::bigint ELSE {base_param}::bigint END)"
+    )
+}
+
+/// 和 [`daily_grant_sql`] 的两个参数一一对应：`(会员档, 非会员档)`，单位毫点。
+///
+/// 存在的唯一理由是把顺序绑死在一处：四个发放点各自 `.bind(a).bind(b)` 手写两个函数名，
+/// 迟早有一处绑反，而那一处的症状是非会员拿到会员档 —— 不报错。
+pub fn daily_grant_binds() -> (i64, i64) {
+    (
+        crate::models::free_milli_points_daily_member(),
+        crate::models::free_milli_points_daily(),
+    )
+}
 
 /// 一页最多多少行。上限存在的理由：`page_size` 是客户端传的，不夹住的话一条
 /// `?page_size=999999` 就等于把全表拉下来，而这个接口本来就是为了**不**这么干才加的。
@@ -1542,6 +1607,36 @@ mod customers_page_tests {
         assert!(
             body.contains("ORDER BY created_at DESC, id DESC"),
             "排序少了 id 这个 tiebreaker，翻页会重复或漏行",
+        );
+        // 每日赠送分两档之后，四个懒发放点都要判会员。它们必须调 daily_grant_sql，不许
+        // 各自往 SQL 里抄一份判据 —— 抄了不报错，只会让某条路径上的会员拿错档，而这
+        // 四条语句形状还不一样（一条在 SET 里、一条在外层 CASE 的 THEN 里、两条在 CTE 里），
+        // 最容易漏。这条断言扫的是 models.rs，而它自己写在 auth.rs 里，不会匹配到自身。
+        let models = include_str!("models.rs");
+        assert_eq!(
+            models.matches("crate::auth::daily_grant_sql(").count(),
+            3,
+            "models.rs 里的三个发放点没有全部共用同一条会员判据",
+        );
+        assert!(
+            !models.contains("plan_expires_at > now()"),
+            "models.rs 又自己写了一份会员判据 —— 口径会漂，而且不报错",
+        );
+        // /api/me 那一处。锚到下一个具名项切片，切不到就 expect 报错；固定行数的窗口会在
+        // 函数变长时静默失效，仍然是绿的。
+        let me_at = src.find("\npub async fn me(").expect("me 改名了");
+        let me_end = src[me_at + 1..]
+            .find("\nconst NAME_MAX_CHARS")
+            .map(|i| me_at + 1 + i)
+            .expect("me 后面那个锚点没了 —— 切片会一路吃到测试模块，断言就恒真了");
+        let me_body = &src[me_at..me_end];
+        assert!(
+            me_body.contains("daily_grant_sql("),
+            "/api/me 的每日发放没走同一条会员判据",
+        );
+        assert!(
+            me_body.contains("free_points_daily_member()"),
+            "/api/me 报的分母又变回全局那一档了 —— 会员的进度条会显示成 300%",
         );
     }
 

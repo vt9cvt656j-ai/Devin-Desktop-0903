@@ -28,16 +28,38 @@ export type PlanQuota = {
 export type AdminSettings = {
   raw_cents_per_credit_usd: number;
   free_points_daily: number;
+  /**
+   * 会员那一档配的是什么。三态，别压成两态：
+   *   undefined —— 这台网关还不认第二档（旧网关不发这个键）
+   *   null      —— 认，但运营没单独配 → 跟随非会员那一档
+   *   number    —— 配了这个数（0 合法，= 关掉会员的免费额度）
+   */
+  free_points_daily_member?: number | null;
+  /** 会员**今天实际拿多少**（没配时 = free_points_daily）。展示用，别拿它回填输入框。 */
+  free_points_daily_member_effective?: number;
   plans: PlanQuota[];
   limits: {
     raw_cents_per_credit_usd: [number, number];
     free_points_daily: [number, number];
+    /** 旧网关不下发。它的**存在与否**就是「这台网关认不认第二档」的探针。 */
+    free_points_daily_member?: [number, number];
   };
   raw_cents_per_point: number;
 };
 
 /** 网关答复之前的兜底，逐字等于改造前的硬编码值——首屏渲染行为不变。 */
-export const FALLBACK: AdminSettings = {
+export /**
+ * 网关答复之前的兜底，逐字等于改造前的硬编码值——首屏渲染行为不变。
+ *
+ * # 这里**故意没有** free_points_daily_member / limits.free_points_daily_member
+ *
+ * 这个站是独立发布的（deploy.sh 只发后端容器，前端走 deploy-admin-ui.sh），所以
+ * 「新控制台 + 旧网关」不是意外，是两次部署之间的常态。而 loadSettings 的合并写法是
+ * `{ ...FALLBACK, ...s }`：只要兜底里有这个字段，旧网关下设置页就会拿兜底值当真值，
+ * 印出一句「会员每天 40 点」—— 而那台网关连第二档的概念都没有。
+ * 一个自信的假数比一句「暂不支持」难查得多。字段缺席 = 不支持，界面据此照实说。
+ */
+const FALLBACK: AdminSettings = {
   raw_cents_per_credit_usd: 663,
   free_points_daily: 40,
   plans: [],
@@ -105,7 +127,39 @@ export async function loadSettings(force = false): Promise<AdminSettings> {
   return inflight;
 }
 
+/**
+ * 设置到货了没有。**写金额之前必须问一次** —— 见 `loaded` 上面那段。
+ *
+ * 订阅走 useSettings()：它变化时组件会重渲染，所以按钮的禁用状态会自己跟上。
+ */
+export function settingsLoaded(): boolean {
+  return loaded;
+}
+
 /** 组件里用它订阅：设置到货后自动重渲染，金额不会停在兜底面值上。 */
+/**
+ * 服务端**当前真实存在**的套餐 key 列表。
+ *
+ * # 为什么不能在前端写死
+ *
+ * 「运营在后台新建的套餐」是个真实存在的动作 —— 线上 `plan_quotas` 现在有 6 个套餐，
+ * 而三个页面里各自写死的那份数组只有 5 个（trial/basic/pro/power/ultra），漏掉了 `ceshi`。
+ * 症状不是报错，是**下拉框里没有那一档**：邮件群发筛不到那批用户、客户页筛选看不到、
+ * 收款页发不出那一档的兑换码。运营会以为「这个套餐坏了」。
+ *
+ * 排序跟服务端的 rank 走（服务端已经按 rank 排好），所以档位高低的顺序在两边永远一致。
+ *
+ * 还没读到设置时回空数组 —— 调用方该显示「读取中」，而不是拿一份可能过期的名单顶上。
+ */
+export function planKeys(): string[] {
+  return currentSettings().plans.map((p) => p.plan).filter(Boolean);
+}
+
 export function useSettings(): AdminSettings {
   return useSyncExternalStore(subscribe, currentSettings, currentSettings);
+}
+
+/** 这台网关认不认「会员那一档」。判据是 limits 里有没有这一项，不是值是不是 null。 */
+export function memberTierSupported(s: AdminSettings = snapshot): boolean {
+  return s.limits?.free_points_daily_member !== undefined;
 }

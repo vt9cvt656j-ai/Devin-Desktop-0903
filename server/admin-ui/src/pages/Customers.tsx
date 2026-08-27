@@ -21,7 +21,10 @@ import {
   creditCentsFromRaw,
   creditDenominator,
   rawCentsFromCreditDollars,
+  settingsLoaded,
+  planKeys,
   useSettings,
+  memberTierSupported,
 } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 import { cents, num, when } from "@/lib/format";
@@ -569,7 +572,21 @@ function CustomerDialog({
         <Fact
           label="免费点数"
           value={`${num(Math.round((user.free_points ?? 0) / MILLI))} 点`}
-          hint={`每日 ${settings.free_points_daily} 点`}
+          hint={
+            /*
+              每日赠送分了两档（设置 → 每日赠送），这里必须跟着分：不然打开一个会员的详情，
+              看到的是非会员那一档的数字，和他池子里实际那份对不上，而且不会有任何报错 ——
+              而这正是运营查「他怎么才这么点」时看的那一格。
+              会员判据用本文件顶上已有的 isActive()，**不另写一份**（服务端那侧是 auth.rs 的
+              ACTIVE_MEMBER_SQL，那条常量的注释点名了这里是它的前端镜像）。
+              旧网关不下发第二档：拿不到就照旧显示单档、也不标注是哪一档，不编一个数出来。
+            */
+            !memberTierSupported(settings)
+              ? `每日 ${settings.free_points_daily} 点`
+              : isActive(user)
+                ? `每日 ${settings.free_points_daily_member_effective ?? settings.free_points_daily} 点（会员档）`
+                : `每日 ${settings.free_points_daily} 点（非会员档）`
+          }
         />
         <Fact
           label="套餐"

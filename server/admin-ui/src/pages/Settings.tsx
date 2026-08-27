@@ -24,7 +24,7 @@ import {
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { cents } from "@/lib/format";
-import { applySettings, useSettings, type AdminSettings, type PlanQuota } from "@/lib/settings";
+import { applySettings, creditCentsFromRaw, memberTierSupported, useSettings, type AdminSettings, type PlanQuota } from "@/lib/settings";
 
 /**
  * 设置 —— 三个原本写死在代码里的运营参数，现在落在 app_settings / plan_quotas 表里。
@@ -84,9 +84,31 @@ export function Settings() {
 
   const [denomInput, setDenomInput] = useState(toDollars(live.raw_cents_per_credit_usd));
   const [freeInput, setFreeInput] = useState(String(live.free_points_daily));
+  /**
+   * 会员那一档的草稿。**空串 = 跟随非会员**（提交 `_clear: true`），填 0 = 关掉会员的
+   * 免费额度。别把它写成 `Number.parseInt(x,10) || 0` 一把梭 —— 那样清空输入框会把全体
+   * 会员的免费额度当天起归零，而后端不报任何错。
+   */
+  const [memberInput, setMemberInput] = useState(
+    live.free_points_daily_member == null ? "" : String(live.free_points_daily_member),
+  );
+  /** 这台网关认不认第二档。见 lib/settings.ts 的 memberTierSupported。 */
+  const [hasMemberTier, setHasMemberTier] = useState(memberTierSupported(live));
   const [plans, setPlans] = useState<PlanDraft>({});
   const [confirmDenom, setConfirmDenom] = useState(false);
   const [confirmText, setConfirmText] = useState("");
+  /** 两档共用一个换算：1 点 = raw_cents_per_point 真实计费分（服务端下发的只读常量）。 */
+  const dailyCost = (points: number) => cents(Math.round(points * live.raw_cents_per_point));
+  const freePoints = Number.parseInt(freeInput, 10) || 0;
+  const memberTrimmed = memberInput.trim();
+  const memberSet = memberTrimmed !== "";
+  const memberPoints = Number.parseInt(memberTrimmed, 10) || 0;
+  const savedMemberText =
+    live.free_points_daily_member == null ? "" : String(live.free_points_daily_member);
+  const freeDirty = String(live.free_points_daily) !== freeInput.trim();
+  const memberDirty = hasMemberTier && savedMemberText !== memberTrimmed;
+  /** 会员按这个草稿最终会拿多少 —— 空串跟随非会员那一档。 */
+  const memberEffective = memberSet ? memberPoints : freePoints;
 
   const refresh = async () => {
     setLoading(true);
@@ -96,6 +118,8 @@ export function Settings() {
       applySettings(s);
       setDenomInput(toDollars(s.raw_cents_per_credit_usd));
       setFreeInput(String(s.free_points_daily));
+      setMemberInput(s.free_points_daily_member == null ? "" : String(s.free_points_daily_member));
+      setHasMemberTier(memberTierSupported(s));
       setPlans(planDraftFrom(s.plans || []));
     } catch (e) {
       setErr(e instanceof Error ? e.message : "读取设置失败");
@@ -132,6 +156,11 @@ export function Settings() {
       applySettings(r);
       setDenomInput(toDollars(r.raw_cents_per_credit_usd));
       setFreeInput(String(r.free_points_daily));
+      // 保存接口返回的**是另一份更小的 JSON**（settings.rs::admin_put 结尾那个 json!，
+      // 没有 limits、没有 raw_cents_per_point），所以这里只按值回填，不去重算「支不支持」。
+      if ("free_points_daily_member" in (r as object)) {
+        setMemberInput(r.free_points_daily_member == null ? "" : String(r.free_points_daily_member));
+      }
       if (r.plans) setPlans(planDraftFrom(r.plans));
       setMsg({ text: okText, ok: true });
     } catch (e) {
@@ -256,30 +285,113 @@ export function Settings() {
 
       <SectionReveal delay={140}>
         <Panel title="每日赠送" bodyClassName="p-5">
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,20rem)_1fr]">
+          {/* 左栏从 20rem 放宽到 32rem：里面从一个输入框变成两个，20rem 塞不下两个 h-12。 */}
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,32rem)_1fr]">
             <div>
-              <Label htmlFor="free">每人每天赠送点数</Label>
-              <Input
-                id="free"
-                inputMode="numeric"
-                value={freeInput}
-                onChange={(e) => setFreeInput(e.target.value)}
-                className="mt-1.5"
-              />
+              {/*
+                两档**并排**，不是上下堆。运营在这一屏真正要判断的是「会员比非会员多多少」，
+                那是个相对量；一上一下、中间还各夹一段说明文字，就没法一眼比。
+                非会员在左：它是基准，会员那档是在它之上的加码，阅读顺序跟着这个走。
+              */}
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <Label htmlFor="free">非会员 · 每天赠送点数</Label>
+                  <Input
+                    id="free"
+                    inputMode="numeric"
+                    value={freeInput}
+                    onChange={(e) => setFreeInput(e.target.value)}
+                    className="mt-1.5"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="free-member">会员 · 每天赠送点数</Label>
+                  <Input
+                    id="free-member"
+                    inputMode="numeric"
+                    value={memberInput}
+                    onChange={(e) => setMemberInput(e.target.value)}
+                    disabled={!hasMemberTier}
+                    placeholder={
+                      hasMemberTier ? `跟随非会员（${live.free_points_daily} 点）` : "网关尚未支持"
+                    }
+                    className="mt-1.5"
+                  />
+                </div>
+              </div>
+
+              {!loading && !hasMemberTier && (
+                <Hint>
+                  这台网关的设置接口里还没有会员这一档 —— 控制台和网关是两次独立发布，
+                  <strong className="font-medium text-foreground">先把网关发上去</strong>
+                  ，再回来刷新这一页，这个框就会解禁。在那之前所有人（包括会员）拿的都是
+                  左边那一档，和现在完全一样。
+                </Hint>
+              )}
+
               <Hint>
-                当前 {live.free_points_daily} 点。运营按点定价：¥0.5 = 10 点，所以 1 点 = ¥0.05，
-                {live.free_points_daily} 点即每天 ¥{(live.free_points_daily * 0.05).toFixed(2)}。
+                非会员当前 <span className="tabular-nums">{live.free_points_daily}</span> 点，
+                每人每天 {dailyCost(live.free_points_daily)} 的真实成本。
+                {hasMemberTier &&
+                  (live.free_points_daily_member == null ? (
+                    <> 会员<strong className="font-medium text-foreground">没单独配</strong>，跟随非会员这一档。</>
+                  ) : (
+                    <>
+                      {" "}会员当前 <span className="tabular-nums">{live.free_points_daily_member}</span> 点，
+                      每人每天 {dailyCost(live.free_points_daily_member)}
+                      {live.free_points_daily_member > live.free_points_daily && (
+                        <>（比非会员每人每天多 {dailyCost(live.free_points_daily_member - live.free_points_daily)}）</>
+                      )}
+                      。
+                    </>
+                  ))}
+                {" "}1 点 = {live.raw_cents_per_point} 真实计费分，两档同一个换算。非会员那格
                 填 0 等于关掉免费额度。
+                {hasMemberTier && (
+                  <>
+                    {" "}会员那格
+                    <strong className="font-medium text-foreground">留空 = 跟随非会员</strong>
+                    ，<strong className="font-medium text-foreground">填 0 = 关掉会员的免费额度</strong>
+                    —— 这两个不是一回事。
+                  </>
+                )}
               </Hint>
+
+              {hasMemberTier && memberSet && memberPoints < freePoints && (
+                <Hint>
+                  <strong className="font-medium text-foreground">会员这一档比非会员少。</strong>
+                  不拦你 —— 会员的额度也可能是有意走套餐而不走免费池。但两个框填反了长得
+                  一模一样，而且发出去之前没有任何别的地方会提醒你。
+                </Hint>
+              )}
+
+              {/*
+                **一个保存按钮，两档一次提交**，不是各存各的。
+                这两个数的含义是相对的：分成两次保存，中间必然有一段「非会员 500 / 会员 300」
+                这样**已经生效**的中间态，而发放是懒发放 —— 那几秒里恰好当天第一次调用的人
+                就照着中间态领走了，且不结转、不补差。admin_put 本来就是一个事务里 COALESCE
+                每个字段，一次 POST 就没有这道缝。
+                只提交改过的那一档：两个都发会把没动过的那档也重写一遍 updated_by/updated_at，
+                审计日志就说不清这次到底改了什么。
+              */}
               <Button
                 className="mt-3"
-                disabled={busy || String(live.free_points_daily) === freeInput.trim()}
-                onClick={() =>
+                disabled={busy || (!freeDirty && !memberDirty)}
+                onClick={() => {
+                  const body: Record<string, unknown> = {};
+                  if (freeDirty) body.free_points_daily = freePoints;
+                  if (memberDirty) {
+                    // 空串是「跟随」，必须发 clear 而不是 0 —— 0 是「关掉会员免费额度」。
+                    if (memberSet) body.free_points_daily_member = memberPoints;
+                    else body.free_points_daily_member_clear = true;
+                  }
                   save(
-                    { free_points_daily: Number.parseInt(freeInput, 10) || 0 },
-                    "每日赠送已保存（明天日切后对所有人生效）",
-                  )
-                }
+                    body,
+                    `已保存（非会员 ${freePoints} 点${
+                      hasMemberTier ? ` · 会员 ${memberEffective} 点` : ""
+                    }，每个人要到他下一次日切后的第一次调用才拿到新数）`,
+                  );
+                }}
               >
                 保存
               </Button>
@@ -293,8 +405,24 @@ export function Settings() {
                 <strong className="font-medium text-foreground">下一次日切之后</strong>的第一次调用生效。
               </Hint>
               <Hint>
+                <strong className="font-medium text-foreground">
+                  是会员还是非会员，在发放的那一刻判一次，当天不再重判。
+                </strong>
+                今天已经领过的人，当天升级成会员
+                <strong className="font-medium text-foreground">不会补上差额</strong>
+                ，要到明天日切后的第一次调用才拿到会员那一档。反过来同样：今天到期的会员，
+                剩下这一天里手上还是会员那一份，不会被收回。这两句都会变成客服问题，先知道答案。
+              </Hint>
+              <Hint>
+                算「会员」的判据是<strong className="font-medium text-foreground">有套餐、且没到期</strong>；
+                不写到期时间的永久套餐一直算有效，已到期的会员算在非会员那一档。这条判据全站
+                只有一处定义（服务端），这一屏不重复判断任何具体用户。
+              </Hint>
+              <Hint>
                 这一项不改变任何人被收多少钱：免费点走的是免费池分支，扣不到余额上。它决定的是
-                你每天送出去多少真实上游消耗。
+                你每天送出去多少真实上游消耗 —— 会员那一档的总支出跟着
+                <strong className="font-medium text-foreground">有效会员人数</strong>走，抬价之前先去
+                「客户」页看一眼那个数。
               </Hint>
             </div>
           </div>

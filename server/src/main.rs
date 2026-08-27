@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             raw_cents_per_credit_usd = s.raw_cents_per_credit_usd,
             free_points_daily = s.free_points_daily,
+            free_points_daily_member = s.free_points_daily_member.map(|v| v.to_string()).unwrap_or_else(|| "跟随".into()),
             "运营参数已装载"
         );
     }
