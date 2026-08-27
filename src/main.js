@@ -80,6 +80,7 @@ import "./styles/app.css";
 // shadcn 组件语汇层。必须排在 app.css 之后 —— 它是对现有组件选择器的重写，
 // 靠源码顺序（而不是 !important）取胜，颠倒顺序就整层失效。
 import "./styles/shadcn.css";
+import "./styles/custom-models.css";
 // React 岛：真正的 shadcn 组件（Radix 行为 + Tailwind）。这一行同时把 Tailwind 的
 // 样式带进来。控制台敲 showUIGallery() 看全部组件在当前配色下的样子。
 import "./ui/mount-gallery.jsx";
@@ -15676,55 +15677,66 @@ async function showCustomModelsDialog() {
   // 配置自定义端点不再要求会员：用自己的 key 打自己的端点，钱是用户自己的。
     
 
-  if (!document.getElementById("cm-style")) {
-    const st = document.createElement("style");
-    st.id = "cm-style";
-    st.textContent =
-      "@keyframes cm-fade{from{opacity:0}to{opacity:1}}" +
-      "@keyframes cm-pop{from{opacity:0;transform:translateY(16px) scale(.96)}to{opacity:1;transform:none}}" +
-      ".cm-ov{position:fixed;inset:0;background:rgba(32,33,36,.45);backdrop-filter:blur(2px);display:grid;place-items:center;z-index:99999;font-family:var(--font);animation:cm-fade .18s ease both}" +
-      ".cm-card{background:#fff;color:#202124;border-radius:18px;width:480px;max-width:94vw;max-height:86vh;display:flex;flex-direction:column;box-shadow:0 24px 70px rgba(60,64,67,.28),0 4px 12px rgba(60,64,67,.14);animation:cm-pop .32s cubic-bezier(.2,.75,.2,1) both;overflow:hidden}" +
-      ".cm-head{display:flex;align-items:center;gap:10px;padding:20px 24px 14px}" +
-      ".cm-title{font-size:16px;font-weight:600;display:flex;align-items:center;gap:8px}" +
-      ".cm-vip{display:inline-flex;align-items:center;border-radius:20px;padding:2px 10px;font-size:11.5px;font-weight:600;background:#e8f0fe;color:#1a73e8}" +
-      ".cm-close{margin-left:auto;cursor:pointer;color:#5f6368;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-size:22px;transition:background .15s}" +
-      ".cm-close:hover{background:#f1f3f4}" +
-      ".cm-body{padding:0 24px 20px;overflow-y:auto}" +
-      ".cm-empty{color:#80868b;font-size:13px;text-align:center;padding:18px 0;border:1px dashed #e0e3e7;border-radius:12px}" +
-      ".cm-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #e8eaed;border-radius:12px;margin-bottom:8px}" +
-      ".cm-row__main{flex:1;min-width:0}" +
-      ".cm-row__name{font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" +
-      ".cm-row__meta{font-size:11.5px;color:#80868b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}" +
-      ".cm-row button{border:0;background:#f1f3f4;color:#3c4043;border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer;transition:background .15s}" +
-      ".cm-row button:hover{background:#e8eaed}" +
-      ".cm-row button.cm-del:hover{background:#fce8e6;color:#d93025}" +
-      ".cm-form{margin-top:14px;border-top:1px solid #f1f3f4;padding-top:14px}" +
-      ".cm-form-title{font-size:13px;font-weight:600;margin-bottom:10px}" +
-      ".cm-form label{display:block;font-size:12px;color:#5f6368;margin-bottom:10px}" +
-      ".cm-form input{display:block;width:100%;box-sizing:border-box;margin-top:4px;padding:9px 12px;border:1px solid #dadce0;border-radius:10px;font-size:13px;outline:none;transition:border-color .15s,box-shadow .15s}" +
-      ".cm-form input:focus{border-color:#1a73e8;box-shadow:0 0 0 3px rgba(26,115,232,.12)}" +
-      ".cm-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:4px}" +
-      ".cm-actions button{border:0;border-radius:10px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s}" +
-      ".cm-save{background:#1a73e8;color:#fff}.cm-save:hover{filter:brightness(1.08)}" +
-      ".cm-cancel{background:#f1f3f4;color:#3c4043}" +
-      ".cm-hint{font-size:11.5px;color:#80868b;margin:2px 0 12px}";
-    document.head.appendChild(st);
-  }
+  // 样式在 src/styles/custom-models.css，随 boot 一起加载 —— 不再运行时注入一整块
+  // 硬编码 CSS。原来那段把颜色写死成 Google Material 的字面量（#fff / #1a73e8 /
+  // #202124…），一条 [data-theme="dark"] 覆盖都没有，所以**暗色主题下整个弹窗
+  // 仍然是白底黑字**。现在全部走 app.css 的令牌，暗色自动成立。
 
   const ov = document.createElement("div");
   ov.className = "cm-ov";
-  ov.innerHTML = `<div class="cm-card">
-    <div class="cm-head"><div class="cm-title">自定义模型 <span class="cm-vip">★ 会员专属</span></div><span class="cm-close">&times;</span></div>
+  // 只动结构，不动逻辑。**所有 querySelector 目标的类名一个没改**，下面的
+  // .cm-list / .cm-in-* / .cm-save / .cm-cancel / .cm-form-title / .cm-close 全部原样命中。
+  // 四处结构改动，每一处都有原因：
+  //   ① .cm-close 从 <span> 变成 <button type="button" aria-label>：span 不可聚焦、
+  //      不响应回车/空格，键盘用户根本关不掉这个弹窗，读屏还把 &times; 念成「乘号」。
+  //   ② .cm-vip 从 .cm-title 的**子节点**挪成**兄弟节点**：这样 <h2> 里只剩纯文字，
+  //      aria-labelledby 报出来的是「自定义模型」而不是「自定义模型 ★ 会员专属」。
+  //   ③ label 从包裹式改成显式 for/id。包裹式本身**是合法关联、不是缺陷** —— 改的
+  //      原因是要在 label 与 input 之间插常驻说明、在 input 里侧插「显示密钥」按钮，
+  //      这两样包裹式做不到（按钮嵌在 label 里，点它会连带激活 label）。
+  //   ④ 「可用逗号或分号一次填多个」从 placeholder 挪成常驻说明 —— placeholder 一
+  //      打字就消失，而那正是打字时最需要看到的一句。
+  // role/aria 一套照抄同文件的 .about-dialog（72677 行），仓内已有范式，不自创。
+  // 十个新 id 不会重名：下面 querySelectorAll(".cm-ov").forEach(remove) 跑在
+  // document.body.appendChild(ov) **之前**，且此刻 ov 还没进文档。
+  //
+  // 三条不能碰的约束（JS 用 textContent 直接写这些元素，塞子元素就会被抹掉）：
+  //   · .cm-form-title 只能是纯文本（formTitle.textContent = "编辑自定义模型"）
+  //   · .cm-save 只能是纯文本（saveBtn.textContent = "保存修改"）→ 主按钮不加图标
+  //   · .cm-row__name / .cm-row__meta 同理，由 renderList 写入
+  ov.innerHTML = `<div class="cm-card" role="dialog" aria-modal="true" aria-labelledby="cmDlgTitle" tabindex="-1">
+    <div class="cm-head">
+      <h2 class="cm-title" id="cmDlgTitle">自定义模型</h2>
+      <span class="cm-vip"><span aria-hidden="true">★</span>会员专属</span>
+      <button class="cm-close" type="button" aria-label="关闭自定义模型"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
     <div class="cm-body">
-      <div class="cm-hint">接入 OpenAI 兼容接口（/v1/chat/completions）；地址与密钥仅保存在本机，不会上传。会员到期后自定义模型将暂停可用。</div>
-      <div class="cm-list"></div>
-      <div class="cm-form">
-        <div class="cm-form-title">新增自定义模型</div>
-        <label>模型分组名称<input class="cm-in-group" placeholder="例如：我的中转站" maxlength="40"></label>
-        <label>模型名称<input class="cm-in-name" placeholder="例如：gpt-4o-mini（可用 , 或 ; 一次填多个）" maxlength="600"></label>
-        <label>对接地址<input class="cm-in-base" placeholder="https://api.example.com/v1" maxlength="300"></label>
-        <label>对接密钥<input class="cm-in-key" type="password" placeholder="sk-…（部分本地服务可留空）" maxlength="500"></label>
-        <div class="cm-actions"><button class="cm-cancel" hidden>取消编辑</button><button class="cm-save">添加</button></div>
+      <p class="cm-hint">接入 OpenAI 兼容接口（/v1/chat/completions）；地址与密钥仅保存在本机，不会上传。会员到期后自定义模型将暂停可用。</p>
+      <div class="cm-list" role="list" aria-label="已添加的自定义模型"></div>
+      <div class="cm-form" role="group" aria-labelledby="cmFormTitle">
+        <h3 class="cm-form-title" id="cmFormTitle">新增自定义模型</h3>
+        <div class="cm-field">
+          <label for="cmInGroup">模型分组名称</label>
+          <span class="cm-input-wrap"><input class="cm-in-group" id="cmInGroup" type="text" placeholder="例如：我的中转站" maxlength="40" autocomplete="off" spellcheck="false"></span>
+        </div>
+        <div class="cm-field">
+          <label for="cmInName">模型名称</label>
+          <span class="cm-input-wrap"><input class="cm-in-name" id="cmInName" type="text" placeholder="例如：gpt-4o-mini" maxlength="600" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="cmHintName cmErrName" data-err="cmErrName"></span>
+          <p class="cm-field__hint" id="cmHintName">可用逗号或分号一次填多个，每个名称会建成一条。</p>
+          <p class="cm-field__err" id="cmErrName"></p>
+        </div>
+        <div class="cm-field">
+          <label for="cmInBase">对接地址</label>
+          <span class="cm-input-wrap"><input class="cm-in-base" id="cmInBase" type="text" inputmode="url" placeholder="https://api.example.com/v1" maxlength="300" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="cmErrBase" data-err="cmErrBase"></span>
+          <p class="cm-field__err" id="cmErrBase"></p>
+        </div>
+        <div class="cm-field cm-field--key">
+          <label for="cmInKey">对接密钥</label>
+          <span class="cm-input-wrap"><input class="cm-in-key" id="cmInKey" type="password" placeholder="sk-…" maxlength="500" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-describedby="cmHintKey"><button class="cm-reveal" type="button" aria-label="显示密钥" aria-pressed="false" aria-controls="cmInKey"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></span>
+          <p class="cm-field__hint" id="cmHintKey">部分本地服务可留空。</p>
+        </div>
+        <div class="cm-actions"><button class="cm-cancel" type="button" hidden>取消编辑</button><button class="cm-save" type="button">添加</button></div>
+        <p class="cm-sr" role="status" aria-live="polite"></p>
       </div>
     </div>
   </div>`;

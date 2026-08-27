@@ -249,3 +249,54 @@ test("测试的跑法必须是跨平台的，且收集不到文件时要报错�
   assert.ok(files.length >= 100,
     `只收集到 ${files.length} 个测试文件 —— 这条断言本身在守一个空窗口`);
 });
+
+/**
+ * 「自定义模型」弹窗的样式必须走令牌，不许写死颜色。
+ *
+ * 这个弹窗以前自带一整块运行时注入的 CSS，颜色全是 Google Material 的字面量
+ * （#fff / #1a73e8 / #202124 / #5f6368…），**一条 [data-theme="dark"] 覆盖都没有** ——
+ * 于是暗色主题下整个弹窗仍然是白底黑字，和 IDE 其余部分不是一套语言。
+ *
+ * 判据是「剥掉注释之后还有没有颜色字面量」：注释里会引用旧的硬编码值来解释历史
+ * （"原来的 #1a73e8 on #e8f0fe 只有 3.93:1"），那是**说明**不是**样式**，
+ * 拿原文直接 grep 会把自己的解释文字判成违规（本仓库踩过六次的那个坑）。
+ *
+ * 同时钉住两套 :root 都有那五个新令牌：CSS 变量少定义一套不会报错，
+ * 只会让引用它的那条声明在该主题下**静默作废**。
+ */
+test("自定义模型弹窗的样式全部走令牌，且新令牌浅色暗色两套都在", () => {
+  const css = readFileSync(join(ROOT, "src/styles/custom-models.css"), "utf8");
+  const code = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const hard = code.match(/#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\(/g) || [];
+  assert.deepEqual(hard, [],
+    "样式里出现了硬编码颜色 —— 暗色主题下这些位置会变成白斑：\n  " + hard.join("\n  "));
+
+  // 反恒真：剥完注释不能把整份文件也剥没了。
+  assert.ok(code.split("{").length > 40,
+    `剥注释后只剩 ${code.split("{").length - 1} 条规则 —— 判据在守一个空文件`);
+  assert.match(code, /var\(--/, "一个令牌都没引用，这份样式没接进体系");
+
+  // 运行时注入的那一整块必须已经删掉，否则等于两套样式并存、后者盖前者。
+  const main = readFileSync(join(ROOT, "src/main.js"), "utf8");
+  assert.ok(!main.includes("cm-style"),
+    "main.js 里还留着运行时注入的 cm-style —— 它会盖掉走令牌的那份");
+  assert.match(main, /import "\.\/styles\/custom-models\.css"/,
+    "样式文件没被 import，弹窗会完全没有样式");
+
+  // 五个新令牌：浅色和暗色两套都必须有。少一套 = 该主题下静默作废。
+  const app = readFileSync(join(ROOT, "src/styles/app.css"), "utf8");
+  const lines = app.split("\n");
+  const blockAt = (startIdx) => {
+    const end = lines.findIndex((l, i) => i > startIdx && l.trimEnd() === "}");
+    return lines.slice(startIdx, end).join("\n");
+  };
+  const lightStart = lines.findIndex((l) => l.trim() === ":root {");
+  const darkStart = lines.findIndex((l) => l.trim().startsWith(':root[data-theme="dark"]'));
+  assert.ok(lightStart >= 0 && darkStart > lightStart, "找不到两套 :root —— 判据失效");
+  const light = blockAt(lightStart);
+  const dark = blockAt(darkStart);
+  for (const tok of ["--scrim", "--accent-solid", "--accent-on", "--destructive", "--field-line"]) {
+    assert.ok(light.includes(`${tok}:`), `${tok} 只在暗色里定义了，浅色下引用它的声明会静默作废`);
+    assert.ok(dark.includes(`${tok}:`), `${tok} 只在浅色里定义了，暗色下引用它的声明会静默作废`);
+  }
+});
