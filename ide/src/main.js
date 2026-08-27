@@ -13797,6 +13797,14 @@ function _isGatewayConfig(config) {
   // 自定义模型直连第三方端点：不是网关请求（L0 提示词注入 / ide-key 兜底都不适用）。
   // 注意用 customModelId 而不是遗留存储字段 customModel（那是个被 _configForStorage
   // 清空的旧字段，老配置里可能残留非空值，撞名会误关 L0）。
+  // 判据留在 customModelId 上。曾经想改成「地址不是网关就算自定义」，被一条既有测试
+  // 当场否掉：**老版本遗留的直连配置**（providerMode:"byok" + 第三方 baseUrl）在运行时
+  // 会被 _aiConfigForRuntime 强制走网关，按地址判会把它们误判成自定义端点 —— L0 关掉、
+  // 客户端把已被构建期剥空描述的 schema 直接发给网关，而网关那侧不会再回填。
+  //
+  // 遗留直连和「子智能体换模型后丢了 customModelId、但 baseUrl 仍是用户端点」这两种，
+  // 单看 baseUrl **在结构上无法区分**。所以真要修后者，得在子智能体那条路上把线路标记
+  // 保住，而不是在这里换判据。
   return !(config && config.customModelId);
 }
 
@@ -15831,6 +15839,7 @@ async function showCustomModelsDialog() {
           <label for="cmInKey">对接密钥</label>
           <span class="cm-input-wrap"><input class="cm-in-key" id="cmInKey" type="password" placeholder="sk-…" maxlength="500" autocomplete="off" spellcheck="false" data-1p-ignore data-lpignore="true" aria-describedby="cmHintKey"><button class="cm-reveal" type="button" aria-label="显示密钥" aria-pressed="false" aria-controls="cmInKey"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button></span>
           <p class="cm-field__hint" id="cmHintKey">部分本地服务可留空。</p>
+          <p class="cm-field__err" id="cmErrKey"></p>
         </div>
         <div class="cm-actions"><button class="cm-cancel" type="button" hidden>取消编辑</button><button class="cm-save" type="button">添加</button></div>
         <p class="cm-sr" role="status" aria-live="polite"></p>
@@ -15854,6 +15863,7 @@ async function showCustomModelsDialog() {
   const revealBtn = ov.querySelector(".cm-reveal");
   const errName = ov.querySelector("#cmErrName");
   const errBase = ov.querySelector("#cmErrBase");
+  const errKey = ov.querySelector("#cmErrKey");
   const srEl = ov.querySelector(".cm-sr");
   // 上一版把这四个节点当纯装饰写进了 markup：眼睛按钮有 aria-label / aria-pressed /
   // aria-controls、有 hover 态、Tab 能停，**却没有任何监听器**；两个 .cm-field__err 和那条
@@ -15882,10 +15892,11 @@ async function showCustomModelsDialog() {
       else input.removeAttribute("aria-invalid");
     }
   };
-  const _clearErrs = () => { _fieldErr(errName, inName, ""); _fieldErr(errBase, inBase, ""); };
+  const _clearErrs = () => { _fieldErr(errName, inName, ""); _fieldErr(errBase, inBase, ""); _fieldErr(errKey, inKey, ""); };
   const _announce = (msg) => { if (srEl) srEl.textContent = String(msg || ""); };
   inName.addEventListener("input", () => _fieldErr(errName, inName, ""));
   inBase.addEventListener("input", () => _fieldErr(errBase, inBase, ""));
+  inKey.addEventListener("input", () => _fieldErr(errKey, inKey, ""));
   // 网页构建（/app/）没有 Rust 那条协议分叉：_realAiFetch 自己拼 OpenAI 形状的请求体、
   // 端点和鉴权头。让这两条协议在网页上「可选然后失败」，就是在造一个坏功能 —— 禁掉并说清楚。
   for (const r of protoRadios) {
@@ -15993,6 +16004,24 @@ async function showCustomModelsDialog() {
       _fieldErr(errBase, inBase, "对接地址需以 http:// 或 https:// 开头");
       _announce("保存失败：对接地址格式不对");
       showToast("对接地址需以 http(s):// 开头"); inBase.focus(); return;
+    }
+    // 密钥格子此前**一个字都不校验**。真实发生过：两个格子里填的是同一个网址，
+    // 于是发出去的是 `Authorization: Bearer https://…/v1`，中转回 401，而界面上这条
+    // 模型看着完全正常 —— 用户只知道"用不了"，无从看出是自己粘错了格子。
+    //
+    // 只拦**几乎不可能是真密钥**的两种：以 http(s):// 开头、或和上面的地址逐字相同。
+    // 不做长度/前缀白名单：中转商的密钥格式五花八门，拦错了比不拦更糟。
+    if (/^https?:\/\//i.test(apiKey)) {
+      _fieldErr(errKey, inKey, "这看起来是一个网址，不是密钥 —— 是不是粘到隔壁格子里了？");
+      _announce("保存失败：密钥格子里填的是网址");
+      showToast("「对接密钥」里填的是网址。密钥通常是 sk- 开头的一串字符，和上面的地址不是一个东西。", { duration: 8000 });
+      inKey.focus(); return;
+    }
+    if (apiKey && apiKey === baseUrl) {
+      _fieldErr(errKey, inKey, "密钥和对接地址一模一样，应该有一个填错了");
+      _announce("保存失败：密钥和地址相同");
+      showToast("「对接密钥」和「对接地址」填的是同一个值，其中一个填错了。", { duration: 8000 });
+      inKey.focus(); return;
     }
     const items = _loadCustomModels();
     const mkId = () => _CUSTOM_MODEL_PREFIX + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -29141,8 +29170,12 @@ async function _readyAiConfig(overrideConfig = null) {
     config.protocol = cmProtocol(_custom.protocol);
     _warnCustomEndpointOnce(_custom);
   }
-  if (!config.baseUrl || !config.apiKey) {
-    showToast(_custom ? "这个自定义模型缺少接入地址或 API key，请在模型设置里补全" : "请先登录账号");
+  // key 的必填性**按线路分**。网关必须有 token；自定义端点不一定 —— 本机跑的
+  // Ollama / LM Studio / vLLM 根本不校验鉴权头。弹窗那句「部分本地服务可留空」
+  // 说的就是这个，可发送侧一直硬卡 apiKey：于是这类端点**存得进去、一次也发不出来**，
+  // 而且报的是「缺少接入地址或 API key」—— 用户去补一个那个服务压根不需要的东西。
+  if (!config.baseUrl || (!config.apiKey && !_custom)) {
+    showToast(_custom ? "这个自定义模型没有填接入地址，请在模型设置里补全" : "请先登录账号");
     if (!_custom) openLoginDialog();
     return null;
   }
@@ -44224,7 +44257,7 @@ function _recoverFromAiFailure(kind, { custom = false } = {}) {
   return false;
 }
 
-function _formatAgentFinalError(err) {
+function _formatAgentFinalError(err, { custom = false } = {}) {
   const tagged = String(err || "");
   const partialStream = /^\[tool-stream-retry-exhausted\]/i.test(tagged);
   const raw = _stripAiRetryPrefix(tagged);
@@ -44239,9 +44272,19 @@ function _formatAgentFinalError(err) {
   const kind = _aiFailureKind(raw);
   const upstreamWords = raw.replace(/^AI request failed\s*\([^)]+\):\s*/i, "").trim().slice(0, 200);
   if (kind === "auth") {
+    // 走自己端点的那一轮，401 是**那个中转**拒绝的，和本产品的登录毫无关系。
+    // 说成「登录已过期、已经把登录框打开了」是双重错误：原因是假的，而且那个动作
+    // 根本没发生（_recoverFromAiFailure 在自定义线路上只提示、不动凭据）。
+    // 用户拿着这句话去重新登录，登完再发一次，还是同一个 401。
+    if (custom) {
+      return "你自己那个端点拒绝了这次请求（401）。八成是这条自定义模型的 API key 不对——到「模型 → 自定义模型」里改一下就行。你在 Mr. Day One 的登录没有问题，也没有被登出。";
+    }
     return "登录已过期，这一轮没有发出去。已经把登录框打开了——重新登录后再发一次就行，你写的内容都还在。";
   }
   if (kind === "payment") {
+    if (custom) {
+      return "你自己那个端点说额度不足（402）。空的是那个中转站的余额，不是 Mr. Day One 的额度——到那边充值或换一条线路即可。";
+    }
     return `额度用完了：会员额度、钱包余额、今日免费点数三样都是空的。免费点数每天 UTC 0 点（北京时间 8:00）重置；也可以开通会员或充值后继续。已经为你打开账户页。${upstreamWords ? `\n服务端原话：${upstreamWords}` : ""}`;
   }
   if (kind === "upstream") {
@@ -56856,7 +56899,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       try { _recoverFromAiFailure(_aiFailureKind(_stripAiRetryPrefix(String(finalErr))), { custom: !!config?.customModelId }); } catch {}
       const note = document.createElement("div");
       note.className = "msg__error";
-      note.textContent = "⚠️ " + _formatAgentFinalError(finalErr);
+      note.textContent = "⚠️ " + _formatAgentFinalError(finalErr, { custom: !!config?.customModelId });
       body.appendChild(note);
     }
     // The outcome card used to be appended here: a harness-generated footer restating
