@@ -351,10 +351,18 @@ fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
         )
     };
     if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+        // MoveFileExW 失败之后再走一次 std 的 rename —— 它比这里多做两件事，而这两件事
+        // 正好各对应一类真实失败：
+        // ① ACCESS_DENIED 时它会用 SetFileInformationByHandle(FileRenameInfoEx,
+        //    POSIX_SEMANTICS) 兜底（std 注释原文：ignore the readonly attribute）——
+        //    治 `attrib +R` 和 Perforce 类仓库的只读文件；
+        // ② 它会加 `\\?\` 长路径前缀（maybe_verbatim），而这里喂的是**裸路径**，
+        //    且应用清单里没有 longPathAware —— 治 208~259 字符那一段
+        //    「能打开、能读、一保存就失败」（暂存文件名比目标长约 52 字符）。
+        // 一行同时解决两件事，且不改变成功路径的行为。
+        return std::fs::rename(from, to);
     }
+    Ok(())
 }
 
 /// Pre-register the user's HOME directory so files are accessible before any
@@ -429,7 +437,8 @@ pub fn create_project_dir(name: String) -> Result<String, String> {
     // 复用同一套注册守卫——这里不另开一条路径。
     let canonical = std::fs::canonicalize(&target).map_err(|e| e.to_string())?;
     register_workspace_root(canonical.to_string_lossy().into_owned())?;
-    Ok(canonical.to_string_lossy().into_owned())
+    // 剥掉 verbatim 前缀再交给前端；登记那份仍用未剥的 canonical（黑名单依赖它）。
+    Ok(strip_verbatim(&canonical.to_string_lossy()))
 }
 
 /// Register a workspace root that the user explicitly opened.
@@ -520,13 +529,49 @@ const BLOCKED_ROOT_PREFIXES: &[&str] = &[
 /// 不相等 —— 于是整张系统目录黑名单一条都匹配不上，`C:\Windows` 能被登记成工作区根，
 /// 而这道闸门在界面上、日志里都不会有任何异样。加上 Windows 路径不区分大小写，
 /// `c:\windows` 同样要能命中。
+/// 把 `canonicalize` 产出的 **verbatim** 前缀剥掉，再交给前端。
+///
+/// Windows 上 `std::fs::canonicalize` 返回 `\\?\C:\Users\me\proj`（同文件
+/// windows_prefix_match_form 的注释就写着这一点）。原样交出去，前端 _toPosix 之后
+/// 变成 `//?/C:/...`，然后至少三处会坏：
+///
+/// · **语言服务全死**：monaco 的 `URI.file("//?/C:/…").toString()` 会把 `?` 当成
+///   authority，产出 `file://%3F/c%3A/…`；Rust 侧剥 `file://` 之后拿到 `?/c:/…`，
+///   normalize_uri_path 只认「/ + 盘符」这一种形状、原样返回，
+///   于是 `builder.current_dir(ws_dir)` 拿到一个不存在的相对路径，
+///   每个语言服务器 spawn 当场失败 —— 补全/跳转/悬停/诊断全部消失且不报错。
+/// · **同一个文件开出两个页签**：_pathIdentity 只做小写化、不剥前缀，
+///   `//?/c:/proj/a.py` 和 `c:/proj/a.py` 归并不了 → 两个独立 model，各自保存互相覆盖。
+///   （文件树走的是 read_dir，用的是**原始** path，所以树和 ⌘P 给的是同一个文件的两个字符串。）
+/// · **cwd**：portable-pty 不剥 verbatim 前缀，而 std 会剥 —— std 自己的注释就是判据
+///   （"the current directory does not support verbatim paths"）。
+///
+/// **登记工作区根用的那份必须保持 canonical 原样**：黑名单比对依赖 verbatim 形式。
+/// 这个函数只用在**返回给前端**的路径上。
+fn strip_verbatim(raw: &str) -> String {
+    raw.strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn windows_prefix_match_form(raw: &str) -> String {
     let stripped = raw
         .strip_prefix(r"\\?\UNC\")
         .map(|rest| format!(r"\\{rest}"))
         .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
         .unwrap_or_else(|| raw.to_string());
-    stripped.replace('/', "\\").to_lowercase()
+    // **去掉尾部分隔符再比。** Windows 的 `std::env::temp_dir()` 返回的是
+    // `C:\Users\x\AppData\Local\Temp\` —— **带尾部反斜杠**。而下面
+    // windows_starts_with_prefix 的判据是「相等，或者剥掉前缀之后剩下的以 \ 开头」，
+    // 拿一个自带尾巴的前缀去比，两条都不可能成立 → 临时目录豁免在 Windows 上**恒假**。
+    // 后果是「写被拒、读没事」，而拒绝文案还写着「临时目录仍然可用」；
+    // 同时它让 Windows 上的 the_systems_own_temp_dir_is_always_writable 这条测试
+    // **现在就是红的** —— 也就是 Rust 测试从没在 Windows 上跑通过一次。
+    let lowered = stripped.replace('/', "\\").to_lowercase();
+    let trimmed = lowered.trim_end_matches('\\');
+    // 纯盘符根（`c:\`）整个 trim 掉会变成 `c:`，那反而匹配不上，留一份保底。
+    if trimmed.is_empty() { lowered } else { trimmed.to_string() }
 }
 
 /// 仍然按组件边界判，别让 `C:\Windowsfoo` 命中 `C:\Windows`。
@@ -552,8 +597,43 @@ fn blocked_root_prefix(path: &Path) -> Option<&'static str> {
     }
     BLOCKED_ROOT_PREFIXES
         .iter()
-        .find(|prefix| starts_with_prefix(path, prefix))
         .copied()
+        .chain(extra_blocked_root_prefixes().iter().copied())
+        .find(|prefix| starts_with_prefix(path, prefix))
+}
+
+/// Windows 上系统不一定装在 C 盘。
+///
+/// BLOCKED_ROOT_PREFIXES 里四条全把盘符写死成 `C:` —— 系统装在 D 盘时整张黑名单
+/// **一条都命中不了**，那道"不许把系统目录登记成工作区根"的保护静默失效。
+/// 这里按 `SystemDrive`（Windows 一定会设）把同样四条在真实系统盘上再生成一份。
+/// 泄漏一次拿 'static：这是进程生命周期的常量表，不是每次调用都分配。
+/// 非 Windows 上返回空切片，行为一个字不变。
+fn extra_blocked_root_prefixes() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        static EXTRA: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        EXTRA.get_or_init(|| {
+            let drive = std::env::var("SystemDrive").unwrap_or_default();
+            let drive = drive.trim_end_matches('\\');
+            // 已经是 C: 就不用再加一份（下面的比对本来就不区分大小写，但省一次分配）。
+            if drive.is_empty() || drive.eq_ignore_ascii_case("C:") {
+                return Vec::new();
+            }
+            ["Windows", "Program Files", "Program Files (x86)", "ProgramData"]
+                .iter()
+                .map(|tail| {
+                    let s: &'static str =
+                        Box::leak(format!("{drive}\\{tail}").into_boxed_str());
+                    s
+                })
+                .collect()
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        &[]
+    }
 }
 
 /// Paths always allowed regardless of workspace roots (temp dirs, macOS firmlinks).
@@ -862,7 +942,7 @@ pub fn list_project_files(root: String, limit: Option<usize>) -> Result<ProjectF
             .to_string_lossy()
             .replace('\\', "/");
         files.push(ProjectFile {
-            path: path.to_string_lossy().to_string(),
+            path: strip_verbatim(&path.to_string_lossy()),
             name,
             rel,
         });
@@ -2017,6 +2097,29 @@ mod tmp_file_tests {
     /// `/tmp` 在 Windows 上被解析成**当前盘根目录下的 `\tmp`**，默认根本不存在，
     /// 于是写入直接失败——依赖它的功能（HTML/CSS 实时预览的临时脚本等）一律起不来。
     #[test]
+    /// Windows 的 temp_dir() **带尾部反斜杠**，前缀比对必须先把它去掉。
+    ///
+    /// 这两个函数**故意不带 cfg**，所以 mac 上也编译、也被这条测试跑到 —— 否则这个
+    /// 判据只能等到有人在 Windows 上跑测试时才发现，而 Rust 测试从没在 Windows 上
+    /// 跑通过一次（正是这个 bug 让 the_systems_own_temp_dir_is_always_writable 在
+    /// Windows 上是红的）。
+    #[test]
+    fn a_windows_prefix_with_a_trailing_separator_still_matches() {
+        // temp_dir() 的真实形状：结尾带一个反斜杠。
+        let tmp = r"C:\Users\me\AppData\Local\Temp\";
+        assert!(
+            super::windows_starts_with_prefix(r"C:\Users\me\AppData\Local\Temp\build\a.txt", tmp),
+            "带尾部分隔符的前缀匹配不上 —— 临时目录豁免在 Windows 上会恒假"
+        );
+        assert!(super::windows_starts_with_prefix(r"C:\Users\me\AppData\Local\Temp", tmp));
+        // 不许因为去尾巴而放宽成「前缀字符串包含」：Temp2 不在 Temp 底下。
+        assert!(!super::windows_starts_with_prefix(r"C:\Users\me\AppData\Local\Temp2\a.txt", tmp));
+        // 盘符根整个 trim 会变成 `c:`，那反而匹配不上，保底分支守着它。
+        assert!(super::windows_starts_with_prefix(r"C:\proj\a.txt", r"C:\"));
+        // verbatim 前缀和正斜杠仍然照常归一。
+        assert!(super::windows_starts_with_prefix(r"\\?\C:\Users\me\proj\a.txt", "C:/Users/me/proj"));
+    }
+
     fn a_temp_file_lands_in_the_systems_temp_dir_not_a_hardcoded_slash_tmp() {
         let name = format!("michael-tmp-probe-{}.txt", std::process::id());
         let written = super::write_tmp_file(name.clone(), "x".into()).expect("写临时文件");
@@ -2357,7 +2460,7 @@ fn search_project_scope(
                 .to_string_lossy()
                 .to_string();
             results.push(FileMatches {
-                path: path.to_string_lossy().to_string(),
+                path: strip_verbatim(&path.to_string_lossy()),
                 name,
                 rel,
                 matches: file_matches,
@@ -3150,17 +3253,28 @@ mod tests {
             .expect("read files.rs");
         let cut = src.find("mod tests").unwrap_or(src.len());
         let code = &src[..cut];
-        let blocked = code
-            .find("fn blocked_root_prefix(")
-            .expect("blocked_root_prefix 必须存在");
-        let blocked_body = &code[blocked..blocked + 400];
+        // **按函数边界取，不用固定字符窗口。** 原来写的是 `&code[at..at + 400]` ——
+        // 两个毛病：① 函数一长（比如加了几行注释）目标就被推出窗口，断言静默失效；
+        // ② 400 字节可能落在一个多字节汉字**中间**，切片直接 panic（实测就是这么炸的）。
+        // 改成从函数头切到下一个列 0 的 `}`，长度上下界兜着解析坏掉的情况。
+        let body_of = |name: &str| -> String {
+            let at = code.find(name).unwrap_or_else(|| panic!("{name} 必须存在"));
+            let rest = &code[at..];
+            let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+            let body = rest[..end].to_string();
+            assert!(
+                body.len() > 80 && body.len() < 4000,
+                "{name} 切出来 {} 字节 —— 边界找错了，这条断言在守一个空窗口",
+                body.len()
+            );
+            body
+        };
         assert!(
-            blocked_body.contains("starts_with_prefix(path, prefix)"),
+            body_of("fn blocked_root_prefix(").contains("starts_with_prefix(path, prefix)"),
             "系统目录黑名单没走 Windows 感知的匹配器，Windows 上会整张空转"
         );
-        let safe = code.find("fn has_safe_prefix(").expect("has_safe_prefix 必须存在");
         assert!(
-            code[safe..safe + 300].contains("starts_with_prefix(path, prefix)"),
+            body_of("fn has_safe_prefix(").contains("starts_with_prefix(path, prefix)"),
             "临时目录豁免同样要按同一条规则匹配"
         );
     }

@@ -15,6 +15,9 @@ const IGNORED_WATCH_DIRS: &[&str] = &[
     "node_modules",
     ".git",
     "target",
+    // Windows 上 MSBuild / Visual Studio 的中间产物目录，是 `target` 的对应物。
+    // 少了它，编一个 .NET / C++ 项目照样会触发这份名单本来要挡的那次卡顿。
+    "obj",
     "dist",
     "build",
     "out",

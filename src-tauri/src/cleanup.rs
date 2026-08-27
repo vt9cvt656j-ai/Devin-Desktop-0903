@@ -277,9 +277,31 @@ fn scan_stale_app_copies() -> Option<CleanupItem> {
 }
 
 /// 隔离区：清掉的东西先搬到这儿，七天后才真删。
-/// 放在缓存目录下——它本身就是「可以丢」的语义。
+///
+/// **不能建在 cache_root() 底下。** macOS 上 cache_root 是 `Library/Caches/<id>`
+/// 这个"容器"，放进去没问题；但非 macOS 上它是
+/// `AppData/Local/<id>/EBWebView/Default/Cache` —— **待清理目录本身**。
+/// 于是 `rename(cache_root, 隔离区/Cache)` 变成「把一个目录搬进它自己的子树」，
+/// Win32 和 POSIX 都必然失败：清理功能在 Windows / Linux 上今天是 100% 失败，
+/// 而且每失败一次就在活缓存目录里留下一层 `_cleanup-quarantine/<时间戳>`。
+/// 给出的理由还硬编码着「移动失败（可能跨卷）」—— 同一个目录里当然不可能跨卷，
+/// 那句话把排查引向完全错误的方向。
+///
+/// 改成挂在**应用数据根**下（和被清理的树同卷、但不在它内部），rename 仍是同卷原子操作。
 fn quarantine_root() -> Option<PathBuf> {
-    Some(cache_root()?.join("_cleanup-quarantine"))
+    #[cfg(target_os = "macos")]
+    {
+        Some(cache_root()?.join("_cleanup-quarantine"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(
+            home()?
+                .join("AppData/Local")
+                .join(BUNDLE_ID)
+                .join("_cleanup-quarantine"),
+        )
+    }
 }
 
 /// 把过了保质期的隔离物真正删掉。每次扫描时顺手做，用户无感。
