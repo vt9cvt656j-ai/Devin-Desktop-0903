@@ -28768,6 +28768,58 @@ test("记忆卫生·召回：无条件塞进来的条目必须和检索命中分
   }
 });
 
+// 自定义模型的悬浮卡必须和内置模型**完全一样**：一样的思考深度档位、一样的上下文窗口。
+//
+// 病灶是一条判据只做了一半：`_builtinThinkingProfileFor` 早就会把 `custom:<随机>` 这个
+// 内部选择器 id 换成用户填的真实模型名再判能力，而**目录那一侧没跟上** ——
+// `_modelCatalogEntry` 拿 `custom:x` 去 MODEL_GROUPS 里找，必然找不到。
+// 于是走目录的每一条都对自定义模型静默失效：
+//   · _liveThinkingLevels 拿到 null → 思考深度只剩「关闭」一格，滑块拖不动
+//   · contextWindows 拿到空 → 上下文滑轨只剩一个兜底值
+//   · 价格拿不到
+// 用户看到的就是：自己加的 deepseek-v4-pro 那张卡是死的，而内置那个同名模型能拖。
+//
+// 判据取自**两端**：同一份目录、同一个真实模型名，内置 id 和 custom: id 必须得到
+// 逐字相同的结果。不是断言「有没有写 custom:」——那种写法改个前缀就哑了。
+test("自定义模型的能力判据要按真实模型名查目录，和内置模型拿到同一份档位", () => {
+  const GROUPS = [{
+    label: "DeepSeek",
+    models: [{
+      id: "deepseek-v4-pro", name: "deepseek-v4-pro",
+      supportedEfforts: ["xhigh", "high", "low"],
+      contextWindows: [{ tokens: 512000, beta: null }, { tokens: 1000000, beta: null }],
+      contextLimit: 512000,
+    }],
+  }];
+  // 分组名故意和目录里的不一样：自定义模型的分组是用户自己起的，
+  // 匹配不上该走 fallback（按模型名找到的第一条），不该返回 null。
+  const CUSTOMS = [{ id: "custom:x", name: "deepseek-v4-pro", group: "我自己的线路" }];
+  const entry = load("_modelCatalogEntry", {
+    MODEL_GROUPS: GROUPS,
+    loadConfig: () => ({}),
+    _CUSTOM_MODEL_PREFIX: "custom:",
+    _customModelById: (id) => CUSTOMS.find((c) => c.id === id) || null,
+  });
+  const live = load("_liveThinkingLevels", { _modelCatalogEntry: entry });
+
+  const builtin = entry("deepseek-v4-pro");
+  const custom = entry("custom:x");
+  assert.ok(builtin, "目录里应当有这一款 —— 判据本身失效了");
+  assert.ok(custom, "自定义模型没解析到目录条目：思考深度和上下文滑块都会退化成一格");
+
+  assert.deepEqual(live("custom:x"), live("deepseek-v4-pro"),
+    "自定义模型拿到的思考档位和内置的不一样 —— 卡片上一个能拖、一个是死的");
+  assert.deepEqual(
+    custom.contextWindows?.map((w) => w.tokens),
+    builtin.contextWindows?.map((w) => w.tokens),
+    "自定义模型拿不到原生窗口列表，上下文滑轨只会剩一格",
+  );
+  assert.equal(custom.contextLimit, builtin.contextLimit);
+
+  // 认不出来的 custom id 不该崩，也不该串到别的模型上。
+  assert.equal(entry("custom:不存在"), null, "查不到的自定义模型应当返回 null，而不是别人的条目");
+});
+
 test("记忆卫生·召回：与当前技术栈无关的笔记不占无条件保底位", () => {
   // 词表从**真模块** stackTable 派生，不在测试台里手编——手编的词表和生产漂开时，
   // 这条断言会绿着骗人（本仓库踩过：测试台自编的数据形状和生产不一致）。
