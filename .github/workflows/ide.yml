@@ -90,3 +90,32 @@ jobs:
 
       - name: Compile Tauri app
         run: cargo build --manifest-path src-tauri/Cargo.toml
+
+  # Windows 编译门禁。这条以前不存在：push/PR 只跑 ubuntu + macos，而 67 处
+  # `cfg(target_os = "windows")` / `cfg(windows)` 分支在这两个平台上**根本不进编译单元** ——
+  # 语法错、类型错、调用不存在的 API，全都查不出来。唯一会在 windows-latest 上编译的
+  # 是 ide-package.yml，而它只能手动触发。也就是说一个打断 Windows 编译的改动可以
+  # 一路全绿地待到有人推 tag，那时版本号已经烧掉了。
+  #
+  # 只做 check 不做 build：check 几分钟就完，而完整 build + 打包在 ide-package.yml 里。
+  # （链接期那一类失败 check 查不到 —— 那条由 scripts/release-preflight.sh 的
+  # `cargo xwin build` 在打 tag 前兜着。）
+  windows-check:
+    name: Windows 编译门禁
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: ide -> target
+
+      - name: Compile-check the desktop app for Windows
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+      # sidecar 是**独立 crate**，Tauri 不会顺带编它，所以必须单独查一次。
+      - name: Compile-check the automation sidecar for Windows
+        run: cargo check --manifest-path automation-framework/Cargo.toml --all-targets

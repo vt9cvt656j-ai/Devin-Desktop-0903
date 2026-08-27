@@ -59,7 +59,9 @@ echo "── Windows 那条分支能不能编过 ──"
 # 在 mac 上 cargo check 只编 mac 那些 cfg 分支，Windows 独家的代码根本不参与编译——
 # 也就是说「本机全绿」对 Windows 版一点保证都没有。实际发生过：改了一个函数签名，
 # mac 全过，Windows 侧四个 cfg 分支全部类型不匹配。
-if command -v cargo-xwin >/dev/null 2>&1; then
+if [ -n "${MICHAEL_SKIP_WINDOWS_GATE:-}" ]; then
+  echo "   （显式跳过：MICHAEL_SKIP_WINDOWS_GATE 已设）"
+elif command -v cargo-xwin >/dev/null 2>&1; then
   (cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc >/dev/null 2>&1) \
     || fail "Windows 目标编不过：cd ide/src-tauri && cargo xwin check --target x86_64-pc-windows-msvc"
   # check **不做链接**，而有一整类失败只在链接期出现。实际发生过：build.rs 用
@@ -72,7 +74,14 @@ if command -v cargo-xwin >/dev/null 2>&1; then
   (cd ide/automation-framework && cargo xwin check --target x86_64-pc-windows-msvc --all-features >/dev/null 2>&1) \
     || fail "sidecar 的 Windows 目标编不过"
 else
-  echo "   （跳过：没装 cargo-xwin。要装：cargo install cargo-xwin）"
+  # 这里以前是 `echo "（跳过）"` —— 而脚本上下每一条别的检查都是硬拦的，
+  # 于是没装 cargo-xwin 的机器上，整段 Windows 门禁被跳过之后照样打印
+  # 「✅ 全部通过，可以打 tag 了」并以 0 退出。发版脚本的价值全在「拦得住」，
+  # 一条会自己让路的检查等于没有。装它只要一条命令，而它拦下的是
+  # 「tag 已经推出去了才发现 Windows 编不出来」。
+  fail "没装 cargo-xwin，Windows 编译门禁跑不了。先装：cargo install cargo-xwin
+   （这道门拦的是「mac 全绿但 Windows 编不过」——那类失败只在打完 tag 之后才暴露。
+     确实要跳过请显式设 MICHAEL_SKIP_WINDOWS_GATE=1，并自己承担后果。）"
 fi
 
 echo "── 工具目录两份是否同步 ──"
