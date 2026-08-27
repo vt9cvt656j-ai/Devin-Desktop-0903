@@ -152,10 +152,14 @@ test("折叠 marker 列表里的每个前缀，源码里都有对应的装配端
  * 从 `_visibleRecent` 起切，不是从 `_recentText` 起 —— 「模型真正会看到哪几条」这件事
  * 就发生在前者里，只切后者等于把被测判据的一半留在窗口外。
  *
- * `gateway` / `covered` 是判据的**外部输入**（网关档位开没开、服务端说前几条已折进摘要），
- * 不是判据本身，所以按参数注入；判据的形状仍然逐字来自源码。
+ * `gateway` / `coveredUserSigs` 是判据的**外部输入**（网关档位开没开、哪几条用户原话
+ * 已被折进摘要），不是判据本身，所以按参数注入；判据的形状仍然逐字来自源码。
+ *
+ * 注意这里是**内容**不是下标：`covered` 数的是请求数组（含 assistant(tool_calls) 和
+ * tool 两类消息），而 memory.recent 只有 user 和每轮最终的 assistant —— 拿前者当后者的
+ * 下标，工具重的一轮会把 recent 整个切空，台账于是每轮全量重列（正是本该消除的那件事）。
  */
-function fadedOf(sess, effectiveMode = "agent", { gateway = false, covered = 0 } = {}) {
+function fadedOf(sess, effectiveMode = "agent", { gateway = false, coveredUserSigs = [] } = {}) {
   const start = SEND.indexOf("const _visibleRecent = (() => {");
   const fadedAt = SEND.indexOf("const _fadedDemands = (", start);
   const end = SEND.indexOf("\n    : [];", fadedAt);
@@ -167,7 +171,7 @@ function fadedOf(sess, effectiveMode = "agent", { gateway = false, covered = 0 }
     `${body}\nreturn _fadedDemands;`,
   )(
     sess, effectiveMode, MODES_WITH_TOOLS, norm,
-    {}, () => gateway, () => ({ covered }),
+    {}, () => gateway, () => ({ coveredUserSigs }),
   );
 }
 
@@ -238,19 +242,25 @@ test("网关压缩档位：按服务端报的 covered 判「已掉出历史」�
     { role: "user", content: "继续" },
   ];
 
+  const sig = norm(text).slice(0, 40);
   assert.deepEqual(
-    fadedOf(sess, "agent", { gateway: true, covered: 0 }), [],
+    fadedOf(sess, "agent", { gateway: true, coveredUserSigs: [] }), [],
     "服务端还没折叠任何一条时不该重列",
   );
-  const faded = fadedOf(sess, "agent", { gateway: true, covered: 1 });
+  const faded = fadedOf(sess, "agent", { gateway: true, coveredUserSigs: [sig] });
   assert.equal(faded.length, 1,
     "服务端已经把这条折进摘要了，本地却因为 recent 没收缩而认定「还在历史里」——反健忘那块整条路上都不触发");
   assert.equal(faded[0], norm(text).slice(0, 240));
 
-  // 网关档位关掉时行为不变：本地会真的裁 recent，covered 不该被拿来用。
+  // **不许按条数切。** 一轮工具往返在请求数组里是 2T+2 条、在 recent 里只有 2 条，
+  // 拿前者当后者的下标必然超切，recent 变空 → 台账每一条都被判成「已折叠」→ 全量重列。
+  const many = fadedOf(sess, "agent", { gateway: true, coveredUserSigs: ["不匹配任何一条的指纹"] });
+  assert.deepEqual(many, [], "指纹对不上就不该判成已折叠（说明判据退回了按条数切）");
+
+  // 网关档位关掉时行为不变：本地会真的裁 recent，这份指纹不该被拿来用。
   assert.deepEqual(
-    fadedOf(sess, "agent", { gateway: false, covered: 1 }), [],
-    "本地压缩那条路不该受 covered 影响",
+    fadedOf(sess, "agent", { gateway: false, coveredUserSigs: [sig] }), [],
+    "本地压缩那条路不该受服务端指纹影响",
   );
 });
 

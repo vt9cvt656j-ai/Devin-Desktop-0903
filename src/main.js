@@ -993,6 +993,12 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     if (config.ideMode) _h["x-ide-mode"] = String(config.ideMode);
     if (config.ideTools) _h["x-ide-tools"] = String(config.ideTools);
     if (config.ideSemanticProfile) _h["x-ide-semantic-profile"] = String(config.ideSemanticProfile).slice(0, 1024);
+    // 会话开场那句。HTTP 头只能是 ASCII，中文必须编码 —— 用 base64(UTF-8)，网关那边同解。
+    if (config.ideSessionGoal) {
+      try {
+        _h["x-ide-session-goal"] = btoa(String.fromCharCode(...new TextEncoder().encode(String(config.ideSessionGoal).slice(0, 4000)))).slice(0, 8192);
+      } catch { /* 编不动就不发，网关自己有兜底 */ }
+    }
     if (config.requestId) _h["x-ide-request-id"] = String(config.requestId).slice(0, 128);
     if (/^[-_A-Za-z0-9]{8,128}$/.test(String(config.ideRunId || ""))) _h["x-ide-run-id"] = String(config.ideRunId);
     // 会话级亲和键。校验和 run id 逐字一致 —— 网关那边两级用的是同一道判据，
@@ -14979,10 +14985,30 @@ function _mcPrefixSet(token, covered, sourceMessages, session = null) {
   // covered 缺失就不存：宁可下一轮整份重传，也不能凭一个错的条数去裁历史 ——
   // 裁错了模型收到的是**错位**的上下文，而且不会有任何报错。
   if (!/^mcp_[a-f0-9]{16,80}$/i.test(t) || c <= 0 || boundary < pinned || boundary >= messages.length) return;
+  // 被折叠掉的那几条**用户原话**的归一化指纹。
+  //
+  // `covered` 是「请求数组去掉开头 system 之后」的条数——那个数组在 agent 轮里会长出
+  // 成对的 assistant(tool_calls) + tool 消息，一轮 T 次工具往返就是 2T+2 条；而
+  // `sess.memory.recent` 只收 user 和每轮最终的 assistant，同一轮只 +2。两个数组的
+  // 成分完全不同，拿 covered 去索引 recent 必然错位（工具重的一轮直接切空）。
+  // 需求台账要问的其实是「这条要求还会不会逐字发出去」——那是**内容**问题不是下标问题，
+  // 所以这里直接把被折叠的用户原话记下来，读的那侧按内容比对，不碰下标。
+  const coveredUserSigs = [];
+  for (let i = pinned; i <= boundary; i++) {
+    const m = messages[i];
+    if (!m || m.role !== "user") continue;
+    // content 可能是字符串，也可能是 [{type:"text",text}] 数组（带附件的那种）。
+    const raw = Array.isArray(m.content)
+      ? m.content.map((part) => String(part?.text || "")).join("\n")
+      : String(m.content ?? "");
+    const sig = _ledgerNorm(raw).slice(0, 40);
+    if (sig) coveredUserSigs.push(sig);
+  }
   _mcPrefixBySession.delete(key);
   _mcPrefixBySession.set(key, {
     token: t,
     covered: c,
+    coveredUserSigs,
     sourceLength: messages.length,
     firstSig: _mcMessageFingerprint(messages[pinned]),
     boundarySig: _mcMessageFingerprint(messages[boundary]),
@@ -29210,6 +29236,23 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 用 sess.id 而不是别的：它的粒度就是一个聊天会话，正是提示词前缀稳定的那个范围；
   // 格式是 base36 时间戳 + 4 位随机 = 12 位字母数字，正好过下面那道头部校验。
   config.ideSessionId = sess && sess.id ? String(sess.id) : "";
+  // 会话的**开场那句**，直接告诉网关。
+  //
+  // 网关压缩时会把「本次会话的原始目标」逐字钉在摘要前面，而它原来是从**当前请求体**
+  // 里现算的（session_anchor_request）。那个前提在第二个压缩轮之后就不成立了：客户端
+  // 按 covered 把已折叠的前缀整段省掉再发，请求体里最早那条用户消息已经是会话中途的
+  // 某一句了 —— 于是那块从第二轮起指着一句半路的话，还带着「冲突时以这段为准」的权威。
+  //
+  // 会话开场那句只有客户端知道得准，而且它一旦确定就再不变（粘住，不重算），
+  // 所以字节稳定、不打碎前缀缓存。
+  try {
+    if (sess && !sess._openingRequest) {
+      const _first = (sess.memory?.recent || []).find((m) => m?.role === "user" && String(m.content || "").trim());
+      const _open = _first ? String(_first.content) : String(text || "");
+      if (_open.trim()) sess._openingRequest = _open.trim().slice(0, 4000);
+    }
+    config.ideSessionGoal = sess?._openingRequest || "";
+  } catch { config.ideSessionGoal = ""; }
   sess._reqId = _billingScopeId;
   // 挂在会话上是给**别的代码路径**取当前这一轮时间线用的（本函数体内一律用局部
   // _turnTimeline）。目前没有任何读者——留着它本身没有害处，但守卫会把它算成只写不读，
@@ -29917,8 +29960,14 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     const all = (sess?.memory?.recent || []);
     if (!_gatewayHandlesCompression(config)) return all;
     try {
-      const covered = Number(_mcPrefixGet(sess)?.covered) || 0;
-      return covered > 0 ? all.slice(covered) : all;
+      // 按**内容**排除，不按下标切。理由写在 _mcPrefixSet 里：covered 数的是请求数组
+      // （含 assistant(tool_calls) / tool 两类消息），而 recent 只有 user 和每轮最终的
+      // assistant——拿前者当后者的下标，工具重的一轮会把 recent 整个切空，于是台账里
+      // 每一条都被判成「已折叠」，近万 token 的历次要求每轮全量重列（正是本该消除的那件事）。
+      const sigs = new Set(_mcPrefixGet(sess)?.coveredUserSigs || []);
+      if (!sigs.size) return all;
+      return all.filter((m) => !(m?.role === "user"
+        && sigs.has(_ledgerNorm(m.content).slice(0, 40))));
     } catch { return all; }
   })();
   const _recentText = (() => {
@@ -29957,7 +30006,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // 发车时快通道多半还没落定，这里仍用同步画像；落定后的受限行为副本由循环边界的
   // _applyFastRouteBehaviorIfLanded 收，方向边界见那边。
   const _decisionFrame = (effectiveMode === "agent")
-    ? _agentDecisionFrameBlock(text, _uiTurnEngineering, _fastRouteProfile, sess?._intentState?.semantic || null)
+    ? _agentDecisionFrameBlock(text, _uiTurnEngineering, _fastRouteProfile, _priorContractForTurn(sess, _curRoot))
     : "";
   const _uiDesignCraft = (effectiveMode === "agent")
     ? _uiDesignCraftBlock(text, _uiTurnEngineering, { serverDesignLayersActive: _serverDesignLayersRouted(config) })
@@ -49874,6 +49923,50 @@ function _agentIntentExecutionBlock(profile, contractCarriesRequirements = false
 // 第一轮通常没有——而"该派哪些角色"恰恰是第一轮就要决定的事，等到第二轮，活已经按 solo 干起来了。
 // 所以让模型第一轮就看到角色计划，但 run.engineering（计划门槛、写入义务、角色派发的准入）
 // 仍然只认完整裁决：精简判断可以指路，不该管闸门。
+/**
+ * 上一轮已经收敛的契约，**且它还适用于当前工作区**。
+ *
+ * 工作区那道闸不是新规矩：`_aiIntentContextForTurn` 对同一份 `session._intentState`
+ * 早就有 `rawPrior.workspace === workspace` 的判断，`_intentState.workspace` 这个字段
+ * 就是为它存的。新调用点直接读 `.semantic` 把闸漏了 —— 后果很具体：同一个会话里换了
+ * 文件夹（换文件夹不清 _intentState），第 2 轮起决策框会印出「目标：把 src/auth.ts 的
+ * 登录改成 OAuth」，而紧邻的前一条消息正在说「工作区已切换，彻底忘掉旧目录的文件路径」。
+ */
+function _priorContractForTurn(session, root) {
+  const prior = session?._intentState;
+  if (!prior || typeof prior !== "object") return null;
+  const was = String(prior.workspace || "");
+  const now = String(root || "");
+  if (was && now && was !== now) return null;
+  return prior.semantic || null;
+}
+
+/** 上一轮契约那一段文本。只带耐久的几维，理由见调用点。 */
+function _priorContractText(priorSemantic) {
+  const carry = [];
+  if (priorSemantic.goal) carry.push(`目标：${String(priorSemantic.goal).slice(0, 420)}`);
+  if (priorSemantic.action || priorSemantic.target) {
+    carry.push(`动作/对象：${priorSemantic.action || "处理"}${priorSemantic.target ? ` → ${String(priorSemantic.target).slice(0, 320)}` : ""}`);
+  }
+  if (priorSemantic.constraints?.length) carry.push(`约束：${priorSemantic.constraints.slice(0, 8).join("；")}`);
+  if (priorSemantic.successCriteria?.length) carry.push(`成功判据：${priorSemantic.successCriteria.slice(0, 8).join("；")}`);
+  return "🎯 **上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）**\n" + carry.join("\n")
+    + "\n这是**上一轮**的判断，不是对你刚收到这句话的判断：用户这一轮的原话优先，"
+    + "他要是改了主意、撤回或换了目标，以他说的为准。本轮裁决落定后会自动补全或纠正。";
+}
+
+/** 快通道的协作初判那一段文本。 */
+function _provisionalRolesText(provisional) {
+  const label = provisional.orchestrationMode === "parallel_roles"
+    ? "并行多角色：契约已明确的实现块可以同时开工，范围不许重叠"
+    : "分阶段多角色：先让只读角色把架构/产品/数据/接口/安全的契约收敛出来，再进实现";
+  const roles = Array.isArray(provisional.roleNeeds) && provisional.roleNeeds.length
+    ? `\n需要的角色（初判）：${provisional.roleNeeds.join("、")}`
+    : "";
+  return `〔协作初判·完整意图裁决还在路上，这是快速判断〕\n协作方式：${label}${roles}`
+    + "\n按它开工即可；完整裁决落定后会自动补全或纠正，不必等它，也不要把这份初判当成最终结论。";
+}
+
 function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiIntent(text), provisional = null, priorSemantic = null) {
   const t = String(text || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
@@ -49904,30 +49997,20 @@ function _agentDecisionFrameBlock(text, profile = _engineeringProfileWithAiInten
   // 并且明说是上一轮的、用户这一轮的原话优先：
   //   · restatedTask / continuation 是对**上一句话**的判断，带过来就是张冠李戴；
   //   · ambiguities 的空数组是「上一句没有歧义」的申报，对这一句不成立（见上面那段）。
+  else if (provisional && provisional.orchestrationMode && provisional.orchestrationMode !== "solo"
+    && priorSemantic && typeof priorSemantic === "object"
+    && (priorSemantic.goal || priorSemantic.target || priorSemantic.constraints?.length)) {
+    // 两块**都要发**：一块说「这一轮要达成什么」（上一轮的契约），另一块说「该派几个角色」
+    // （快通道的协作初判）。上一版把契约那块写成排在协作初判前面的 else-if，于是
+    // 「恢复会话后的第一轮」——正好两者同时在场——协作初判被整条吃掉，多角色那条路又不通了。
+    lines.splice(1, 0, _priorContractText(priorSemantic), _provisionalRolesText(provisional));
+  }
   else if (priorSemantic && typeof priorSemantic === "object"
     && (priorSemantic.goal || priorSemantic.target || priorSemantic.constraints?.length)) {
-    const _carry = [];
-    if (priorSemantic.goal) _carry.push(`目标：${String(priorSemantic.goal).slice(0, 420)}`);
-    if (priorSemantic.action || priorSemantic.target) {
-      _carry.push(`动作/对象：${priorSemantic.action || "处理"}${priorSemantic.target ? ` → ${String(priorSemantic.target).slice(0, 320)}` : ""}`);
-    }
-    if (priorSemantic.constraints?.length) _carry.push(`约束：${priorSemantic.constraints.slice(0, 8).join("；")}`);
-    if (priorSemantic.successCriteria?.length) _carry.push(`成功判据：${priorSemantic.successCriteria.slice(0, 8).join("；")}`);
-    lines.splice(1, 0,
-      "🎯 **上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）**\n" + _carry.join("\n")
-      + "\n这是**上一轮**的判断，不是对你刚收到这句话的判断：用户这一轮的原话优先，"
-      + "他要是改了主意、撤回或换了目标，以他说的为准。本轮裁决落定后会自动补全或纠正。");
+    lines.splice(1, 0, _priorContractText(priorSemantic));
   }
   else if (provisional && provisional.orchestrationMode && provisional.orchestrationMode !== "solo") {
-    const _label = provisional.orchestrationMode === "parallel_roles"
-      ? "并行多角色：契约已明确的实现块可以同时开工，范围不许重叠"
-      : "分阶段多角色：先让只读角色把架构/产品/数据/接口/安全的契约收敛出来，再进实现";
-    const _roles = Array.isArray(provisional.roleNeeds) && provisional.roleNeeds.length
-      ? `\n需要的角色（初判）：${provisional.roleNeeds.join("、")}`
-      : "";
-    lines.splice(1, 0,
-      `〔协作初判·完整意图裁决还在路上，这是快速判断〕\n协作方式：${_label}${_roles}`
-      + "\n按它开工即可；完整裁决落定后会自动补全或纠正，不必等它，也不要把这份初判当成最终结论。");
+    lines.splice(1, 0, _provisionalRolesText(provisional));
   }
   if (p.projectEngineering || p.engineeringGrade || p.allProjectsEngineering || p.projectScope || p.architecture) {
     // 交付规格律——补的是一条**整个项目里从来没有过**的规则（全仓搜 MVP/最小可用/糊弄，
@@ -52270,6 +52353,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   let verifyNudges = 0, _lastVerifyNudgeAtImplOps = -1;
   let _lastUiNudgeAtImplOps = -1;
   let _verifiedAtImplOps = -1, _prevVerifyErrs = null, _noProgressVerify = 0; // auto-verify convergence state (re-verify after new edits; stop once errors stop dropping)
+  // 项目 linter 那条腿的**独立**收敛计数。上面那对只由类型/语法诊断驱动，而
+  // 「类型干净」正是走进 lint 分支的前提，共用会让那道界恒不生效（详见 lint 分支处）。
+  let _prevLintErrs = null, _noProgressLint = 0;
   let _verifyExhausted = false; // real verify budget genuinely spent (10 runs, or no check cmd after 2 nudges) → allow an honest finish even if later edits bump _implOps
   let _uiVerifiedAtImplOps = -1, uiVerifyNudges = 0, _browserViewportKind = "";
   // UI verification phase machine: 'idle' | 'running' | 'completed'. Prevent reset-on-mutation loops by only clearing nudges on first entry into running.
@@ -55031,10 +55117,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 仓库里本来就有的问题不能算到模型头上，否则门一开就永远关不上，模型会被推去
         // 改一堆跟本轮任务无关的代码。抓不到（没配 linter / 没装）就留空，
         // 下面 `ran:false` 那一支会让整道门安静跳过。
+        // lint baseline 有**自己的**已抓集合，不跟诊断那条共用。
+        //
+        // 共用的话有个静默的坑：上面那个 filter 是无条件 `add(key)` 的（诊断 baseline
+        // 抓没抓到都算抓过），而 lint baseline 可能失败（没装 linter、超时、版本不对）。
+        // 失败时这批路径已经被标记成「抓过」，此后再也不会重试 —— 仓库里**本来就有**的
+        // lint 错误会被永久算成模型这一轮新引入的，门一开就再也关不上。
         try {
-          const _lintBase = await _projectLintFindings(_newBaselinePaths, root, null);
-          if (_lintBase.ran) {
-            run._lintBaseline = (run._lintBaseline || []).concat(_lintBase.findings);
+          run._lintBaselinePaths = run._lintBaselinePaths || new Set();
+          const _lintTargets = _newBaselinePaths.filter((path) => {
+            const key = _pathIdentity(_resolveRel(path, root));
+            return !run._lintBaselinePaths.has(key);
+          });
+          if (_lintTargets.length) {
+            const _lintBase = await _projectLintFindings(_lintTargets, root, null);
+            if (_lintBase.ran) {
+              // 只有真抓到了才记「抓过」；没抓到留着下一批重试。
+              for (const path of _lintTargets) run._lintBaselinePaths.add(_pathIdentity(_resolveRel(path, root)));
+              run._lintBaseline = (run._lintBaseline || []).concat(_lintBase.findings);
+            }
           }
         } catch {}
       }
@@ -55346,9 +55447,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 走同一道阻断门、同一条「不再收敛就停止阻断」的收敛计数：多开一道门就多一处
         // 会打转的地方，而这两条腿说的是同一件事——「你刚写的这版有新问题」。
         let _lintReportText = "";
+        let _lintErrCount = 0;
         try {
           const _lint = await _projectLintFindings([...run._diagnosticCheckPaths], root, run._lintBaseline || []);
           if (_lint.ran && _lint.findings.length) {
+            _lintErrCount = _lint.findings.length;
             _lintReportText = _lintReport(_lint.findings[0].linter, _lint.findings);
           }
           // 「配了 linter 却跑不起来」是事实，说一次就够（run 级去重），
@@ -55371,9 +55474,17 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             + (_lintReportText ? "\n\n" + _lintReportText : ""));
         } else if (_lintReportText && _live()) {
           // 类型/语法干净、但项目规则报了错：这条路此前整个不存在。
+          //
+          // **自己的收敛计数。** 上一版直接用了诊断那条腿的 `_noProgressVerify`，
+          // 而那个计数器只在 `_errNow` 分支里改 —— 「类型干净」恰恰是走进这条分支的前提，
+          // 于是每一轮先被重置成 0，`< 2` 恒真，「不再收敛就停止阻断」那道界结构上不存在。
+          // 抄了表达式没抄计数器，是这个仓库反复出现的那种恒真守卫。
+          if (_prevLintErrs != null && _lintErrCount >= _prevLintErrs) _noProgressLint++;
+          else _noProgressLint = 0;
+          _prevLintErrs = _lintErrCount;
           interleaveVerifies++;
           runHadTrouble = true;
-          run._diagnosticBlock = _noProgressVerify < 2 ? _lintReportText : "";
+          run._diagnosticBlock = _noProgressLint < 2 ? _lintReportText : "";
           _pushNudge("diag", "[BLOCKING_NEW_DIAGNOSTICS] 你刚才的修改在**项目自己的规则**下报错了（语法和类型是干净的，所以上面那条腿看不见）。先修复并重新验证；不要改项目的 lint 配置来绕过它：\n\n" + _lintReportText);
         } else if (_d.ran) {
           run._diagnosticBlock = "";

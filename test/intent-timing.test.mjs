@@ -376,9 +376,9 @@ test("角色计划第一轮就要到，但只当指路用——闸门仍然只�
   assert.match(fn, /\[\.\.\.new Set\(roles\)\]\.slice\(0, 5\)/, "角色要去重并封顶，别让它列一长串");
 
   // 临时契约必须**自报是临时的**：否则模型会把初判当最终结论，完整裁决到了也不改。
-  // 按 AST 边界取整个函数：固定字符窗口（原来是 slice(0,3000)）在函数变长时会静静地
-  // 不再覆盖被断言的那几行，而且仍然全绿。
-  const body = fnSource("_agentDecisionFrameBlock", { code: true });
+  // 这两段文本已经抽成各自的生成器（同一段话原来在两个分支里写了两遍）。
+  const body = fnSource("_provisionalRolesText", { code: true })
+    + "\n" + fnSource("_agentDecisionFrameBlock", { code: true });
   assert.match(body, /〔协作初判·完整意图裁决还在路上，这是快速判断〕/,
     "临时契约没有自报身份——模型会把它当成最终结论");
   assert.match(body, /完整裁决落定后会自动补全或纠正/, "要说清它会被修正，否则模型不敢改口");
@@ -394,17 +394,23 @@ test("第 2 轮起本轮契约必然赶不上第一发——要把上一轮的�
   // 就在第一发决定完了。上一轮收敛出来的契约躺在 sess._intentState.semantic 里，
   // 零延迟零成本，不用它纯属浪费。
   const body = fnSource("_agentDecisionFrameBlock", { code: true });
+  const carry = fnSource("_priorContractText", { code: true });
   assert.match(body, /priorSemantic = null/, "没有接上一轮契约的入口");
-  assert.match(body, /上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）/,
+  assert.match(carry, /上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）/,
     "带过来了却不自报身份 —— 模型会把上一轮的目标当成这一轮的");
-  assert.match(body, /用户这一轮的原话优先/,
+  assert.match(carry, /用户这一轮的原话优先/,
     "必须明说用户改主意时以他为准，否则这块会把用户的转向压掉");
   // 只带耐久的那几维，而且是**真的跑一遍**看渲染结果 —— 只按源码文本断言
   // `priorSemantic.constraints` 之类会被 else-if 的守卫喂到（那里也出现同一个属性名），
   // 于是删掉真正那行 push 照样全绿（实测漏网）。
   const frame = load("_agentDecisionFrameBlock", {
-    _agentIntentExecutionBlock: undefined,
+    // 真实实现太重（要整套画像），这里注一个**最小但真实形状**的契约生成器：
+    // 它只回答「本轮契约在不在场」，而这条断言问的正是这个。
+    _agentIntentExecutionBlock: (p) => (p?.intentSemantic?.goal
+      ? `🎯 本轮意图契约\n目标：${p.intentSemantic.goal}` : ""),
     _engineeringProfileWithAiIntent: () => ({}),
+    _priorContractText: load("_priorContractText"),
+    _provisionalRolesText: load("_provisionalRolesText"),
   });
   const rendered = frame("再改改", {}, null, {
     goal: "做一个多租户后台",
@@ -431,7 +437,14 @@ test("第 2 轮起本轮契约必然赶不上第一发——要把上一轮的�
     "空的语义帧同样不该发");
 
   // 完整契约在场时不许出现：那才是本轮真正的裁决，两份契约同时摆着必然打架。
-  const at = body.indexOf("if (intentContract) lines.splice");
-  const carryAt = body.indexOf("上一轮已经收敛的契约");
-  assert.ok(at > 0 && carryAt > at, "带过来的契约必须挂在 else 分支上，不能和本轮契约并存");
+  //
+  // 这条原来只比两个 indexOf 的先后 —— 把 `else` 删掉（也就是它自己点名的那个缺陷）
+  // 照样全绿，因为文本顺序没变。改成**真的跑一遍**：本轮契约在场时，上一轮那块必须缺席。
+  const withCurrent = frame("再改改", {
+    intentSemantic: { goal: "本轮真正的目标", restatedTask: "本轮的复述", confidence: 0.9 },
+  }, null, { goal: "上一轮的目标", constraints: ["上一轮的约束"] });
+  assert.ok(withCurrent.includes("本轮真正的目标"), "本轮契约本身没发出来");
+  assert.ok(!withCurrent.includes("上一轮已经收敛的契约"),
+    "本轮裁决已经在场，上一轮那块还在发 —— 两份契约同时摆着，模型必然打架");
+  assert.ok(!withCurrent.includes("上一轮的目标"));
 });

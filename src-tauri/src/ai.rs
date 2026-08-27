@@ -203,6 +203,9 @@ pub struct AiConfig {
     pub ide_run_id: Option<String>,
     /// 会话级亲和键，见发头处的注释。
     pub ide_session_id: Option<String>,
+    /// 会话开场那句用户请求，base64(UTF-8)。网关压缩时用它当「原始目标」，
+    /// 而不是从已被截断的请求体里现算（那样第二个压缩轮起就指着一句半路的话）。
+    pub ide_session_goal: Option<String>,
     #[serde(default)]
     pub ide_step_index: Option<i64>,
     #[serde(default)]
@@ -770,6 +773,16 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
     }) {
         rb = rb.header("x-ide-session-id", session_id);
     }
+    // 只校验它是合法 base64 字符集且有界：内容是用户原话，网关那边解码后自己再截。
+    if let Some(goal) = config.ide_session_goal.as_deref().filter(|value| {
+        !value.is_empty()
+            && value.len() <= 8192
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    }) {
+        rb = rb.header("x-ide-session-goal", goal);
+    }
     if let Some(step_index) = config
         .ide_step_index
         .filter(|value| (0..=10_000).contains(value))
@@ -1330,6 +1343,7 @@ mod ide_header_tests {
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
+            ide_session_goal: None,
             reasoning_effort: None,
             thinking_budget: None,
             thinking_effort: None,
@@ -1712,6 +1726,7 @@ mod stream_timeout_tests {
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
+            ide_session_goal: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
             thinking_budget,
             thinking_effort: None,

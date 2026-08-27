@@ -21,17 +21,20 @@ const matches = load("_planStepMatchesEvidence", {
 
 test("步骤点了名的文件，动了别处就不打勾", () => {
   const step = { content: "实现 src/pages/login.tsx 的表单校验" };
+  // 触达判据是 `_resolvedPath`（文件操作真正落盘时写回的绝对路径），不是 `call.path`
+  // —— 后者在 _mapToolCall 里是**卡片标题槽位**：search 往里塞查询串、web_fetch 塞 URL、
+  // design_research 塞的干脆是「设计调研」四个字。
   assert.equal(
-    matches(step, ["implement"], { type: "edit", path: "src/pages/login.tsx" }), true,
+    matches(step, ["implement"], { type: "edit", _resolvedPath: "/repo/src/pages/login.tsx" }), true,
     "改的就是这一步点名的文件，必须打勾",
   );
   assert.equal(
-    matches(step, ["implement"], { type: "edit", path: "src/utils/date.ts" }), false,
+    matches(step, ["implement"], { type: "edit", _resolvedPath: "/repo/src/utils/date.ts" }), false,
     "改的是别的文件却打了勾 —— 进度条在走、活没干",
   );
-  // 大小写和目录写法不该造成分歧：两边走同一套归一化。
+  // 大小写不该造成分歧：两边走同一套归一化。
   assert.equal(
-    matches(step, ["implement"], { type: "edit", path: "src/Pages/Login.tsx" }), true,
+    matches(step, ["implement"], { type: "edit", _resolvedPath: "/repo/src/Pages/Login.tsx" }), true,
   );
   // multi_edit 的目标在 edits[] 里，不在 path 上。
   assert.equal(
@@ -45,13 +48,20 @@ test("步骤点了名的文件，动了别处就不打勾", () => {
 test("两边任一没点名就不表态——这条判据只能拒绝勾，不能新增勾", () => {
   // 步骤没写具体文件：交回给类别判据，行为和加这条之前一模一样。
   const vague = { content: "实现登录页" };
-  assert.equal(matches(vague, ["implement"], { type: "edit", path: "src/utils/date.ts" }), true);
-  assert.equal(matches(vague, ["investigate"], { type: "edit", path: "src/utils/date.ts" }), false,
+  assert.equal(matches(vague, ["implement"], { type: "edit", _resolvedPath: "/repo/src/utils/date.ts" }), true);
+  assert.equal(matches(vague, ["investigate"], { type: "edit", _resolvedPath: "/repo/src/utils/date.ts" }), false,
     "类别判据照旧管用");
 
   // 调用没有结构化目标（跑命令、开浏览器）：同样不表态。
   const named = { content: "实现 src/pages/login.tsx 的表单校验" };
   assert.equal(matches(named, ["implement"], { type: "cmd", command: "npm create vite@latest app" }), true);
+
+  // **`call.path` 一个字都不该被当路径读。** 一次搜索的关键词落在 path 里，
+  // 拿去和步骤点名的文件求交集必然对不上 —— 而这条判据只会拒绝勾，
+  // 于是一个点了名的步骤会被任意一次取证调用永久挡住。
+  assert.equal(matches(named, ["implement"], { type: "search", path: "登录 表单校验" }), true,
+    "把搜索关键词当成了「动过的文件」");
+  assert.equal(matches(named, ["implement"], { type: "web_fetch", path: "https://example.com/docs" }), true);
 
   // 完全不传 call（旧调用点、或没有 call 的场景）行为不变。
   assert.equal(matches(named, ["implement"]), true);
@@ -66,6 +76,21 @@ test("目标抽取只收像路径/标识符的东西，不把版本号和中文�
   );
   // 反引号里是一整句中文说明时不收。
   assert.deepEqual(planStepTargets({ content: "按 `先读懂再动手` 来做" }), []);
+  // **带点的库名/域名不是文件。** 「用 chart.js 画个折线图」再正常不过，而一旦被当成
+  // 点名的交付物，这一步就再也勾不上了。判据是「它带路径分隔符吗」。
+  for (const lib of ["用 chart.js 画个折线图", "接入 socket.io 实时推送", "把 next.js 升到 15", "看 react.dev 的文档"]) {
+    assert.deepEqual(planStepTargets({ content: lib }), [], `库名/域名被当成文件了：${lib}`);
+  }
+  assert.deepEqual(planStepTargets({ content: "改 src/chart.js" }).sort(), ["chart.js", "src"].sort(),
+    "真写了目录时仍然要认");
+  // 根目录点文件：两侧归一化必须对称，否则改对了也判成冲突。
+  assert.deepEqual(planStepTargets({ content: "配好 .eslintrc.json" }), [".eslintrc.json"]);
+  assert.equal(
+    targetsConflict(planStepTargets({ content: "配好 .eslintrc.json" }),
+      toolTouchedTargets({ _resolvedPath: "/repo/.eslintrc.json" })),
+    false,
+    "开头那个点被剥掉了一侧 —— 改对了根目录点文件反而判成动的是别处",
+  );
 });
 
 test("交付物这一关排在类别判据之前——顺序反了它就形同虚设", () => {

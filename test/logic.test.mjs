@@ -10717,7 +10717,7 @@ test("Agent decision frame gives task-specific old-hand operating rules", () => 
   // 第四个参数是**上一轮已经收敛的契约**。理由同样是时序：那道等待窗口按会话只付一次
   // （sess._intentWaitPaid），所以第 2 轮起本轮裁决必然赶不上第一次模型调用，契约要等
   // 循环边界的 late-adopt 才有——而「要不要动手、动哪儿、算不算做完」就在第一发决定完了。
-  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\)\s*\n?\s*\? _agentDecisionFrameBlock\(text, _uiTurnEngineering, _fastRouteProfile, sess\?\._intentState\?\.semantic \|\| null\)/,
+  assert.match(SRC, /const _decisionFrame = \(effectiveMode === "agent"\)\s*\n?\s*\? _agentDecisionFrameBlock\(text, _uiTurnEngineering, _fastRouteProfile, _priorContractForTurn\(sess, _curRoot\)\)/,
     "Agent send path must add the decision frame to the per-turn preamble，并把上一轮的契约带上");
   assert.doesNotMatch(SRC, /_uiTurnEngineering = _fastRouteProfile|run\.engineering = _fastRouteProfile/,
     "快通道的判断不许写进驱动闸门的那份画像——它只负责给模型指路");
@@ -22909,7 +22909,7 @@ test("client modules have no undeclared identifiers", async () => {
     "String","Symbol","Uint32Array","Uint8Array","WeakMap","WeakSet","globalThis","isNaN","parseFloat",
     "parseInt","structuredClone","undefined","decodeURIComponent","encodeURIComponent",
     // DOM / browser
-    "AbortController","AbortSignal","Blob","BroadcastChannel","CSS","CustomEvent","Event","FileReader",
+    "AbortController","AbortSignal","Blob","BroadcastChannel","CSS","CustomEvent","Event","FileReader","btoa","atob",
     "FormData","Image","MutationObserver","Node","Notification","PerformanceObserver","ResizeObserver",
     "TextDecoder","TextEncoder","URL","URLSearchParams","alert","cancelAnimationFrame","clearInterval",
     "clearTimeout","confirm","console","crypto","document","fetch","getComputedStyle","localStorage","sessionStorage","location","navigator",
@@ -30626,7 +30626,7 @@ test("每轮重扫整个项目要按工作区变更缓存，别每步都愣一�
   const _endAnchor = SRC.indexOf("const _runtimeStateBlock = ", at);
   assert.ok(_endAnchor > at, "运行状态块后面那条语句不见了 —— 这条断言的边界没了");
   assert.doesNotMatch(
-    stripJsComments(SRC.slice(at, _endAnchor)).replace(/if \(run\._rtStateTick[\s\S]*\n      \}/, ""),
+    stripJsComments(SRC.slice(at, _endAnchor)).replace(/if \(run\._rtStateTick[\s\S]*?\n      \}/, ""),
     /await _promiseOrFallbackWithin\(_agentRuntimeStateBlock/,
     "缓存外面还留着一次无条件调用",
   );
