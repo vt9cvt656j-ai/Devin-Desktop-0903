@@ -30,13 +30,25 @@ fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<Stri
     // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出来），
     // 输出稍多就写满。而这里的超时文案说的是「可能在等系统弹权限框」——
     // 那会把排查引向完全错误的方向。
-    let (tx_o, rx_o) = std::sync::mpsc::channel::<String>();
-    let (tx_e, rx_e) = std::sync::mpsc::channel::<String>();
-    if let Some(mut so) = child.stdout.take() {
-        std::thread::spawn(move || { let mut b = String::new(); let _ = so.read_to_string(&mut b); let _ = tx_o.send(b); });
+    // 读**字节**再解码，不是 read_to_string：非 UTF-8 时 std 会把已读字节**整个回滚**
+    // （校验失败时 buf.set_len 退回原长），于是拿到的是空串而不是乱码。
+    // 这条路上有裸文本输出（不过 ConvertTo-Json，所以没有 \uXXXX 转义兜底）：
+    // 「✓ 已切换到 X」「已向 X 发出激活请求但它仍不在前台」。中文 Windows 上它们走
+    // CP936 出管道 → 非法 UTF-8 → out 和 err **双双为空** → 下面那句
+    // `out.is_empty() && !err.trim().is_empty()` 不成立 → 返回 Ok("")：
+    // **一次失败的激活被报成一次内容为空的成功**，而这是 system open/focus 的唯一出口。
+    // decode_process_output 是 tasks.rs:600 那份现成经验的另一半。
+    // None 分支显式 drop 发送端：不 drop 的话 recv_timeout 收不到 Disconnected，
+    // 每次调用平白走满整个宽限期。
+    let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
+    match child.stdout.take() {
+        Some(mut so) => { std::thread::spawn(move || { let mut b = Vec::new(); let _ = so.read_to_end(&mut b); let _ = tx_o.send(b); }); }
+        None => drop(tx_o),
     }
-    if let Some(mut se) = child.stderr.take() {
-        std::thread::spawn(move || { let mut b = String::new(); let _ = se.read_to_string(&mut b); let _ = tx_e.send(b); });
+    match child.stderr.take() {
+        Some(mut se) => { std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); let _ = tx_e.send(b); }); }
+        None => drop(tx_e),
     }
     loop {
         match child.try_wait() {
@@ -52,8 +64,10 @@ fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<Stri
             Err(e) => return Err(format!("{e}")),
         }
     }
-    let out = rx_o.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
-    let err = rx_e.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
+    let out = crate::process_util::decode_process_output(
+        &rx_o.recv_timeout(Duration::from_millis(2000)).unwrap_or_default());
+    let err = crate::process_util::decode_process_output(
+        &rx_e.recv_timeout(Duration::from_millis(2000)).unwrap_or_default());
     let out = out.trim().to_string();
     if out.is_empty() && !err.trim().is_empty() {
         return Err(err.trim().to_string());

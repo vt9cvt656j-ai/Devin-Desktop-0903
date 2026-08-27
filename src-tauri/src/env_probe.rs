@@ -216,21 +216,36 @@ fn wait_with_timeout(
     // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出这个病）：
     // 一个改动多的仓库，`git status --porcelain` 轻松超过 4KB → git 探测恒超时、
     // dirty_files 落 -1。这是个共享 helper，它的每一个调用方都吃这个亏。
+    // wait_with_output 做的第一件事就是关掉 stdin —— 少这一步的话，一个接了 piped stdin
+    // 的调用方会永远等下去（子进程在读一个不会关闭的管道）。当前两个调用方都传
+    // Stdio::null，所以今天没有活 bug，但下一个用 piped stdin 的会撞上。
+    drop(child.stdin.take());
     let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
     let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
-    if let Some(mut so) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            let _ = so.read_to_end(&mut b);
-            let _ = tx_o.send(b);
-        });
+    // **没接管道的那一路必须显式 drop 发送端。** 用 `if let` 时，分支不走 = 发送端没被
+    // move 进线程 = 它作为函数局部变量一直活到 return，于是 recv_timeout 永远收不到
+    // Disconnected，必须走满整个宽限期。实测：git_facts 把 stderr 设成 null 且被调用
+    // 三次，每次多等 500ms → 一次 probe_env 平白多 1.5 秒（这个模块自述"典型几百毫秒"）。
+    // 用 match 把 None 分支写出来，让通道立刻断开。
+    match child.stdout.take() {
+        Some(mut so) => {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = so.read_to_end(&mut b);
+                let _ = tx_o.send(b);
+            });
+        }
+        None => drop(tx_o),
     }
-    if let Some(mut se) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            let _ = se.read_to_end(&mut b);
-            let _ = tx_e.send(b);
-        });
+    match child.stderr.take() {
+        Some(mut se) => {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = se.read_to_end(&mut b);
+                let _ = tx_e.send(b);
+            });
+        }
+        None => drop(tx_e),
     }
     let start = std::time::Instant::now();
     loop {
@@ -581,7 +596,10 @@ mod stub_tests {
         assert!(out.stderr.is_empty());
         // stderr 没接管道 → 那一路的 recv 会走满宽限期。宽限期是 500ms，
         // 总耗时必须仍在秒级以内，否则每一次探测都会平白多等一截。
-        assert!(started.elapsed() < std::time::Duration::from_secs(2),
-            "没接管道的那一路把调用拖慢了 {:?}", started.elapsed());
+        // 阈值必须紧到能抓住「没接管道那一路走满宽限期」。原来写的是 2 秒 —— 宽了 4 倍，
+        // 恰好放过 500ms 的宽限期，于是这条断言对它是恒真的（实测漏网）。
+        assert!(started.elapsed() < std::time::Duration::from_millis(200),
+            "没接管道的那一路把调用拖慢了 {:?} —— 发送端没被 drop，recv_timeout 走满了宽限期",
+            started.elapsed());
     }
 }

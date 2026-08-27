@@ -306,9 +306,16 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
     // 宁可让它响地失败，也不要给一份安静的假数据。
     if target.pid.filter(|p| *p > 0).is_none() {
         if let Some(name) = target.app.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            // 补救必须**真的能清掉这条错**。上一版写的是「先 activate 再读，或者直接传 pid」——
+            // 两条都走不通：再发一次同样的调用命中同一个 if、报同一条错，构成确定性重试死循环；
+            // 而 pid 这条路上 read_ui_snapshot 在非 mac 平台的签名就是 `_pid: Option<i64>`，
+            // 参数被下划线丢掉，且 system windows / system_app_windows 两个出口都只给标题
+            // 和进程名、不给 pid —— 模型根本拿不到它。
+            // 唯一能执行的那条是「切到前台之后**不带 app 参数**重发」。
             return Err(format!(
                 "这个平台上不能按名字（「{name}」）定位窗口，只能读**当前前台窗口**。\
-                 请先用 window.activate 把目标窗口切到前台再读，或者直接传 pid。"
+                 请先用 system 的 focus/open 把「{name}」切到前台，然后**去掉 app 参数**\
+                 重发一次 read_screen —— 带着 app 重发会撞同一条错。"
             ));
         }
     }
@@ -390,7 +397,9 @@ pub async fn read_screen(
     let target_explicit = target.is_explicit();
     // 名字在这里就解析成 pid，往下一律只有 pid：读和点必须用**同一条**解析规则，
     // 否则读屏解析到 A、动作解析到 B，签名校验还会过（同名按钮长得一样）。
-    let target_pid = resolve_target_pid(&target)?;
+    // OCR 那条诊断必须排在 resolve_target_pid **之前**。它在后面的话，非 mac 平台上
+    // 「ocr=true + app=…」会先撞上下面那条「不能按名字定位」的错，模型拿到的是一条
+    // 和它真正问题无关的诊断（它的问题是 OCR 压根不支持指定目标）。
     // OCR 拍的是屏幕像素，压根没有"目标应用"这个概念——它只能拍最前面那个。
     // 静默忽略 app/pid 会让模型以为自己 OCR 了后台窗口，然后基于别的应用的文字往下做。
     if use_ocr && target_explicit {
@@ -399,6 +408,7 @@ pub async fn read_screen(
             target.describe()
         ));
     }
+    let target_pid = resolve_target_pid(&target)?;
     // Invalidate old refs before starting a new read. A failed or concurrent read
     // must never leave a ref from an older foreground process actionable.
     clear_latest_ax_refs()?;
@@ -1461,6 +1471,25 @@ fn run_powershell(script: &str, ms: u64) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // 读端和等待必须并行（同 read_ui_elements / sysctl / env_probe 那几处）。
+    // **这一处的后果比那几处都重**：调用方 perform_ax_action 已经把 UIA 动作
+    // 执行完了（Invoke / Toggle / SetValue 都已发出），才在写回执时卡住 → 8 秒超时 →
+    // 返回「动作超时」→ 模型重发 ui_click → **同一个按钮点两次、同一个表单提交两次**。
+    // 那几处最坏是读不到东西，这一处是已生效的副作用被报成没生效。
+    //
+    // 「输出通常小于 4KB 所以不会撑满管道」这个理由不成立：读屏那支脚本对 value 做了
+    // 120 字符截断，而这支动作回读**没有任何截断**（$nv 是控件的全部文本）。
+    let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
+    match child.stdout.take() {
+        Some(mut so) => {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = so.read_to_end(&mut b);
+                let _ = tx_o.send(b);
+            });
+        }
+        None => drop(tx_o),
+    }
     let deadline = Instant::now() + Duration::from_millis(ms);
     loop {
         match child.try_wait() {
@@ -1476,11 +1505,14 @@ fn run_powershell(script: &str, ms: u64) -> Option<String> {
             Err(_) => return None,
         }
     }
-    let mut s = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut s);
-    }
-    let t = s.trim().to_string();
+    // 读字节再解码，不用 read_to_string：非 UTF-8 时 std 会把已读字节**整个回滚**，
+    // 拿到的是空串而不是乱码 —— 中文 Windows 上控件文本走 CP936 出管道，
+    // 于是一次成功的动作会被报成「没有输出」。decode_process_output 先按 UTF-8 严格解，
+    // 解不动才按系统代码页解（tasks.rs:600 那份现成经验的另一半）。
+    let raw = rx_o
+        .recv_timeout(Duration::from_millis(2000))
+        .unwrap_or_default();
+    let t = crate::process_util::decode_process_output(&raw).trim().to_string();
     if t.is_empty() { None } else { Some(t) }
 }
 
