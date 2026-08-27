@@ -34,6 +34,8 @@ mod marketplace;
 mod mcp;
 mod net;
 mod process_util;
+// 自定义模型的上游线协议翻译（openai / anthropic / xai_responses）。
+mod protocol;
 mod proxy;
 mod public_data;
 mod qr;
@@ -337,6 +339,7 @@ pub fn run() {
             ai::ai_chat,
             ai::ai_chat_with_tools,
             ai::ai_complete,
+            ai::ai_protocols,
             ai::cancel_ai,
             ai::web_fetch,
             ai::web_search,

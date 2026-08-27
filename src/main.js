@@ -952,6 +952,15 @@ async function _realAiFetch(config, messages, tools, onEvent) {
     streamMetric("requestStarted");
     let key = config.apiKey;
     const isGateway = _isGatewayConfig(config);
+    // 网页构建没有 Rust 那条协议分叉：下面的请求体、端点、鉴权头全是 OpenAI 形状，而且
+    // 浏览器直连 api.anthropic.com 还会被 CORS 挡。这里只能失败 —— 但要说清为什么，
+    // 而不是让它去打一个错端点换回一句看不懂的 404/网络错误。
+    const _proto = cmProtocol(config.protocol);
+    if (_proto !== "openai") {
+      const _msg = `「${CM_PROTOCOL_UI[_proto].label}」协议只在桌面版可用。请把这条自定义模型改成 OpenAI 兼容协议，或改用桌面版。`;
+      try { onEvent({ kind: "error", message: _msg }); } catch {}
+      throw new Error(_msg);
+    }
     if (!key && isGateway) {
       // /api/ide-key now requires login (returns THIS user's own key) — pass the JWT.
       try { const tok = (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || ""; const r = await fetch(config.baseUrl + "/api/ide-key", { headers: tok ? { Authorization: "Bearer " + tok } : {}, signal: turnController?.signal }); key = (await r.json()).api_key; } catch {}
@@ -14072,6 +14081,10 @@ let MODEL_GROUPS = [];
 const _CUSTOM_MODELS_KEY = "michael_custom_models_v1";
 const _CUSTOM_MODEL_PREFIX = "custom:";
 
+// 上游线协议：取值、归一化、界面文案。取值必须是 Rust 侧 crate::protocol::PROTOCOLS 的
+// 逐字子集 —— 对不上时不会报错，只会静默退回 openai 打错端点。
+import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel } from "./agent/wire-protocol.js";
+
 function _loadCustomModels() {
   try {
     const parsed = JSON.parse(localStorage.getItem(_CUSTOM_MODELS_KEY) || "[]");
@@ -14086,7 +14099,11 @@ function _loadCustomModels() {
         name: it.name.trim(),
         baseUrl: it.baseUrl.trim(),
         apiKey: String(it.apiKey || ""),
-      }));
+      }))
+      // 形状收进 normalizeCustomModel：上面这个 .map 是**定形**的，只在保存侧写 protocol
+      // 而不改这里，表现是「选了 Anthropic、保存成功、发出去还是 /chat/completions」，
+      // 而且全程零报错。这是本次改动的头号静默失效点。
+      .map(normalizeCustomModel);
   } catch { return []; }
 }
 
@@ -15711,7 +15728,7 @@ async function showCustomModelsDialog() {
       <button class="cm-close" type="button" aria-label="关闭自定义模型"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
     <div class="cm-body">
-      <p class="cm-hint">接入 OpenAI 兼容接口（/v1/chat/completions）；地址与密钥仅保存在本机，不会上传。会员到期后自定义模型将暂停可用。</p>
+      <p class="cm-hint">接入 OpenAI 兼容接口、Anthropic 原生接口或 xAI Responses（在下面选）；地址与密钥仅保存在本机，不会上传。会员到期后自定义模型将暂停可用。</p>
       <div class="cm-list" role="list" aria-label="已添加的自定义模型"></div>
       <div class="cm-form" role="group" aria-labelledby="cmFormTitle">
         <h3 class="cm-form-title" id="cmFormTitle">新增自定义模型</h3>
@@ -15724,6 +15741,16 @@ async function showCustomModelsDialog() {
           <span class="cm-input-wrap"><input class="cm-in-name" id="cmInName" type="text" placeholder="例如：gpt-4o-mini" maxlength="600" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" aria-describedby="cmHintName cmErrName" data-err="cmErrName"></span>
           <p class="cm-field__hint" id="cmHintName">可用逗号或分号一次填多个，每个名称会建成一条。</p>
           <p class="cm-field__err" id="cmErrName"></p>
+        </div>
+        <div class="cm-field">
+          <span class="cm-field__label" id="cmProtoLabel">接口协议</span>
+          <div class="cm-seg" role="radiogroup" aria-labelledby="cmProtoLabel" aria-describedby="cmHintProto cmGapsProto">
+            <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="openai" checked><span>OpenAI 兼容</span></label>
+            <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="anthropic"><span>Anthropic 原生</span></label>
+            <label class="cm-seg__opt"><input class="cm-in-proto" type="radio" name="cmProto" value="xai_responses"><span>xAI Responses</span></label>
+          </div>
+          <p class="cm-field__hint" id="cmHintProto"></p>
+          <ul class="cm-gaps" id="cmGapsProto"></ul>
         </div>
         <div class="cm-field">
           <label for="cmInBase">对接地址</label>
@@ -15751,11 +15778,46 @@ async function showCustomModelsDialog() {
   const saveBtn = ov.querySelector(".cm-save");
   const cancelBtn = ov.querySelector(".cm-cancel");
   const formTitle = ov.querySelector(".cm-form-title");
+  const protoRadios = [...ov.querySelectorAll(".cm-in-proto")];
+  const hintProto = ov.querySelector("#cmHintProto");
+  const gapsProto = ov.querySelector("#cmGapsProto");
+  // 网页构建（/app/）没有 Rust 那条协议分叉：_realAiFetch 自己拼 OpenAI 形状的请求体、
+  // 端点和鉴权头。让这两条协议在网页上「可选然后失败」，就是在造一个坏功能 —— 禁掉并说清楚。
+  for (const r of protoRadios) {
+    if (!inTauri && CM_PROTOCOL_UI[r.value]?.desktopOnly) {
+      r.disabled = true;
+      r.closest(".cm-seg__opt")?.setAttribute("title", "这个协议只在桌面版可用");
+      r.closest(".cm-seg__opt")?.classList.add("cm-seg__opt--off");
+    }
+  }
+  const readProto = () => cmProtocol(protoRadios.find((r) => r.checked)?.value);
+  // 选了协议之后地址写法和能力缺口都要跟着变。**这不是装饰**：Anthropic 的地址是
+  // https://api.anthropic.com（不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错；
+  // 而 gaps 那几句是「不许假装支持」在界面上的唯一落点。
+  const syncProto = () => {
+    const ui = CM_PROTOCOL_UI[readProto()];
+    inBase.placeholder = ui.ph;
+    hintProto.textContent = ui.hint;
+    gapsProto.replaceChildren(...ui.gaps.map((g) => {
+      const li = document.createElement("li");
+      li.textContent = g;
+      return li;
+    }));
+    gapsProto.hidden = ui.gaps.length === 0;
+  };
+  const writeProto = (p) => {
+    const want = cmProtocol(p);
+    for (const r of protoRadios) r.checked = (r.value === want);
+    syncProto();
+  };
+  for (const r of protoRadios) r.addEventListener("change", syncProto);
+  syncProto();
   let editingId = null;
 
   const resetForm = () => {
     editingId = null;
     inGroup.value = ""; inName.value = ""; inBase.value = ""; inKey.value = "";
+    writeProto(CM_PROTOCOL_DEFAULT);
     formTitle.textContent = "新增自定义模型";
     saveBtn.textContent = "添加";
     cancelBtn.hidden = true;
@@ -15773,10 +15835,11 @@ async function showCustomModelsDialog() {
       row.className = "cm-row";
       row.innerHTML = `<div class="cm-row__main"><div class="cm-row__name"></div><div class="cm-row__meta"></div></div><button class="cm-edit" type="button">编辑</button><button class="cm-del" type="button">删除</button>`;
       row.querySelector(".cm-row__name").textContent = it.group + " · " + it.name;
-      row.querySelector(".cm-row__meta").textContent = it.baseUrl + (it.apiKey ? "　密钥 ••••" + it.apiKey.slice(-4) : "　无密钥");
+      row.querySelector(".cm-row__meta").textContent = CM_PROTOCOL_UI[it.protocol].label + "　" + it.baseUrl + (it.apiKey ? "　密钥 ••••" + it.apiKey.slice(-4) : "　无密钥");
       row.querySelector(".cm-edit").addEventListener("click", () => {
         editingId = it.id;
         inGroup.value = it.group; inName.value = it.name; inBase.value = it.baseUrl; inKey.value = it.apiKey;
+        writeProto(it.protocol);
         formTitle.textContent = "编辑自定义模型";
         saveBtn.textContent = "保存修改";
         cancelBtn.hidden = false;
@@ -15807,6 +15870,11 @@ async function showCustomModelsDialog() {
       inName.value.split(/[,;，；]/).map((x) => x.trim()).filter(Boolean),
     )];
     const baseUrl = inBase.value.trim().replace(/\/+$/, "");
+    // 协议是**端点**的属性，而这个表单里端点唯一（一次只填一个地址），所以一次保存只可能
+    // 有一个协议，和 group/baseUrl/apiKey 今天的做法一致：整批共用。
+    // 但**每条存一份**而不是按 group 存 —— group 是用户可随手复用的自由文本标签，两个
+    // 不相干的中转站完全可能取同一个组名，按组存会把它们绑死。
+    const protocol = readProto();
     const apiKey = inKey.value.trim();
     if (!names.length) { showToast("请填写模型名称"); inName.focus(); return; }
     if (!/^https?:\/\/\S+$/i.test(baseUrl)) { showToast("对接地址需以 http(s):// 开头"); inBase.focus(); return; }
@@ -15817,16 +15885,16 @@ async function showCustomModelsDialog() {
       const at = items.findIndex((x) => x.id === editingId);
       // Editing with several names: the edited row takes the first, the rest become new
       // entries — otherwise the extras would be silently dropped.
-      if (at >= 0) items[at] = { ...items[at], group, name: names[0], baseUrl, apiKey };
+      if (at >= 0) items[at] = { ...items[at], group, name: names[0], baseUrl, apiKey, protocol };
       for (const name of names.slice(1)) {
         if (items.length >= 64) break;
-        items.push({ id: mkId(), group, name, baseUrl, apiKey });
+        items.push({ id: mkId(), group, name, baseUrl, apiKey, protocol });
         added++;
       }
     } else {
       for (const name of names) {
         if (items.length >= 64) break;
-        items.push({ id: mkId(), group, name, baseUrl, apiKey });
+        items.push({ id: mkId(), group, name, baseUrl, apiKey, protocol });
         added++;
       }
     }
@@ -16175,6 +16243,9 @@ function _builtinThinkingProfileFor(id) {
   // Custom entries use an internal selector id, but thinking capability belongs
   // to the real upstream model name. Preferences remain keyed by the selector id.
   let capabilityId = String(id || "");
+  // 自定义条目的模型名是**用户手打的**，下面 Claude 分支按代次分流靠的是对它做正则。
+  // 猜不出代次时不能掉进 adaptive —— 见该分支里的别名保护。
+  const _fromCustom = capabilityId.startsWith("custom:");
   if (capabilityId.startsWith("custom:") && typeof _customModelById === "function") {
     try {
       const custom = _customModelById(capabilityId);
@@ -16316,6 +16387,14 @@ function _builtinThinkingProfileFor(id) {
   // wire shape on aggregator (OpenAI-protocol) routes that forward the body verbatim.
   if (/claude|opus|sonnet|haiku|fable|mythos/.test(s)) {
     if (/haiku/.test(s)) return none(t("model.thinking.reason.claudeHaiku"));
+    // 别名保护。`sonnet-latest` / `claude-latest` 这类名字匹配不出代次（_claudeGeneration
+    // → 0），旧代码会让它掉进下面的 adaptive 分支，于是给一个可能是 4.5 的模型发
+    // {"type":"adaptive"} + output_config.effort —— 硬 400，而界面上「保存成功、档位可调」，
+    // 用户看到的只是整轮失败。猜不出来就不猜。
+    // 只对自定义条目生效：网关模型有实时目录兜底，不吃这个坑。
+    if (_fromCustom && _claudeGeneration(s) === 0) {
+      return none("这个名字看不出 Claude 代次（例如 sonnet-latest 这类别名）。思考开关的形状按代次分两套、发错是硬 400，所以这条模型上不发思考参数。把模型名写成带版本号的形式（例如 claude-sonnet-4-5）即可开启。");
+    }
     if (/3[-_.]?5(?!\d)/.test(s)) return none("Claude 3.5 系列无扩展思考能力。");
     if (/3[-_.]?7(?!\d)/.test(s)) {
       return {
@@ -28153,6 +28232,12 @@ async function _predictNextAsk(sess) {
     let _predictCfg = { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model: cfg.model, viaGateway: true };
     try {
       const _cm = _customModelById && _customModelById(cfg.model);
+      // 下一句预测是**第三条**发送路径：它自己拼 _chatCompletionsUrl + Bearer，不经过
+      // Rust 的协议分叉。非 OpenAI 协议的自定义端点上，这一发必然打错端点（例如
+      // https://api.anthropic.com/v1/chat/completions）→ 404，而外层是 catch{}，连日志
+      // 都没有 —— 表现成「灰字预测在这个模型上不出现」，用户找不到原因。
+      // 宁可不预测，也不发一个必然失败的请求。
+      if (_cm && cmProtocol(_cm.protocol) !== "openai") return;
       if (_cm) _predictCfg = { baseUrl: _cm.baseUrl, apiKey: _cm.apiKey, model: _cm.name, viaGateway: false };
     } catch {}
     if (_predictCfg.viaGateway) {
@@ -28866,6 +28951,9 @@ async function _readyAiConfig(overrideConfig = null) {
     // 这个字段不能省：思考档位偏好按它绑回 `custom:` 选择器 id，删了每轮会读错档位。
     // 它同时也是「不发网关注入头」的判据——第三方端点确实不该指望网关注入。
     config.customModelId = _custom.id;
+    // 本轮走哪种线协议。Rust 侧按它分叉 URL / 请求体 / 鉴权头；缺省或不认识 → openai，
+    // 与今天逐字相同（存量条目根本没有这个字段，走的就是这条路）。
+    config.protocol = cmProtocol(_custom.protocol);
     _warnCustomEndpointOnce(_custom);
   }
   if (!config.baseUrl || !config.apiKey) {
@@ -28918,7 +29006,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     // Gemini 发 thinkingConfig、OpenAI 发 reasoning_effort），而 _applyThinkingToConfig 只写
     // 目标族用得上的那几个键。Object.assign 不删多余键，于是从 Claude 切到 GPT 时上一族的
     // thinking:{type:"adaptive"} 会跟着一起发出去——对端要么忽略、要么直接 400。
-    for (const k of ["reasoningEffort", "thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort", "customModelId"]) {
+    for (const k of ["reasoningEffort", "thinkingBudget", "thinking", "thinkingConfig", "thinkingEffort", "customModelId", "protocol"]) {
       delete config[k];
     }
     Object.assign(config, routed);
