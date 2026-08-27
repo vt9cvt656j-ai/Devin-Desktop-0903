@@ -3,6 +3,7 @@ import test from "node:test";
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { load, SRC } from "./helpers/source.mjs";
 
@@ -143,7 +144,10 @@ test("在真正引入漂移的那次提交上抓得到（活的标定）", () =>
   // 这条漂移是靠人工取样复核出来的；这里断言机器也抓得到同一句。
   let before, after;
   try {
-    const git = (...a) => execFileSync("git", a, { cwd: new URL("..", import.meta.url).pathname, maxBuffer: 512 * 1024 * 1024 }).toString();
+    // 用 fileURLToPath 而不是裸 .pathname：Windows 上 `new URL(...).pathname` 得到的是
+    // `/C:/Users/...` —— **前面多一个斜杠**，那不是合法的 Win32 路径，execFileSync 的 cwd
+    // 会直接失败。这是 import.meta.url 最经典的一条跨平台坑。
+    const git = (...a) => execFileSync("git", a, { cwd: fileURLToPath(new URL("..", import.meta.url)), maxBuffer: 512 * 1024 * 1024 }).toString();
     before = git("show", "7690ef5^:src/main.js");
     after = git("show", "7690ef5:src/main.js");
   } catch {

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 // 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
@@ -110,7 +111,9 @@ test("在真语料上的命中密度要维持在可接受范围", () => {
     const p = join(d, e.name);
     if (e.isDirectory()) walk(p); else if ([".js", ".mjs"].includes(extname(e.name))) files.push(p);
   } };
-  walk(new URL("../src", import.meta.url).pathname);
+  // fileURLToPath 而不是裸 .pathname：Windows 上后者是 `/C:/…`，多一个前导斜杠，
+  // readdirSync 当场失败。（这个测试扫的是 src/ 下每个文件，一坏就整条红。）
+  walk(fileURLToPath(new URL("../src", import.meta.url)));
   let hits = 0, lines = 0;
   for (const f of files) {
     const s = readFileSync(f, "utf8");
