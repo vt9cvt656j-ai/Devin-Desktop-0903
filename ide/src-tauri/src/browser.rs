@@ -2318,7 +2318,13 @@ pub fn close_all() {
 const ORPHAN_PROFILE_PATTERN: &str = concat!(
     "rust-headless-chrome-profile",          // headless_chrome 老版本的临时名
     "|michael-ide-browser",                  // browser.rs 的兜底临时 profile
-    "|\\.mrdayone/browser-profile",           // 持久 profile（主力，含 -edge/-brave/-chromium）
+    // 两处都不能写死：**分隔符**在 Windows 命令行里是反斜杠（`C:\Users\x\.mrdayone\browser-profile`），
+    // **目录名**在老用户那儿是 legacy 的 `.michael-ide`（app_dir_name() 会返回它）。
+    // 匹配不上的后果有三个，而且都是「响亮地说假话」：孤儿浏览器杀不掉（下次启动
+    // SingletonLock 全线冲突）；is_browser_running 剔不掉自己的实例，用户一个浏览器
+    // 都没开却被告知「你确实开着 Chrome」；discover 会优先去接管自己的孤儿。
+    // 注意 legacy 名让**老 macOS 用户今天也已经中招**，不只是 Windows。
+    "|\\.(mrdayone|michael-ide)[/\\\\]browser-profile", // 持久 profile（主力，含 -edge/-brave/-chromium）
     "|rust_automation_browser_",             // automation-framework 的临时 profile
     "|\\.mrday-browser-session",              // automation-framework 的持久 profile
 );

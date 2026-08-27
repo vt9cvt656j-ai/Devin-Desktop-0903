@@ -47377,7 +47377,11 @@ const WORKER_SCOPE_ALL = "*";
 function _pathInScope(target, scopeRel, root) {
   if (!scopeRel || !scopeRel.length) return false;
   const t = _normRel(target, root);
-  if (!t || t.startsWith("..") || t.startsWith("/")) return false;
+  // 盘符也算逃逸。同一个函数下面八行就写着 `/^[A-Za-z]:[\\/]/`，这一条漏了 ——
+  // Windows 上 `C:/Windows/...` 过不了这道闸，scope 为 "*" 的 worker 在多根窗口里
+  // 就能改另一个已注册的根。（落点仍要过 Rust 侧校验，所以写不到 C:\Windows；
+  // 真正漏掉的是「另一个工作区根」这一格。）
+  if (!t || t.startsWith("..") || t.startsWith("/") || /^[A-Za-z]:[\\/]/.test(t)) return false;
   // Whole-workspace worker: any in-root, non-escaping path is writable.
   if (scopeRel.includes(WORKER_SCOPE_ALL)) return true;
   return scopeRel.some((s) => { const e = s.replace(/\/+$/, ""); return t === e || t.startsWith(e + "/"); });
