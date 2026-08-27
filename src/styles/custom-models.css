@@ -277,6 +277,14 @@
 .cm-gaps:empty, .cm-gaps[hidden] { display: none; }
 .cm-gaps li { margin: 2px 0; }
 
+/* 只给读屏的播报位。没有这条规则它就是一段普通可见文字，会在弹窗底部凭空多出一行
+ * 「已添加 3 个自定义模型」——上一版就是这样：markup 写了、样式没写、JS 也没写。
+ * 不用 display:none / visibility:hidden：那两个会让 aria-live 不再播报。 */
+.cm-sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
 .cm-field__hint { margin: 5px 0 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--text-dim) }
 .cm-field__err  { margin: 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--destructive); font-weight: 500 }
 .cm-field__err:not(:empty) { margin-top: 5px }

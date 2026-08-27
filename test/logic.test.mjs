@@ -12735,7 +12735,10 @@ test("natural-language capability queries are routed by the semantic tool orches
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
     // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
     // 测试，这里直接给它定稿文本，顺便捕获真正发出去的请求体。
-    _fetchCompletionText: async (_url, _headers, payload) => {
+    // 三条认知腿改走 _cognitiveLegComplete（按协议分叉）之后，请求体从第三个参数
+    // 挪到了第二个。桩这一层而不是 _fetchCompletionText：后者在非 openai 协议上
+    // 根本不会被调到，桩它等于什么都没桩。
+    _cognitiveLegComplete: async (_config, payload) => {
       request = payload;
       return JSON.stringify({
         tools: ["local_discovery", "not_registered"],
@@ -19239,7 +19242,8 @@ test("语义收尾评审工具仍可独立使用，但 quiet turn 不会被评�
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
     // 同上：这条测试关心评审逻辑，不关心传输。给定稿文本，顺便捕获请求体。
-    _fetchCompletionText: async (_url, _headers, payload) => {
+    // 同上：改桩 _cognitiveLegComplete，请求体是第二个参数。
+    _cognitiveLegComplete: async (_config, payload) => {
       reviewRequest = payload;
       return JSON.stringify({
         done: false,
@@ -33782,7 +33786,9 @@ test("离线蒸馏：不进前台、不常跑、只写带得出数的事实", ()
   assert.match(src, /total - last < _DISTILL_EVERY/, "没有攒批闸门，会每轮都发一次模型调用");
   assert.ok(loadConst("_DISTILL_EVERY") >= 20, "攒批阈值太小，成本会失控");
   const markAt = src.indexOf("localStorage.setItem(_distillMarkKey(root)");
-  const fetchAt = src.indexOf("_fetchCompletionText");
+  // 发送口改成了 _cognitiveLegComplete（按协议分叉）。锚点跟着换，判断没变：
+  // 先把「跑过了」记进 localStorage，再发请求 —— 否则失败一次就每轮重试。
+  const fetchAt = src.indexOf("_cognitiveLegComplete");
   assert.ok(markAt > 0 && fetchAt > 0 && markAt < fetchAt,
     "要先记账再发请求 —— 否则失败一次就会每轮重试，变成重试风暴");
   // 不重入。
@@ -33791,7 +33797,7 @@ test("离线蒸馏：不进前台、不常跑、只写带得出数的事实", ()
   assert.match(src, /if \(window\._distillRunning\) return;/,
     "没有并发闸，两轮同时结束会重复发请求");
   const setAt = src.indexOf("window._distillRunning = true;");
-  assert.ok(setAt > 0 && setAt < src.indexOf("_fetchCompletionText"),
+  assert.ok(setAt > 0 && setAt < src.indexOf("_cognitiveLegComplete"),
     "并发标志要在发请求之前置位，否则闸门形同虚设");
   // 只写事实：提示词里必须明令禁止空话，并要求带支持次数。
   assert.match(src, /禁止空话/, "没禁空话 —— 「建议加强测试」这种对模型基本无效");
