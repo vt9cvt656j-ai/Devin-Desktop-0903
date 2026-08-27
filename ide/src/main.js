@@ -14239,7 +14239,14 @@ function _setModelAvatar(avatarEl, id) {
 /** Resolve a brand: detect from the model id first (most reliable), then fall
  *  back to the connection's explicit provider/brand. */
 function brandFor(m) {
-  const byId = brandOf((m && m.id) || "");
+  // custom: 前缀要先解析成真实模型名再认牌子 —— 和 _modelContextLimit /
+  // _builtinThinkingProfileFor / _modelCatalogEntry 同一个规矩。不解析的话自定义模型的
+  // 悬浮卡头上是个通用芯片图标，而同一条模型在菜单里显示的是它真正的牌子，两处对不上。
+  let _idForBrand = (m && m.id) || "";
+  if (typeof _CUSTOM_MODEL_PREFIX === "string" && _idForBrand.startsWith(_CUSTOM_MODEL_PREFIX)) {
+    _idForBrand = (m && m.name) || _idForBrand;
+  }
+  const byId = brandOf(_idForBrand);
   if (byId.sym !== "i-cpu") return byId;
   const key = (m && m.brand ? m.brand : "").toLowerCase();
   if (BRAND_SYM[key] && hasBrandMark(BRAND_SYM[key])) return _brandMark(BRAND_SYM[key]);
@@ -17118,7 +17125,12 @@ function buildModelMenu() {
           + `<span class="name"></span>`
           + `<span class="check-slot">${active ? `<svg class="check"><use href="#i-check" /></svg>` : ""}</span>`;
         item.querySelector(".name").textContent = cm.name;
-        item.addEventListener("mouseenter", hideModelInfoCard);
+        // 自定义模型**也要弹悬浮卡**。这里原来挂的是 hideModelInfoCard —— 主动把卡片
+        // 藏掉，于是这一整组模型没有任何地方能调思考深度和上下文档位，而网关模型悬停就有。
+        // 卡片需要的数据这条路上全都拿得到：_modelContextLimit 和 _builtinThinkingProfileFor
+        // 都认 custom: 前缀（前者解析成 _fallbackModelContextLimit(名字)，后者按代次分流）；
+        // 价格是「未知」，那对用户自己的中转本来就是实话。
+        item.addEventListener("mouseenter", () => showModelInfoCard(cm, item));
         item.addEventListener("click", () => {
           // 选用即验会员（权威的到期复核在每次发送前的 _readyAiConfig 里再做一次）。
           // 选中自定义模型不再要求会员——同上，用的是用户自己的额度。
