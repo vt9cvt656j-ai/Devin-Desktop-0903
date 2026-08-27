@@ -160,3 +160,34 @@ test("构建前要扫掉上次没收干净的 DMG 中间产物", () => {
   // 清了要说，否则下次有人排查"为什么我的映像被卸载了"会一头雾水
   assert.match(SH, /预清 DMG 残留：卸载 \$_stale_mounts 个挂载/);
 });
+
+// MSI 的 UpgradeCode 必须**等于 Tauri 的默认推导值**，不能是随手造的另一个 UUID。
+//
+// 这条测试是从一次真实的错误里长出来的。为了防「改品牌名会断升级链」，
+// upgradeCode 被显式写死了 —— 但写进去的是一个**自造**的 uuid5，而 v0.3.90 / v0.4.9 /
+// v0.4.11 三个正式版都已经发过 MSI，那些机器上装的 UpgradeCode 是 **Tauri 的默认值**
+// `uuid5(DNS, "<productName>.exe.app.x64")`。两者不等 = Windows 认不出新版是同一个产品
+// = 更新**并排装成第二个应用**、旧版留在控制面板里删不掉。
+// 也就是说那次「修复」正好把它要防的事亲手做了一遍。
+//
+// 所以判据不是「有没有写死」，而是「写死的那个值等不等于默认推导值」。
+// 显式写出来仍然有意义：以后**改品牌名不会再动它**（默认值会跟着变，写死的不会）。
+test("MSI 的 UpgradeCode 必须等于 Tauri 的默认推导值，否则已装用户的更新会变成并排安装", async () => {
+  const code = CONF?.bundle?.windows?.wix?.upgradeCode;
+  assert.ok(code, "bundle.windows.wix.upgradeCode 没写 —— 默认值由 productName 推导，改名就断升级链");
+
+  // uuid5(NAMESPACE_DNS, name)，就地算一遍，不引第三方库。
+  const { createHash } = await import("node:crypto");
+  const DNS = Buffer.from("6ba7b8109dad11d180b400c04fd430c8", "hex");
+  const h = createHash("sha1").update(DNS).update(Buffer.from(`${CONF.productName}.exe.app.x64`, "utf8")).digest();
+  const b = Buffer.from(h.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50;          // version 5
+  b[8] = (b[8] & 0x3f) | 0x80;          // RFC 4122 variant
+  const hex = b.toString("hex");
+  const want = [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)]
+    .join("-").toUpperCase();
+
+  assert.equal(code.toUpperCase(), want,
+    `upgradeCode 和 Tauri 的默认推导值对不上。已经发出去的 MSI 用的是默认值，`
+    + `不一致会让老用户的更新并排装成第二个应用。productName="${CONF.productName}" 应得 ${want}`);
+});

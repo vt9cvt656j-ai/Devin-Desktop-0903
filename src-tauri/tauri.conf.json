@@ -43,7 +43,7 @@
     "homepage": "https://michaelide.xyz",
     "windows": {
       "wix": {
-        "upgradeCode": "CDDD40FF-E4CF-506E-9793-22F498E14592"
+        "upgradeCode": "EAA61F2F-23BB-5413-8FC3-6F1C83A9D20C"
       },
       "nsis": {
         "languages": ["SimpChinese", "TradChinese", "English"],
