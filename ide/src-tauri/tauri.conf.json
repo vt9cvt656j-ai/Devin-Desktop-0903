@@ -39,6 +39,17 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Mr. Day One",
+    "homepage": "https://michaelide.xyz",
+    "windows": {
+      "wix": {
+        "upgradeCode": "CDDD40FF-E4CF-506E-9793-22F498E14592"
+      },
+      "nsis": {
+        "languages": ["SimpChinese", "TradChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    },
     "createUpdaterArtifacts": true,
     "externalBin": [
       "binaries/automation-server"
