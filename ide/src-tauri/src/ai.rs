@@ -647,25 +647,6 @@ async fn read_sse_text(
                 || v["type"] == "response.completed"
                 || v["type"] == "response.incomplete"
             {
-                // xAI Responses 的停止原因既不在 choices 里也不在 delta 里，而在这一帧的
-                // response.status / incomplete_details.reason 上。不认它，这条路上的
-                // finishReason 恒为空串 —— 而它是**唯一**能分清「模型什么都没产出」和
-                // 「产到一半被输出预算截断」的信号，_billableAiComplete 的补余量重试
-                // （_finish(out) === "length"）就永远不触发，表现成「这个模型答得就是短」。
-                //
-                // 判据和 protocol.rs 那条流式解码逐字同源（见
-                // xai_truncated_response_reports_length_not_stop）：先看
-                // incomplete_details.reason == "max_output_tokens"，再退到帧类型本身。
-                if finish.is_empty() {
-                    if v.pointer("/response/incomplete_details/reason").and_then(serde_json::Value::as_str)
-                        == Some("max_output_tokens")
-                        || v["type"] == "response.incomplete"
-                    {
-                        finish = "length".to_string();
-                    } else if v["type"] == "response.completed" {
-                        finish = "stop".to_string();
-                    }
-                }
                 saw_done = true;
             }
         }
