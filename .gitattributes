@@ -1,0 +1,48 @@
+# 行尾锁死成 LF。
+#
+# 没有这个文件时，Windows 上 git 的 core.autocrlf 默认是 true：检出时把仓库里的 \n
+# 全部换成 \r\n。而这个仓库有 **845 处按源码文本断言**的 JS 测试（SRC.includes /
+# extractFn / CODE 切片）和 **125 处** Rust 侧 include_str! / read_to_string 的源码断言 ——
+# 它们全都建立在「文件里是 \n」这个前提上。行尾一变，整片测试同时红，
+# 而且红得毫无道理可言（断言说「找不到这段代码」，可代码明明就在那儿）。
+#
+# 这也是「测试从没在 Windows 上跑通过」这件事里，最可能的单一大面积原因。
+#
+# `* text=auto eol=lf` 的含义：git 认为是文本的文件，工作区里一律 LF。
+# 二进制文件由下面的 binary 规则兜住，不会被误改。
+* text=auto eol=lf
+
+# 这些必须逐字节保真：改一个字节就是另一个文件。
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.dmg   binary
+*.msi   binary
+*.exe   binary
+*.dll   binary
+*.node  binary
+*.wasm  binary
+*.sqlite3 binary
+
+# sidecar 二进制是手工编、手工提交的（automation-server-*），
+# 任何行尾转换都会把可执行文件破坏掉。
+ide/src-tauri/binaries/** binary
+
+# Windows 批处理必须是 CRLF，否则 cmd.exe 解析会出怪问题。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# shell 脚本必须是 LF，否则 `#!/usr/bin/env bash` 后面跟一个 \r，
+# 内核找不到解释器，报 "bad interpreter"。
+*.sh    text eol=lf
