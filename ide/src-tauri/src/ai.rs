@@ -203,6 +203,9 @@ pub struct AiConfig {
     pub ide_run_id: Option<String>,
     /// 会话级亲和键，见发头处的注释。
     pub ide_session_id: Option<String>,
+    /// 会话开场那句用户请求，base64(UTF-8)。网关压缩时用它当「原始目标」，
+    /// 而不是从已被截断的请求体里现算（那样第二个压缩轮起就指着一句半路的话）。
+    pub ide_session_goal: Option<String>,
     #[serde(default)]
     pub ide_step_index: Option<i64>,
     #[serde(default)]
@@ -644,6 +647,25 @@ async fn read_sse_text(
                 || v["type"] == "response.completed"
                 || v["type"] == "response.incomplete"
             {
+                // xAI Responses 的停止原因既不在 choices 里也不在 delta 里，而在这一帧的
+                // response.status / incomplete_details.reason 上。不认它，这条路上的
+                // finishReason 恒为空串 —— 而它是**唯一**能分清「模型什么都没产出」和
+                // 「产到一半被输出预算截断」的信号，_billableAiComplete 的补余量重试
+                // （_finish(out) === "length"）就永远不触发，表现成「这个模型答得就是短」。
+                //
+                // 判据和 protocol.rs 那条流式解码逐字同源（见
+                // xai_truncated_response_reports_length_not_stop）：先看
+                // incomplete_details.reason == "max_output_tokens"，再退到帧类型本身。
+                if finish.is_empty() {
+                    if v.pointer("/response/incomplete_details/reason").and_then(serde_json::Value::as_str)
+                        == Some("max_output_tokens")
+                        || v["type"] == "response.incomplete"
+                    {
+                        finish = "length".to_string();
+                    } else if v["type"] == "response.completed" {
+                        finish = "stop".to_string();
+                    }
+                }
                 saw_done = true;
             }
         }
@@ -769,6 +791,16 @@ fn with_ide_headers(rb: reqwest::RequestBuilder, config: &AiConfig) -> reqwest::
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     }) {
         rb = rb.header("x-ide-session-id", session_id);
+    }
+    // 只校验它是合法 base64 字符集且有界：内容是用户原话，网关那边解码后自己再截。
+    if let Some(goal) = config.ide_session_goal.as_deref().filter(|value| {
+        !value.is_empty()
+            && value.len() <= 8192
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    }) {
+        rb = rb.header("x-ide-session-goal", goal);
     }
     if let Some(step_index) = config
         .ide_step_index
@@ -1330,6 +1362,7 @@ mod ide_header_tests {
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
+            ide_session_goal: None,
             reasoning_effort: None,
             thinking_budget: None,
             thinking_effort: None,
@@ -1712,6 +1745,7 @@ mod stream_timeout_tests {
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             ide_session_id: None,
+            ide_session_goal: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
             thinking_budget,
             thinking_effort: None,

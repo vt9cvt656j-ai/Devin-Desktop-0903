@@ -85,9 +85,24 @@ export function detectLinter(files, manifest = null) {
  * 返回 null 表示「这一批里没有这个 linter 管得着的文件」——调用方据此整个跳过，
  * 而不是跑一次全仓扫描。全仓扫描在交错验证里是不可接受的：几秒预算，几万个文件。
  */
-export function lintCommand(linter, relPaths) {
+/**
+ * 落回仓库相对路径。
+ *
+ * 调用方给的路径**两种都有**：抓 baseline 那次是模型填的原始 `call.path`（通常相对），
+ * 开阻断门那次是 `call._resolvedPath`（一定绝对）。两次给同一个 linter 喂不同形状的
+ * 路径，轻则报告里路径不一致、baseline 抵扣对不上，重则像 go vet 那样直接拼出非法参数。
+ */
+function _relativeTo(root, path) {
+  const p = String(path || "").replace(/\\/g, "/");
+  const r = String(root || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  if (r && p.toLowerCase().startsWith(r.toLowerCase() + "/")) return p.slice(r.length + 1);
+  return p;
+}
+
+export function lintCommand(linter, relPaths, root = "") {
   const files = (Array.isArray(relPaths) ? relPaths : [])
-    .filter((rel) => linter?.langs?.has?.(_extOf(rel)));
+    .filter((rel) => linter?.langs?.has?.(_extOf(rel)))
+    .map((rel) => _relativeTo(root, rel));
   if (!linter || !files.length) return null;
   switch (linter.id) {
     case "eslint":
@@ -102,9 +117,19 @@ export function lintCommand(linter, relPaths) {
     case "ruff":
       return { program: "ruff", args: ["check", "--output-format", "json", "--quiet", ...files] };
     case "golangci-lint":
-      return { program: "golangci-lint", args: ["run", "--out-format", "json", ...files] };
+      // **刻意不带格式标志。** v1 的 `--out-format json` 在 v2 里已经删掉（实测 2.13.1
+      // 报 `unknown flag: --out-format`、退出码 3、stdout 空），而 v2 换成了
+      // `--output.json.path`。两个版本都在用，写死任一个都会让另一半用户上恒不可用。
+      // 默认文本输出 `file:line:col: message (linter)` 在**两个大版本上都一样**，
+      // 而下面的行格式解析本来就认它 —— 少一个会随上游漂的判据。
+      return { program: "golangci-lint", args: ["run", ...files] };
     case "go-vet":
       // go vet 吃的是包，不是文件；给它文件所在的目录（去重）。
+      //
+      // 传进来的可能是**绝对路径**（阻断门那次调用喂的是 `_resolvedPath`）。
+      // 直接拼 `./` + 绝对路径会得到 `.//Users/...` 这种非法包模式，go 报
+      // `lstat …: no such file or directory`，整条腿在所有 Go 仓库上恒不可用。
+      // 所以这里必须先落回仓库相对路径 —— 见 `_relativeTo`。
       return { program: "go", args: ["vet", ...[...new Set(files.map((f) => {
         const at = String(f).lastIndexOf("/");
         return at > 0 ? `./${f.slice(0, at)}/...` : "./...";
@@ -167,14 +192,26 @@ export function parseLintErrors(linterId, stdout) {
   if (linterId === "biome") {
     for (const d of parsed?.diagnostics || []) {
       if (String(d?.severity || "").toLowerCase() !== "error") continue;
-      out.push(_finding(d?.location?.path?.file, d?.location?.span?.[0], d?.category, d?.description));
+      // **两个大版本的形状不一样，两边都认。** 实测：
+      //   2.5.10 → location.path 是**裸字符串**，行号在 location.start.line，正文叫 message
+      //   1.9.4  → location.path 是 {file}，location.span 是**字节偏移**二元组，正文叫 description
+      // 上一版按 1.x 写、还把 span[0] 当行号（那在 1.x 上也是错的），于是在 2.x 上
+      // 每条 error 解析成「空文件名 + 空正文 + 行号 0」，阻断门照开、模型收到一条
+      // 定位不到也读不懂的错误；findingKey 还因此塌成「|规则|」，把新引入的真错静默抵扣掉。
+      const loc = d?.location || {};
+      const file = typeof loc.path === "string" ? loc.path : loc.path?.file;
+      out.push(_finding(file, loc.start?.line, d?.category, d?.message ?? d?.description));
     }
     return out;
   }
   if (linterId === "oxlint") {
     for (const d of parsed?.diagnostics || []) {
       if (String(d?.severity || "").toLowerCase() !== "error") continue;
-      out.push(_finding(d?.filename, d?.labels?.[0]?.span?.offset, d?.code, d?.message));
+      // span 里 line/column/offset 三个字段都在（实测 oxlint 1.80.0）。
+      // 上一版取的是 offset —— 字节偏移，量级是行号的几十倍：小文件里指向不存在的行，
+      // 大文件里指向一个**存在但完全无关**的行，而模型被明确要求去那儿修。
+      const _span = d?.labels?.[0]?.span || {};
+      out.push(_finding(d?.filename, _span.line, d?.code, d?.message));
     }
     return out;
   }

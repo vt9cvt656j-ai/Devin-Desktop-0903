@@ -78,7 +78,11 @@ fn is_allowed(program: &str) -> bool {
 
 /// 跑一次 linter 并把原始输出交回去。**不解析、不判断**——解析在 JS 侧
 /// （src/agent/project-lint.js），那里是纯函数、可测、可变异验证。
-#[tauri::command]
+///
+/// `async` 不是可选的：这条命令有 8 秒硬超时，而 Tauri 的**同步**命令跑在主线程上，
+/// 也就是 UI 线程。同步版本会让每一批改动之后整个界面冻住最多 8 秒——比它要解决的
+/// 问题还严重。标了 async 之后 Tauri 把它派到异步运行时，界面不受影响。
+#[tauri::command(async)]
 pub fn project_lint_run(program: String, args: Vec<String>, cwd: String) -> LintOutput {
     if !is_allowed(&program) {
         return LintOutput::failed(format!("程序不在 lint 白名单里：{program}"));
@@ -86,25 +90,48 @@ pub fn project_lint_run(program: String, args: Vec<String>, cwd: String) -> Lint
     if cwd.trim().is_empty() {
         return LintOutput::failed("没有工作目录");
     }
+    // **必须走 process_util，不能用裸 Command::new。** 这是本仓已经踩过并修好的坑，
+    // 它同时打掉过 LSP、MCP 和 F5 调试三块，而这里是个新调用点、没接上：
+    //
+    //   · PATH：GUI 启动的应用拿到的 PATH 很窄（Finder 里双击打开时基本只有
+    //     /usr/bin:/bin:/usr/sbin:/sbin），nvm / volta / homebrew / 用户级 npm 前缀
+    //     全不在里面 —— 也就是**打包发出去之后**这条腿必然一个 linter 都起不来，
+    //     而开发机上从终端 `npm run tauri dev` 起的时候一切正常，看不出来。
+    //   · PATHEXT：Windows 的 CreateProcessW 只给无扩展名的名字补 `.exe`、不查 PATHEXT，
+    //     而 npm 装出来的是 `npx.cmd` —— eslint/biome/oxlint 三条 JS 腿在 Windows 上
+    //     结构性哑掉。resolve_command 就是为这件事写的。
+    //
+    // 白名单在**解析之前**判（判的是调用方给的裸名字），所以解析出绝对路径不会绕过它。
+    let resolved = crate::process_util::resolve_command(&program, Some(cwd.as_str()));
     // 参数一律原样传给 exec，不经过 shell。所以这里不需要转义，也**不能**有转义——
     // 加转义反而会让 `--ext=.ts,.tsx` 这种带逗号的参数被改写。
-    let mut command = std::process::Command::new(&program);
+    let mut command = crate::process_util::command(&resolved);
     command
         .args(&args)
         .current_dir(&cwd)
+        .env("PATH", crate::process_util::augmented_path(Some(cwd.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
+    // 自成进程组：超时要杀的是**整棵子树**。`npx eslint` 起的是 node，真正干活的是孙进程，
+    // 只 kill 直接子进程的话 npx 退出而 eslint 还在跑，读管道的两个线程也跟着挂住。
+    #[cfg(unix)]
     {
-        use std::os::windows::process::CommandExt;
-        // 不要弹出控制台窗口：这条命令每批改动后都会跑一次。
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        use std::os::unix::process::CommandExt;
+        // Safe：pre_exec 里只调 setsid()，异步信号安全，不分配、不加锁。
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
     let child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return LintOutput::failed(format!("启动失败：{err}")),
     };
+    #[cfg(unix)]
+    let pgid = child.id() as i32;
     match crate::env_probe::wait_with_timeout_pub(child, LINT_TIMEOUT) {
         Some(out) => LintOutput {
             code: out.status.code().unwrap_or(-1),
@@ -112,7 +139,15 @@ pub fn project_lint_run(program: String, args: Vec<String>, cwd: String) -> Lint
             stderr: String::from_utf8_lossy(&out.stderr).to_string(),
             note: String::new(),
         },
-        None => LintOutput::failed(format!("超时（{}ms）", LINT_TIMEOUT.as_millis())),
+        None => {
+            // wait_with_timeout 只 kill 了直接子进程。整个进程组也要收掉，
+            // 否则一个卡住的 eslint 会一直占着 CPU 和文件锁，而我们已经不看它了。
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            LintOutput::failed(format!("超时（{}ms）", LINT_TIMEOUT.as_millis()))
+        }
     }
 }
 
@@ -174,7 +209,18 @@ mod tests {
                 "lint 执行路径经过了 shell（{shell}）—— 白名单只管程序名，参数会被 shell 重新解释"
             );
         }
-        assert!(prod.contains("Command::new(&program)"), "启动的必须是白名单校验过的那个程序名");
+        assert!(
+            prod.contains("crate::process_util::command(&resolved)"),
+            "没走 process_util —— GUI 启动时 PATH 很窄，打包发出去之后一个 linter 都起不来"
+        );
+        assert!(
+            prod.contains("crate::process_util::resolve_command(&program"),
+            "没解析命令名 —— Windows 上 npx.cmd 找不到，三条 JS 腿结构性哑掉"
+        );
+        assert!(
+            prod.contains("#[tauri::command(async)]"),
+            "同步命令跑在 UI 线程上，8 秒超时会把界面冻住"
+        );
     }
 
     /// 真跑一次白名单里的程序，确认输出和退出码是原样交回的。

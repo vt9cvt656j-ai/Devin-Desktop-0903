@@ -780,8 +780,8 @@ test("the linker catches the defects it was written for", () => {
       // 同一道门的第二条腿：语法和类型干净、项目自己的规则报错的那条路。
       // 它是"业务逻辑错误实时知道"唯一的机械来源，断了不会有任何报错。
       why: "B1b — the project-linter leg stops reaching the same gate",
-      src: mutate('run._diagnosticBlock = _noProgressVerify < 2 ? _lintReportText : "";', 'run._diagnosticBlock = "";'),
-      check: (s) => /run\._diagnosticBlock\s*=\s*_noProgressVerify\s*<\s*2\s*\?\s*_lintReportText/.test(s),
+      src: mutate('run._diagnosticBlock = _noProgressLint < 2 ? _lintReportText : "";', 'run._diagnosticBlock = "";'),
+      check: (s) => /run\._diagnosticBlock\s*=\s*_noProgressLint\s*<\s*2\s*\?\s*_lintReportText/.test(s),
     },
     {
       why: "S3 — a decision verdict is computed and discarded",
