@@ -655,7 +655,26 @@ pub fn get() -> &'static KnowledgeIndex {
 
 /// BM25 search over the corpus. `domain` optionally restricts to one domain.
 pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit> {
-    search_inner(query, domain, top_k, None)
+    search_inner(query, domain, top_k, None, None)
+}
+
+/// 和 `search` 一样，但**排除某一个域**。
+///
+/// 唯一的用处是「无域自动检索」那条路：它只有 2 个名额，而 michael-design 一个域
+/// 就占了全库 52%（468/893 段），实测 10 条真实中文建站/写工具请求，设计段拿走 13/20。
+/// 于是「做个网站」拿回来的两段全是配色克制和信任信号，而 Database Selection
+/// Decision Tree、Service Decomposition Rules、ORM & Driver Selection 一条都进不来 ——
+/// 架构和选型全凭模型印象。
+///
+/// 设计活**另有专属注入通道**（design_knowledge_block），它在这条路上占名额是纯重复。
+/// 排除的是过滤不是打分，限定域的路径和那条专属通道都不受影响。
+pub fn search_excluding(
+    query: &str,
+    domain: Option<&str>,
+    top_k: usize,
+    exclude_domain: &str,
+) -> Vec<SearchHit> {
+    search_inner(query, domain, top_k, None, Some(exclude_domain))
 }
 
 /// Like `search`, but the caller controls the per-hit text cap (bytes, truncated on a
@@ -668,7 +687,7 @@ pub fn search_with_cap(
     top_k: usize,
     cap: usize,
 ) -> Vec<SearchHit> {
-    search_inner(query, domain, top_k, Some(cap))
+    search_inner(query, domain, top_k, Some(cap), None)
 }
 
 fn search_inner(
@@ -676,6 +695,7 @@ fn search_inner(
     domain: Option<&str>,
     top_k: usize,
     cap_override: Option<usize>,
+    exclude_domain: Option<&str>,
 ) -> Vec<SearchHit> {
     const K1: f64 = 1.5;
     const B: f64 = 0.75;
@@ -709,6 +729,14 @@ fn search_inner(
     for (i, c) in idx.chunks.iter().enumerate() {
         if let Some(ref d) = resolved_domain {
             if c.domain.to_lowercase() != *d {
+                continue;
+            }
+        }
+        // 排除某个域。只在「无域自动检索」那条路上用，见 `search_excluding`。
+        // 放在打分**之前**：这是过滤，不是降权 —— 降权会让它在别的段都不相关时
+        // 又冒出来，而它在这条路上占名额本来就是纯重复。
+        if let Some(ex) = exclude_domain {
+            if c.domain.eq_ignore_ascii_case(ex) {
                 continue;
             }
         }
@@ -928,6 +956,55 @@ mod design_share_guard {
             share <= 0.25,
             "设计蓝本抢走了 {:.1}% 的无域名额（{design}/{total}）——实测基线是 6.2%。\n             涨到这个程度就该给 search 加一个排除 michael-design 的信号了：\n             设计活另有专属注入通道，它在这里占名额是纯损失。",
             share * 100.0
+        );
+    }
+
+    /// 上面那条守卫量的是**英文架构黑话**，而真实用户说的是中文。
+    ///
+    /// 用 10 条真实形状的中文请求量出来，设计段占 65%（13/20），远超那条 25% 的线 ——
+    /// 也就是说守卫存在、却一直在量另一个查询分布，从没响过。
+    /// 现在无域那条路会排除 michael-design（`search_excluding`），这条测的是它真的生效。
+    #[test]
+    fn the_domain_less_path_leaves_room_for_architecture() {
+        let real_requests = [
+            "做个网站",
+            "帮我写个命令行工具",
+            "做一个会员系统",
+            "写个后台管理",
+            "做个博客",
+            "帮我搭个 API 服务",
+            "做个小程序后端",
+            "写个数据同步脚本",
+            "做个多租户的排班系统",
+            "帮我做个电商下单流程",
+        ];
+        let mut design = 0usize;
+        let mut total = 0usize;
+        for q in real_requests {
+            for h in super::search_excluding(q, None, 2, "michael-design") {
+                total += 1;
+                if h.domain == "michael-design" {
+                    design += 1;
+                }
+            }
+        }
+        assert!(total >= 8, "只命中 {total} 个名额，这条测试失去落点（语料没加载？）");
+        assert_eq!(
+            design, 0,
+            "无域路径还是让设计蓝本占了 {design}/{total} 个名额 —— \n             架构和选型的段进不来，用户看到的是「配色讲得很细、技术选型全凭印象」",
+        );
+
+        // 上面测的是这个函数的行为；这一条钉的是**调用点真的在用它**。
+        // 少了这条，把 prompts.rs 那边改回 `search(...)` 照样全绿，而线上就退回原样了。
+        let call_site = include_str!("prompts.rs");
+        assert!(
+            call_site.contains("crate::knowledge::search_excluding(&query, domain, max_hits, \"michael-design\")"),
+            "无域自动检索那条路没在用排除版 —— 设计蓝本会继续占掉那 2 个名额",
+        );
+        // 而且**只在无域时**排除：限定了域的请求（包括明确要 michael-design 的）不受影响。
+        assert!(
+            call_site.contains("let hits = if domain.is_some() {"),
+            "排除没有限定在无域那一支 —— 明确要设计知识的请求会被一起挡掉",
         );
     }
 }

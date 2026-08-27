@@ -1343,15 +1343,29 @@ fn latest_user_request(body: &serde_json::Value) -> Option<String> {
 /// `latest_user_request`. The visible symptom was worse than the cost — a session that opened with
 /// "fix the GUI and run it" carried the michael-design block on turn 1 and had silently dropped it
 /// by turn 20, because the newest message no longer looked like UI work.
-fn session_anchor_request(body: &serde_json::Value) -> Option<String> {
+pub(crate) fn session_anchor_request(body: &serde_json::Value) -> Option<String> {
     let msgs = body.get("messages")?.as_array()?;
-    for m in msgs.iter() {
-        if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+    let user_texts = || {
+        msgs.iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter_map(user_message_text)
+    };
+
+    // **一趟，从最早那条开始。**
+    //
+    // 这里曾经改成过两趟（先整轮找「最早一条带标记的」，找不到再退回无标记）。那是错的，
+    // 而且错得很隐蔽：客户端**只给本轮那一条**套请求分隔符，历史里回放的用户消息全是裸文本
+    // （main.js 的 memory.push 存的是原文，_memoryMessagesForModel 也不补标记）。于是
+    // 「最早一条带标记的」= 全场唯一带标记的 = 本轮那条，`session_anchor_request` 直接退化成
+    // `latest_user_request` —— 锚点每轮都变，而它的产物在系统前缀里，整段缓存逐轮作废
+    // （本文件另有实测：这类抖动把 120k token 请求的命中率打到 2%）。
+    //
+    // 真正要挡的是「锚点落在 harness 写的编排笔记上」。那个判据不该靠"有没有标记"，
+    // 而该直接认那些笔记自己的开头标记 —— 它们是客户端发的、字节固定的（见下面的常量）。
+    for text in user_texts() {
+        if is_harness_orchestration_note(&text) {
             continue;
         }
-        let Some(text) = user_message_text(m) else { continue };
-        // Prefer the marked request: the IDE wraps the real ask in a large project preamble, and
-        // retrieval must not search that blob.
         if let Some(marked) = extract_marked_user_request(&text) {
             if !marked.trim().is_empty() {
                 return Some(marked);
@@ -1364,6 +1378,22 @@ fn session_anchor_request(body: &serde_json::Value) -> Option<String> {
         }
     }
     None
+}
+
+/// 这条 user 消息是 harness 自己写的编排笔记吗。
+///
+/// role=user 的消息里有一大半不是人打的：运行进度草稿纸、交付事实回执、编排提示。
+/// 它们全带着客户端固定的开头标记，所以这道判据是**字节级**的，不靠猜措辞。
+/// 常量必须和客户端逐字一致（ide/src/main.js 的 `_ORCH_NOTE` / `_DELIVERY_FACTS_TAG` /
+/// 草稿纸那个前缀），改一头就是这道判据静默失效。
+fn is_harness_orchestration_note(text: &str) -> bool {
+    const HARNESS_PREFIXES: [&str; 3] = [
+        "〔系统编排提示——这不是用户发言",
+        "[本轮交付事实]",
+        "[运行进度草稿纸",
+    ];
+    let head = text.trim_start();
+    HARNESS_PREFIXES.iter().any(|p| head.starts_with(p))
 }
 
 /// Put request-specific runtime context immediately before the latest real user content. Keeping
@@ -1403,6 +1433,39 @@ fn prepend_runtime_context_to_latest_user(
         }
         _ => false,
     }
+}
+
+/// 会话是不是还停在开场白：只有一条 user 消息，且此前没有任何助手回合或工具结果。
+///
+/// 这是给 `is_context_only_location_statement` 那条早退兜底的结构判据。那条判据靠词表，
+/// 词表会漏；这条只看对话形状，用户换什么措辞都改不动它。
+fn is_opening_user_turn(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(|value| value.as_array()) else {
+        return false;
+    };
+    let mut user_turns = 0usize;
+    for message in messages {
+        match message.get("role").and_then(|role| role.as_str()) {
+            Some("user") => {
+                user_turns += 1;
+                // tool_result 是以 user 消息承载的，出现即说明已经跑过工具。
+                let has_tool_result = message
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(|kind| kind.as_str()) == Some("tool_result")
+                        })
+                    });
+                if has_tool_result {
+                    return false;
+                }
+            }
+            Some("assistant") => return false,
+            _ => {}
+        }
+    }
+    user_turns == 1
 }
 
 /// A location statement supplies conversation context; it is not permission to geocode, browse,
@@ -1473,8 +1536,12 @@ fn is_context_only_location_statement(query: &str) -> bool {
         return false;
     }
 
-    let address_shape = value.chars().any(|ch| ch.is_ascii_digit())
-        || [
+    // 这里**刻意不把「句中有任意 ASCII 数字」当成地址证据**。数字是这道判据历史上唯一的
+    // 误判来源：行号、版本号、端口号、楼层、第 N 版全是数字，而上面那张 looks_technical
+    // 是手工黑名单、永远补不全（「我在做第 2 版」既不含表里任何词、又有数字，旧判据直接
+    // 命中，于是整轮被摘掉工具表）。改成必须出现真正的行政区划/街道/地标词 —— 少认几句
+    // 「我在北京」只是退回常规处理，零损失；多认一句工程话则是整轮赤手空拳。
+    let address_shape = [
             "省",
             "市",
             "区",
@@ -2043,7 +2110,7 @@ fn user_local_time_block_at(headers: &HeaderMap, now_utc: chrono::DateTime<chron
 /// 原本是裸的 `take(n)`：蓝本被切在 `bg-` 这种半截 class 串上，模型看不出这是被截断的，
 /// 于是把半截规格当成完整规格照抄——按钮没有背景色、卡片没有 hover、区块只有上半段。
 /// 切点也退到最近的换行/空格边界，别停在一个 CSS 声明中间。
-fn bounded_chars(text: &str, max_chars: usize) -> String {
+pub(crate) fn bounded_chars(text: &str, max_chars: usize) -> String {
     let mut count = 0usize;
     let mut cut = text.len();
     for (idx, _) in text.char_indices() {
@@ -2116,7 +2183,17 @@ fn auto_knowledge_block_for_semantic_task(
     user_request: Option<&str>,
     domain: Option<&str>,
 ) -> Option<AutoKnowledgeInjection> {
-    if mode != "agent" {
+    // 语料对 plan / reviewer 同样成立，而且是**最该有的两个模式**：
+    //
+    // - plan 正是技术选型发生的地方。选型定错，后面 agent 模式拿到再多参考也只是在错的
+    //   栈上写对的代码。此前 plan 一段都拿不到，「用什么数据库 / 怎么拆服务 / 选哪个 ORM」
+    //   全凭模型印象——而 Database Selection Decision Tree、Service Decomposition Rules
+    //   这些段就躺在库里没人读。
+    // - reviewer 要认代码里的 bug 和漏洞，这恰恰最吃领域参考（HIPAA、鉴权、注入面……）。
+    //
+    // chat / explorer 不放：那是对话和浏览，不做工程判断，1-2KB 的前缀在那里是纯负担。
+    // 门本身没放宽——仍然要 engineering 旗标 + 命中分数下限，零命中时块整个不出现。
+    if !matches!(mode, "agent" | "plan" | "reviewer") {
         return None;
     }
     let request = user_request?.trim();
@@ -2129,7 +2206,21 @@ fn auto_knowledge_block_for_semantic_task(
         AUTO_KNOWLEDGE_MAX_HITS
     };
     let query = bounded_chars(request, AUTO_KNOWLEDGE_MAX_QUERY_CHARS);
-    let hits = crate::knowledge::search(&query, domain, max_hits)
+    // **无域时排除设计蓝本。**
+    //
+    // 这条路只有 2 个名额（`max_hits`），而 michael-design 一个域就占全库 52%
+    // （468/893 段）。实测 10 条真实中文建站/写工具请求，设计段拿走 13/20 ——
+    // 「做个网站」拿回来的两段全是配色克制和信任信号，而 Database Selection
+    // Decision Tree、Service Decomposition Rules、ORM & Driver Selection 一条都进不来。
+    // 用户看到的是：架构和选型全凭模型印象，而配色纪律被反复说。
+    //
+    // 设计活另有专属注入通道（design_knowledge_block），它在这里占名额是纯重复。
+    // 限定了域的请求不受影响（那是用户/画像明确要的域，包括明确要 michael-design）。
+    let hits = if domain.is_some() {
+        crate::knowledge::search(&query, domain, max_hits)
+    } else {
+        crate::knowledge::search_excluding(&query, domain, max_hits, "michael-design")
+    }
         .into_iter()
         .filter(|hit| hit.score >= AUTO_KNOWLEDGE_MIN_SCORE)
         .take(max_hits)
@@ -3747,8 +3838,25 @@ fn ide_run_telemetry(headers: &HeaderMap) -> (String, String, String) {
     (h("x-ide-run-id"), h("x-ide-step-index"), h("x-ide-step-kind"))
 }
 
+/// 「这个请求体已经组装过了，别再组装一遍」。
+///
+/// 网关内部重发时（断流之后换个出口重来）会带上它。
+pub const ALREADY_ASSEMBLED_HEADER: &str = "x-ide-assembled";
+
 pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Result<(), String> {
     let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
+    // **幂等闸。**
+    //
+    // 这个函数对 system 是无条件 `insert(0)`，没有任何「已经加过了」的判据。
+    // 网关内部重发一个**已经组装过**的请求体时，整份系统提示词会被插第二遍 ——
+    // 上游前缀在第二个块就分叉，整段对话（agent 场景常十几万 token）按未命中缓存的
+    // 全价重算，还要再付一次缓存写入。本该几乎白送的重发变成整轮里最贵的一发。
+    //
+    // 这个坑是真踩过的：断流续写第一版就是「再走一遍入口」，上线后才查出来。
+    // 判据放在函数最前面，因为下面每一条注入路径都要被它挡住，漏一条就等于没有。
+    if hdr(ALREADY_ASSEMBLED_HEADER).is_some_and(|v| !v.trim().is_empty()) {
+        return Ok(());
+    }
     let mode = match hdr("x-ide-mode") {
         Some(m) if !m.is_empty() => m,
         _ => return Ok(()), // not opted in → leave the request exactly as the client sent it
@@ -3809,9 +3917,14 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
     // 的理由」那条）一个字节都发不出去。对真的只报了个地址的用户，这是刻意的（下面
     // address_context_does_not_activate_research_or_unrelated_specializations 钉着）；
     // 危险的是**误命中**，所以判据里那道工程否决不能删。
-    let context_only = user_request
-        .as_deref()
-        .is_some_and(is_context_only_location_statement);
+    // 词表判据再怎么补都是黑名单，而这条早退的代价是**整轮没有工具**。所以再加一道
+    // 词汇改不动的结构判据：只有「对话的第一句」能走这条路。会话里一旦已经有过助手回合
+    // 或工具结果，就说明这是一段进行中的工作，此时一句像在报位置的话是上下文，
+    // 不构成把工具表摘掉的理由 —— 误判的爆炸半径被钉死在开场白那一句上。
+    let context_only = is_opening_user_turn(body)
+        && user_request
+            .as_deref()
+            .is_some_and(is_context_only_location_statement);
     if context_only {
         // This is a server-side capability boundary, not merely a prompt preference. Remove both
         // client-provided runtime/MCP schemas and any chance of static schema injection below.
@@ -4022,7 +4135,12 @@ pub fn assemble_into(headers: &HeaderMap, body: &mut serde_json::Value) -> Resul
         //
         // 研究类请求的行为不变：research 旗标照旧路由 graph.agent.research 模块，那是
         // 另一条路，这里放宽不动它。
-        if engineering_intent {
+        // 这里刻意**不用** `engineering_intent`：那个变量身上绑着 `mode == "agent"`，
+        // 因为它还要决定 agent.engineering 提示词模块挂不挂，而模块只存在于 agent 基座。
+        // 语料是另一件事，plan/reviewer 同样该有（见
+        // auto_knowledge_block_for_semantic_task 的注释）。模式判据**只写在那一处**，
+        // 这里只判旗标 —— 两处各写一份模式名单迟早会分叉。
+        if semantic("engineering") {
             // 域只能来自画像旗标。这里不看 knowledge_query 一个字——网关不分类，只被告知。
             knowledge_domain = semantic_knowledge_domain(&semantic_profile);
             if let Some(injected) = auto_knowledge_block_for_semantic_task(
@@ -6185,6 +6303,75 @@ mod tests {
         // 真的只报了个位置，仍然要命中——上面那条早退对它是刻意的。
         assert!(is_context_only_location_statement("我目前在上海胶州路282号"));
         assert!(is_context_only_location_statement("我现在在北京朝阳区"));
+
+        // 这几条是**旧判据真的会误杀**的形状：一个 looks_technical 词都不含，却有数字。
+        // 旧的 address_shape 把「句中有任意 ASCII 数字」当地址证据，于是全部命中。
+        for statement in [
+            "我在做第 2 版",
+            "我在 3 楼",
+            "我们在跑第 5 轮",
+            "我在等那 2 个人回消息",
+        ] {
+            assert!(
+                !is_context_only_location_statement(statement),
+                "数字被当成地址证据了，这一轮会被摘掉全部工具：{statement}"
+            );
+        }
+    }
+
+    /// 词表判据永远补不全，所以这条早退还有一道**词汇改不动的结构判据**：只有对话的
+    /// 第一句能触发它。这条测的是结构判据本身 —— 同一句地址，开场白命中、
+    /// 对话已经开始之后不命中。
+    #[test]
+    fn only_the_opening_turn_can_strip_the_tool_table() {
+        let address = "我目前在上海胶州路282号";
+        assert!(
+            is_opening_user_turn(&serde_json::json!({
+                "messages": [{"role": "user", "content": address}]
+            })),
+            "开场白应当仍然走得通，否则真报地址的用户拿不到那条克制指引"
+        );
+        // 已经有过助手回合 —— 这是一段进行中的工作。
+        assert!(!is_opening_user_turn(&serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "帮我看下这个项目"},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": address}
+            ]
+        })));
+        // 只有一条 user 消息、但前面已经有助手回合（例如客户端把开场白折进了助手侧）：
+        // 光看 user 条数是数不出来的，必须真的把助手回合当成「进行中」的证据。
+        assert!(!is_opening_user_turn(&serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": "我可以帮你看这个项目"},
+                {"role": "user", "content": address}
+            ]
+        })));
+        // 跑过工具。这里刻意用**单条** user 消息同时装 tool_result 和正文 ——
+        // 这正是 Anthropic 协议的真实形状，光数 user 条数会把它当成开场白。
+        assert!(!is_opening_user_turn(&serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                {"type": "text", "text": address}
+            ]}]
+        })));
+        // 多轮用户消息也算进行中。
+        assert!(!is_opening_user_turn(&serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "在吗"},
+                {"role": "user", "content": address}
+            ]
+        })));
+
+        // 钉住调用点：早退必须由这道结构判据把门，否则这个函数存在也白存在。
+        // 只取第一个测试模块**之前**的正文。用 rfind 会把本模块自己也算进去，
+        // 于是断言匹配到的是它自己那行字符串字面量，改坏产品代码也照样绿。
+        let raw = include_str!("prompts.rs");
+        let src = &raw[..raw.find("\nmod tests {").unwrap_or(raw.len())];
+        assert!(
+            src.contains("let context_only = is_opening_user_turn(body)"),
+            "早退没被结构判据把门 —— 词表一漏就是整轮赤手空拳"
+        );
     }
 
     #[test]
@@ -7188,6 +7375,125 @@ mod tests {
             "how should I react to this issue in my life",
         ] {
             assert!(!looks_like_engineering_diagnostic(ordinary_question));
+        }
+    }
+
+    /// 会话锚点决定了整轮系统前缀（工程语料检索 query、设计蓝本判断）围着哪句话转，
+    /// 而 role=user 的消息里有一大半是 harness 写的编排笔记。这条测的是：
+    /// 只要会话里存在人真正打的那句（带 IDE 请求分隔符），锚点就必须落在它上面，
+    /// 哪怕它排在编排笔记后面。
+    #[test]
+    fn the_session_anchor_skips_harness_orchestration_notes() {
+        let real = "帮我做一个多租户 SaaS 的后端";
+        let wrapped = format!(
+            "项目上下文：这是一个 Rust 仓库，有 214 个文件……\n\n{}\n\n{}",
+            USER_REQUEST_BOUNDARY_PREFIX, real
+        );
+        // 编排笔记在前，人真正打的那句在后 —— 这是续跑轮的真实形状。
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "[本轮交付事实]\n本轮改动 3 个文件，测试 941 通过。"},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": wrapped},
+            ]
+        });
+        assert_eq!(
+            session_anchor_request(&body).as_deref(),
+            Some(real),
+            "锚点落在了 harness 的编排笔记上 —— 整轮的语料检索都会围着一句交付回执转"
+        );
+
+        // **锚点必须是最早那条人话，不是最新那条。**
+        //
+        // 这条守的是一次已经犯过的回归：把「先整轮找带标记的」当判据，而客户端只给
+        // 本轮那一条套分隔符（历史里回放的用户消息全是裸文本），于是锚点=最新一条，
+        // session_anchor_request 直接退化成 latest_user_request，系统前缀逐轮作废。
+        let multi_turn = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "帮我做一个多租户 SaaS 的后端"},
+                {"role": "assistant", "content": "好的"},
+                {"role": "user", "content": format!(
+                    "项目上下文：……\n\n{}\n\n{}", USER_REQUEST_BOUNDARY_PREFIX, "再把计费那块补上")},
+            ]
+        });
+        assert_eq!(
+            session_anchor_request(&multi_turn).as_deref(),
+            Some("帮我做一个多租户 SaaS 的后端"),
+            "锚点跟着最新一条走了 —— 它的产物在系统前缀里，每轮变一次就是整段缓存逐轮作废"
+        );
+        assert_ne!(
+            session_anchor_request(&multi_turn),
+            latest_user_request(&multi_turn),
+            "锚点和「最新请求」不该是同一个值，否则这个函数存在也白存在"
+        );
+
+        // 一条带标记的都没有（纯 API 客户端，没有 IDE 包装）：仍然退回最早那条正文，
+        // 否则这些客户端会整个失去锚点。
+        let plain = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "写个命令行工具"},
+                {"role": "assistant", "content": "好"},
+                {"role": "user", "content": "继续"},
+            ]
+        });
+        assert_eq!(
+            session_anchor_request(&plain).as_deref(),
+            Some("写个命令行工具"),
+            "无 IDE 包装的客户端不该失去锚点"
+        );
+    }
+
+    /// plan 是技术选型真正发生的地方，reviewer 是认 bug 和漏洞的地方 —— 这两个模式
+    /// 此前一段语料都拿不到。这条走的是**生产那条组装路径**（assemble_into），
+    /// 不是单测那个 `auto_knowledge_block`：门开在函数里，但块能不能落到系统提示上，
+    /// 只有走完整条路才算数。
+    #[test]
+    fn planning_and_review_modes_receive_engineering_corpus() {
+        let request = "帮我设计一个多租户 SaaS 的后端，要能扛住十万用户";
+        let mut got: Vec<&str> = Vec::new();
+        for mode in ["agent", "plan", "reviewer"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", mode.parse().unwrap());
+            headers.insert(
+                "x-ide-semantic-profile",
+                "2.5:engineering,existing_project".parse().unwrap(),
+            );
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": request}]
+            });
+            assemble_into(&headers, &mut body);
+            let sys = body["messages"][0]["content"].as_str().unwrap_or_default();
+            if sys.contains("平台知识库·与真实用户请求相关的工程参考") {
+                got.push(mode);
+            }
+        }
+        assert_eq!(
+            got,
+            vec!["agent", "plan", "reviewer"],
+            "只有 {got:?} 拿到了工程语料 —— 选型和查漏那两个模式还在凭印象做选型"
+        );
+
+        // chat / explorer 刻意不放：那是对话和浏览，不做工程判断。
+        for mode in ["chat", "explorer"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-ide-mode", mode.parse().unwrap());
+            headers.insert(
+                "x-ide-semantic-profile",
+                "2.5:engineering,existing_project".parse().unwrap(),
+            );
+            let mut body = serde_json::json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": request}]
+            });
+            assemble_into(&headers, &mut body);
+            assert!(
+                !body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("平台知识库·与真实用户请求相关的工程参考"),
+                "{mode} 模式不该背这 1-2KB"
+            );
         }
     }
 
@@ -8677,5 +8983,42 @@ mod semantic_profile_source_tests {
         assert!(src.contains(call), "装配处绕开了这个函数，自己又写了一份判据——两边会漂");
         let def = concat!("pub(crate) fn semantic_profile", "_source(headers: &HeaderMap)");
         assert_eq!(src.matches(def).count(), 1, "出现了第二份实现");
+    }
+
+    /// 组装必须幂等 —— 这条是断流重发能不能安全存在的前提。
+    ///
+    /// 这个函数对 system 是无条件 `insert(0)`。网关内部重发一个**已经组装过**的
+    /// 请求体时，整份系统提示词会被插第二遍：上游前缀在第二个块就分叉，
+    /// 整段对话（agent 场景常十几万 token）按未命中缓存的全价重算，
+    /// 还要再付一次缓存写入。本该几乎白送的重发变成整轮里最贵的一发。
+    ///
+    /// 这不是假设，是上线之后查出来的：续写第一版就是「再走一遍入口」。
+    #[test]
+    fn assembling_twice_is_a_no_op() {
+        let mut h = HeaderMap::new();
+        h.insert("x-ide-mode", axum::http::HeaderValue::from_static("agent"));
+        let base = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "写个函数"}],
+        });
+
+        // 第一次：正常组装，system 被插进去。
+        let mut once = base.clone();
+        let _ = super::assemble_into(&h, &mut once);
+        let n1 = once["messages"].as_array().map_or(0, |m| m.len());
+        assert!(n1 > 1, "第一次组装什么都没加？那这条测试测不到东西");
+
+        // 第二次（带幂等头）：一个字都不许再加。
+        let mut twice = once.clone();
+        h.insert(super::ALREADY_ASSEMBLED_HEADER, axum::http::HeaderValue::from_static("1"));
+        let _ = super::assemble_into(&h, &mut twice);
+        assert_eq!(twice, once, "带着幂等头还是组装了 —— 前缀会分叉，整段对话按全价重算");
+
+        // 没带那个头的话照旧会再插一遍 —— 这一条钉的是「闸真的在起作用」，
+        // 不是「这个函数碰巧幂等」。
+        let mut again = once.clone();
+        h.remove(super::ALREADY_ASSEMBLED_HEADER);
+        let _ = super::assemble_into(&h, &mut again);
+        assert_ne!(again, once, "没有幂等头时也不组装了？那这道闸测的是别的东西");
     }
 }

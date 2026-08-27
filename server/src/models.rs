@@ -96,6 +96,21 @@ const CHAT_UPSTREAM_MAX_ROUTES_HARD_CAP: usize = 24;
 /// 开了也来不及把答案拿回来 —— 只会把仅剩的时间烧在一个注定被 `remaining` 掐断的
 /// 请求上，然后用户既没拿到答案、又多等了这一下。
 const CHAT_UPSTREAM_MIN_TRY_WINDOW: Duration = Duration::from_secs(2);
+
+/// 因为「表头前卡死」最多换几个出口。
+///
+/// # 为什么允许换，以前不允许
+///
+/// 老规矩是「上游没把话说完就一律收手」，理由是上游**可能正在跑这次请求**，
+/// 再发一次就是重复跑模型、重复计费。那条理由对「发出去一半」成立，
+/// 但对「表头都没回来」这一种要弱得多：**客户端一个字节都没收到**，
+/// 换个出口重发对用户完全无缝 —— 他只是多等一会儿，而不是看见一个 504。
+///
+/// 线上这一类是最多的：半小时的日志里 11 次 `upstream stalled before response headers`。
+///
+/// 上限是 1：一次是「上游抖了一下」，再多就是拿钱去救一个已经等太久的请求 ——
+/// 用户那边的等待并没有省下来，而上游那几笔可能都在计费。
+const CHAT_MAX_STALL_SWITCHES: u8 = 1;
 const CHAT_UPSTREAM_ROUTE_COOLDOWN: Duration = Duration::from_secs(20);
 
 /// 「这次失败之后还有没试过的上游出口」这件事告诉客户端时用的响应头。
@@ -2648,6 +2663,17 @@ pub async fn admin_list(
     let rows = sqlx::query_as::<_, Model>("SELECT * FROM models ORDER BY sort, created_at")
         .fetch_all(&state.db)
         .await?;
+    // 派单实际认哪些模型 —— **出口自带的货也算**。
+    //
+    // 控制台原来拿 `enabled_models` 当这条线路的模型集合，那只是线路自己声明的那一份；
+    // 出口可以带线路本身没有的货（route_endpoints::effective_models 就是干这个的）。
+    // 「排序」那一屏靠它判断「哪些模型会换线」，少算就会说「没有模型会换线，所以这个
+    // 次序纯粹是显示顺序」—— 而那一屏存在的理由正是「排序会静默改变用户按谁的倍率付钱」。
+    let outlets = crate::route_endpoints::load_for_routes(
+        &state.db,
+        &rows.iter().map(|m| m.id).collect::<Vec<_>>(),
+    )
+    .await;
     let list: Vec<serde_json::Value> = rows
         .iter()
         .map(|m| {
@@ -2664,7 +2690,42 @@ pub async fn admin_list(
                 "model_names": m.model_names,
                 "model_prices": m.model_prices,
                 "model_caps": m.model_caps,
+                // 这条线路每个在售模型的**实时 OpenRouter 目录价**。
+                //
+                // 控制台原来只有点了「拉取模型」之后才拿得到实时价（走 /available），
+                // 而打开一条**已经配好**的线路时一个价都没有 —— 存的 model_caps 里只有
+                // 上下文档位，没有价。于是界面上只剩你当初填的那个数字，看不出它和现价
+                // 差了多少，也没法退回自动。价格就是这么僵住的。
+                //
+                // 这里直接从内存里的目录取（每 6 小时刷新，不发网络请求），所以列表一打开
+                // 就有，且永远是现价。
+                "catalog_prices": allowed_ids(m)
+                    .iter()
+                    .filter_map(|mid| {
+                        let e = crate::model_catalog::lookup(mid)?;
+                        let (i, o) = (e.input_price?, e.output_price?);
+                        Some((
+                            mid.clone(),
+                            json!({
+                                "in": i,
+                                "out": o,
+                                "cache_read": e.cache_read_price,
+                                "cache_write": e.cache_write_price,
+                            }),
+                        ))
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
                 "power_route": m.power_route,
+                "effective_models": crate::route_endpoints::effective_models(
+                    m,
+                    outlets.get(&m.id).map(|v| v.as_slice()).unwrap_or(&[]),
+                ),
+                // 必须下发：控制台的「关闭缓存计费」是个**受控复选框**，初值取
+                // `Boolean(conn?.cache_disabled)`。不下发的话它对任何线路都显示成没勾，
+                // 而保存时又会把 `cache_disabled: false` 原样发回来 ——
+                // 于是运营只要打开这条线路的弹窗随便改点别的再保存，就会**静默地把缓存计费重新打开**。
+                // 线上 GPT 那条线现在就是 true，正好踩在这个坑上。
+                "cache_disabled": m.cache_disabled,
                 "model_billing": m.model_billing,
                 "protocol": m.protocol,
                 "effort_passthrough": m.effort_passthrough,
@@ -4726,6 +4787,43 @@ pub(crate) fn effective_cache_prices(
 /// users). Uses ONLY the upstream's authoritative `usage`; no usage / no price → 0 (never
 /// guesses). Cache-aware (cached input 0.1×). Hard $50/call ceiling.
 #[allow(clippy::too_many_arguments)]
+/// 扫一遍上游回执的 usage，看有没有「这一笔花了多少」这种字段。
+///
+/// 各家名字不一：`cost`、`total_cost`、`cost_usd`、`quota`、`charge`、`consumed`…
+/// 发现了就打一行 INFO，字段名和值都带上 —— 那是把一家从「只能手工录」变成
+/// 「自动拿到真实进价」的入口。没发现就一句不打，不会刷屏。
+///
+/// **只观测、不参与计费。** 上游报的数是它自己的余额单位，直接当美元用会差一个
+/// 充值汇率 —— 那正是这套账里刚修过的一类错。
+fn report_upstream_cost_fields(model_id: &str, u: &serde_json::Value) {
+    const NEEDLES: [&str; 7] = ["cost", "charge", "quota", "consum", "spend", "price", "billing"];
+    let Some(obj) = u.as_object() else { return };
+    let mut hits: Vec<String> = Vec::new();
+    // 只下探一层：各家把细项放在 *_details 里，再深就没有了。
+    for (k, v) in obj {
+        let lk = k.to_ascii_lowercase();
+        if NEEDLES.iter().any(|n| lk.contains(n)) && !v.is_null() {
+            hits.push(format!("{k}={v}"));
+        }
+        if let Some(inner) = v.as_object() {
+            for (k2, v2) in inner {
+                let lk2 = k2.to_ascii_lowercase();
+                if NEEDLES.iter().any(|n| lk2.contains(n)) && !v2.is_null() {
+                    hits.push(format!("{k}.{k2}={v2}"));
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        return;
+    }
+    tracing::info!(
+        model = %model_id,
+        fields = %hits.join(" "),
+        "[upstream-cost] 上游回执里带了成本字段 —— 可以据此自动拿真实进价"
+    );
+}
+
 fn compute_cost(
     usage: Option<&serde_json::Value>,
     model_id: &str,
@@ -4743,6 +4841,11 @@ fn compute_cost(
         Some(u) if u.is_object() => u,
         _ => return 0,
     };
+    // 上游自己报没报「这一笔花了多少」。**零成本的探针**：不发任何额外请求，
+    // 只看已经收到的回执里有没有成本字段。有的话那就是最好的价目来源 ——
+    // 它是**实际扣的钱**，已经含了分组倍率、活动折扣这些看不见的因素，
+    // 比任何公开价目表都准，而且一分钱不用花。中转不公布价目时这是唯一免费的路。
+    report_upstream_cost_fields(model_id, u);
     let completion = u
         .get("completion_tokens")
         .and_then(|v| v.as_f64())
@@ -5196,6 +5299,33 @@ fn strip_cache_control(body: &mut serde_json::Value) {
 /// 哈希用 SHA-256 而不是 std 的 DefaultHasher：后者的算法**Rust 保留在版本间更换的权利**
 /// （同文件 gw_cache_key 的注释就写着这条）。换一次 Rust，全部键静默改值、亲和性清零，
 /// 而且不报错——正是这类缓存问题最难查的形状。
+/// 亲和键该拿哪个标识：**会话优先，run id 兜底。**
+///
+/// run id 是客户端**每条用户消息**新造的（main.js 的 sendPrompt 里），
+/// 而这个键的用途是「把同一段对话路由回同一台上游机器」——粒度对不上，
+/// 于是每问一句就换一台机器，几万 token 的前缀整份重算。
+///
+/// 线上实测这一刀（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k token）：
+/// ```text
+///   claude-fable-5  92.7% / 93.9%   落差 1.1 点   ← 走显式缓存断点，不靠机器亲和
+///   claude-opus-5   84.7% / 92.8%   落差 8.1 点
+///   grok-4.6        23.7% / 40.9%   落差 17.2 点
+///   qwen3.8-max     18.4% / 45.0%   落差 26.6 点
+/// ```
+/// 掉下去的那一刀正好落在「每一轮的第一发」上 —— 用户按下回车之后那一停。
+///
+/// 老客户端不发会话头，退回 run id，行为和以前一字不差。
+fn affinity_scope<'a>(headers: &'a HeaderMap) -> Option<&'a str> {
+    let pick = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    pick("x-ide-session-id").or_else(|| pick("x-ide-run-id"))
+}
+
 fn openai_prompt_cache_key(body: &serde_json::Value, run_id: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -6634,6 +6764,8 @@ async fn bill(
         tokens.completion,
         tokens.cached,
         tokens.cache_creation,
+        // 形状跟着回执走。不传的话对账只能靠硬夹一刀猜，而那一刀对 Anthropic 是错的。
+        tokens.prompt_includes_cached,
     );
 }
 
@@ -9317,6 +9449,194 @@ pub async fn audio_transcriptions(
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
 }
 
+/// 断流之后**原样重发**（一个字都还没吐出去的那一种）。
+///
+/// 这一种没有拼接问题：客户端什么都没收到，重发一次对它完全无缝。线上第一次触发
+/// 就是它 —— 上游回了 200、流开起来了，然后抛 `Concurrency limit exceeded`，
+/// 用户什么都没拿到。它既不算「表头前卡死」（表头到了），又没有正文可续。
+///
+/// 能开的前提是 `prompts::assemble_into` 现在**幂等**了（`ALREADY_ASSEMBLED_HEADER`）。
+/// 在那之前，重发会把整份系统提示词插第二遍：前缀分叉、整段对话按未命中缓存的全价
+/// 重算，本该几乎白送的重发变成整轮里最贵的一发。那个坑上线之后才查出来。
+pub(crate) const RETRY_EMPTY_STREAM_ENABLED: bool = true;
+
+/// **带预填的续写（吐了一半才断的那一种）仍然关着。**
+///
+/// 一轮对抗审计查出四条结构性问题，不是补丁能修的：
+///
+/// 1. **Anthropic 那条路根本走不通。** 预填（assistant 结尾）和 thinking 互斥，
+///    而 Claude 线路默认开着思考 —— 最主要的那条路上这个功能从来没能生效过。
+/// 2. **去重对长回答结构性失效。** `strip_overlap` 拿「已发内容的**结尾** 400 字」去比，
+///    而上游重述是从**开头**说起。正文一超过 400 字，两个窗口不可能相交，
+///    砍重叠恒等于 0 —— 用户看到同一段答案说两遍，而且第二遍是真金白银生成的。
+/// 3. 预填末尾的空白会让 Anthropic 直接 400（断流那一刻结尾是空格或换行非常常见）。
+/// 4. 滚动缓存的断点会落在预填那条消息上 —— 每次续写白付一次缓存写入，
+///    还会把断点从「最后一条 tool_result」挪到会话末尾。
+///
+/// 重做的方向是**换个出口重答、让客户端把已显示的部分替换掉**：没有预填就没有
+/// thinking 冲突、没有拼接就没有去重、没有末尾空白问题。那要客户端一起改。
+pub(crate) const CONTINUATION_ENABLED: bool = false;
+
+/// 续写请求带的标记头。带着它进来的请求**不许再续** —— 防套娃。
+pub(crate) const CONTINUATION_HEADER: &str = "x-ide-continuation";
+
+/// 续写时点名「别再挑这个出口」。值是出口的 `health_id`。
+///
+/// 内部用的头。外部请求带了也只是让自己少一个候选，够不到别人的线路 ——
+/// 和 `x-ide-route` 一样，只在**已经算出来的候选**里生效。
+pub(crate) const AVOID_ENDPOINT_HEADER: &str = "x-ide-avoid-endpoint";
+
+/// 断在半截之后，接着写完，把新增的部分推给同一个客户端连接。
+///
+/// # 为什么是「再调一次入口」而不是「在这里重发」
+///
+/// 每个出口自己的上游请求体带着一堆散落的决定：缓存开关、思考钳位、beta 头、
+/// xAI/Anthropic 各自的翻译、缓存亲和的粘性键。在泵任务里照抄一份必然漂移，
+/// 而漂移的代价落在计费路径上。再走一遍 `chat_completions` 是**零重复**，
+/// 而且它会按刚刚更新过的成功率重新挑出口 —— 刚死掉的那个此刻已经被记了一笔失败。
+///
+/// 代价是这一段单独计一次费。那是**如实**的：上游那边确实又跑了一次生成。
+///
+/// # 重复怎么防
+///
+/// 「带着已生成的内容接着写」在 Anthropic 那边是原生的（assistant 预填），
+/// OpenAI 兼容那边不保证 —— 有的模型会从头再说一遍。所以先攒一小段，
+/// 和已经发出去的尾巴对一遍，重叠的砍掉，再往下透传。
+///
+/// 回 `Ok(true)` = 接上了；`Ok(false)` = 上游没给出可用的续写。
+///
+/// 返回类型写成显式装箱的 future，而不是 `async fn`：这里和 `chat_completions`
+/// 互相调用，`async fn` 的返回类型是不透明的，编译器要推断它就得先知道它自己
+/// （E0391 类型环）。写成 `Pin<Box<dyn Future + Send>>` 把环断开。
+fn continue_stream<'a>(
+    state: &'a AppState,
+    headers: &'a HeaderMap,
+    next_body: serde_json::Value,
+    already: &'a str,
+    // 刚死掉的那个出口的 `health_id`。续写要明确避开它。
+    avoid: uuid::Uuid,
+    tx: &'a tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + 'a>> {
+    Box::pin(async move {
+    let mut h = headers.clone();
+    h.insert(
+        axum::http::HeaderName::from_static(CONTINUATION_HEADER),
+        axum::http::HeaderValue::from_static("1"),
+    );
+    // **不能**去掉 request id。
+    //
+    // 它是结算查询（/api/usage/settlement/:request_id）唯一的关联键：去掉之后
+    // 重发那一笔的 model_usage 行 request_id 为空，永远进不了那次 SUM ——
+    // IDE 里显示的花费只含第一段，而余额扣走的是两段，用户对不上账、
+    // 客服也查不到那笔差额从哪来。日志里两段撞在一起是小事，账对不上是大事。
+    //
+    // **幂等头必须带上。** 入口那边 `assemble_into` 对 system 是无条件 insert(0)，
+    // 不带这个头的话整份系统提示词会被插第二遍：前缀分叉、整段对话按未命中缓存的
+    // 全价重算，还要再付一次缓存写入。本该几乎白送的重发变成整轮里最贵的一发。
+    h.insert(
+        axum::http::HeaderName::from_static(crate::prompts::ALREADY_ASSEMBLED_HEADER),
+        axum::http::HeaderValue::from_static("1"),
+    );
+    // 点名避开刚死的那个出口。
+    if let Ok(v) = axum::http::HeaderValue::from_str(&avoid.to_string()) {
+        h.insert(axum::http::HeaderName::from_static(AVOID_ENDPOINT_HEADER), v);
+    }
+
+    // **在递归点装箱。** 这里是 `chat_completions` → 续写 → `chat_completions`，
+    // 一个 async 递归：编译器要推断这个 future 的大小和 Send 与否，就得先知道它自己的，
+    // 推不出来。装成 `Pin<Box<dyn Future + Send>>` 把这个环断开 —— Send 由类型断言，
+    // 不再靠推断。
+    let fut: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response, AppError>> + Send>,
+    > = Box::pin(chat_completions(
+        axum::extract::State(state.clone()),
+        h,
+        axum::Json(next_body),
+    ));
+    let resp = fut.await.map_err(|_| "续写请求被拒".to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("续写请求回了 {}", resp.status().as_u16()));
+    }
+    // **必须确认回来的真的是 SSE，才敢往客户端那条流里推。**
+    //
+    // 客户端那条连接的 Content-Type 早就定成 text/event-stream 了（第一段发出去时定的）。
+    // 续写会被派到**另一个**出口，而这一行里确实存在「不认 stream 参数、把它当普通请求
+    // 处理」的中转 —— 那种出口会回一整块 JSON。原样推进去的话，客户端的 SSE 解析器
+    // 只能把没有 `data:` 前缀的行丢掉，用户看到的是答案停在半截、外加一个
+    // 「流不完整」的报错，比不续更糟。
+    //
+    // 判据放在这里而不是靠后面的帧形状：`into_body()` 会把响应头整个丢掉，
+    // 过了这一行就再也读不到 Content-Type 了。
+    let is_sse = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    if !is_sse {
+        return Err("续写那一发回的不是 SSE（多半是个不认 stream 参数的出口）".to_string());
+    }
+
+    use futures_util::StreamExt;
+    let mut stream = resp.into_body().into_data_stream();
+    // 攒到看得出有没有重述为止，再决定砍多少。
+    let mut buf = String::new();
+    let mut held: Vec<u8> = Vec::new();
+    let mut resolved = false;
+    let mut sent_any = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("续写流读失败：{e}"))?;
+        if resolved {
+            if tx.send(Ok(chunk)).await.is_err() {
+                return Ok(sent_any);
+            }
+            sent_any = true;
+            continue;
+        }
+        held.extend_from_slice(&chunk);
+        crate::failover::absorb_text(&chunk, &mut buf);
+        if buf.chars().count() >= 400 {
+            sent_any |= flush_continuation(&mut resolved, &held, &buf, already, tx).await;
+            held.clear();
+        }
+    }
+    if !resolved {
+        sent_any |= flush_continuation(&mut resolved, &held, &buf, already, tx).await;
+    }
+    Ok(sent_any)
+    })
+}
+
+/// 把攒下来的第一段推出去：没有重述就原样透传，有重述就只发去掉重叠的那部分。
+async fn flush_continuation(
+    resolved: &mut bool,
+    held: &[u8],
+    buf: &str,
+    already: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) -> bool {
+    *resolved = true;
+    let skip = crate::failover::strip_overlap(already, buf);
+    if skip == 0 {
+        // 没重述：原样透传，思考块、工具块什么都不丢。
+        return tx.send(Ok(axum::body::Bytes::from(held.to_vec()))).await.is_ok();
+    }
+    // 重述了：**不能**把攒下的原始帧发出去（里面就是那段重复的话）。
+    // 改成自己造一帧，只装去掉重叠之后剩下的正文。
+    let rest = &buf[skip..];
+    if rest.is_empty() {
+        return false;
+    }
+    let frame = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{ "index": 0, "delta": { "content": rest } }]
+        })
+    );
+    tx.send(Ok(axum::body::Bytes::from(frame.into_bytes()))).await.is_ok()
+}
+
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9423,6 +9743,37 @@ pub async fn chat_completions(
             candidates = plain;
         }
     }
+    // 用户在 IDE 里点的是哪一组，就先敲那条线路的门。
+    //
+    // # 为什么需要这个
+    //
+    // 同一个模型挂在两条线路上时，IDE 的模型列表里是**两个分组**，而且两组显示的价不一样
+    // （线上实测 claude-sonnet-5：Claude 组显示 $10/$15，优惠 Claude 组显示 $2/$10）。
+    // 但在这之前，用户点哪一组发出去的请求逐字相同 —— 派单只按「模型名 + sort 升序」，
+    // 于是永远落在 sort 最前的那条。后果不是内部毛利问题，是**用户看到 $2、按 $10 扣**。
+    // 生产实测：倍率 0.06 的「优惠 Claude」建好之后一次都没被派到过（0 行流水）。
+    //
+    // # 为什么是「提示」不是「钉死」
+    //
+    // 只把它挪到队首，后面的换线（健康、冷却、卡顿、失败重试）照常 —— 用户选的那条
+    // 挂了还是得能兜到别的线路上去，否则这个功能就变成了「一条线路坏了整组不可用」。
+    //
+    // # 越权检查
+    //
+    // 只在**已经算出来的候选**里挑。候选是「这条线路 effective_models 里有这个模型」筛出来的，
+    // 所以这个头至多让用户在他本来就能从列表里点到的那几条之间选一条，够不到别的。
+    // 认不出的 id 一律忽略（不报错）：老版客户端不带这个头，带了个过期 id 也不该让请求失败。
+    if let Some(want) = headers
+        .get("x-ide-route")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok())
+    {
+        if let Some(at) = candidates.iter().position(|m| m.id == want) {
+            let picked = candidates.remove(at);
+            candidates.insert(0, picked);
+        }
+    }
+
     let primary_conn = candidates
         .first()
         .cloned()
@@ -9504,7 +9855,38 @@ pub async fn chat_completions(
     //
     // 位置在免费池收窄**之后**：先决定用哪些线路，再决定每条线路走哪个门。
     if !endpoint_map.is_empty() {
-        candidates = crate::route_endpoints::expand(&candidates, &endpoint_map, &model_id);
+        // 自带地址的成败单独取一次：它在 route_endpoints 表里没有行，
+        // 不取的话它永远「没有样本」＝永远算靠谱，而最初暴露这个问题的就是它。
+        let own_rates = crate::route_endpoints::load_own_rates(
+            &state.db,
+            &candidates.iter().map(|m| m.id).collect::<Vec<_>>(),
+        )
+        .await;
+        candidates =
+            crate::route_endpoints::expand(&candidates, &endpoint_map, &own_rates, &model_id);
+    }
+
+    // 续写时明确避开刚死掉的那个出口。
+    //
+    // 不能靠「它刚被记了一笔失败，排序自然会绕开」——那一笔是 `tokio::spawn` 出去的，
+    // 落库有延迟，而续写紧接着就发。竞态之下多半还没写进去，于是续写又挑中同一个
+    // 刚断掉的出口，这个功能就白做了。所以由续写自己在头里点名，不猜。
+    //
+    // **只避不删**：如果避开之后一个候选都不剩，那就还用它 —— 一个可能还活着的出口
+    // 好过直接把请求打死。
+    if let Some(avoid) = headers
+        .get(AVOID_ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok())
+    {
+        let kept: Vec<Model> = candidates
+            .iter()
+            .filter(|m| m.health_id() != avoid)
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            candidates = kept;
+        }
     }
 
     let route_count = candidates.len();
@@ -9594,7 +9976,7 @@ pub async fn chat_completions(
                     // `mc_prefix` 必须由 apply 先读取。旧顺序在调用 apply 之前就把它删了，
                     // 导致服务端永远拿不到客户端回传的前缀，Redis 只写不读。
                     compression_prefix =
-                        apply_michael_compression(&state, &mut body, &model_id, tier, uid, client_context_window(&headers)).await?;
+                        apply_michael_compression(&state, &mut body, &model_id, tier, uid, client_context_window(&headers), ide_session_goal(&headers).as_deref()).await?;
                     compression_applied = Some(tier);
                 }
                 None => {
@@ -9757,6 +10139,8 @@ pub async fn chat_completions(
         let mut err_low = String::new();
         let mut selected_conn = None;
         let mut attempted_sends = 0u32;
+        // 因为「表头前卡死」而换出口的次数。上限见 `CHAT_MAX_STALL_SWITCHES`。
+        let mut stall_switches = 0u8;
         // 429 单线路排队的累计等待与次数（见 RATE_LIMIT_QUEUE_* 常量）。跨整轮存活：
         // 最终还是失败时，错误文案要能说出「网关已经替你等了多久」。
         let mut rate_limit_waited = Duration::ZERO;
@@ -9801,7 +10185,14 @@ pub async fn chat_completions(
         // 绝不因为「都满了」就不发请求。
         let sticky = crate::route_endpoints::sticky_key(
             &uid,
+            // 阶梯：**会话 → run → 只有 uid**。`sticky_key` 的文档一直写着这三级，
+            // 而调用点只传了 run id —— 第一级压根不存在。
+            //
+            // 差别在这里咬人：run id 每条用户消息就换一个，于是首选出口一让位，
+            // 同一段对话的下一轮会被分到**另一个**替补出口上，上游那份提示词缓存
+            // 整份重来。会话那一级正是为这件事写的。
             &[
+                headers.get("x-ide-session-id").and_then(|v| v.to_str().ok()),
                 headers.get("x-ide-run-id").and_then(|v| v.to_str().ok()),
             ],
             state.cfg.jwt_secret.as_bytes(),
@@ -9927,6 +10318,8 @@ pub async fn chat_completions(
                 );
                 break 'routes;
             }
+            // 这一轮有没有「表头都没回来就卡死」。每轮重置。
+            let mut stalled_before_headers = false;
             // 这条线路是不是**完整地回了一个错误响应**。只有它为真时才允许换下一条。
             let mut upstream_answered_with_error = false;
             // protocol="anthropic" → native /v1/messages with translated OpenAI⇄Anthropic body;
@@ -10115,7 +10508,10 @@ pub async fn chat_completions(
                     //   ② prompt_cache_key（提示缓存的粘性键）→ 下面这段
                     //   ③ x-grok-conv-id（会话粒度的机器亲和）→ 下面这段
                     //   ④ 工具参数完整性 → 由 XaiRespSse 在响应侧做，同 AnthSse
-                    let _run_id = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok());
+                    // 会话优先、run id 兜底。判据只此一处（`affinity_scope`）——
+                    // 两条协议分支各写一遍的话，改一处漏一处的表现就是「某个协议的
+                    // 缓存突然不命中了」，而且没有任何地方会报错。
+                    let _run_id = affinity_scope(&headers);
                     let _affinity = route_needs_cache_affinity(&model_id, &candidate.base_url);
                     if _affinity {
                         if let Some(o) = candidate_upstream_body.as_object_mut() {
@@ -10184,7 +10580,10 @@ pub async fn chat_completions(
                     // 的请求整份重算，而且**不随对话轮次改善**（第 1 轮 38.3%、后续
                     // 39.7%）——前缀问题会越聊越差、TTL 问题会越聊越好，两个都不是。
                     // 同期 deepseek 只有 2.6%，而它的缓存落在硬盘上、根本没有机器亲和这回事。
-                    let _run_id = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok());
+                    // 会话优先、run id 兜底。判据只此一处（`affinity_scope`）——
+                    // 两条协议分支各写一遍的话，改一处漏一处的表现就是「某个协议的
+                    // 缓存突然不命中了」，而且没有任何地方会报错。
+                    let _run_id = affinity_scope(&headers);
                     let _affinity = route_needs_cache_affinity(&model_id, &candidate.base_url);
                     let mut oai_body = body.clone();
                     if _affinity {
@@ -10318,9 +10717,20 @@ pub async fn chat_completions(
                             "upstream stalled before response headers"
                         );
                         mark_route_stall(candidate.health_id());
+                        // 记下「这一轮是**表头都没回来**就卡死了」。
+                        //
+                        // 这一种和「发出去一半」不一样：**客户端一个字节都没收到**，
+                        // 所以换一个出口重发对用户是完全无缝的 —— 他只是多等了一会儿。
+                        // 代价是上游那边可能还在跑、还会计费（我们已经把请求 drop 掉了，
+                        // 但对方未必立刻停）。这笔钱换的是「用户不会看见一个 504」，
+                        // 是运营方自己的取舍，所以只允许换**一次**。
+                        stalled_before_headers = true;
                         // 卡满整段预算才失败，是最该被面板看见的一种坏 —— 这次事故那条线
                         // 44 小时全是这个形状。
                         route_health::spawn_fail(&state, candidate.health_id(), 504);
+                        route_health::spawn_attempt(
+                            &state, candidate.health_id(), &model_id, false, Some(504), None,
+                        );
                         // 恢复判定交给后台 1-token 探针，不再由下一个用户的真实请求付费。
                         route_health::spawn_stall_recovery(&state, candidate.clone());
                         route_failed_transient = true;
@@ -10333,6 +10743,16 @@ pub async fn chat_completions(
                         // 不是「这一轮流式完整结束」—— 流中途断掉在 agentic IDE 里多半是
                         // 用户按了停止，算成线路故障会把好线路刷红、然后告警被静音。
                         route_health::spawn_ok(&state, candidate.health_id());
+                        // 同一件事也落库一份：Redis 那个连败计数没有模型维度、没有历史，
+                        // 算不出成功率。耗时取表头往返 —— 和这里判「开始回话」同一个时刻。
+                        route_health::spawn_attempt(
+                            &state,
+                            candidate.health_id(),
+                            &model_id,
+                            true,
+                            Some(r.status().as_u16()),
+                            Some(send_started.elapsed().as_millis() as u64),
+                        );
                         success = Some(r);
                         selected_conn = Some(candidate.clone());
                         break 'routes;
@@ -10351,6 +10771,9 @@ pub async fn chat_completions(
                             })
                             .flatten();
                         route_health::spawn_fail(&state, candidate.health_id(), err_status);
+                        route_health::spawn_attempt(
+                            &state, candidate.health_id(), &model_id, false, Some(err_status), None,
+                        );
                         if err_status == 429 {
                             // 上游自己说了要等多久，就等多久 —— 别再拿一个拍脑袋的
                             // 20 秒去猜。记在**出口**上：一条线路挂三个出口，
@@ -10547,6 +10970,9 @@ pub async fn chat_completions(
                         err_status = 502;
                         err_low = e.to_string().to_lowercase();
                         route_health::spawn_fail(&state, candidate.health_id(), 502);
+                        route_health::spawn_attempt(
+                            &state, candidate.health_id(), &model_id, false, Some(502), None,
+                        );
                         if attempt + 1 >= candidate_max_attempts {
                             route_failed_transient = true;
                             break;
@@ -10595,6 +11021,24 @@ pub async fn chat_completions(
             // 「一次请求只发一次」那条规矩真正想表达的东西——它以前被粗暴地实现成
             // 「一条线路都不许换」，连上游明确说了「我失败了」的情况也一并禁掉。
             if !upstream_answered_with_error {
+                // **例外：表头都没回来就卡死。**
+                //
+                // 那种情况客户端一个字节都没收到，换个出口重发对用户完全无缝 ——
+                // 他只是多等一会儿，而不是看见一个 504。线上日志里这一类是最多的
+                // （半小时里 11 次「upstream stalled before response headers」）。
+                //
+                // 只换一次：上游那边可能还在跑、还会计费。一次是「抖了一下」，
+                // 三次就是拿钱换一个已经等太久的请求，不划算。
+                if stalled_before_headers && stall_switches < CHAT_MAX_STALL_SWITCHES {
+                    stall_switches += 1;
+                    tracing::info!(
+                        model = %model_id,
+                        route_id = %candidate.id,
+                        stall_switches,
+                        "表头前卡死；客户端还没收到任何字节，换下一个出口重发"
+                    );
+                    continue 'routes;
+                }
                 break 'routes;
             }
             tracing::info!(
@@ -10714,6 +11158,18 @@ pub async fn chat_completions(
         let step_tool_turn_task = step_is_tool_turn(&body);
         // Absorb short provider bursts without making the billing/cache pump stop reading the
         // upstream while Hyper or nginx drains a handful of tiny SSE frames.
+        // 续写要用的三样。**只在这里克隆一次**，泵任务里再拿不到外面的东西。
+        //
+        // 走的是「再调一次网关自己的入口」这条路，而不是在泵任务里重建上游请求 ——
+        // 每个出口自己的请求体带着一堆散落的决定（缓存开关、思考钳位、beta 头、
+        // 各协议的翻译、缓存亲和的粘性键），照抄一份必然漂移，而漂移的代价在计费路径上。
+        // 再走一遍入口是零重复，而且它会按**刚刚更新过的成功率**重新挑出口 ——
+        // 刚死掉的那个此刻已经被记了一笔失败，自然轮不到它。
+        let cont_body = body.clone();
+        let cont_headers = headers.clone();
+        // 这一发本身是不是续写。是的话就不许再续 —— 否则一个持续抽风的上游
+        // 会让一次用户请求变成一串真实生成。
+        let is_continuation = headers.get(CONTINUATION_HEADER).is_some();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(256);
         // Move the in-flight guard into the pump task: the handler returns as soon as
         // the response head is ready, but the request is not settled until this task
@@ -10741,6 +11197,8 @@ pub async fn chat_completions(
                                                // usage comes from the converter's accumulated counts.
             let mut tail: Vec<u8> = Vec::new();
             let mut complete = false;
+            // 这一轮是不是由两段拼起来的。拼过的绝不进响应缓存，理由见置位处。
+            let mut did_continue = false;
             let mut client_closed = false;
             let mut stream_failure: Option<String> = None;
             // anthropic connections: translate the upstream Anthropic SSE → OpenAI SSE on the fly.
@@ -10922,6 +11380,94 @@ pub async fn chat_completions(
                     _ => (json!({}), false),
                 }
             };
+            // **流中途死掉也要记一笔失败。**
+            //
+            // 在这之前，成功与否只在拿到响应表头那一刻记（`spawn_ok`）—— 于是一个
+            // 「每次开头都正常、说到一半就断」的出口，在成功率里是 **100%**。
+            // 而选路的可靠性闸正是建立在那个数上的，等于建在假数据上。
+            //
+            // 判据是 `!client_closed`：客户端还连着而流断了，那是上游的问题；
+            // 客户端自己走了（agentic IDE 里多半是用户按了停止）不算 ——
+            // 把用户按停止算成线路故障会把好线路刷红，那条一直写在 `spawn_ok` 旁边。
+            //
+            // 状态码用 200：表头确实回了 200，坏在后面。这样面板上「最后状态 200
+            // 却有失败」本身就是「中途断」的signature，一眼能认出来。
+            if !complete && !client_closed {
+                crate::route_health::spawn_attempt(&st, hid, &req_model, false, Some(200), None);
+                tracing::warn!(
+                    model = %req_model,
+                    endpoint_id = %hid,
+                    reason = %stream_failure.clone().unwrap_or_else(|| "流未完成".into()),
+                    "流中途断掉，客户端还连着 —— 记一笔失败，让成功率反映它"
+                );
+            }
+            // ── 断在半截 → 接着写完，用户看不出中间换过出口 ──────────────────
+            //
+            // 条件一条都不能少：
+            //   · 流没写完，而客户端还连着（用户按停止不算）；
+            //   · 这一发本身不是续写（不许套娃）；
+            //   · **没开始过工具调用** —— 那时候断在半截 JSON 里，拼出来的参数可能是
+            //     合法 JSON 却是错的意思，而工具调用是会真的执行的；
+            //   · 已经吐出去过正文（一个字都没吐的那种由派单循环里的「表头前卡死换出口」
+            //     管，那条更早、更便宜）。
+            // 按次计费的线路不重发：那会把整笔按次费用再收一次，和第一段实际生成了
+            // 多少字毫无关系 —— 一次抖动扣两次整价，而用户只收到一份回答。
+            let _retry_ok = !matches!(bmode.as_str(), "per_call") && percall <= 0;
+            if !complete
+                && !client_closed
+                && !is_continuation
+                && _retry_ok
+                && !crate::failover::saw_tool_call(&acc)
+            {
+                let mut said = String::new();
+                crate::failover::absorb_text(&acc, &mut said);
+                // 两种形状，都要接住：
+                //
+                //   · **吐了一半才断** → 带着已生成的内容续写，只推新增的部分；
+                //   · **一个字都没吐就断** → 原样重发一次。表头已经到了（200），
+                //     所以「表头前卡死换出口」那条管不着它；而没有正文也就没有拼接问题，
+                //     风险比续写更小。线上第一次触发就是这一种：上游回了 200、
+                //     流开起来了，然后抛 `Concurrency limit exceeded` —— 用户什么都没拿到，
+                //     而这恰恰是最该换个出口重试的情形。
+                let next_body = if said.trim().is_empty() {
+                    // 空流重发：没有拼接问题，风险最小，而且这是线上真实发生的那一种。
+                    RETRY_EMPTY_STREAM_ENABLED.then(|| cont_body.clone())
+                } else if CONTINUATION_ENABLED {
+                    crate::failover::continuation_body(&cont_body, &said)
+                } else {
+                    None
+                };
+                if let Some(next_body) = next_body {
+                    tracing::info!(
+                        model = %req_model,
+                        already_chars = said.chars().count(),
+                        mode = if said.trim().is_empty() { "重发" } else { "续写" },
+                        "流断在半截；再走一遍派单，把这次答完"
+                    );
+                    match continue_stream(&st, &cont_headers, next_body, &said, hid, &tx).await {
+                        Ok(true) => {
+                            // 接上了。这一段的账单由那一次调用自己记（它确实是第二次
+                            // 真实生成），这里只把「没写完」这个结论撤掉 —— 客户端拿到的
+                            // 是一份完整回答。
+                            complete = true;
+                            stream_failure = None;
+                            // **但这一份绝不能进响应缓存。**
+                            //
+                            // 缓存写的是 `acc`，而 acc 只装第一段的字节 —— 续写那部分只进了
+                            // tx，从来不进 acc。把 complete 置成 true 正好解锁了下面那道
+                            // 缓存闸，于是存进去的是**断流那一刻的半截内容**（连
+                            // `data: [DONE]` 都没有），一存一小时。
+                            //
+                            // 后果比断流本身糟得多：接下来一小时里同样的请求会直接命中
+                            // 这份半截缓存，而缓存命中那条路没有泵任务，**再也续不上** ——
+                            // 一次上游抖动被固化成「每次都只答一半」。
+                            did_continue = true;
+                        }
+                        Ok(false) => tracing::warn!(model = %req_model, "续写没能接上，客户端拿到的是半截"),
+                        Err(e) => tracing::warn!(model = %req_model, error = %e, "续写失败"),
+                    }
+                }
+            }
             if !usage_reported {
                 tracing::warn!(model = %req_model, "provider omitted authoritative usage; rate billing is zero");
             }
@@ -11073,7 +11619,7 @@ pub async fn chat_completions(
             // Cache the FULL (OpenAI-shape) stream for identical future requests (only when complete).
             // 中转丢块的坏流（只有思考）绝不缓存：客户端的快速重试请求体逐字节相同，
             // 命中缓存就会拿回同一份坏流，钳位后的重试永远打不到上游。
-            if complete && !relay_dropped_blocks && !thinking_went_missing && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
+            if complete && !did_continue && !relay_dropped_blocks && !thinking_went_missing && !acc.is_empty() && acc.len() < 1_000_000 && response_cache_safe(&acc) {
                 let mut rconn = st.redis.clone();
                 let stored: Result<(), redis::RedisError> = redis::cmd("SET")
                     .arg(&ckey_task)
@@ -11779,6 +12325,164 @@ pub async fn image_generations(
 }
 
 #[cfg(test)]
+mod route_pick_tests {
+    /// 用户在 IDE 里点的是哪一组，网关必须听。
+    ///
+    /// 同一个模型挂在两条线路上时，IDE 的列表里是**两个分组，而且两组显示的价不一样**
+    /// （线上实测 claude-sonnet-5：一组 $10/$15、另一组 $2/$10）。在这条闸之前，
+    /// 两组点下去发出去的请求逐字相同，派单只按「模型名 + sort 升序」——
+    /// 于是用户看到 $2、按 $10 扣。生产实测倍率 0.06 的那条线路建好后 0 行流水。
+    #[test]
+    fn the_group_the_user_picked_gets_asked_first() {
+        let src = include_str!("models.rs");
+        let at = src.find("\npub async fn chat_completions(").expect("chat_completions 改名了");
+        let end = src[at + 1..]
+            .find("\npub async fn ")
+            .map(|i| at + 1 + i)
+            .unwrap_or(src.len());
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(body.contains("\"x-ide-route\""), "网关不认用户选的线路了");
+        // 必须是**挪到队首**，不是直接拿它当唯一目标 —— 用户选的那条挂了还得能换线，
+        // 否则一条线路坏了整组不可用。
+        assert!(
+            body.contains("candidates.insert(0, picked)"),
+            "不是挪到队首 —— 换线兜底会被绕过",
+        );
+        // 只在已经算出来的候选里挑：候选是「这条线路有这个模型」筛出来的，
+        // 所以这个头够不到用户本来点不到的线路。
+        assert!(
+            body.contains("candidates.iter().position(|m| m.id == want)"),
+            "没有在候选里查 —— 那就成了让客户端随便指定线路",
+        );
+
+        // 客户端两条发送路都要带上这个头，少一条就有一半场景还是老样子。
+        let js = include_str!("../../ide/src/main.js");
+        assert!(js.contains("_h[\"x-ide-route\"] = _routeId"), "网页端那条路没带");
+        assert!(js.contains("config.ideRouteId = rid"), "桌面端那条路没带");
+        let tauri = include_str!("../../ide/src-tauri/src/ai.rs");
+        assert!(
+            tauri.contains("pub ide_route_id: Option<String>")
+                && tauri.contains("rb.header(\"x-ide-route\", rid)"),
+            "Tauri 那一跳把它丢了",
+        );
+        // 客户端得先把线路 id 留下来才谈得上带 —— 它以前在解析目录时就被丢掉了。
+        assert!(js.contains("connId: String(it.conn_id"), "目录解析又把线路 id 丢了");
+        // 查目录要带分组，否则卡片上的价、上下文、思考档位仍然读的是第一条线路那份。
+        assert!(
+            js.contains("function _modelCatalogEntry(id = \"\", group = \"\")"),
+            "查目录不带分组 —— 显示的参数还是另一条线路的",
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_price_tests {
+    /// 线路列表必须带上**实时目录价**。
+    ///
+    /// 控制台原来只有点过「拉取模型」才拿得到实时价（走 /available），而打开一条已经配好的
+    /// 线路时一个价都没有 —— 存的 model_caps 里只有上下文档位。于是界面上只剩当初填的
+    /// 那个数字，看不出它和现价差多少：线上实测 deepseek-v4-flash 填 3、现价 0.0795，差 37 倍。
+    ///
+    /// 价格僵住的根因就是这个：填的时候看得见现价（placeholder），填完就再也看不见了。
+    #[test]
+    fn the_route_list_carries_the_live_catalog_price() {
+        let src = include_str!("models.rs");
+        let at = src.find("\npub async fn admin_list(").expect("admin_list 改名了");
+        let end = src[at + 1..]
+            .find("\npub async fn ")
+            .map(|i| at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            body.contains("\"catalog_prices\":"),
+            "线路列表没下发实时目录价 —— 控制台就只能显示当初填死的那个数",
+        );
+        assert!(
+            body.contains("crate::model_catalog::lookup(mid)"),
+            "实时价不是从内存目录取的 —— 那就又是一份会过期的快照",
+        );
+
+        let ui = include_str!("../admin-ui/src/pages/Routing.tsx");
+        let code: String = ui
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("catalog_prices"), "控制台没用这个字段");
+        // 填了价之后现价仍然要看得见，还要能一键退回自动。
+        // 断言要**钉在具体那一处**。这三条第一版分别写成 `priceGap(`、`用现价`、
+        // `nz(r.pin) > 0 || nz(r.pout) > 0`，而每一个在文件里都不止出现一次
+        // （函数定义 + 调用点、按钮文案 + title、保存过滤 + 行内判断），
+        // 于是把真正那一处改坏，断言照样命中别处 —— 变异测试三条全绿。
+        assert!(code.contains("function priceGap("), "算「比现价高几倍」的函数没了");
+        assert!(
+            code.contains("priceGap(r).toFixed(1)"),
+            "界面上不再显示你填的比现价高几倍",
+        );
+        assert!(
+            code.contains("patch(r.id, { pin: \"\", pout: \"\" })"),
+            "单行「用现价」（清掉手填价）的入口没了",
+        );
+        assert!(
+            code.contains("prev.map((r) => ({ ...r, pin: \"\", pout: \"\" }))"),
+            "整条线路「全部用现价」的入口没了",
+        );
+        // 留空 = 不写覆盖 = 运行时查实时目录。这条不能被改成写 0（写 0 会被当成覆盖）。
+        assert!(
+            code.contains(".filter((r) => nz(r.pin) > 0 || nz(r.pout) > 0)"),
+            "保存时不再是「只收非零项」—— 清空会变成写 0，那是另一种覆盖",
+        );
+    }
+}
+
+#[cfg(test)]
+mod controlled_checkbox_tests {
+    /// 受控复选框的字段**必须下发**，否则保存会静默改写它。
+    ///
+    /// 控制台的「关闭缓存计费」初值取 `Boolean(conn?.cache_disabled)`，而列表接口原来不回这个
+    /// 字段 —— 于是它对任何线路都显示成没勾，保存时又把 `cache_disabled: false` 原样发回来。
+    /// 运营打开这条线路的弹窗随便改点别的再保存，就把缓存计费重新打开了，页面上毫无痕迹。
+    /// 线上 GPT 那条线的库值就是 true，正好踩在这个坑上。
+    ///
+    /// 服务端那侧是 `req.cache_disabled.unwrap_or(m.cache_disabled)`，防的是"没传"，
+    /// 防不住"传了个错的" —— 所以这道闸只能立在下发这一端。
+    #[test]
+    fn a_controlled_checkbox_is_always_sent_back() {
+        let src = include_str!("models.rs");
+        let at = src
+            .find("\npub async fn admin_list(")
+            .expect("admin_list 改名了");
+        let end = src[at + 1..]
+            .find("\npub async fn ")
+            .map(|i| at + 1 + i)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            body.contains("\"cache_disabled\": m.cache_disabled"),
+            "线路列表没下发 cache_disabled —— 控制台那个复选框会永远显示没勾，保存即改写",
+        );
+        // 控制台确实在用受控写法（不是只读展示），所以这条闸有意义。
+        let ui = include_str!("../admin-ui/src/pages/Routing.tsx");
+        assert!(
+            ui.contains("useState(Boolean(conn?.cache_disabled))")
+                && ui.contains("cache_disabled: cacheDisabled,"),
+            "控制台那个复选框的形状变了 —— 这条测试守的前提没了，要重新看",
+        );
+    }
+}
+
+#[cfg(test)]
 mod billing_tests {
     /// 拉模型列表这条路不许回显上游 URL 或原始错误体。
     ///
@@ -12120,19 +12824,409 @@ mod billing_tests {
         assert_eq!(chat_upstream_retry_base_delay_ms(99), 4_000);
     }
 
+    /// 断在半截接着写：**四个前提一个都不能少**。
+    ///
+    /// 少 `!client_closed` → 用户按了停止我们还去续，白花钱还可能把答案推给一个
+    /// 已经走了的连接；
+    /// 少 `!is_continuation` → 套娃，一个抽风的上游能把一次请求变成一串真实生成；
+    /// 少 `!saw_tool_call` → 断在半截 JSON 里续写，拼出来的工具参数可能是合法 JSON
+    /// 却是错的意思，而工具调用是**会真的执行**的；
+    /// 少 `!complete` → 好好的流也去续一遍。
+    #[test]
+    fn continuation_needs_all_four_preconditions() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains(
+                "if !complete\n                && !client_closed\n                && !is_continuation\n                && _retry_ok\n                && !crate::failover::saw_tool_call(&acc)"
+            ),
+            "续写的前提少了一条 —— 每一条少了都会出真问题，见这条测试的说明",
+        );
+        // 套娃的闸要真的挂上：续写请求必须带那个标记头，进来时也必须认它。
+        assert!(
+            prod.contains("h.insert(\n        axum::http::HeaderName::from_static(CONTINUATION_HEADER),"),
+            "续写请求没带防套娃的标记头",
+        );
+        assert!(
+            prod.contains("let is_continuation = headers.get(CONTINUATION_HEADER).is_some();"),
+            "进来时没认那个标记头 —— 防套娃的闸等于没有",
+        );
+    }
+
+    /// **拼接过的流绝不进响应缓存。** 这条比断流本身更要紧。
+    ///
+    /// 缓存写的是 `acc`，而 acc 只装第一段的字节 —— 续写那部分只进了 tx。
+    /// 续写成功时把 `complete` 置真，正好解锁那道缓存闸，于是存进去的是**断流那一刻的
+    /// 半截内容**（连 `data: [DONE]` 都没有），一存一小时。
+    ///
+    /// 后果比断流糟得多：接下来一小时同样的请求直接命中这份半截缓存，
+    /// 而缓存命中那条路**没有泵任务**，再也续不上 —— 一次上游抖动被固化成
+    /// 「每次都只答一半」。
+    #[test]
+    fn a_stitched_stream_is_never_cached() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains("if complete && !did_continue && !relay_dropped_blocks"),
+            "拼接过的流还会被写进响应缓存 —— 那份是半截的，会把一次抖动固化成一小时",
+        );
+        assert!(
+            prod.contains("did_continue = true;"),
+            "续写成功时没有标记 —— 那道缓存闸拦不住它",
+        );
+        // 标记只在**续写真的接上**时置位，别处不许设。
+        assert_eq!(
+            prod.matches(concat!("did_continue", " = true")).count(),
+            1,
+            "did_continue 被多处置位了 —— 会把本该缓存的正常流也挡掉",
+        );
+    }
+
+    /// 续写回来的必须**真的是 SSE** 才敢往客户端那条流里推。
+    ///
+    /// 客户端那条连接的 Content-Type 第一段就定成 text/event-stream 了。而续写会被派到
+    /// 另一个出口，这一行里确实存在「不认 stream 参数、把它当普通请求处理」的中转
+    /// （route_endpoints.rs 里那道流式探测的注释和测试都写着这类站真实存在）。
+    /// 把一整块 JSON 原样推进去，客户端的解析器只能把没有 `data:` 前缀的行丢掉 ——
+    /// 用户看到答案停在半截外加一个「流不完整」的报错，比不续更糟。
+    #[test]
+    fn a_non_sse_continuation_is_refused_not_forwarded() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains(".is_some_and(|v| v.contains(\"text/event-stream\"));"),
+            "续写没确认回来的是不是 SSE —— 非 SSE 的字节会污染客户端那条流",
+        );
+        assert!(
+            prod.contains("if !is_sse {"),
+            "认出来不是 SSE 却还是推出去了",
+        );
+        // 判据必须在 into_body() **之前** —— 那一行会把响应头整个丢掉。
+        let at_check = prod.find("let is_sse = resp").expect("SSE 判据不见了");
+        let at_body = prod.find("resp.into_body().into_data_stream()").expect("取流那一行不见了");
+        assert!(
+            at_check < at_body,
+            "Content-Type 判据写在了 into_body() 之后 —— 那时候响应头已经没了",
+        );
+    }
+
+    /// 亲和键必须**会话优先**，不能只有 run id。
+    ///
+    /// run id 是客户端每条用户消息新造的，而这个键的用途是「把同一段对话路由回同一台
+    /// 上游机器」—— 粒度对不上，每问一句就换一台，几万 token 前缀整份重算。
+    ///
+    /// 线上实测（按「一轮里的第一发 / 轮内续跑」切开，输入 >20k）：
+    /// claude-fable-5 落差 1.1 点（不靠机器亲和）、grok-4.6 17.2 点、qwen3.8-max 26.6 点。
+    /// 掉的那一刀正好落在「每一轮的第一发」上。
+    #[test]
+    fn the_affinity_key_prefers_the_session_over_the_run() {
+        let mk = |pairs: &[(&str, &str)]| {
+            let mut h = axum::http::HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        };
+        // 两个都在 → 用会话。
+        assert_eq!(
+            super::affinity_scope(&mk(&[("x-ide-session-id", "sess123456"), ("x-ide-run-id", "run_abc")])),
+            Some("sess123456"),
+        );
+        // 只有 run（老客户端）→ 退回 run，行为和以前一字不差。
+        assert_eq!(super::affinity_scope(&mk(&[("x-ide-run-id", "run_abc")])), Some("run_abc"));
+        // 会话是空串 → 不算数，退回 run。空串当键会让所有会话撞成同一个。
+        assert_eq!(
+            super::affinity_scope(&mk(&[("x-ide-session-id", "  "), ("x-ide-run-id", "run_abc")])),
+            Some("run_abc"),
+        );
+        // 都没有 → None，由 openai_prompt_cache_key 退回「模型 + 首条 system」。
+        assert_eq!(super::affinity_scope(&mk(&[])), None);
+
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        // 两条协议分支都必须走这个判据，不许各写各的 —— 各写一遍的表现是
+        // 「某个协议的缓存突然不命中」，而且没有任何地方会报错。
+        assert_eq!(
+            prod.matches("let _run_id = affinity_scope(&headers);").count(),
+            2,
+            "不是两条协议分支都在用会话优先的判据",
+        );
+        assert!(
+            !prod.contains("let _run_id = headers.get(\"x-ide-run-id\")"),
+            "还有分支在直接读 run id —— 那一条上会话粒度不生效",
+        );
+        // 出口分配那条粘性键也要有会话这一级（它的文档一直写着三级，实际只有两级）。
+        assert!(
+            prod.contains("headers.get(\"x-ide-session-id\").and_then(|v| v.to_str().ok()),\n                headers.get(\"x-ide-run-id\")"),
+            "出口粘性键缺了会话那一级 —— 首选出口一让位，同一段对话就会被分到别的替补上",
+        );
+    }
+
+    /// 空流重发能开、带预填的续写还得关着 —— 两者分开，理由都留在代码里。
+    #[test]
+    fn only_the_empty_stream_retry_is_on() {
+        assert!(super::RETRY_EMPTY_STREAM_ENABLED, "空流重发被关掉了 —— 那种情况用户什么都拿不到");
+        assert!(
+            !super::CONTINUATION_ENABLED,
+            "带预填的续写被打开了 —— 先确认 Anthropic 预填与 thinking 互斥、\
+             长回答去重、末尾空白、缓存断点这四条都解决了",
+        );
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        // 两条分支各走各的开关，不能共用一个 —— 共用的话开一个就等于开两个。
+        assert!(
+            prod.contains("RETRY_EMPTY_STREAM_ENABLED.then(|| cont_body.clone())")
+                && prod.contains("} else if CONTINUATION_ENABLED {"),
+            "两种情形共用了一个开关 —— 打开空流重发会把带预填的续写一起放出来",
+        );
+    }
+
+    /// 重发必须带**幂等头**，否则系统提示词会被组装第二遍。
+    ///
+    /// 这是上线之后才查出来的：入口的 `assemble_into` 对 system 是无条件 `insert(0)`，
+    /// 没有幂等判据。重发一个已经组装过的请求体 → 前缀在第二个块就分叉 →
+    /// 整段对话（agent 场景常十几万 token）按未命中缓存的全价重算，还要再付一次
+    /// 缓存写入。本该几乎白送的重发变成整轮里最贵的一发。
+    #[test]
+    fn the_retry_never_reassembles_the_prompt() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains("crate::prompts::ALREADY_ASSEMBLED_HEADER"),
+            "重发没带幂等头 —— 系统提示词会被插第二遍，整段对话按全价重算",
+        );
+        // request id **不能**去掉：它是结算查询唯一的关联键，去掉之后重发那一笔
+        // 永远进不了 SUM，用户看到的花费只含第一段而余额扣的是两段。
+        assert!(
+            !prod.contains("h.remove(\"x-ide-request-id\")"),
+            "重发把 request id 去掉了 —— 那一笔进不了结算查询，用户对不上账",
+        );
+        // 按次计费的线路不许重发：那会把整笔按次费用再收一次。
+        assert!(
+            prod.contains("let _retry_ok = !matches!(bmode.as_str(), \"per_call\") && percall <= 0;"),
+            "按次计费的线路也在重发 —— 一次抖动扣两次整价，而用户只收到一份回答",
+        );
+    }
+
+    /// 续写现在是**关着的**，而且关的理由必须留在代码里。
+    ///
+    /// 它的做法是「断了就再走一遍网关自己的入口」，而那个入口不是幂等的：
+    /// `prompts::assemble_into` 对 system 无条件 `insert(0)`，续写会把整份系统提示词
+    /// 插第二遍 —— 前缀分叉，整段对话按未命中缓存的全价重算。另有三条结构性的问题
+    /// （Anthropic 预填与 thinking 互斥、去重对超过 400 字的回答失效、按次计费扣两次）。
+    ///
+    /// 这条测试守的是「别在没解决那几条之前把它悄悄打开」。
+    #[test]
+    fn continuation_stays_off_until_the_entry_point_is_idempotent() {
+        assert!(
+            !super::CONTINUATION_ENABLED,
+            "续写被打开了 —— 先确认入口的重复组装、Anthropic 预填、长回答去重、\
+             按次计费这四条都解决了",
+        );
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        // 闸必须真的在判定里，不能只是定义了一个没人读的常量。
+        // 判定的形状 2026-08-27 拆过一次：空流重发和带预填的续写各走各的开关，
+        // 所以这里钉的是**带预填那一支**的开关。
+        assert!(
+            prod.contains("} else if CONTINUATION_ENABLED {"),
+            "带预填那一支的开关没接进判定 —— 定义了也没用",
+        );
+        // 入口确实会重复组装：这是关掉它的**根据**，根据没了就该重新评估。
+        assert!(
+            prod.contains("crate::prompts::assemble_into(&headers, &mut body)"),
+            "入口不再组装提示词了？那关掉续写的理由可能已经不成立，重新评估",
+        );
+    }
+
+    /// 「一个字都没吐就断」也要接住 —— 那是最该重试的一种。
+    ///
+    /// 线上第一次真实触发就是它：上游回了 200、流开起来了，然后抛
+    /// `Concurrency limit exceeded`，用户什么都没拿到。它既不算「表头前卡死」
+    /// （表头到了），又没有正文可续 —— 两条机制原来都没接住，而它的风险其实
+    /// 比续写还小：没有正文就没有拼接问题，原样重发一次即可。
+    #[test]
+    fn an_empty_stream_that_dies_is_retried_not_abandoned() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains("let next_body = if said.trim().is_empty() {")
+                && prod.contains("RETRY_EMPTY_STREAM_ENABLED.then(|| cont_body.clone())"),
+            "一个字都没吐就断的那种没被接住 —— 用户什么都拿不到",
+        );
+        // 有正文时仍然走续写，不能退化成整个重发（那会让用户看到答案说两遍）。
+        assert!(
+            prod.contains("crate::failover::continuation_body(&cont_body, &said)"),
+            "有正文时没走续写 —— 整段重发会让用户看到答案说两遍",
+        );
+    }
+
+    /// 续写必须**明确避开**刚死掉的那个出口，不能靠竞态。
+    ///
+    /// 「它刚被记了一笔失败，排序自然会绕开」这条不成立：那一笔是 `tokio::spawn`
+    /// 出去的，落库有延迟，而续写紧接着就发。竞态之下多半还没写进去，
+    /// 于是续写又挑中同一个刚断掉的出口 —— 整个功能白做，而且看起来像是「续写没用」。
+    ///
+    /// 同样要紧的是**只避不删**：避开之后一个候选都不剩时还得用它 ——
+    /// 一个可能还活着的出口好过直接把请求打死。
+    #[test]
+    fn the_continuation_explicitly_avoids_the_endpoint_that_just_died() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        // 发的那一侧：点名。
+        assert!(
+            prod.contains("h.insert(axum::http::HeaderName::from_static(AVOID_ENDPOINT_HEADER), v);"),
+            "续写没点名要避开哪个出口 —— 会靠竞态，多半又挑中刚死的那个",
+        );
+        assert!(
+            prod.contains("continue_stream(&st, &cont_headers, next_body, &said, hid, &tx)"),
+            "传的不是这个出口的 health_id",
+        );
+        // 收的那一侧：真的把它从候选里拿掉。
+        assert!(
+            prod.contains("let kept: Vec<Model> = candidates")
+                && prod.contains(".filter(|m| m.health_id() != avoid)"),
+            "派单没认那个头 —— 点了名也没用",
+        );
+        // 只避不删。
+        assert!(
+            prod.contains("if !kept.is_empty() {\n            candidates = kept;\n        }"),
+            "避开之后候选空了还硬避 —— 那会把请求直接打死",
+        );
+    }
+
+    /// 重述过的那一段**绝不能**原样透传。
+    ///
+    /// 「带着已生成内容接着写」在 Anthropic 那边是原生的，OpenAI 兼容那边不保证 ——
+    /// 有的模型会从头再说一遍。把攒下来的原始帧直接发出去，用户就会看到同一段话
+    /// 说了两遍，那比断掉更像 bug。
+    #[test]
+    fn a_restated_continuation_is_never_forwarded_raw() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        let at = prod.find("async fn flush_continuation(").expect("续写收尾函数不见了");
+        let seg = &prod[at..];
+        let end = seg.find("\n}\n").unwrap_or(seg.len());
+        let body = &seg[..end];
+        // 没重述才原样透传。
+        assert!(
+            body.contains("if skip == 0 {") && body.contains("tx.send(Ok(axum::body::Bytes::from(held.to_vec())))"),
+            "没重述时不再原样透传了 —— 思考块和工具块会被丢掉",
+        );
+        // 重述了就自己造一帧，只装去掉重叠之后的正文。
+        assert!(
+            body.contains("let rest = &buf[skip..];") && body.contains("\"delta\": { \"content\": rest }"),
+            "重述的那一段没有被去重 —— 用户会看到同一段话说两遍",
+        );
+        // 而且**不能**在重述分支里把 held 发出去。
+        let restated = &body[body.find("let rest = &buf[skip..];").unwrap()..];
+        assert!(
+            !restated.contains("held"),
+            "重述分支里还在发攒下来的原始帧 —— 那里面就是重复的话",
+        );
+    }
+
+    /// 流中途死掉必须记成失败，否则成功率是假的。
+    ///
+    /// 成功与否原来只在拿到响应表头那一刻记（`spawn_ok`）—— 一个「每次开头都正常、
+    /// 说到一半就断」的出口在成功率里是 **100%**。而选路的可靠性闸正建立在那个数上，
+    /// 等于建在假数据上：越是这种坏法，越会被排到第一位。
+    ///
+    /// 同样要紧的是**不能记多**：客户端自己走了（agentic IDE 里多半是用户按了停止）
+    /// 不是线路故障，算进去会把好线路刷红、然后告警被静音。判据只有 `!client_closed`。
+    #[test]
+    fn a_stream_that_dies_midway_is_recorded_as_a_failure() {
+        let prod = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
+        assert!(
+            prod.contains("if !complete && !client_closed {"),
+            "流中途断没记失败 —— 成功率会把这种出口显示成 100%",
+        );
+        // 记的是**这个出口**（hid），不是线路 id —— 记错了成功率会算到别人头上。
+        let at = prod.find("if !complete && !client_closed {").unwrap();
+        let seg = &prod[at..];
+        let end = seg.find("\n            }").unwrap_or(seg.len());
+        assert!(
+            seg[..end].contains("spawn_attempt(&st, hid, &req_model, false,"),
+            "中途断的失败没记在这个出口上",
+        );
+        // 用户按停止不算故障：判据里必须有 client_closed。
+        assert!(
+            !seg[..end].contains("if !complete {"),
+            "把「客户端自己走了」也算成线路故障了 —— 那会把好线路刷红",
+        );
+    }
+
     /// 同一条线路上，一次用户请求只发一次 —— 这条不许松。
     ///
     /// 理由在循环里：传输层失败也可能发生在上游**已经收下 body 之后**，重发会重复跑模型、
-    /// 重复计费。所以每条线路只发一次，而且卡死 / 发送出错之后**不换线**。
+    /// 重复计费。所以每条线路只发一次。
+    ///
+    /// # 2026-08-27 起有一个**明确的例外**
+    ///
+    /// 「表头都没回来就卡死」这一种允许换一个出口（`CHAT_MAX_STALL_SWITCHES = 1`）。
+    /// 那时候**客户端一个字节都没收到**，换出口重发对用户完全无缝；而线上这一类
+    /// 恰恰是最多的（半小时 11 次）。代价是上游那边可能还在跑、还会计费 ——
+    /// 那是运营方自己的取舍，所以只允许一次。
+    ///
+    /// 「发出去一半」和「流中途断」不走这条路：前者可能已经在跑，后者由续写机制
+    /// （`failover.rs`）处理，两者都不在这里放松。
     #[test]
     fn one_send_per_route_and_no_failover_when_nothing_came_back() {
         assert_eq!(CHAT_UPSTREAM_MAX_ATTEMPTS_PER_ROUTE, 1);
+        assert_eq!(super::CHAT_MAX_STALL_SWITCHES, 1, "卡死换出口的次数上限被改了");
 
         // 换线由 `upstream_answered_with_error` 一处判定，且只在收到完整错误响应时置位。
-        let loop_src = include_str!("models.rs");
+        //
+        // **必须先把测试模块剥掉。** 不剥的话下面几条断言会匹配到它们自己写在源码里的
+        // 那串字面量 —— 于是把实现删干净了测试照样绿。这个文件里已经有别的测试
+        // 用 `concat!` 拆字面量来绕，这里用剥的，因为要判的形状不止一处。
+        let loop_src = include_str!("models.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .unwrap_or("");
         assert!(
             loop_src.contains("if !upstream_answered_with_error {"),
-            "换线的闸门不见了：卡死/发送出错必须当场收手，不能换线重发",
+            "换线的闸门不见了：发送出错必须当场收手，不能换线重发",
+        );
+        // 那个例外必须**只对表头前卡死**开，而且带次数上限 —— 少任何一半，
+        // 「一次请求只发一次」就从「有一个说得清的例外」变成「形同虚设」。
+        assert!(
+            loop_src
+                .contains("if stalled_before_headers && stall_switches < CHAT_MAX_STALL_SWITCHES {"),
+            "卡死换出口的例外没有同时限定「表头前」和次数 —— 那等于放开了重发",
+        );
+        // 而且这一位只在**表头前卡死**那一支置位，别处不许设。
+        let stall_set = concat!("stalled_before_headers", " = true");
+        assert_eq!(
+            loop_src.matches(stall_set).count(),
+            1,
+            "「表头前卡死」这一位被多处置位了 —— 别的失败形状会混进重发路径",
         );
         // 用 concat! 拆开写，否则这段断言**自己**也会被 include_str! 数进去（源码里就有这串字面量），
         // 计数永远比真实的多一。
@@ -13025,6 +14119,15 @@ mod billing_tests {
             body.contains("&tokens.model_name"),
             "记账用的模型名和计费用的不是同一个字段 —— 两张表会对不上",
         );
+        // 回执形状必须**跟着这一份回执**走，不能写死。
+        //
+        // 写死 true 的后果是单向的：Anthropic 的 prompt 不含缓存读，对账会把超出的
+        // 那一段整个夹掉。线上实测最近 7 天两个 claude 模型合计丢了 1590 万个缓存读
+        // token —— 成本低估、毛利高估，而且这一位事后从数字反推不出来，补不回来。
+        assert!(
+            body.contains("tokens.prompt_includes_cached,"),
+            "出口用量没带上回执形状 —— 对账只能靠夹刀猜，而那一刀对 Anthropic 是错的",
+        );
     }
 
     /// 中转把**它自己上游的失败**转出来时，必须换线，不能当成「请求写错了」。
@@ -13206,8 +14309,10 @@ mod billing_tests {
     /// exactly 40 点. Pin the arithmetic so a future edit cannot quietly desync the two.
     #[test]
     fn daily_allowance_is_two_yuan_worth_of_points() {
+        // 无锁读全局 CACHE，而 settings.rs 的几条用例会把它 swap 成 0 / 100 / MAX。
+        // 不拿这把锁，这条**钱的断言**会偶发变红，而且每次红的不一定是同一条。
+        let _g = crate::settings::settings_test_guard();
         assert_eq!(super::free_points_daily(), 40);
-        // ¥0.5 buys 10 点, so the daily grant is ¥2.00 exactly.
         let yuan_per_point = 0.5_f64 / 10.0;
         assert!((super::free_points_daily() as f64 * yuan_per_point - 2.0).abs() < 1e-9);
     }
@@ -16765,7 +17870,7 @@ mod michael_compression_wiring_tests {
             ]
         });
         // 压掉前两条（索引相对 pinned 之后：0=老消息, 1=assistant），逐字从 2 起。
-        compression_write_back(&mut body, 1, 2, &["早期摘要".to_string()], None);
+        compression_write_back(&mut body, 1, 2, &["早期摘要".to_string()], None, None);
         let arr = body["messages"].as_array().expect("messages 必须还在");
 
         assert_eq!(arr[0]["role"], "system");
@@ -16773,17 +17878,106 @@ mod michael_compression_wiring_tests {
             arr[0]["content"], "系统提示词",
             "钉住的系统提示词必须原样保留"
         );
+        // 原始目标块排在摘要**之前**：摘要是有损的，目标是原文，冲突时以原文为准。
         assert_eq!(arr[1]["role"], "system");
+        let goal = arr[1]["content"].as_str().unwrap();
         assert!(
-            arr[1]["content"].as_str().unwrap().contains("早期摘要"),
+            goal.contains("本次会话的原始目标") && goal.contains("老消息"),
+            "被压掉的那条原始请求必须逐字留下来，否则长会话会忘掉用户到底要什么：{goal}"
+        );
+        assert_eq!(arr[2]["role"], "system");
+        assert!(
+            arr[2]["content"].as_str().unwrap().contains("早期摘要"),
             "摘要作为一条新的 system 注入"
         );
         // 逐字尾部必须是**原始对象**，结构字段一个不少。
-        assert_eq!(arr[2]["role"], "tool");
-        assert_eq!(arr[2]["tool_call_id"], "call_1", "tool_call_id 不能丢");
-        assert_eq!(arr[2]["name"], "read_file", "name 不能丢");
-        assert_eq!(arr[3]["content"], "新问题");
-        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[3]["role"], "tool");
+        assert_eq!(arr[3]["tool_call_id"], "call_1", "tool_call_id 不能丢");
+        assert_eq!(arr[3]["name"], "read_file", "name 不能丢");
+        assert_eq!(arr[4]["content"], "新问题");
+        assert_eq!(arr.len(), 5);
+    }
+
+    /// 没有摘要就没有失忆，也就不该白背这个块 —— 否则它会在短会话里凭空多出一条
+    /// system，把前缀缓存打碎。
+    #[test]
+    fn the_original_goal_block_only_appears_once_history_is_lossy() {
+        let base = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "user", "content": "帮我做个多租户后台" },
+                { "role": "user", "content": "当前问题" }
+            ]
+        });
+        let mut body = base.clone();
+        compression_write_back(&mut body, 1, 0, &[], None, None);
+        assert!(
+            !serde_json::to_string(&body["messages"])
+                .unwrap()
+                .contains("本次会话的原始目标"),
+            "一段摘要都没有时不该注入原始目标块"
+        );
+
+        let mut compressed = base;
+        compression_write_back(&mut compressed, 1, 1, &["早期摘要".into()], None, None);
+        assert!(
+            serde_json::to_string(&compressed["messages"])
+                .unwrap()
+                .contains("帮我做个多租户后台"),
+            "历史被压过之后，原始目标必须逐字在场"
+        );
+    }
+
+    /// 目标块必须来自客户端那一句，**不是**从请求体现算。
+    ///
+    /// 从第二个压缩轮起，客户端按 covered 把已折叠的前缀整段省掉再发，请求体里最早那条
+    /// 用户消息已经是会话中途的某一句。上一版从 body 现算，于是那块指着一句半路的话，
+    /// 还挂着「冲突时以这段为准」—— 比不发更糟。
+    #[test]
+    fn the_goal_block_comes_from_the_client_not_from_a_truncated_body() {
+        // 第二个压缩轮的真实形状：开场那句已经不在 body 里了。
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "user", "content": "再把导出那块补上" },
+                { "role": "user", "content": "当前问题" }
+            ]
+        });
+        compression_write_back(&mut body, 1, 1, &["早期摘要".into()], None, Some("帮我做一个多租户 SaaS 的后端"));
+        let wire = serde_json::to_string(&body["messages"]).unwrap();
+        assert!(wire.contains("帮我做一个多租户 SaaS 的后端"),
+            "没用客户端给的开场那句");
+        assert!(!wire.contains("原始目标（逐字保留，不随压缩改写）---\\n再把导出那块补上"),
+            "把会话中途的一句话当成了「原始目标」");
+
+        // 非 IDE 客户端没有这个头：退回从 body 取（它们不走前缀续传，body 是完整的）。
+        let mut plain = serde_json::json!({
+            "messages": [
+                { "role": "system", "content": "规则" },
+                { "role": "user", "content": "写个命令行工具" },
+                { "role": "user", "content": "继续" }
+            ]
+        });
+        compression_write_back(&mut plain, 1, 1, &["早期摘要".into()], None, None);
+        assert!(serde_json::to_string(&plain["messages"]).unwrap().contains("写个命令行工具"),
+            "纯 API 客户端不该因此失去目标块");
+    }
+
+    /// 头是 base64(UTF-8)：中文过不了 ASCII-only 的 HTTP 头，编解码两边必须对齐。
+    #[test]
+    fn the_session_goal_header_round_trips_chinese() {
+        use base64::Engine as _;
+        let goal = "帮我做一个多租户 SaaS 的后端，要能扛住十万用户";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(goal.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ide-session-goal", encoded.parse().unwrap());
+        assert_eq!(ide_session_goal(&headers).as_deref(), Some(goal));
+
+        // 解不出来就当没有 —— 错的目标比没有目标更糟（它带着「以这段为准」的权威）。
+        let mut bad = HeaderMap::new();
+        bad.insert("x-ide-session-goal", "not-valid-base64!!".parse().unwrap());
+        assert_eq!(ide_session_goal(&bad), None);
+        assert_eq!(ide_session_goal(&HeaderMap::new()), None);
     }
 
     #[test]
@@ -16803,16 +17997,21 @@ mod michael_compression_wiring_tests {
             2,
             &["认证模块曾修改".to_string()],
             Some(evidence),
+            None,
         );
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
         assert_eq!(messages[0]["content"], "规则");
         assert!(messages[1]["content"]
             .as_str()
             .unwrap()
+            .contains("本次会话的原始目标"));
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
             .contains("认证模块曾修改"));
-        assert_eq!(messages[2]["content"], evidence);
-        assert_eq!(messages[3]["content"], "当前问题");
+        assert_eq!(messages[3]["content"], evidence);
+        assert_eq!(messages[4]["content"], "当前问题");
     }
 
     #[test]
@@ -17582,18 +18781,71 @@ async fn compression_take_prefix(
 ///
 /// `verbatim_from` 是**相对于 pinned 之后那段**的索引，与 `compression_plan_input`
 /// 的返回值口径一致。
+/// 客户端送来的「本次会话开场那句」，base64(UTF-8)。
+///
+/// 解不出来就当没有 —— 这块的兜底是「从 body 现算」，而**错的目标比没有目标更糟**
+/// （它带着「冲突时以这段为准」的权威），所以这里宁可什么都不给，也不猜。
+fn ide_session_goal(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine as _;
+    let raw = headers.get("x-ide-session-goal")?.to_str().ok()?;
+    if raw.is_empty() || raw.len() > 8192 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 fn compression_write_back(
     body: &mut serde_json::Value,
     pinned: usize,
     verbatim_from: usize,
     summaries: &[String],
     retrieved_history: Option<&str>,
+    session_goal: Option<&str>,
 ) {
     let Some(arr) = body.get("messages").and_then(|v| v.as_array()) else {
         return;
     };
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len() + 1);
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(arr.len() + 2);
     out.extend(arr.iter().take(pinned).cloned());
+    // **原始目标逐字保留，永不进摘要。**
+    //
+    // 压缩是从最老的消息开始吃的，而最老的那条恰恰是人一开始说要做什么。长会话跑到
+    // 后面，模型手里只剩「早期摘要：改了 3 个文件、修了个报错」——用户的目标本身被
+    // 一个便宜模型改写过一次，还被折进了要点里。这就是「跑着跑着就忘了我要干嘛」。
+    //
+    // 放在这里而不是各个调用点：write_back 有四个生产调用点，任何一个漏掉都等于这条
+    // 保护在那条路上不存在。摘要非空 ⇒ 历史已经有损，这时才需要它；短会话原文还在
+    // 逐字尾部里，不重复注入。
+    //
+    // 位置也是固定的（钉住的 system 之后、摘要之前），且文本取自会话最早那条带标记的
+    // 用户请求 —— 逐字节稳定，不会打碎上游的前缀缓存。
+    if !summaries.is_empty() {
+        // **目标必须由客户端直接告诉我们，不能从 body 现算。**
+        //
+        // 上一版是 `session_anchor_request(body)`。那个前提只在第一个压缩轮成立：
+        // 从第二轮起客户端按 covered 把已折叠的前缀整段省掉再发，body 里最早那条用户
+        // 消息已经是会话中途的某一句了。于是这块从第二轮起指着一句半路的话，还带着
+        // 「冲突时以这段为准」的权威 —— 比不发更糟。
+        //
+        // 客户端在 x-ide-session-goal 里送开场那句（会话内粘住、字节稳定）。
+        // 非 IDE 客户端没有这个头，退回从 body 取 —— 它们不走前缀续传，body 是完整的。
+        if let Some(goal) = session_goal
+            .map(str::to_string)
+            .or_else(|| crate::prompts::session_anchor_request(body))
+            .map(|goal| goal.trim().chars().take(4000).collect::<String>())
+            .filter(|goal| !goal.is_empty())
+        {
+            out.push(json!({
+                "role": "system",
+                "content": format!(
+                    "--- 本次会话的原始目标（逐字保留，不随压缩改写）---\n{goal}\n\n                     下面的历史摘要是压缩过的、有损的；与这段原始目标冲突时以这段为准。                     每一步都要指向它，不要因为摘要里没提就当它不存在。"
+                ),
+            }));
+        }
+    }
     if let Some(text) = crate::compression::summary_system_text(summaries) {
         out.push(json!({ "role": "system", "content": text }));
     }
@@ -18106,6 +19358,7 @@ async fn apply_michael_compression(
     tier: crate::compression::Tier,
     uid: uuid::Uuid,
     client_window: Option<usize>,
+    session_goal: Option<&str>,
 ) -> Result<Option<(String, usize)>, AppError> {
     use crate::compression as mc;
 
@@ -18122,7 +19375,7 @@ async fn apply_michael_compression(
     let (pinned, msgs) = compression_plan_input(body);
     if msgs.is_empty() {
         if !carried.summaries.is_empty() {
-            compression_write_back(body, pinned, 0, &carried.summaries, None);
+            compression_write_back(body, pinned, 0, &carried.summaries, None, session_goal);
         }
         return Ok(None);
     }
@@ -18237,6 +19490,7 @@ async fn apply_michael_compression(
             0,
             &carried.summaries,
             retrieved.text.as_deref(),
+            session_goal,
         );
         tracing::info!(
             %uid,
@@ -18326,6 +19580,7 @@ async fn apply_michael_compression(
                     0,
                     &carried.summaries,
                     retrieved.text.as_deref(),
+                    session_goal,
                 );
             }
             return Ok(None);
@@ -18440,6 +19695,7 @@ async fn apply_michael_compression(
         verbatim_from,
         &summaries,
         retrieved.text.as_deref(),
+        session_goal,
     );
 
     let mut all_keys = carried.summary_keys.clone();
@@ -19554,7 +20810,14 @@ mod power_route_tests {
         // 所有普通请求就静默改走强力线路、按它计费，界面上看不出来。
         let src = dispatch_src();
         let at = src.find("let want_power").expect("派单那段没了");
-        let block = &src[at..(at + 2400).min(src.len())];
+        // 按**结构**取，不按固定字节数。原来是 `at + 2400`，而这段代码里有中文注释 ——
+        // 前面插一段字，2400 这个偏移就会落在某个汉字的第二个字节上，整条测试
+        // panic 在「not a char boundary」而不是它要守的那件事上（今天就这么翻了一次）。
+        // 顺带：固定窗口还会随着代码变长而守不到尾部，那种失效是**静默**的。
+        let block = &src[at..src[at..]
+            .find("let primary_conn")
+            .map(|i| at + i)
+            .unwrap_or_else(|| src.len())];
         assert!(
             block.contains("filter(|m| !m.power_route)"),
             "普通请求没把强力线路排除掉，排序一变就会悄悄接普通流量"
