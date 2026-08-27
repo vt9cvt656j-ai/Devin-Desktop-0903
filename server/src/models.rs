@@ -7153,6 +7153,7 @@ fn anthropic_thinking(model: &str, effort: Option<&str>) -> Option<serde_json::V
         model,
         effort,
         std::env::var("MICHAEL_THINKING_DISPLAY").ok().as_deref(),
+        std::env::var("MICHAEL_GROK_THINKING").ok().as_deref(),
     )
 }
 
@@ -7168,6 +7169,7 @@ fn anthropic_thinking_with_display(
     model: &str,
     effort: Option<&str>,
     display_override: Option<&str>,
+    grok_shape: Option<&str>,
 ) -> Option<serde_json::Value> {
     if std::env::var("MICHAEL_ANTHROPIC_THINKING").ok().as_deref() == Some("0") {
         return None;
@@ -7272,6 +7274,64 @@ fn anthropic_thinking_with_display(
             return Some(json!({"type":"adaptive"}));
         }
         return Some(json!({"type":"adaptive","display": display}));
+    }
+    // ── 非 Claude 的模型落在一条 **Anthropic 形状** 的出口上 ────────────────
+    //
+    // 上面每一条判据都是围着 Claude 家族名写的（haiku / claude-3-5 / claude-3-7 /
+    // 0 < claude_generation <= 4.6 / contains("claude")|fable|mythos），grok 一条都不匹配——
+    // claude_generation 只扫 opus/sonnet/haiku/fable/mythos/claude 六个家族名，"grok-4.6"
+    // 返回 0.0（"4.6" 不会让它误判：版本号只在家族名右侧才解析），于是它穿到函数
+    // 末尾的 None，调用方那句 `if let Some(t) = &thinking` 什么都不插：
+    // 用户在转盘上拨到「极限」，网关**根本没有向上游请求过思考**。
+    //
+    // 不是假设：Grok 线路 3ecc0e13 今天挂着一个 protocol=anthropic 的出口
+    // （route_endpoints f0bb2b41 → modelflare.dev），出口协议覆盖线路协议，它在接真实
+    // 流量、而且按汇率换算后的成本是候选 #1。生产遥测原文（2026-08-27）：
+    //   inbound chat request     model=grok-4.6 reasoning_effort="xhigh"
+    //   native Anthropic request model=grok-4.6 protocol="anthropic"
+    //       thinking_type="absent" output_config_effort="absent"
+    //
+    // **发什么形状是上游中转的属性，不是文档的属性。** modelflare 的公开文档只有八页
+    // 接入指南，没有 API 参考页；讲 Anthropic 兼容端点那页只点名 claude-opus-4-8 /
+    // claude-sonnet-5，通篇没有 grok，也通篇没有 thinking / budget_tokens / reasoning
+    // 任何一个词。2026-08-27 查过，**查不到**。查不到不等于不支持，所以这里不赌一个
+    // 「看着最像」的形状，而是发最保守的那个、留一个不用发版就能换形状的逃生舱，
+    // 照 MICHAEL_THINKING_DISPLAY 的先例来。默认取经典的 enabled + budget_tokens：
+    // 中转普遍认，而且它正是本文件 3.7 / 4.6 两族在聚合上游上被实测验证过「能回思考流」
+    // 的那一个（adaptive 在那类上游上是静默忽略：200 但一个 thinking_delta 都不回）。
+    //
+    //     MICHAEL_GROK_THINKING 未设 / =budget   → {"type":"enabled","budget_tokens":N}
+    //     MICHAEL_GROK_THINKING=adaptive         → {"type":"adaptive"}（调用点会补
+    //                                              output_config.effort）
+    //     MICHAEL_GROK_THINKING=adaptive_display → {"type":"adaptive","display":"summarized"}
+    //     MICHAEL_GROK_THINKING=off              → None，一字不差退回改这行之前的行为
+    //
+    // 认不出来的值落回 budget 那一档（保守优先），不是 panic 也不是 None —— 一个拼错的
+    // 环境变量不该等于「把思考关掉」。换完读网关自己的 `Anthropic stream outcome` 里的
+    // thinking_utf8_chars 判哪个赢，别看界面：这条出口一超时就落回自带地址的
+    // /v1/chat/completions，那条路上思考正文结构性拿不到，界面上两种失败同形。
+    //
+    // 判据复用 _is_xai_route 的模型名那一半（base_url 传空串：这里只有模型名可判）。
+    // 手写第二份「是不是 Grok」的清单，是本仓库已经栽过的那个坑。
+    if _is_xai_route(&m, "") {
+        return match grok_shape.unwrap_or("budget") {
+            "off" | "none" => None,
+            "adaptive" => Some(json!({"type":"adaptive"})),
+            "adaptive_display" | "summarized" => {
+                Some(json!({"type":"adaptive","display":"summarized"}))
+            }
+            // 分档和上面 4.6 那族逐字一致 —— IDE 转盘的 budgets 就是这四个数，
+            // 两边不一致就会出现「客户端画的档位和网关真正发出去的形状对不上」。
+            _ => {
+                let budget = match eff {
+                    "low" => 4096,
+                    "high" => 24000,
+                    "max" | "xhigh" => 32000,
+                    _ => 12000,
+                };
+                Some(json!({"type":"enabled","budget_tokens":budget}))
+            }
+        };
     }
     None
 }
@@ -14834,7 +14894,8 @@ mod billing_tests {
         // The escape hatch has to work, or the next person measuring is blocked on a deploy.
         // 走纯函数版：改进程环境会漏给并行跑的其它测试（见 anthropic_thinking_with_display）。
         let reverted =
-            anthropic_thinking_with_display("claude-opus-5", Some("high"), Some("omitted")).unwrap();
+            anthropic_thinking_with_display("claude-opus-5", Some("high"), Some("omitted"), None)
+                .unwrap();
         assert!(reverted.get("display").is_none(), "the kill switch must actually revert");
         // 而且 env 这一层必须真的接在那个参数上，否则线上那个开关是死的。
         let src = include_str!("models.rs");
@@ -14849,6 +14910,111 @@ mod billing_tests {
         assert_eq!(t46["type"], "enabled", "4.6 keeps the explicit-budget form");
         assert!(t46.get("display").is_none(), "4.6 must not gain a display field");
     }
+
+    /// grok 在 Anthropic 协议那条出口上，思考**根本没被请求过**。
+    ///
+    /// 这个函数每一条分支都认 Claude 家族名，而 claude_generation("grok-4.6") 是 0.0，
+    /// 于是 grok 一路穿到函数末尾的 None，调用点什么都不插。生产遥测实录：客户端
+    /// 明明发了 reasoning_effort="xhigh"，翻成 Anthropic 形状之后 thinking_type="absent"。
+    ///
+    /// 形状是上游的属性、不是文档的属性 —— 中转的公开文档没有 API 参考页，查不到它把
+    /// thinking 映射成 xAI 的哪一档。所以默认发最保守的经典形式，并留一个环境开关，让
+    /// 下一个人不用发版就能换形状、再读 thinking_utf8_chars 判哪个赢。这条守的是
+    /// **有人在决定这个问题**，不是守某一个具体形状。
+    #[test]
+    fn grok_is_asked_to_think_on_the_anthropic_bridge() {
+        seed_catalog();
+        for id in ["grok-4.6", "grok-4.5"] {
+            let t = anthropic_thinking(id, Some("xhigh")).unwrap_or_else(|| {
+                panic!("{id}: 思考根本没被请求过 —— 上游收不到任何 thinking 键")
+            });
+            assert_eq!(t["type"], "enabled", "{id} 默认取最保守的经典形式");
+            assert_eq!(t["budget_tokens"], 32000, "{id}");
+        }
+        assert_eq!(
+            anthropic_thinking("grok-4.6", Some("low")).expect("low 也要发")["budget_tokens"],
+            4096
+        );
+        // 档位梯度必须和 4.6 那一支同源 —— 两支共用同一张表，别各写一份慢慢漂。
+        assert_eq!(
+            anthropic_thinking("grok-4.6", Some("high")),
+            anthropic_thinking("claude-sonnet-4-6", Some("high")),
+        );
+        // 逃生舱：候选形状都要能不发版切出来，最后一档一字不差退回改这行之前的行为。
+        assert_eq!(
+            anthropic_thinking_with_display("grok-4.6", Some("high"), None, Some("adaptive")),
+            Some(json!({"type":"adaptive"}))
+        );
+        assert_eq!(
+            anthropic_thinking_with_display("grok-4.6", Some("high"), None, Some("adaptive_display")),
+            Some(json!({"type":"adaptive","display":"summarized"}))
+        );
+        assert_eq!(
+            anthropic_thinking_with_display("grok-4.6", Some("high"), None, Some("off")),
+            None,
+            "关不掉的开关不是开关"
+        );
+        // 认不出来的值必须落回默认那一档：一个拼错的环境变量不该等于「把思考关掉」。
+        assert_eq!(
+            anthropic_thinking_with_display("grok-4.6", Some("high"), None, Some("banana")),
+            Some(json!({"type":"enabled","budget_tokens":24000}))
+        );
+        // 没说档位 / 明确关掉，仍然一个 thinking 键都不发。
+        assert_eq!(anthropic_thinking("grok-4.6", None), None);
+        assert_eq!(anthropic_thinking("grok-4.6", Some("off")), None);
+        // 开关必须真的接在环境上，否则线上那个逃生舱是死的（同 MICHAEL_THINKING_DISPLAY）。
+        // 运行时读而不是 include_str!：把正在编译的这个文件嵌进来，cargo 的变更检测会滞后
+        // 一个 build，断言可能对着上一版字节通过 —— 本文件里真发生过一次。
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let cut = src.find("\nmod billing_tests").expect("tests module");
+        let production = &src[..cut];
+        assert!(
+            production.len() > 400_000 && production.len() < src.len(),
+            "切出来的生产段是 {} 字节 —— 锚点漂了，这条断言在守一个空窗口",
+            production.len()
+        );
+        assert!(
+            production.contains("std::env::var(\"MICHAEL_GROK_THINKING\").ok().as_deref()"),
+            "逃生舱没接到环境上"
+        );
+        // Claude 全家一条都不能被这条新分支截住 —— 它插在所有 Claude 分支之后。
+        assert_eq!(anthropic_thinking("claude-haiku-4-5", Some("high")), None);
+        assert_eq!(anthropic_thinking("claude-3-5-sonnet", Some("high")), None);
+        assert_eq!(
+            anthropic_thinking("claude-3-7-sonnet", Some("high")),
+            Some(json!({"type":"enabled","budget_tokens":12000}))
+        );
+        assert_eq!(
+            anthropic_thinking("claude-opus-4-6", Some("high")),
+            Some(json!({"type":"enabled","budget_tokens":24000}))
+        );
+        assert_eq!(
+            anthropic_thinking("claude-opus-5", Some("high")),
+            Some(json!({"type":"adaptive","display":"summarized"}))
+        );
+        // 既不是 Claude 也不是 Grok 的，仍然什么都不发。
+        assert_eq!(anthropic_thinking("gpt-5.5", Some("high")), None);
+        assert_eq!(anthropic_thinking("glm-5", Some("high")), None);
+        assert_eq!(anthropic_thinking("deepseek-v4-pro", Some("high")), None);
+
+        // max_tokens 地板：新分支让 grok 也走进 thinking_on 那条路径，确认没顶到离谱。
+        let deep = oai_to_anthropic(&json!({
+            "model": "grok-4.6", "reasoning_effort": "xhigh",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(deep["thinking"], json!({"type":"enabled","budget_tokens":32000}));
+        let mt = deep["max_tokens"].as_i64().unwrap();
+        assert_eq!(mt, 40_000, "xhigh 被封顶折成 high，就该拿 high 那一档余量");
+        assert!(
+            mt <= official_max_output("grok-4.6").expect("目录里有 grok-4.6"),
+            "地板把 max_tokens 顶过了模型自己的输出上限"
+        );
+        // 经典形式不发 output_config：实测聚合上游一收到 effort 就把整段思考换成一句摘要。
+        assert!(deep.get("output_config").is_none());
+    }
+
 
     #[test]
     fn oai_to_anthropic_enables_thinking_and_drops_temp() {
