@@ -132,6 +132,17 @@ pub async fn offer(
 #[derive(Deserialize)]
 pub struct RedeemReq {
     pub code: String,
+    /// 换取这张会话的**浏览器**自己的设备 id（localStorage 里那个）。
+    ///
+    /// 以前这里没有这个字段，于是下面 start_session 传的是 None、落成空 device_id ——
+    /// 而「设备」这一页正是按 device_id 分组的。后果：桌面端每交接一次，网页控制台上
+    /// 就多出一台「Chrome · macOS」，同一个浏览器、同一个 IP、三四行并排，
+    /// 而这恰恰是当初加 device_id 那次迁移要修掉的症状。
+    ///
+    /// 老版本的页面不发这个字段 → None → 行为和以前一模一样（落空、按指纹折叠），
+    /// 不会因为服务端先上线而坏掉。
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// `POST /api/auth/handoff/redeem` — 网页用交接码取走会话。取走即焚。
@@ -185,10 +196,20 @@ pub async fn redeem(
 
     // 走和登录完全相同的那条路 —— 设备列表、撤销、过期全都一致。
     // device 记成 web：这张令牌是给浏览器用的，不是给 App 自己用的。
-    // device_id 传 None：换取的请求体里只有 code，浏览器那个 localStorage 里的 id 还没有
-    // 办法送过来，所以这一行落成空 device_id，按指纹和这个浏览器自己的登录并成一台设备
-    // （见 sessions.rs 的折叠）。要让它带上 id，得先给 /gate 那个页面加字段。
-    let token = crate::auth::start_session(&state, &user, &headers, Some("web"), None).await?;
+    //
+    // device_id 用**换取方**（浏览器）自己的那个，不是桌面端的：这张令牌是给浏览器的，
+    // 它该和这个浏览器已有的会话并成同一台设备。
+    // 上一版这里写死 None，理由是「换取的请求体里只有 code，得先给 /gate 加字段」——
+    // 而 /gate 早就加了（登录/注册/OAuth 三条路径都在发），只有这一条没跟上。
+    // 于是每交接一次就多一行空 device_id 的会话，设备页上同一个浏览器排出三四台。
+    let token = crate::auth::start_session(
+        &state,
+        &user,
+        &headers,
+        Some("web"),
+        req.device_id.as_deref(),
+    )
+    .await?;
     tracing::info!(%uid, "desktop handoff redeemed");
     Ok(Json(json!({ "ready": true, "token": token })))
 }
@@ -318,9 +339,23 @@ mod tests {
             redeem.contains("headers: axum::http::HeaderMap"),
             "会话要按换取方的请求头记，否则设备列表上是 App 的 IP 和 User-Agent",
         );
+        // 判据按**参数**取而不是按单行调用写法取：这一句后来因为多传一个参数换了行，
+        // 原来那条 `contains("start_session(&state, &user, &headers,")` 当场变红，
+        // 而它要守的东西（用换取方的头签会话）一个字没变。
+        let mint = redeem.find("start_session(").expect("redeem 里要签会话");
+        let call = &redeem[mint..(mint + 220).min(redeem.len())];
         assert!(
-            redeem.contains("start_session(&state, &user, &headers,"),
-            "会话在 redeem 里签，用的是这个浏览器的头",
+            call.contains("&headers"),
+            "会话在 redeem 里签，用的是这个浏览器的头：{call}",
+        );
+        // device_id 必须用**换取方**（浏览器）自己的那个。
+        // 这里曾经写死 None，理由是「/gate 还没法把它送过来」—— 而 /gate 早就在发了
+        // （登录/注册/OAuth 三条都有），只有这条没跟上。后果是每交接一次就多一行空
+        // device_id 的会话，设备页上同一个浏览器排成三四台，而那正是当初加 device_id
+        // 那次迁移要修掉的症状。
+        assert!(
+            !call.contains("Some(\"web\"), None)") && call.contains("req.device_id"),
+            "交接签会话时没带换取方的 device_id —— 设备页会把同一个浏览器列成多台：{call}",
         );
         let getdel = redeem.find("GETDEL").expect("取走即焚");
         let mint = redeem.find("start_session(").expect("签会话");

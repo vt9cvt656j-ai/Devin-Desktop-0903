@@ -589,7 +589,9 @@ function a0b(a,b){a=a-0x19c;const c=a0a();let d=c[a];if(a0b['SGwsDT']===undefine
     wrap.style.visibility = "hidden";
     setMsg("");
     try {
-      var r = await post("/api/auth/handoff/redeem", { code: code });
+      // device_id 必须一起送：这张令牌落成的是**这个浏览器**的一行会话，
+      // 不带 id 的话它会以空 device_id 落库，设备页上就多出一台重复的机器。
+      var r = await post("/api/auth/handoff/redeem", { code: code, device_id: deviceId() });
       if (r.ok && r.data && r.data.token) return finish(r.data.token);
       setMsg((r.data && r.data.error) || "This sign-in link has expired. Open the app and try again.", "err");
     } catch (e) {
