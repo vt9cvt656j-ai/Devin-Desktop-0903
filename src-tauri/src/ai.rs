@@ -647,6 +647,25 @@ async fn read_sse_text(
                 || v["type"] == "response.completed"
                 || v["type"] == "response.incomplete"
             {
+                // xAI Responses 的停止原因既不在 choices 里也不在 delta 里，而在这一帧的
+                // response.status / incomplete_details.reason 上。不认它，这条路上的
+                // finishReason 恒为空串 —— 而它是**唯一**能分清「模型什么都没产出」和
+                // 「产到一半被输出预算截断」的信号，_billableAiComplete 的补余量重试
+                // （_finish(out) === "length"）就永远不触发，表现成「这个模型答得就是短」。
+                //
+                // 判据和 protocol.rs 那条流式解码逐字同源（见
+                // xai_truncated_response_reports_length_not_stop）：先看
+                // incomplete_details.reason == "max_output_tokens"，再退到帧类型本身。
+                if finish.is_empty() {
+                    if v.pointer("/response/incomplete_details/reason").and_then(serde_json::Value::as_str)
+                        == Some("max_output_tokens")
+                        || v["type"] == "response.incomplete"
+                    {
+                        finish = "length".to_string();
+                    } else if v["type"] == "response.completed" {
+                        finish = "stop".to_string();
+                    }
+                }
                 saw_done = true;
             }
         }
@@ -1811,6 +1830,70 @@ mod stream_timeout_tests {
             .unwrap();
         // read_sse_text 现在同时带回 finish_reason；这个夹具只关心正文，取第一项即可。
         read_sse_text(resp, Duration::from_secs(5), None).await.map(|(text, _finish)| text)
+    }
+
+    /// 同 run_sse_text，但把 finish_reason 也带回来。
+    async fn run_sse_finish(body: Vec<u8>) -> Result<(String, String), String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&body).unwrap();
+            let _ = socket.flush();
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        read_sse_text(resp, Duration::from_secs(5), None).await
+    }
+
+    /// xAI Responses 的停止原因在 response.status / incomplete_details 上，既不在 choices
+    /// 里也不在 delta 里。不认它，finishReason 恒为空串 —— 而 _billableAiComplete 的
+    /// 「补余量重试」只认 "length"，于是被输出预算截断的辅助回答永远不会被重试，
+    /// 表现成「这个模型答得就是短」，不报错。
+    #[tokio::test]
+    async fn xai_responses_completion_reports_length_when_truncated() {
+        let truncated = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"半截\"}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        let (text, finish) = run_sse_finish(truncated.as_bytes().to_vec()).await.unwrap();
+        assert_eq!(text, "半截");
+        assert_eq!(finish, "length", "被截断却报不出 length —— 补余量重试永远不会触发");
+
+        let done = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"整段\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+        let (text2, finish2) = run_sse_finish(done.as_bytes().to_vec()).await.unwrap();
+        assert_eq!(text2, "整段");
+        assert_eq!(finish2, "stop", "正常收尾要报 stop，否则和「什么都没产出」分不开");
+    }
+
+    /// Anthropic 的 stop_reason 在 message_delta 上，**先到**、message_stop 后到。
+    /// 新加的收尾判据不许把它覆盖掉。
+    #[tokio::test]
+    async fn anthropic_completion_keeps_the_stop_reason_it_already_saw() {
+        let body = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"话\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (text, finish) = run_sse_finish(body.as_bytes().to_vec()).await.unwrap();
+        assert_eq!(text, "话");
+        assert_eq!(finish, "length", "message_stop 把先到的 stop_reason 覆盖成了别的");
     }
 
     /// 走 OpenAI 形状的中转：增量在 choices[0].delta.content。
