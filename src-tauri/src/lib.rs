@@ -29,6 +29,7 @@ mod image_location;
 mod knowledge;
 mod local_discovery;
 mod location;
+mod lint;
 mod lsp;
 mod marketplace;
 mod mcp;
@@ -330,6 +331,7 @@ pub fn run() {
             git::git_show,
             ui_clone::ui_diff,
             env_probe::probe_env,
+            lint::project_lint_run,
             git::git_stash,
             git::git_stash_pop,
             git::git_stash_apply,

@@ -351,16 +351,31 @@ test("补全通道缺席才返回 null；工作区取证拿不到就降级成 ha
   assert.equal(flags?.implementation, true,
     "有补全通道（web 构建同样满足）时快通道必须工作");
 
-  // 工作区取证：桌面端才有项目扫描；web 上如实说没有，不拦整条腿。
-  const evidence = (flag) => load("_aiIntentWorkspaceEvidence", {
-    inTauri: flag,
+  // 工作区取证的判据是「这个工作区扫过没有」，**不是**「是不是桌面端」。
+  //
+  // 上一版按 inTauri 判，于是网页版每一轮 hasWorkspace 恒 false、topLevel/stack 恒空。
+  // 那个前提是错的：填 _agentContextCache / _projectStacks 的是 _gatherAgentContext，
+  // 它一个 inTauri 都没有，走的是 backend.readDir/readTextFile，而 mockBackend 两个都实现了
+  // （网页版是一整套模拟工程）。分类器因此在网页版上看不见语言/框架/测试命令。
+  const evidence = (cache, stacks) => load("_aiIntentWorkspaceEvidence", {
     _normalizeFsPath: (p) => String(p || ""),
-    _agentContextCache: {},
-    _projectStacks: new Map(),
+    _agentContextCache: cache,
+    _projectStacks: stacks,
     _aiIntentText: intentText,
   });
-  assert.deepEqual(evidence(false)("/repo"),
+  const _scanned = { root: "/repo", ts: Date.now(), rootFp: "src | package.json | test" };
+  const _stacks = new Map([["/repo", { lang: "TypeScript", framework: "React", test: "vitest" }]]);
+  // 真的没打开文件夹：两端都如实降级，这条路不变。
+  assert.deepEqual(evidence({}, new Map())(""),
     { hasWorkspace: false, snapshotReady: false, topLevel: [], stack: {} },
-    "web 上工作区取证必须降级为 hasWorkspace:false，而不是报假证据");
-  assert.equal(evidence(true)("/repo").hasWorkspace, true);
+    "没打开文件夹时必须如实说没有，而不是报假证据");
+  // 扫过的工作区：不管在哪个构建上，扫出来的事实都要交出去。
+  const got = evidence(_scanned, _stacks)("/repo");
+  assert.equal(got.hasWorkspace, true);
+  assert.equal(got.snapshotReady, true, "扫过就是扫过——快照状态不该被构建类型抹掉");
+  assert.deepEqual(got.topLevel, ["src", "package.json", "test"],
+    "顶层文件名没交出去，分类器只能从一句话里猜项目长什么样");
+  assert.equal(got.stack.lang, "TypeScript");
+  assert.equal(got.stack.framework, "React");
+  assert.equal(got.stack.test, "vitest");
 });

@@ -25,7 +25,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 // 按名字取真源码只有一份实现：test/helpers/source.mjs 的 fnSource（acorn 按 AST 边界切）。
 // 本文件的 SRC/CODE 还要同样处理 prompts.rs，所以那两个绑定保持本地不动。
-import { fnSource } from "./helpers/source.mjs";
+import { fnSource, load } from "./helpers/source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
@@ -376,11 +376,62 @@ test("角色计划第一轮就要到，但只当指路用——闸门仍然只�
   assert.match(fn, /\[\.\.\.new Set\(roles\)\]\.slice\(0, 5\)/, "角色要去重并封顶，别让它列一长串");
 
   // 临时契约必须**自报是临时的**：否则模型会把初判当最终结论，完整裁决到了也不改。
-  const frame = CODE.slice(CODE.indexOf("function _agentDecisionFrameBlock"));
-  const body = frame.slice(0, 3000);
+  // 按 AST 边界取整个函数：固定字符窗口（原来是 slice(0,3000)）在函数变长时会静静地
+  // 不再覆盖被断言的那几行，而且仍然全绿。
+  const body = fnSource("_agentDecisionFrameBlock", { code: true });
   assert.match(body, /〔协作初判·完整意图裁决还在路上，这是快速判断〕/,
     "临时契约没有自报身份——模型会把它当成最终结论");
   assert.match(body, /完整裁决落定后会自动补全或纠正/, "要说清它会被修正，否则模型不敢改口");
   assert.match(body, /else if \(provisional && provisional\.orchestrationMode && provisional\.orchestrationMode !== "solo"\)/,
     "临时契约必须只在完整契约缺席、且真的要多角色时才出现——否则纯属噪音");
+});
+
+
+test("第 2 轮起本轮契约必然赶不上第一发——要把上一轮的契约带上去顶着", () => {
+  // 那道等待窗口按会话只付一次（sess._intentWaitPaid，理由写在 sendPrompt 里）：
+  // 第 2 轮起，本轮裁决必然赶不上第一次模型调用，契约要等循环边界的 late-adopt 才有，
+  // 也就是**第二个模型回合**。而一轮里最关键的判断——要不要动手、动哪儿、算不算做完——
+  // 就在第一发决定完了。上一轮收敛出来的契约躺在 sess._intentState.semantic 里，
+  // 零延迟零成本，不用它纯属浪费。
+  const body = fnSource("_agentDecisionFrameBlock", { code: true });
+  assert.match(body, /priorSemantic = null/, "没有接上一轮契约的入口");
+  assert.match(body, /上一轮已经收敛的契约（本轮裁决还在路上，先按它开工）/,
+    "带过来了却不自报身份 —— 模型会把上一轮的目标当成这一轮的");
+  assert.match(body, /用户这一轮的原话优先/,
+    "必须明说用户改主意时以他为准，否则这块会把用户的转向压掉");
+  // 只带耐久的那几维，而且是**真的跑一遍**看渲染结果 —— 只按源码文本断言
+  // `priorSemantic.constraints` 之类会被 else-if 的守卫喂到（那里也出现同一个属性名），
+  // 于是删掉真正那行 push 照样全绿（实测漏网）。
+  const frame = load("_agentDecisionFrameBlock", {
+    _agentIntentExecutionBlock: undefined,
+    _engineeringProfileWithAiIntent: () => ({}),
+  });
+  const rendered = frame("再改改", {}, null, {
+    goal: "做一个多租户后台",
+    action: "实现",
+    target: "计费模块",
+    constraints: ["金额一律用分"],
+    successCriteria: ["跑通回归"],
+    // 下面三个是对**上一句话**的判断，一个字都不该出现在这一轮。
+    restatedTask: "上一句话被复述成了这样",
+    continuation: "continue",
+    ambiguities: ["上一句里那个没搞清的点"],
+  });
+  for (const durable of ["做一个多租户后台", "计费模块", "金额一律用分", "跑通回归"]) {
+    assert.ok(rendered.includes(durable), `耐久维度没渲染出来：${durable}`);
+  }
+  for (const perMessage of ["上一句话被复述成了这样", "上一句里那个没搞清的点"]) {
+    assert.ok(!rendered.includes(perMessage),
+      `${perMessage} 是对上一句话的判断，带到这一轮就是张冠李戴`);
+  }
+  // 上一轮什么都没收敛过（第 1 轮、或裁决从没落定）时整块不发，别凭空多一段。
+  assert.ok(!frame("随便说点什么", {}, null, null).includes("上一轮已经收敛的契约"),
+    "没有上一轮契约时不该凭空造一块");
+  assert.ok(!frame("随便说点什么", {}, null, {}).includes("上一轮已经收敛的契约"),
+    "空的语义帧同样不该发");
+
+  // 完整契约在场时不许出现：那才是本轮真正的裁决，两份契约同时摆着必然打架。
+  const at = body.indexOf("if (intentContract) lines.splice");
+  const carryAt = body.indexOf("上一轮已经收敛的契约");
+  assert.ok(at > 0 && carryAt > at, "带过来的契约必须挂在 else 分支上，不能和本轮契约并存");
 });

@@ -19,6 +19,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
 import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/agent/plan-target.js";
 
 // 模型现在可以在 update_plan 里逐步声明 kind，动词表退化成兜底，所以这两个函数多了
 // 一个依赖。本文件测的是**兜底那条路**（没有声明时的行为），声明那条路见
@@ -26,9 +27,12 @@ import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/so
 const PLAN_STEP_KINDS = new Set(["investigate", "implement", "execute", "verify"]);
 const actionKind = new Function("_PLAN_STEP_KINDS",
   `${extractFn("_planStepActionKind")}\n;return _planStepActionKind;`)(PLAN_STEP_KINDS);
-const matches = new Function("_PLAN_STEP_KINDS",
+// 交付物判据（「这一步点了名的东西，这次调用动了没有」）已抽成 src/agent/plan-target.js。
+// 按**真实实现**注进来 —— 在这里手写一份等价物就是测试台自编形状，实现改了它还绿。
+const matches = new Function(
+  "_PLAN_STEP_KINDS", "_planStepTargets", "_toolTouchedTargets", "_planTargetsConflict",
   `${extractFn("_planStepActionKind")}\n${extractFn("_planStepMatchesEvidence")}\n;return _planStepMatchesEvidence;`,
-)(PLAN_STEP_KINDS);
+)(PLAN_STEP_KINDS, planStepTargets, toolTouchedTargets, targetsConflict);
 
 // 用户那份真实计划，逐字照抄
 const REAL_PLAN = [

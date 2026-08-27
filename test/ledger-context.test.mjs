@@ -12,7 +12,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 // 按名字取真源码 / 取顶层常量的值，只有一份实现：test/helpers/source.mjs。
 // 这个文件的源码断言历来跑在**原文**上（下面自己剥注释），所以 SRC 绑定 main.js 原文。
-import { SRC, fnSource as extractFn, loadConst } from "./helpers/source.mjs";
+import { SRC, fnSource as extractFn, loadConst, load } from "./helpers/source.mjs";
 
 // 注释里会引用被修掉的旧代码，所以凡是对源码文本的断言都先剥注释。按上下文逐字符扫，
 // 认得字符串 / 模板串 / 正则字面量（两条正则式的剥法会把 `/\//` 当成行注释吃掉真代码）。
@@ -146,15 +146,28 @@ test("折叠 marker 列表里的每个前缀，源码里都有对应的装配端
 
 // ═══ 2. 差集两侧同一个归一化 ══════════════════════════════════════════════════════
 
-/** sendPrompt 里真实的差集判据：_recentText + _fadedDemands。 */
-function fadedOf(sess, effectiveMode = "agent") {
-  const start = SEND.indexOf("const _recentText = (() => {");
+/**
+ * sendPrompt 里真实的差集判据：_visibleRecent + _recentText + _fadedDemands。
+ *
+ * 从 `_visibleRecent` 起切，不是从 `_recentText` 起 —— 「模型真正会看到哪几条」这件事
+ * 就发生在前者里，只切后者等于把被测判据的一半留在窗口外。
+ *
+ * `gateway` / `covered` 是判据的**外部输入**（网关档位开没开、服务端说前几条已折进摘要），
+ * 不是判据本身，所以按参数注入；判据的形状仍然逐字来自源码。
+ */
+function fadedOf(sess, effectiveMode = "agent", { gateway = false, covered = 0 } = {}) {
+  const start = SEND.indexOf("const _visibleRecent = (() => {");
   const fadedAt = SEND.indexOf("const _fadedDemands = (", start);
   const end = SEND.indexOf("\n    : [];", fadedAt);
   assert.ok(start > 0 && fadedAt > start && end > fadedAt, "找不到差集判据那段");
   const body = SEND.slice(start, end + "\n    : [];".length);
-  return new Function("sess", "effectiveMode", "_MODES_WITH_TOOLS", "_ledgerNorm", `${body}\nreturn _fadedDemands;`)(
+  return new Function(
+    "sess", "effectiveMode", "_MODES_WITH_TOOLS", "_ledgerNorm",
+    "config", "_gatewayHandlesCompression", "_mcPrefixGet",
+    `${body}\nreturn _fadedDemands;`,
+  )(
     sess, effectiveMode, MODES_WITH_TOOLS, norm,
+    {}, () => gateway, () => ({ covered }),
   );
 }
 
@@ -165,8 +178,13 @@ function pushOf(text, sess) {
   const end = SEND.indexOf("\n    }", tail);
   assert.ok(start > 0 && tail > start && end > tail, "找不到入账那段");
   const body = SEND.slice(start, end + "\n    }".length);
-  new Function("text", "sess", "_ledgerNorm", "_applyExplicitMemoryCorrection", "_autoMemoryCapture", "_identityRoot", body)(
-    text, sess, norm, () => true, () => {}, "",
+  // 「这句话算不算没内容」的判据已经抽成了 `_isFillerUtterance`（预热那边也要用同一份，
+  // 两份各自演化的话，同一句话在两处会给出不同答案）。这个沙箱只 eval 入账那一段，
+  // 所以要把它按**真实实现**注进来 —— 在这里手写一份等价物就等于测试台自编形状，
+  // 实现改了它还绿。
+  const isFiller = load("_isFillerUtterance");
+  new Function("text", "sess", "_ledgerNorm", "_applyExplicitMemoryCorrection", "_autoMemoryCapture", "_identityRoot", "_isFillerUtterance", body)(
+    text, sess, norm, () => true, () => {}, "", isFiller,
   );
 }
 
@@ -205,6 +223,35 @@ test("真正掉出历史的那条照样捞回来——差集不是被关掉了",
   // 历史里被 _lexCompress 改过的消息（行尾空白被删）也算「还在」。
   sess.memory.recent = [{ role: "user", content: text.replace(/[ \t]+\n/g, "\n") + "   " }];
   assert.deepEqual(fadedOf(sess, "agent"), []);
+});
+
+test("网关压缩档位：按服务端报的 covered 判「已掉出历史」，不按本地存了什么", () => {
+  // 网关档位下 memory.recent 从不收缩（_compactHistoryIfNeeded 第一行就 return），
+  // 压缩发生在服务端。旧判据拿本地 recent 做差集，于是在**唯一会失忆的那条路上恒为空**。
+  const text = MULTILINE_TEXTS[0];
+  const sess = { memory: { recent: [] }, _demandLedger: [] };
+  pushOf(text, sess);
+  // 本地历史一条没少，但服务端已经把前 1 条折进摘要了。
+  sess.memory.recent = [
+    { role: "user", content: text },
+    { role: "assistant", content: "改好了" },
+    { role: "user", content: "继续" },
+  ];
+
+  assert.deepEqual(
+    fadedOf(sess, "agent", { gateway: true, covered: 0 }), [],
+    "服务端还没折叠任何一条时不该重列",
+  );
+  const faded = fadedOf(sess, "agent", { gateway: true, covered: 1 });
+  assert.equal(faded.length, 1,
+    "服务端已经把这条折进摘要了，本地却因为 recent 没收缩而认定「还在历史里」——反健忘那块整条路上都不触发");
+  assert.equal(faded[0], norm(text).slice(0, 240));
+
+  // 网关档位关掉时行为不变：本地会真的裁 recent，covered 不该被拿来用。
+  assert.deepEqual(
+    fadedOf(sess, "agent", { gateway: false, covered: 1 }), [],
+    "本地压缩那条路不该受 covered 影响",
+  );
 });
 
 test("入账两条路（sendPrompt / 插话）和比对走的是同一个归一化函数", () => {

@@ -205,6 +205,18 @@ fn probe_one(name: &str, flag: &str) -> ToolPresence {
 
 /// 等子进程，超时就杀掉。标准库没有带超时的 wait，这里用轮询——探测都是毫秒级返回的
 /// 短命令，20ms 的粒度足够，不值得为它引入一个依赖。
+/// `wait_with_timeout` 的对外出口。
+///
+/// 单开一个薄壳而不是把原函数改成 pub：这个模块自述「只报事实」，而 lint 那条路
+/// 借的只是「有界地等一个子进程」这件工程能力，跟环境探测无关。名字不同，
+/// 读到调用点的人不会以为 lint 在做环境探测。
+pub fn wait_with_timeout_pub(
+    child: std::process::Child,
+    limit: Duration,
+) -> Option<std::process::Output> {
+    wait_with_timeout(child, limit)
+}
+
 fn wait_with_timeout(
     mut child: std::process::Child,
     limit: Duration,

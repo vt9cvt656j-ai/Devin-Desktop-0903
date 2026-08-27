@@ -197,6 +197,9 @@ const sinkAdvice = load("_sinkRiskAdvice", {
   _sinkRisksInWrite: risks,
   _ambiguousFailureInWrite: ambiguous,
   _missingWhyInWrite: load("_missingWhyInWrite", { _splitCodeAndComments: splitCC }),
+  // 三种写入形状的正文抽取抽成了 _writeBodyOf（安全旗标那条路要用同一份，
+  // 两处各写一份迟早分叉）。
+  _writeBodyOf: load("_writeBodyOf"),
 });
 
 test("六类危险汇聚点各自认得出，且指到行号和原文", () => {
@@ -258,14 +261,50 @@ test("同一处不许被 3 行窗口重复报三次", () => {
 test("话是挂在**这一次写入**上的，不是等收尾", () => {
   // 这条钉住「实时」本身。两个挂载点（流式写入 + 批处理写入）都要接上，
   // 漏一个就有一半的写入拿不到。
-  assert.match(SRC, /entry\._mutationAdvice = String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)/,
+  // 两个挂载点已经收敛成 _afterWriteAdvice 一处（"手工保持两处同步"在这个仓库栽过
+  // 好几次，漏掉一处不报错，只让那条路上这机制不存在）。所以这里钉两件事：
+  // 两条路都走那一个函数，且那个函数里拼接防住了 null。
+  assert.match(SRC, /entry\._mutationAdvice = _afterWriteAdvice\(run, call, root\)/,
     "流式那条写入路径没接上");
-  assert.match(SRC, /it\._mutationAdvice = String\(_debugMutationBlockResult\(run, it\.call, root\) \|\| ""\) \+ _sinkRiskAdvice\(it\.call\)/,
+  assert.match(SRC, /it\._mutationAdvice = _afterWriteAdvice\(run, it\.call, root\)/,
     "批处理那条写入路径没接上");
-  // 拼接必须防住 null——_debugMutationBlockResult 掉出尾部时是 undefined，
-  // 直接相加会给模型一句 "undefined⚠ 这次写入…"
-  assert.doesNotMatch(SRC, /_debugMutationBlockResult\(run, call, root\) \+ _sinkRiskAdvice/,
-    "没防住 null，模型会收到 `null⚠…`");
+  const after = fnSource("_afterWriteAdvice", { code: true });
+  assert.match(after, /String\(_debugMutationBlockResult\(run, call, root\) \|\| ""\) \+ _sinkRiskAdvice\(call\)/,
+    "拼接没防住 null——_debugMutationBlockResult 掉出尾部时是 undefined，模型会收到 `undefined⚠…`");
+});
+
+test("安全旗标按**写出来的代码**点亮，不按用户的措辞", () => {
+  // 网关那份缺陷分类清单挂在 securityRisk 旗标上，而那个旗标来自意图裁决 ——
+  // 也就是模型对「用户这句话」的判断。用户说「做个待办列表」，旗标不亮；
+  // 模型接着写了一段拼 SQL 的查询 —— 清单一个字都不发。判据得跟着代码走。
+  const kinds = load("_securitySinkKinds", {
+    _writeBodyOf: load("_writeBodyOf"),
+    _sinkRisksInWrite: risks,
+  });
+  assert.deepEqual(kinds({ path: "a.js", content: "export const add = (a, b) => a + b;" }), [],
+    "干净代码点亮了安全旗标 —— 那等于每次写文件都挂一整张分类表");
+  assert.deepEqual(
+    kinds({ path: "api.ts", content: "const q = `SELECT * FROM u WHERE id = ${id}`;" }),
+    ["SQL 拼接"],
+  );
+  // 三种写入形状都要取到正文：改存量代码走的是后两条，而那正是命中率最高的场景。
+  assert.deepEqual(
+    kinds({ path: "api.ts", newString: "const q = `SELECT * FROM u WHERE id = ${id}`;" }),
+    ["SQL 拼接"],
+    "edit_file 的正文在 newString（驼峰）里 —— 取不到就等于这条路上没有安全检测",
+  );
+  assert.deepEqual(
+    kinds({ path: "api.ts", edits: [{ new_string: "const q = `SELECT * FROM u WHERE id = ${id}`;" }] }),
+    ["SQL 拼接"],
+    "multi_edit 的正文在 edits[].new_string 里",
+  );
+
+  // 真的把旗标推进会话画像，而不是算完就扔。
+  const after = fnSource("_afterWriteAdvice", { code: true });
+  assert.match(after, /_semanticProfileFlags/, "算出来了却没进画像 —— 网关那边什么都不会变");
+  assert.match(after, /flags\.push\("defects_write"\)/, "挂的不是缺陷分类那面旗");
+  assert.match(after, /!flags\.includes\("defects_write"\)/,
+    "没去重 —— 画像是单调并集，每次写入都 push 会把同一面旗堆几十遍");
 });
 
 test("判据在本仓库自己的代码上只留下真发现", () => {
