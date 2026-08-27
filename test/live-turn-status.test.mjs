@@ -22,6 +22,14 @@ const statsText = load("_turnStatsText", {
   _dispUsd: (c) => `$${c}`,
 });
 
+// 行内撤下「模型 / 首显」之后，这两个量的**唯一**出口就是 tooltip。所以这里必须把
+// tooltip 也真跑起来：只断言行内没有，等于允许「顺手把记录点也删掉」这种改法照样绿。
+const statsTitle = load("_turnStatsTitle", {
+  _fmtElapsed: (ms) => `${Math.round(Number(ms) || 0)}ms`,
+  _tokenShort: (n) => String(n),
+  _dispUsd: (c) => `$${c}`,
+});
+
 const T0 = 1_700_000_000_000;
 const line = (opts) => statsText(opts).html.replace(/<[^>]+>/g, "");
 
@@ -115,12 +123,34 @@ test("还没开过任何一轮时退回任务级判据（首轮开跑前的等�
   assert.match(line({ elapsedMs: 3000, timeline: null, live: true }), /等待上游首字节/);
 });
 
-test("收尾（非 live）不加等待标签，任务级的「模型/首显」两项不变", () => {
+// 「模型 24s / 首显 24s」从行内撤下 —— 但只是换出口，不是丢数据。
+//
+// 用户在 grok-4.6 的回复下看到的是「⏱ 25s  模型 24s  首显 24s」：三个几乎相同的秒数。
+// 那条线路不做流式转发，首字节到达时整段已经生成完，于是两个「首个事件」必然贴着总耗时。
+// 这一项对用户是纯噪音，而在做流式转发的线路上它仍然有诊断价值 —— 所以搬进 tooltip，
+// 不是删除。这条测试同时钉住两边：行内没有了，tooltip 里还在，而且 tooltip 还挂在出口上。
+test("收尾（非 live）不加等待标签，且行内不再显示「模型 / 首显」两项", () => {
   const done = turn({ firstProgressAt: T0 + 800, firstVisibleAt: T0 + 1200, endedAt: T0 + 5000 });
-  const text = line({ elapsedMs: 30000, timeline: timelineOf(done), live: false });
+  const tl = timelineOf(done);
+  const text = line({ elapsedMs: 30000, timeline: tl, live: false });
   assert.doesNotMatch(text, /等待上游首字节|接收中/);
-  assert.match(text, /模型 800ms/, "任务级首个模型事件仍按任务级显示");
-  assert.match(text, /首显 1200ms/);
+  assert.doesNotMatch(text, /模型 800ms/, "行内还在显示「首个模型事件」耗时——用户明确要求撤下");
+  assert.doesNotMatch(text, /首显 1200ms/, "行内还在显示「首显」耗时——用户明确要求撤下");
+  // 撤下显示 ≠ 撤掉记录点。
+  const title = statsTitle({ elapsedMs: 30000, timeline: tl });
+  assert.match(title, /任务首个有效模型事件: 800ms/, "撤下行内的同时把任务级记录也弄丢了");
+  assert.match(title, /任务首个实际文字渲染: 1200ms/);
+  assert.match(title, /模型进度 800ms model · 首显 1200ms text/, "逐轮明细也要还在");
+  // 「不挪、直接删」的全部前提是 tooltip 还挂在渲染出口上。构造器里有数据 ≠ 用户够得着：
+  // 20302（实时）/20442（收尾）任一处的 el.title 被顺手删掉，上面三条照样全绿而两个数彻底消失。
+  assert.ok((SRC.match(/el\.title = _turnStatsTitle\(/g) || []).length >= 2,
+    "tooltip 没挂在渲染出口上了——行内已经撤下，这两个数就彻底看不到了");
+  // 等待期间必须照样说话：firstProgressMs / firstVisibleMs 两个 const 还是那条退路的判据，
+  // 别顺手一起删干净了。startedAt 不能是 0——Number(null) === 0 会让 _timelineElapsed 返回 0
+  // 而不是 null，这条退路永远进不去，断言就成了摆设。
+  assert.match(line({ elapsedMs: 3000, live: true,
+    timeline: { startedAt: T0, firstModelProgressAt: null, firstVisibleAt: null, turns: [] } }),
+    /等待上游首字节/);
 });
 
 test("判据不再是任务级首次事件", () => {
@@ -128,7 +158,14 @@ test("判据不再是任务级首次事件", () => {
   const fn = SRC.slice(at, RAW_SRC.indexOf("function _turnStatsTitle", at));
   const liveAt = fn.indexOf("if (live) {");
   assert.ok(liveAt > 0, "找不到 live 分支");
-  const liveBlock = fn.slice(liveAt, fn.indexOf("if (firstProgressMs != null)", liveAt));
+  // 下界原来钉的是 `if (firstProgressMs != null)` —— 那一行已经被删掉了，indexOf 会返回
+  // -1，slice(liveAt, -1) 于是切到函数末尾，窗口悄悄撑大而这条测试**照样全绿**
+  // （撑大之后 doesNotMatch(/_timelineElapsed\(/) 仍然通过，因为剩下的调用都在 liveAt 之前）。
+  // 换成 live 分支后面第一个必然存在的结构，并断言它真的找到了。
+  const boundary = fn.indexOf("if (settlement) {", liveAt);
+  assert.ok(boundary > liveAt, "找不到 live 分支的下界（if (settlement)）——切片会退化成整个函数，下面几条守卫会变恒真");
+  const liveBlock = fn.slice(liveAt, boundary);
+  assert.ok(liveBlock.length < 3000, `切出来 ${liveBlock.length} 字节，不像是 live 分支，锚点失效了`);
   assert.match(liveBlock, /timeline\?\.turns/, "live 分支必须看逐轮数据");
   assert.match(liveBlock, /endedAt/, "必须按「这一轮结束没有」判定");
   // 任务级字段只允许在「一轮都还没开过」那条退路上出现。
