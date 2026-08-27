@@ -15452,16 +15452,13 @@ function openLoginDialog() {
  */
 const _CUSTOM_WARNED_KEY = "michael-ide.custom-endpoint.warned.v1";
 function _warnCustomEndpointOnce(custom) {
-  try {
-    const id = String(custom?.id || "");
-    if (!id) return;
-    const seen = JSON.parse(localStorage.getItem(_CUSTOM_WARNED_KEY) || "[]");
-    if (Array.isArray(seen) && seen.includes(id)) return;
-    localStorage.setItem(_CUSTOM_WARNED_KEY, JSON.stringify([...(Array.isArray(seen) ? seen : []), id]));
-    // 「下一句预测也会关闭」这半句以前是错的：OpenAI 兼容的自定义端点上预测一直是开着的
-    // （见 _predictNextAsk 里 viaGateway:false 那支）。真实规则按协议分，照着说。
-    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩会关闭。下一句预测在 OpenAI 兼容协议上照常，Anthropic / xAI Responses 上不发。", { duration: 9000 });
-  } catch {}
+  // 这条提醒**已经去掉**（用户要求）。原先每个端点弹一次，说的是「工具描述和完整系统
+  // 提示词由服务端下发，这条路上拿不到」—— 那件事仍然成立，但它写在弹窗里的协议说明
+  // 和能力缺口清单上更合适：那里是**填之前**看到，而不是切完之后飘一条九秒的横幅。
+  //
+  // 保留这个函数壳子和它的 localStorage 记号：调用点在 _readyAiConfig 里，删函数要连着
+  // 改调用点，而这个位置以后如果要放别的一次性提示，记号是现成的。
+  void custom;
 }
 
 async function michaelAccessGate() {
