@@ -701,7 +701,7 @@ pub struct PythonModuleSymbols {
 }
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct PythonModuleCache {
     modules: Vec<String>,
