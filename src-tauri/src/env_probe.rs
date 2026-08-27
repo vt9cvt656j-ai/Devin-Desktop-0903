@@ -209,10 +209,43 @@ fn wait_with_timeout(
     mut child: std::process::Child,
     limit: Duration,
 ) -> Option<std::process::Output> {
+    use std::io::Read;
+    // **读管道必须和等待并行。** 上一版只在 try_wait 报「已退出」之后才调
+    // wait_with_output()（那才是真正去读管道的一步）—— 而子进程写满管道缓冲之后会
+    // 阻塞在写上、永远不退出，于是这里恒定走到超时分支返回 None。
+    // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出这个病）：
+    // 一个改动多的仓库，`git status --porcelain` 轻松超过 4KB → git 探测恒超时、
+    // dirty_files 落 -1。这是个共享 helper，它的每一个调用方都吃这个亏。
+    let (tx_o, rx_o) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_e, rx_e) = std::sync::mpsc::channel::<Vec<u8>>();
+    if let Some(mut so) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = so.read_to_end(&mut b);
+            let _ = tx_o.send(b);
+        });
+    }
+    if let Some(mut se) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = se.read_to_end(&mut b);
+            let _ = tx_e.send(b);
+        });
+    }
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => {
+                // 进程已退出 → 读线程随即收到 EOF。给短等待上界而不是无限 recv：
+                // 读线程理论上不会卡，但一个卡住的线程不该让整个探测挂死。
+                // 没接管道的那一路（Stdio::null）收不到值，recv_timeout 超时后按空处理。
+                let grace = Duration::from_millis(500);
+                return Some(std::process::Output {
+                    status,
+                    stdout: rx_o.recv_timeout(grace).unwrap_or_default(),
+                    stderr: rx_e.recv_timeout(grace).unwrap_or_default(),
+                });
+            }
             Ok(None) => {
                 if start.elapsed() >= limit {
                     let _ = child.kill();
@@ -501,5 +534,54 @@ mod stub_tests {
         let src = include_str!("env_probe.rs");
         assert!(src.contains("let looks_absent = !o.status.success()"), "判据不该只看输出");
         assert!(src.contains("|| low.contains(\"not found\")"));
+    }
+
+    /// 输出撑满管道缓冲时，等待不能死锁。
+    ///
+    /// `wait_with_timeout` 上一版只在 try_wait 报「已退出」之后才调 wait_with_output()
+    /// ——那才是真正去读管道的一步。而子进程写满管道缓冲之后会阻塞在写上、永远不退出，
+    /// 于是这个函数恒定走到超时分支返回 None。
+    ///
+    /// 缓冲大小是平台相关的（Windows 匿名管道默认 4096 字节，Unix 是 65536），
+    /// 但**死锁机制本身与平台无关**。这里发 512KB，两个平台都远远超过阈值，
+    /// 所以这条测试在 mac/Linux 上就能抓到回归，不必等 Windows。
+    /// 真实触发场景：一个改动多的仓库，`git status --porcelain` 轻松超过 4KB
+    /// → Windows 上 git 探测恒超时、dirty_files 落 -1。
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_fills_the_pipe_still_completes() {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("head -c 524288 /dev/zero | tr '\\0' 'x'")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        // 给 10 秒：这条命令本身是毫秒级的，超时只可能是死锁。
+        let out = super::wait_with_timeout(child, std::time::Duration::from_secs(10))
+            .expect("管道被写满就等不到进程退出了 —— 读端必须和等待并行");
+        assert!(out.status.success(), "子进程本身应该正常退出");
+        assert_eq!(out.stdout.len(), 524_288, "输出被截断了：{}", out.stdout.len());
+    }
+
+    /// 没接管道的那一路不能因为 recv 超时而拖慢每一次调用。
+    #[cfg(unix)]
+    #[test]
+    fn a_child_without_piped_stderr_returns_promptly() {
+        let started = std::time::Instant::now();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo hi")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        let out = super::wait_with_timeout(child, std::time::Duration::from_secs(5)).expect("应当拿到输出");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+        assert!(out.stderr.is_empty());
+        // stderr 没接管道 → 那一路的 recv 会走满宽限期。宽限期是 500ms，
+        // 总耗时必须仍在秒级以内，否则每一次探测都会平白多等一截。
+        assert!(started.elapsed() < std::time::Duration::from_secs(2),
+            "没接管道的那一路把调用拖慢了 {:?}", started.elapsed());
     }
 }
