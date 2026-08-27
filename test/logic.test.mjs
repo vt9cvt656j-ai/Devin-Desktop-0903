@@ -26156,7 +26156,9 @@ test("no harness-generated footer is appended under the model's answer", () => {
 
   // Run errors are deliberately exempt — they render on their own and must keep doing so,
   // otherwise deleting the card would silently hide failures.
-  assert.match(SRC, /note\.textContent = "⚠️ " \+ _formatAgentFinalError\(finalErr\)/,
+  // 只钉「这条错误仍然渲染出来」，不钉它的完整参数列表 —— 后者会在给
+  // _formatAgentFinalError 增参时假红（实际发生过：加 { custom } 区分自定义端点那一次）。
+  assert.match(SRC, /note\.textContent = "⚠️ " \+ _formatAgentFinalError\(finalErr\b/,
     "a run error must still surface to the user on its own");
 });
 

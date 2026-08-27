@@ -36,7 +36,8 @@ test("自定义端点不再要求会员——钱是用户自己的", () => {
 
 test("覆写必须排在网关校验之前，否则只用自己端点的人会被「请先登录账号」拦住", () => {
   const override = READY.indexOf("config.baseUrl = _custom.baseUrl");
-  const validate = READY.indexOf("if (!config.baseUrl || !config.apiKey)");
+  // key 的必填性现在按线路分（本地 Ollama 不需要 key），锚点跟着实现走。
+  const validate = READY.indexOf("if (!config.baseUrl ||");
   assert.ok(override >= 0, "自定义端点的覆写不见了");
   assert.ok(validate >= 0, "网关字段校验不见了");
   assert.ok(override < validate,
@@ -295,4 +296,73 @@ test("调用点要把「本轮是不是自己的端点」传下去——不传�
   const loop = extractFn("_runAgenticLoop", { code: true });
   assert.match(loop, /_recoverFromAiFailure\([\s\S]{0,200}?customModelId/,
     "调用点没传 custom —— 自己端点的 401 照样会把用户登出，这条门形同虚设");
+});
+
+test("密钥格子里填网址必须当场拦下——这是真实发生过的「配好了却用不了」", () => {
+  // 真实案例：两个格子里填的是同一个网址（https://api.teamorouter.cn/v1，29 字符），
+  // 于是发出去的是 `Authorization: Bearer https://…/v1`，中转回 401。而界面上这条模型
+  // 看着完全正常 —— 用户只知道「用不了」，无从看出是自己粘错了格子。密钥格子此前
+  // **一个字都不校验**。
+  const save = extractFn("showCustomModelsDialog", { code: true });
+  assert.match(save, /\/\^https\?:\\\/\\\/\/i\.test\(apiKey\)/,
+    "密钥格子不拦网址 —— 用户把地址粘进密钥格，界面照收，然后 401");
+  assert.match(save, /apiKey === baseUrl/,
+    "不拦「密钥和地址逐字相同」这种情况");
+  assert.match(save, /id="cmErrKey"/, "密钥格子没有行内报错位，错误只能靠 toast 飘一下");
+});
+
+test("自定义端点的 401 红字不许说「已经把登录框打开了」——那个动作没有发生", () => {
+  // 截图实证：新 toast 说「你没有被登出」，同一屏的红字却说「登录已过期，已经把登录框
+  // 打开了」。两句话互相矛盾，而红字那句是双重错误：原因是假的，动作也没发生
+  // （_recoverFromAiFailure 在自定义线路上只提示、不动凭据）。用户照它去重新登录，
+  // 登完再发一次还是同一个 401。
+  const fmt = extractFn("_formatAgentFinalError", { code: true });
+  assert.match(fmt, /function _formatAgentFinalError\(err, \{ custom/,
+    "格式化函数不知道本轮走的是哪条线路，只能一律说「登录已过期」");
+  const i = fmt.indexOf('if (custom)');
+  const j = fmt.indexOf('登录已过期');
+  assert.ok(i > 0 && i < j, "custom 分支必须排在那句通用文案之前，否则永远走不到");
+  const loop = extractFn("_runAgenticLoop", { code: true });
+  assert.match(loop, /_formatAgentFinalError\([\s\S]{0,120}?customModelId/,
+    "调用点没把线路传下去 —— 上面那个分支等于没有");
+});
+
+test("自定义端点上 L0 必须关掉，否则工具只剩名字、schema 被剥光", () => {
+  // 用户问「我的智能体和工具是否也能用」。判据在这里：L0 是「只发工具名、让网关按
+  // 自己那份目录回填 schema」的省流协议。自定义端点没有网关，L0 一旦开着，模型收到的
+  // 工具就只有名字没有参数 —— 那才是真正的「工具用不了」。
+  const l0 = extractFn("_l0On", { code: true });
+  assert.match(l0, /_isGatewayConfig/, "L0 的判据不再是「是不是网关线路」");
+  // 线路判据现在要比对 MICHAEL_API，必须注入 —— 不注入的话它退化成「什么都不是网关」，
+  // 断言会以一种看不出来的方式变绿。
+  const isGw = load("_isGatewayConfig", { MICHAEL_API: "https://code.mrday.one" });
+  assert.equal(isGw({ customModelId: "custom:x", baseUrl: "https://relay/v1" }), false,
+    "自定义配置被判成网关 —— L0 会开，工具 schema 被剥光，模型拿到一串没有参数的名字");
+  assert.equal(isGw({ baseUrl: "https://code.mrday.one" }), true, "网关配置必须仍然走 L0");
+});
+
+test("线路判据：网关线路必须仍然走 L0，自定义线路必须关掉", () => {
+  // 曾想把判据改成「地址不是网关就算自定义」，被 logic.test.mjs 里那条
+  // 「legacy direct-provider settings must still be treated as Michael gateway turns」
+  // 当场否掉：老版本遗留的直连配置（providerMode:"byok" + 第三方 baseUrl）运行时会被
+  // 强制走网关，按地址判会把它们误判成自定义端点。遗留直连和「子智能体丢了
+  // customModelId 但 baseUrl 仍是用户端点」这两种，单看 baseUrl 结构上无法区分。
+  const isGw = load("_isGatewayConfig", { MICHAEL_API: "https://code.mrday.one" });
+  assert.equal(isGw({ baseUrl: "https://code.mrday.one", apiKey: "t" }), true);
+  assert.equal(isGw({ providerMode: "byok", baseUrl: "https://api.openai.com/v1" }), true,
+    "遗留直连配置运行时被强制走网关，这里判成自定义会让 L0 关掉、把剥空的 schema 发给网关");
+  assert.equal(isGw({ customModelId: "custom:x", baseUrl: "https://relay/v1" }), false);
+  assert.equal(isGw(null), true, "拿不到配置时按网关算");
+});
+
+test("本机端点可以没有 key——弹窗说「部分本地服务可留空」，发送侧就不能硬卡", () => {
+  // Ollama / LM Studio / vLLM 不校验鉴权头。此前这类端点存得进去、一次也发不出来，
+  // 报的还是「缺少接入地址或 API key」——用户去补一个那个服务压根不需要的东西。
+  const ready = extractFn("_readyAiConfig", { code: true });
+  assert.match(ready, /if \(!config\.baseUrl \|\| \(!config\.apiKey && !_custom\)\)/,
+    "发送侧仍对自定义端点硬卡 apiKey");
+  assert.doesNotMatch(ready, /"这个自定义模型缺少接入地址或 API key/,
+    "文案还在说「或 API key」——那对本地端点是错的指引");
+  // 弹窗那句提示必须还在，否则用户不知道可以留空
+  assert.match(SRC, /部分本地服务可留空/, "留空这件事没有任何地方告诉用户");
 });
