@@ -15959,7 +15959,12 @@ async function showCustomModelsDialog() {
       row.className = "cm-row";
       row.innerHTML = `<div class="cm-row__main"><div class="cm-row__name"></div><div class="cm-row__meta"></div></div><button class="cm-edit" type="button">编辑</button><button class="cm-del" type="button">删除</button>`;
       row.querySelector(".cm-row__name").textContent = it.group + " · " + it.name;
-      row.querySelector(".cm-row__meta").textContent = CM_PROTOCOL_UI[it.protocol].label + "　" + it.baseUrl + (it.apiKey ? "　密钥 ••••" + it.apiKey.slice(-4) : "　无密钥");
+      // 已经存在磁盘上的坏记录也要当场看得见。保存那一步的校验只拦**新的**输入 ——
+      // 而真实案例里用户的密钥格早就填成了网址（和地址逐字相同），列表上显示成
+      // 「密钥 ••••n/v1」，看着完全正常。他得点进编辑、再点一次保存才会被告知。
+      // 这一行是纯文本（.cm-row__* 不能塞子元素），所以用字符串拼一个显眼的标记。
+      const _keyLooksWrong = !!it.apiKey && (/^https?:\/\//i.test(it.apiKey) || it.apiKey === it.baseUrl);
+      row.querySelector(".cm-row__meta").textContent = CM_PROTOCOL_UI[it.protocol].label + "　" + it.baseUrl + (_keyLooksWrong ? "　⚠️ 密钥格里填的是网址，请改成真正的密钥" : it.apiKey ? "　密钥 ••••" + it.apiKey.slice(-4) : "　无密钥");
       row.querySelector(".cm-edit").addEventListener("click", () => {
         editingId = it.id;
         inGroup.value = it.group; inName.value = it.name; inBase.value = it.baseUrl; inKey.value = it.apiKey;
