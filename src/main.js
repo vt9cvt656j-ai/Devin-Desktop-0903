@@ -14504,7 +14504,27 @@ function _modelContextRows(m) {
 }
 
 function _modelCatalogEntry(id = "") {
-  const target = String(id || "").trim();
+  // **自定义模型要按真实模型名去查目录。**
+  //
+  // 自定义模型的选择器 id 是 `custom:<随机>` 这种内部键，拿它去目录里找必然找不到 ——
+  // 于是每一条走这里的能力判据都对自定义模型静默失效：
+  //   · _liveThinkingLevels → null → 思考深度只剩「关闭」一格，滑块拖不动
+  //   · contextWindows → 空 → 上下文滑轨只剩一个兜底值
+  //   · 价格 → 空
+  // 而 _builtinThinkingProfileFor **早就做了这一步**（它把 custom: 换成 custom.name
+  // 再判能力），只有目录这一侧没跟上。两边判据不一致的结果就是：内置模型的卡片有
+  // 能拖的档位，用户自己加的同一个模型只有一格灰的。
+  //
+  // 归一化放在**入口**而不是各个调用点：走这条路的有五处（上下文上限、原生窗口列表、
+  // 思考档位、强力版按钮、价格），逐个改容易漏，而漏掉的那个会继续静默失效。
+  // 偏好仍然按选择器 id 存 —— 这里只影响「查能力」，不影响「记住用户选了什么」。
+  let target = String(id || "").trim();
+  if (target.startsWith(_CUSTOM_MODEL_PREFIX) && typeof _customModelById === "function") {
+    try {
+      const custom = _customModelById(target);
+      if (custom?.name) target = String(custom.name).trim();
+    } catch {}
+  }
   if (!target) return null;
   const targetLc = target.toLowerCase();
   for (const group of MODEL_GROUPS || []) {
