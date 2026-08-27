@@ -59,6 +59,30 @@
   --titlebar-h: 44px;
   --statusbar-h: 26px;
   --radius: 10px;
+
+  /* ---- 弹窗 / 表单语义色 ------------------------------------------------
+   * 这里写字面量是**令牌定义**，使用点一律 var()。五个都在下面的
+   * :root[data-theme="dark"] 里有对应值，少一个 → 那条声明整条作废且不报错。
+   *
+   * --accent-solid / --accent-on 必须成对。--accent 是「线条与文字用的强调色」，
+   * 拿它当填充面会翻车：实测白字压浅色 --accent(#0a84ff) 只有 3.65:1、压暗色
+   * --accent(#4daafc) 只有 2.48:1。**这是「用了令牌暗色就自动成立」唯一不成立
+   * 的一格 —— 填充面的前景色不会跟着背景一起翻。**
+   *
+   * --destructive 故意不叫 --danger：app.css:659 的 .chat-tab__x:hover 把
+   * var(--danger,#f85149) 当**背景**并压死 color:#fff，app.css:14538 的
+   * .ref-chip__x:hover 又把它当**前景**。一个令牌满足不了两边，而定义 --danger
+   * 会同时改掉那两处。换名字，爆炸半径为零。
+   *
+   * --field-line 是表单控件专用边框色。--line(1.23:1) 和 --line-strong(1.38:1)
+   * 远低于 WCAG 1.4.11 对控件边界的 3:1，但它俩是全局的，动了重排整个 IDE。
+   * 这里的 α 是扫出来刚好过线的值：→ #8c8c8c，对输入底 3.36:1、对卡片 3.25:1。
+   * 分隔线继续用 --line —— 那是纯装饰，不承载「识别控件」的职责。 */
+  --scrim: rgba(24, 24, 27, 0.38);
+  --accent-solid: #0a5bc4;
+  --accent-on: #ffffff;
+  --destructive: #b3261e;
+  --field-line: rgba(0, 0, 0, 0.45);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 12px 32px rgba(0, 0, 0, 0.12);
 
@@ -98,6 +122,15 @@
   --active: rgba(255, 255, 255, 0.09);
   --sel: rgba(77, 170, 252, 0.22);
   --shimmer: rgba(255, 255, 255, 0.07);
+
+  /* 与浅色一一对应。注意 --accent-solid / --accent-on 在这里**关系反过来**：
+     暗色 --accent(#4daafc) 当填充底已经够亮，前景必须换成深色（7.73:1），
+     放白字只有 2.48:1。浅色那一侧则是深底白字。这正是必须拆令牌的原因。 */
+  --scrim: rgba(0, 0, 0, 0.62);
+  --accent-solid: #4daafc;
+  --accent-on: #0f0f10;
+  --destructive: #ff6b66;
+  --field-line: rgba(255, 255, 255, 0.40);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.65), 0 18px 48px rgba(0, 0, 0, 0.58);
 }
