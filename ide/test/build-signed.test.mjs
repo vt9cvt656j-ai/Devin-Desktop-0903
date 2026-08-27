@@ -100,7 +100,13 @@ test("挂载点一定会被卸掉，包括校验失败提前退出的那两条�
 
 test("MRDAYONE_TARGET 指定架构时，每一处产物路径都跟着走", () => {
   assert.match(SH, /TARGET="\$\{MRDAYONE_TARGET:-\}"/);
-  assert.match(SH, /TARGET_DIR="target\$\{TARGET:\+\/\$TARGET\}\/release"/);
+  // 产物根要认 CARGO_TARGET_DIR：写死相对的 `target/` 时，一旦重定向 target 目录
+  // （复用缓存、或在 git worktree 里从固定快照构建），下面每一处校验都对着不存在的
+  // 路径去找 —— 报「没有找到本次的更新产物」，而构建其实成功了。更要紧的是反过来
+  // 那一半：真正发给用户的那条路上，签名稳定性校验从来没跑过。
+  assert.match(SH, /_TARGET_ROOT="\$\{CARGO_TARGET_DIR:-target\}"/,
+    "产物根写死了 target/ —— 重定向 CARGO_TARGET_DIR 时整套校验静默跳过");
+  assert.match(SH, /TARGET_DIR="\$\{_TARGET_ROOT\}\$\{TARGET:\+\/\$TARGET\}\/release"/);
   assert.match(SH, /\$\{TARGET:\+--target "\$TARGET"\}/, "构建命令没把 --target 传下去");
   // 三处校验路径：更新产物、验收的 .app、兜底找的 .dmg
   assert.match(SH, /_bundle_dir="\$TARGET_DIR\/bundle\/macos"/);
