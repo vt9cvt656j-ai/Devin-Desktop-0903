@@ -21,6 +21,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
 import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
+import { load } from "./helpers/source.mjs";
+import { cmProtocol, normalizeCustomModel } from "../src/agent/wire-protocol.js";
 
 const READY = extractFn("_readyAiConfig");
 
@@ -87,16 +89,51 @@ test("必须如实告诉用户「走自己的端点会变弱」，否则这就�
 // 全部用 fnSource 按 AST 取函数体，不用固定行窗口 —— 函数一变长，固定窗口就悄悄不再
 // 守住尾部，而且仍然是绿的。
 
-test("读取侧必须归一化，否则「选了协议也不生效」且全程零报错", () => {
-  // _loadCustomModels 里那个 .map 是**定形**的：不在里面列出来的字段每次读取都被静默
-  // 丢掉。只在保存侧写 protocol 而不改这里，表现是「弹窗选了 Anthropic、提示保存成功、
-  // 列表也刷新了，发出去的还是 /chat/completions」。这是本次改动的头号静默失效点。
-  // { code: true } = 从剥掉注释的那份里切。上面那段注释里就写着 normalizeCustomModel，
-  // 不剥的话这条断言是被自己的注释喂绿的 —— 把 .map(normalizeCustomModel) 整行删掉它
-  // 照样过。这个仓库吃过这个亏，helpers/source.mjs 的这个开关就是为它准备的。
-  const load = extractFn("_loadCustomModels", { code: true });
-  assert.match(load, /\.map\(normalizeCustomModel\)/,
-    "读取侧没有归一化——保存侧写进去的 protocol 每次读取都会被那个定形 .map 丢掉");
+test("协议存得进也读得回——这是**往返**，不是「源码里有没有那行字」", () => {
+  // 这条测试的前一版是 `assert.match(fnSource("_loadCustomModels"), /normalizeCustomModel/)`，
+  // 它**恒真**：当时函数里还有一个定形的 .map（只列 id/group/name/baseUrl/apiKey），
+  // normalizeCustomModel 接在它后面，拿到的 it.protocol 恒为 undefined。于是
+  // 21 条测试全绿、协议功能整个是死的：选了 Anthropic 也照样打 /chat/completions。
+  //
+  // 教训是判据的形状不对，不是断言写得不够细：只要还在验「源码长什么样」，就永远
+  // 验不到「它到底吐出什么」。所以这里把真函数取出来，配真的 localStorage 跑一遍往返。
+  const store = {};
+  const _loadCustomModels = load("_loadCustomModels", {
+    localStorage: { getItem: (k) => store[k] ?? null, setItem: (k, v) => { store[k] = String(v); } },
+    _CUSTOM_MODELS_KEY: "mrday.custom_models",
+    _CUSTOM_MODEL_PREFIX: "custom:",
+    cmProtocol,
+    normalizeCustomModel,
+  });
+
+  const saved = [
+    { id: "custom:a", group: "我的", name: "claude-sonnet-4-5", baseUrl: "https://api.anthropic.com", apiKey: "sk-a", protocol: "anthropic" },
+    { id: "custom:b", group: "我的", name: "grok-4", baseUrl: "https://api.x.ai", apiKey: "sk-b", protocol: "xai_responses" },
+    { id: "custom:c", group: "我的", name: "gpt-4o", baseUrl: "https://relay.example/v1", apiKey: "sk-c", protocol: "openai" },
+    // 存量条目：根本没有 protocol 字段，必须落回 openai 且其余字段一个不丢
+    { id: "custom:d", group: "老的", name: "gpt-4o-mini", baseUrl: "https://old.example/v1", apiKey: "sk-d" },
+  ];
+  store["mrday.custom_models"] = JSON.stringify(saved);
+
+  const got = _loadCustomModels();
+  assert.equal(got.length, 4, "过滤器把合法条目吃掉了");
+  const by = Object.fromEntries(got.map((x) => [x.id, x]));
+
+  assert.equal(by["custom:a"].protocol, "anthropic",
+    "存 anthropic 读回来不是 anthropic —— 用户选了协议也不生效，而且全程零报错");
+  assert.equal(by["custom:b"].protocol, "xai_responses", "xai_responses 在读取时被丢掉了");
+  assert.equal(by["custom:c"].protocol, "openai");
+  assert.equal(by["custom:d"].protocol, "openai", "存量条目没有 protocol 字段时必须落回 openai");
+
+  // 其余字段一个都不能丢：保存/删除都走 _saveCustomModels(_loadCustomModels()…)，
+  // 这里丢掉的字段会在下一次保存时被永久写没。
+  assert.equal(by["custom:d"].name, "gpt-4o-mini");
+  assert.equal(by["custom:d"].baseUrl, "https://old.example/v1");
+  assert.equal(by["custom:d"].apiKey, "sk-d");
+  assert.equal(by["custom:d"].group, "老的");
+  assert.deepEqual(Object.keys(by["custom:a"]).sort(),
+    ["apiKey", "baseUrl", "group", "id", "name", "protocol"],
+    "读出来的形状变了 —— 多一个字段是脏数据，少一个是静默丢配置");
 });
 
 test("协议注入必须排在校验之前", () => {
@@ -155,4 +192,57 @@ test("列表行要印出协议——选错了不点开编辑根本看不出来",
   // （文件顶部 `import { CODE as SRC }`），所以直接在它上面断言不会被注释喂绿。
   assert.match(SRC, /CM_PROTOCOL_UI\[it\.protocol\]\.label/,
     "列表行不印协议：用户在一堆条目里分不出哪条是 Anthropic，选错只能靠 404 反推");
+});
+
+test("三条认知腿在非 OpenAI 协议上必须走协议分叉，而不是打一个不存在的端点", async () => {
+  // 工具编排 / 收尾评审 / 离线蒸馏此前各自拼 _chatCompletionsUrl + Bearer，绕过 Rust 的
+  // 协议分叉。用户选了 Anthropic 原生之后，这三样 100% 打到
+  // https://api.anthropic.com/v1/chat/completions → 404，而三处都是 catch{}，界面零提示。
+  //
+  // 这条是**行为**测试：把真函数取出来跑，看它到底调了谁。源码文本断言在这个仓库栽过
+  // 一次（读取侧那条），不再用。
+  const calls = [];
+  const _cognitiveLegComplete = load("_cognitiveLegComplete", {
+    cmProtocol,
+    _fetchCompletionText: (url) => { calls.push(["openai直发", url]); return Promise.resolve("{}"); },
+    _chatCompletionsUrl: (b) => String(b).replace(/\/+$/, "") + "/chat/completions",
+    _billableAiComplete: (cfg) => { calls.push(["走Rust协议分叉", cfg.protocol]); return Promise.resolve("{}"); },
+  });
+
+  const body = { model: "m", messages: [{ role: "user", content: "x" }] };
+
+  // openai：逐字走老路（铁律 1 —— 存量条目行为一个字节不变）
+  calls.length = 0;
+  await _cognitiveLegComplete({ baseUrl: "https://relay.example/v1", apiKey: "k", protocol: "openai" }, body, 100);
+  assert.deepEqual(calls, [["openai直发", "https://relay.example/v1/chat/completions"]],
+    "openai 那条路被改动了 —— 存量自定义端点的三条腿会跟着变");
+
+  // 没有 protocol 字段的存量条目，同样走老路
+  calls.length = 0;
+  await _cognitiveLegComplete({ baseUrl: "https://relay.example/v1", apiKey: "k" }, body, 100);
+  assert.equal(calls[0][0], "openai直发", "存量条目（无 protocol）不该被改道");
+
+  for (const p of ["anthropic", "xai_responses"]) {
+    calls.length = 0;
+    await _cognitiveLegComplete({ baseUrl: "https://api.anthropic.com", apiKey: "k", protocol: p }, body, 100);
+    assert.equal(calls[0][0], "走Rust协议分叉",
+      `${p} 上仍在直发 OpenAI 形状的 /chat/completions —— 这三条腿会 100% 静默失败`);
+    assert.equal(calls[0][1], p, "协议没被透传下去，Rust 侧会落回 openai");
+  }
+});
+
+test("三条腿都必须**经过**那个 helper —— 上一条只测 helper 自己，某条腿改回直发它抓不到", () => {
+  // 变异实测：把 _semanticToolOrchestrator 改回 _fetchCompletionText(_chatCompletionsUrl(…))，
+  // 上一条行为测试**照样绿**。所以需要这一条守「调用点还在不在」。
+  //
+  // 判据是**否定式**的：不许再出现 _chatCompletionsUrl —— 那是绕过协议分叉的唯一形状。
+  // 用 { code: true } 从剥了注释的源码里取，否则 helper 的说明文字（里面就写着
+  // _chatCompletionsUrl）会把断言喂反。
+  for (const fn of ["_semanticToolOrchestrator", "_wrapUpCritic", "_offlineDistillIfDue"]) {
+    const src = extractFn(fn, { code: true });
+    assert.match(src, /_cognitiveLegComplete\(/,
+      `${fn} 不再走 _cognitiveLegComplete —— 非 OpenAI 协议上它会 100% 静默失败`);
+    assert.doesNotMatch(src, /_chatCompletionsUrl\(/,
+      `${fn} 又自己拼 /chat/completions 了 —— Anthropic 端点上这是必然 404，而外层是 catch{}`);
+  }
 });

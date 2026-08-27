@@ -14109,16 +14109,16 @@ function _loadCustomModels() {
       && typeof it.id === "string" && it.id.startsWith(_CUSTOM_MODEL_PREFIX)
       && typeof it.name === "string" && it.name.trim()
       && typeof it.baseUrl === "string" && /^https?:\/\//i.test(it.baseUrl.trim()))
-      .map((it) => ({
-        id: it.id,
-        group: String(it.group || "").trim() || "自定义模型",
-        name: it.name.trim(),
-        baseUrl: it.baseUrl.trim(),
-        apiKey: String(it.apiKey || ""),
-      }))
-      // 形状收进 normalizeCustomModel：上面这个 .map 是**定形**的，只在保存侧写 protocol
-      // 而不改这里，表现是「选了 Anthropic、保存成功、发出去还是 /chat/completions」，
-      // 而且全程零报错。这是本次改动的头号静默失效点。
+      // 形状**只有一处**：normalizeCustomModel。这里原本还有一个定形的 .map（列 id/group/
+      // name/baseUrl/apiKey，没有 protocol），normalizeCustomModel 接在它后面 —— 于是拿到的
+      // it.protocol 恒为 undefined，读出来永远是 openai。表现正是「选了 Anthropic、提示保存
+      // 成功、列表也刷新了，发出去还是 /chat/completions」，全程零报错。
+      //
+      // 更糟的是它会**改坏存量数据**：保存/删除都走 _saveCustomModels(_loadCustomModels()…)，
+      // 所以随便新增或删掉一条，就会把存储里所有 anthropic/xai 条目一起写成 openai。
+      //
+      // 守这条的测试必须是**存进去再读回来的往返**，不能是「源码里有没有 normalizeCustomModel
+      // 这行字」—— 后者在上面那个定形 .map 还在的时候一样是绿的（21 条全绿、功能全断）。
       .map(normalizeCustomModel);
   } catch { return []; }
 }
@@ -15415,7 +15415,9 @@ function _warnCustomEndpointOnce(custom) {
     const seen = JSON.parse(localStorage.getItem(_CUSTOM_WARNED_KEY) || "[]");
     if (Array.isArray(seen) && seen.includes(id)) return;
     localStorage.setItem(_CUSTOM_WARNED_KEY, JSON.stringify([...(Array.isArray(seen) ? seen : []), id]));
-    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩与下一句预测也会关闭。", { duration: 9000 });
+    // 「下一句预测也会关闭」这半句以前是错的：OpenAI 兼容的自定义端点上预测一直是开着的
+    // （见 _predictNextAsk 里 viaGateway:false 那支）。真实规则按协议分，照着说。
+    showToast("已切到你自己的端点：工具描述和完整系统提示词由服务端下发，这条路上拿不到，智能体会比走网关时弱一些；长上下文压缩会关闭。下一句预测在 OpenAI 兼容协议上照常，Anthropic / xAI Responses 上不发。", { duration: 9000 });
   } catch {}
 }
 
@@ -15823,6 +15825,41 @@ async function showCustomModelsDialog() {
   const protoRadios = [...ov.querySelectorAll(".cm-in-proto")];
   const hintProto = ov.querySelector("#cmHintProto");
   const gapsProto = ov.querySelector("#cmGapsProto");
+  const revealBtn = ov.querySelector(".cm-reveal");
+  const errName = ov.querySelector("#cmErrName");
+  const errBase = ov.querySelector("#cmErrBase");
+  const srEl = ov.querySelector(".cm-sr");
+  // 上一版把这四个节点当纯装饰写进了 markup：眼睛按钮有 aria-label / aria-pressed /
+  // aria-controls、有 hover 态、Tab 能停，**却没有任何监听器**；两个 .cm-field__err 和那条
+  // aria-live 也一样从来没被写过。一个长得像按钮、点下去什么都不发生的东西，比没有这个
+  // 按钮更糟；而校验失败只发 toast，读屏用户和视线不在右上角的人都收不到。
+  if (revealBtn) {
+    revealBtn.addEventListener("click", () => {
+      const show = inKey.type === "password";
+      inKey.type = show ? "text" : "password";
+      revealBtn.setAttribute("aria-pressed", show ? "true" : "false");
+      revealBtn.setAttribute("aria-label", show ? "隐藏密钥" : "显示密钥");
+      inKey.focus();
+    });
+  }
+  // 关掉弹窗前把密钥还原成密文：这个 DOM 会被复用，否则下次打开是明文。
+  const _resetReveal = () => {
+    inKey.type = "password";
+    revealBtn?.setAttribute("aria-pressed", "false");
+    revealBtn?.setAttribute("aria-label", "显示密钥");
+  };
+  // 行内报错。toast 会飘走、也不进读屏；错在哪个格子里必须写在那个格子下面。
+  const _fieldErr = (el, input, msg) => {
+    if (el) { el.textContent = msg || ""; el.hidden = !msg; }
+    if (input) {
+      if (msg) input.setAttribute("aria-invalid", "true");
+      else input.removeAttribute("aria-invalid");
+    }
+  };
+  const _clearErrs = () => { _fieldErr(errName, inName, ""); _fieldErr(errBase, inBase, ""); };
+  const _announce = (msg) => { if (srEl) srEl.textContent = String(msg || ""); };
+  inName.addEventListener("input", () => _fieldErr(errName, inName, ""));
+  inBase.addEventListener("input", () => _fieldErr(errBase, inBase, ""));
   // 网页构建（/app/）没有 Rust 那条协议分叉：_realAiFetch 自己拼 OpenAI 形状的请求体、
   // 端点和鉴权头。让这两条协议在网页上「可选然后失败」，就是在造一个坏功能 —— 禁掉并说清楚。
   for (const r of protoRadios) {
@@ -15860,6 +15897,8 @@ async function showCustomModelsDialog() {
     editingId = null;
     inGroup.value = ""; inName.value = ""; inBase.value = ""; inKey.value = "";
     writeProto(CM_PROTOCOL_DEFAULT);
+    _resetReveal();
+    _clearErrs();
     formTitle.textContent = "新增自定义模型";
     saveBtn.textContent = "添加";
     cancelBtn.hidden = true;
@@ -15918,8 +15957,17 @@ async function showCustomModelsDialog() {
     // 不相干的中转站完全可能取同一个组名，按组存会把它们绑死。
     const protocol = readProto();
     const apiKey = inKey.value.trim();
-    if (!names.length) { showToast("请填写模型名称"); inName.focus(); return; }
-    if (!/^https?:\/\/\S+$/i.test(baseUrl)) { showToast("对接地址需以 http(s):// 开头"); inBase.focus(); return; }
+    _clearErrs();
+    if (!names.length) {
+      _fieldErr(errName, inName, "请填写模型名称");
+      _announce("保存失败：请填写模型名称");
+      showToast("请填写模型名称"); inName.focus(); return;
+    }
+    if (!/^https?:\/\/\S+$/i.test(baseUrl)) {
+      _fieldErr(errBase, inBase, "对接地址需以 http:// 或 https:// 开头");
+      _announce("保存失败：对接地址格式不对");
+      showToast("对接地址需以 http(s):// 开头"); inBase.focus(); return;
+    }
     const items = _loadCustomModels();
     const mkId = () => _CUSTOM_MODEL_PREFIX + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     let added = 0;
@@ -15944,6 +15992,7 @@ async function showCustomModelsDialog() {
     _saveCustomModels(items);
     if (dropped > 0) showToast(`自定义模型上限 64 个，有 ${dropped} 个未添加`);
     else showToast(editingId ? "已保存修改" : (added > 1 ? `已添加 ${added} 个自定义模型` : "已添加自定义模型"));
+    _announce(editingId ? "已保存修改" : `已添加 ${added} 个自定义模型`);
     resetForm();
     renderList();
     refreshModelBadge(); // 改名波及当前选中项时同步底栏标签
@@ -28341,7 +28390,13 @@ async function _predictNextAsk(sess) {
       // https://api.anthropic.com/v1/chat/completions）→ 404，而外层是 catch{}，连日志
       // 都没有 —— 表现成「灰字预测在这个模型上不出现」，用户找不到原因。
       // 宁可不预测，也不发一个必然失败的请求。
-      if (_cm && cmProtocol(_cm.protocol) !== "openai") return;
+      if (_cm && cmProtocol(_cm.protocol) !== "openai") {
+        // 记下原因再走。这个字段是「为什么这儿没有预测」的唯一答案来源，而它**没有复位点** ——
+        // 不写的话，会话里先前留下的 timeout / too_generic 会一直挂在输入框的 title 上，
+        // 把「这条模型上根本不发预测」说成一个完全不相干的失败。
+        sess._askPredictReject = "protocol_not_openai";
+        return;
+      }
       if (_cm) _predictCfg = { baseUrl: _cm.baseUrl, apiKey: _cm.apiKey, model: _cm.name, viaGateway: false };
     } catch {}
     if (_predictCfg.viaGateway) {
@@ -50417,19 +50472,14 @@ async function _offlineDistillIfDue(root, config) {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     // 三块并行：串行要付三倍墙钟，而这是后台活动、不该占那么久的取消窗口。
     const to = ctrl ? setTimeout(() => ctrl.abort(), 60000) : null;
-    const texts = await Promise.all(chunks.map((digest) => _fetchCompletionText(
-      _chatCompletionsUrl(config.baseUrl), {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + (config.apiKey || ""),
-        "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      },
+    const texts = await Promise.all(chunks.map((digest) => Promise.resolve(_cognitiveLegComplete(config,
       { model: config.model,
         messages: [{ role: "system", content: sys },
           { role: "user", content: `历史运行记录（每行一轮，✓/△/✗ 是收尾状态，不代表活干成了）：\n${digest}` }],
         // 预算和收尾评审同源：推理内容和正文共用输出预算，会推理的模型要留余量。
         max_tokens: _criticMaxTokens(config.model) },
-      ctrl ? ctrl.signal : undefined,
-    ).catch(() => "")));
+      _criticMaxTokens(config.model), ctrl ? ctrl.signal : undefined,
+    )).catch(() => "")));
     if (to) clearTimeout(to);
     // 一块产不出来不影响别块——这正是切块的意义，全有或全无才是原来那个病。
     const lessons = [];
@@ -50951,6 +51001,37 @@ function _cognitiveLegEffort(config) {
   return pref && pref !== "off" ? { reasoning_effort: pref } : {};
 }
 
+/**
+ * 三条认知腿（工具编排 / 收尾评审 / 离线蒸馏）唯一的发送口。
+ *
+ * 它们此前各自拼 `_chatCompletionsUrl(config.baseUrl)` + `Authorization: Bearer`，
+ * **绕过 Rust 的协议分叉**。用户一旦把自定义模型选成 Anthropic 原生或 xAI Responses，
+ * 这三样就 100% 打到一个不存在的端点（例如 https://api.anthropic.com/v1/chat/completions）
+ * → 404，而三处都是 `catch { return null; }`，界面上零提示。表现是「工具选得莫名其妙、
+ * 收尾不评审、记忆不蒸馏」，用户找不到原因 —— 主发送路径明明是好的。
+ *
+ * openai 那条路**逐字不变**（铁律 1：没有 protocol 的存量条目行为一个字节不动）。
+ * 非 openai 走 backend.aiComplete → Rust ai_complete，那里第一行就是
+ * Wire::of(config.protocol)，URL / 请求体 / 鉴权头都按协议翻。
+ *
+ * 两处有意的差异，不是漏掉：
+ *  · `reasoning_effort` 不再进请求体 —— Rust 那条路的 body 由它自己从 config 现拼。
+ *    这在 Anthropic 上本来就是对的：protocol.rs 会把这个键整个丢掉，硬发是 400。
+ *  · AbortController 的 signal 用不上 —— Rust 侧有自己的超时（StreamTimeouts::for_config）。
+ *    调用方的 setTimeout 仍然会跑，只是不再能提前掐断这一发。
+ */
+function _cognitiveLegComplete(config, body, maxTokens, signal) {
+  if (cmProtocol(config?.protocol) === "openai") {
+    return _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
+      "Content-Type": "application/json",
+      Authorization: "Bearer " + (config.apiKey || ""),
+      "x-ide-request-id": String(config.requestId || "").slice(0, 128),
+    }, body, signal);
+  }
+  const cfg = { ...config, model: String(body?.model || config.model || ""), temperature: 0 };
+  return Promise.resolve(_billableAiComplete(cfg, body?.messages || [], maxTokens)).catch(() => null);
+}
+
 // 认知腿的期限跟着**同一份 config 的思考档位**走，而不是写死一个数。
 //
 // 起因：收尾评审吃 _cognitiveLegEffort 把用户选的 reasoning_effort 原样带上去，期限却
@@ -51063,11 +51144,9 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   try {
     const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     const to = ctrl ? setTimeout(() => ctrl.abort(), _cognitiveLegDeadlineMs(config)) : null;
-    const _post = (sysText, maxTokens) => _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + (config.apiKey || ""),
-        "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      }, { model: reviewModel, ..._cognitiveLegEffort(config), messages: [{ role: "system", content: sysText }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0 }, ctrl ? ctrl.signal : undefined)
+    const _post = (sysText, maxTokens) => Promise.resolve(_cognitiveLegComplete(config,
+      { model: reviewModel, ..._cognitiveLegEffort(config), messages: [{ role: "system", content: sysText }, { role: "user", content: user }], max_tokens: maxTokens, temperature: 0 },
+      maxTokens, ctrl ? ctrl.signal : undefined))
       .catch(() => null);
     // 核心半（done/verified/instruction）预算小、无目录；观察半保留原预算（findings 要引真实位置）。
     // 预算与有界辅助调用同源（_criticMaxTokens：普通 2000 / 推理 +4096 余量）。
@@ -51593,11 +51672,9 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
     // losing it and then burning quota in the background; batch-checkpoint routes must
     // never stall the loop for the worst-case planner.
     const to = ctrl ? setTimeout(() => ctrl.abort(), Math.max(1000, deadlineMs | 0)) : null;
-    const _text = await _fetchCompletionText(_chatCompletionsUrl(config.baseUrl), {
-        "Content-Type": "application/json",
-        Authorization: "Bearer " + (config.apiKey || ""),
-        "x-ide-request-id": String(config.requestId || "").slice(0, 128),
-      }, { model: plannerModel, ..._cognitiveLegEffort(config), messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0 }, ctrl ? ctrl.signal : undefined);
+    const _text = await _cognitiveLegComplete(config,
+      { model: plannerModel, ..._cognitiveLegEffort(config), messages: [{ role: "system", content: catalogSystem }, { role: "user", content: user }], max_tokens: 3000, temperature: 0 },
+      3000, ctrl ? ctrl.signal : undefined);
     if (to) clearTimeout(to);
     if (_text == null) return null;
     const j = _safeJsonLoose(_text);

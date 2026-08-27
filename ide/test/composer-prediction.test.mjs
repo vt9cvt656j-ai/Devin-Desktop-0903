@@ -404,10 +404,14 @@ test("预测的输出预算要按模型能力给，60 对原生推理模型等�
    */
   // 读**剥掉注释**的源码。这几条断言禁的写法在注释里被逐字引用过（说明为什么不能那么写），
   // 直接对原文断言会被自己的注释喂到 —— 这个仓库有前科，一律先剥注释。
-  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"));
-  assert.ok(!/max_tokens:\s*60\b/.test(src.slice(0, 6000)),
+  // 按 AST 取**这一个函数**。原先是 `SRC_CODE.slice(indexOf(...), +6000)`：函数一长，
+  // temperature 那句就被挤出窗口（实际发生过）。而去掉长度上界更糟 —— src 会变成「从这里
+  // 到文件末尾」，于是 main.js 别处任何一个 temperature: 0.3 都会把下面那条否定断言打红。
+  // 两种都是固定窗口的死法，正解是不切窗口。
+  const src = grab("_predictNextAsk", { code: true });
+  assert.ok(!/max_tokens:\s*60\b/.test(src),
     "又写死 max_tokens: 60 了——原生推理模型会零输出");
-  assert.match(src.slice(0, 6000), /max_tokens: _predictMaxTokens\(_predictCfg\.model\)/,
+  assert.match(src, /max_tokens: _predictMaxTokens\(_predictCfg\.model\)/,
     "预算没有按模型能力算");
 
   // 判据必须是「模型自己声明了推理档位」，不是模型名单——和 _criticMaxTokens 同源。
@@ -423,8 +427,12 @@ test("预测的输出预算要按模型能力给，60 对原生推理模型等�
     "余量没有复用共享常量，又散了一个新魔数");
 
   // temperature：这是单点预测不是创作，和同文件其它有界辅助调用一致取 0。
-  assert.ok(!/temperature:\s*0\.3/.test(src.slice(0, 6000)), "temperature 还是 0.3");
-  assert.match(src.slice(0, 6000), /temperature: 0,/, "temperature 不是 0");
+  //
+  // 不再 `src.slice(0, 6000)`：src 已经是按 AST 取出的**整个函数体**，再切一刀就是
+  // 第二层固定窗口。函数里多几行注释，temperature 那句就被挤出窗口 —— 实际发生过一次，
+  // 而这种切法更常见的死法是窗口仍然覆盖、却不再守住它要守的那行，且一直是绿的。
+  assert.ok(!/temperature:\s*0\.3/.test(src), "temperature 还是 0.3");
+  assert.match(src, /temperature: 0,/, "temperature 不是 0");
 });
 
 test("预测必须显式关思考，否则网关把它升级成 effort=high + max_tokens 40000", () => {

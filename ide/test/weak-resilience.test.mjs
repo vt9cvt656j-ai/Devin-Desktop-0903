@@ -128,7 +128,8 @@ const _mkCritic = (responder, calls = []) => load("_wrapUpCritic", {
   _chatCompletionsUrl: () => "https://x/v1/chat/completions",
   _safeJsonLoose: (t) => { try { return JSON.parse(t); } catch { return null; } },
   _recordModelJsonOutcome: (...a) => calls.push(a),
-  _fetchCompletionText: async (_u, _h, payload) => responder(payload),
+  // 收尾评审改走 _cognitiveLegComplete：请求体从第三个参数挪到第二个。
+  _cognitiveLegComplete: async (_cfg, payload) => responder(payload),
 });
 const _CRITIC_CFG = { baseUrl: "https://x", apiKey: "k", model: "m" };
 // 两半靠系统提示词区分：观察半带 findings 规则与工具目录，核心半没有。
