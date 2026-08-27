@@ -475,7 +475,10 @@ test("预测必须显式关思考，否则网关把它升级成 effort=high + ma
 });
 
 test("期限要和预算一起抬，只改一半是把顶满上限换成静默超时", () => {
-  const src = SRC_CODE.slice(SRC_CODE.indexOf("async function _predictNextAsk"), SRC_CODE.indexOf("async function _predictNextAsk") + 8000);
+  // 按 AST 取整个函数体，**不要**固定字符窗口。原先是 `+ 8000`：函数一长，尾部那两条
+  // 「失败留痕」断言就落到窗口外 —— 这次是响亮地红了（加了 6 行注释就越界），但同样的
+  // 形状更常见的死法是窗口仍然覆盖、却不再守住它本来要守的那几行，而且一直是绿的。
+  const src = grab("_predictNextAsk", { code: true });
   // 钉「算出来的期限**真的被用上**」，不是「算出来了」。只验前者的话，把 setTimeout 的
   // 第二个参数改回 12000、让 _deadlineMs 变成死值，测试照样绿（变异实测漏网）。
   assert.match(src, /_cognitiveLegDeadlineMs\(_predictCfg\)/, "没复用已有的分档期限助手");

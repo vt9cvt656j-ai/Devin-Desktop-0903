@@ -233,6 +233,50 @@
 }
 .cm-field input:disabled { opacity: .5; cursor: not-allowed }
 
+/* ---- 协议分段控件 + 能力缺口清单 -----------------------------------------
+ * 不复用 refine.css 的 .seg：那个类已经不是通用分段控件，它是侧栏专用的下划线页签，
+ * 还挂着 #sideTabs.seg 的宽度规则、.explorer 的容器查询和一条按 #tabDebug 命中的媒体
+ * 查询。放进表单是视觉错 + 耦合错。
+ *
+ * 底层是原生 radio（键盘方向键、读屏语义全都自带），这里只把它画成分段样式。
+ * 颜色全部走令牌，和同一个弹窗里的输入框同一套。
+ * ------------------------------------------------------------------------- */
+.cm-field__label {
+  display: block; margin-bottom: 5px;
+  font-size: var(--t-small, 12px); font-weight: 500; color: var(--text-dim);
+}
+.cm-seg {
+  display: flex; gap: 0; padding: 2px;
+  background: var(--editor-bg);
+  border: 1px solid var(--field-line); border-radius: var(--ui-radius-md, 6px);
+  box-shadow: var(--ui-shadow-xs);
+}
+.cm-seg__opt { flex: 1 1 0; min-width: 0; position: relative; }
+/* 不能 display:none —— 那会让它从 Tab 序里消失。压到 1px 并保留可聚焦。 */
+.cm-seg__opt input {
+  position: absolute; width: 1px; height: 1px; opacity: 0; margin: 0; pointer-events: none;
+}
+.cm-seg__opt span {
+  display: block; height: 28px; line-height: 28px; text-align: center;
+  font-size: var(--t-body, 13px); color: var(--text-dim);
+  border-radius: var(--ui-radius-sm, 4px); cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-seg__opt:hover input:not(:checked):not(:disabled) + span { color: var(--text); background: var(--hover); }
+.cm-seg__opt input:checked + span { color: var(--accent-on); background: var(--accent-solid); font-weight: 600; }
+.cm-seg__opt input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 网页构建上桌面专属协议不可选 —— 看得出来是「这里不能用」，而不是「点了没反应」。 */
+.cm-seg__opt--off span { opacity: .42; cursor: not-allowed; text-decoration: line-through; }
+
+/* 能力缺口：不许假装支持的唯一界面落点。灰但不能灰到看不见。 */
+.cm-gaps {
+  margin: 6px 0 0; padding: 0 0 0 16px; list-style: disc;
+  font-size: var(--t-small, 12px); line-height: 1.5; color: var(--text-dim);
+}
+.cm-gaps:empty, .cm-gaps[hidden] { display: none; }
+.cm-gaps li { margin: 2px 0; }
+
 .cm-field__hint { margin: 5px 0 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--text-dim) }
 .cm-field__err  { margin: 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--destructive); font-weight: 500 }
 .cm-field__err:not(:empty) { margin-top: 5px }

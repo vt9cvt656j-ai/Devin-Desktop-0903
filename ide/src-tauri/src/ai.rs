@@ -161,6 +161,13 @@ pub struct AiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// 自定义模型的**上游线协议**：`openai` / `anthropic` / `xai_responses`。
+    ///
+    /// 缺省（存量的自定义模型记录里没有这个字段）和任何未知值一律落 OpenAI 兼容，
+    /// 那条路上的 URL、请求体、鉴权头、SSE 解析和这个字段存在之前逐字一致。
+    /// 网关线路永远不带它。判据与翻译全在 `crate::protocol`。
+    #[serde(default)]
+    pub protocol: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -368,7 +375,8 @@ pub async fn ai_complete(
     messages: Vec<serde_json::Value>,
     max_tokens: u32,
 ) -> Result<serde_json::Value, String> {
-    let url = chat_completions_url(&config.base_url)?;
+    let wire = crate::protocol::Wire::of(config.protocol.as_deref());
+    let url = crate::protocol::endpoint_url(wire, &config.base_url)?;
     let cancel_id = cancellation_id(&config);
     let cancel_flag = cancel_id.as_deref().map(register_cancel);
     let _cancel_guard = cancel_id.map(CancelGuard);
@@ -382,6 +390,8 @@ pub async fn ai_complete(
         "temperature": config.temperature.unwrap_or(0.1),
         "messages": messages,
     });
+    // 非 OpenAI 协议下形状要翻；默认 openai 时 translate_request 是恒等变换。
+    let payload = crate::protocol::translate_request(wire, &payload)?;
 
     let client = &*HTTP;
     let completion_timeout = StreamTimeouts::for_config(&config).response_headers;
@@ -428,6 +438,28 @@ pub async fn ai_chat_with_tools(
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     ai_chat_inner(config, messages, Some(tools), on_event).await
+}
+
+/// 自定义模型能选的协议，连同**每条协议翻译不了的能力**。
+///
+/// 界面的协议下拉必须从这里取，而不是自己再抄一份字符串：抄一份的下场是新增协议时
+/// 只改一半，而「下拉里有、后端不认」的表现是静默退回 OpenAI —— 用户填了 Anthropic
+/// 地址，请求却打到 /chat/completions，报回来的是一句 404，看着像地址填错了。
+///
+/// `unsupported` 是「不许假装支持」那条铁律的落点：这几句要原样显示在下拉旁边。
+#[tauri::command]
+pub fn ai_protocols() -> Vec<serde_json::Value> {
+    crate::protocol::PROTOCOLS
+        .iter()
+        .map(|id| {
+            let wire = crate::protocol::Wire::of(Some(id));
+            serde_json::json!({
+                "id": wire.id(),
+                "label": wire.label(),
+                "unsupported": wire.unsupported(),
+            })
+        })
+        .collect()
 }
 
 fn ai_error_detail_from_body(body: &str) -> String {
@@ -576,12 +608,35 @@ async fn read_sse_text(
                     finish = normalize_finish_reason(fr).to_string();
                 }
             }
+            if v["type"] == "message_delta" {
+                // Anthropic 原生把停止原因放在这里，不在 choices 里。少了这一句，走原生
+                // 端点的 Cmd+K 分不清「模型没产出」和「被 max_tokens 砍断」。
+                if let Some(sr) = v["delta"]["stop_reason"].as_str().filter(|s| !s.is_empty()) {
+                    finish = normalize_finish_reason(sr).to_string();
+                }
+            }
             if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
                 out.push_str(t);
             } else if v["type"] == "content_block_delta" {
                 if let Some(t) = v["delta"]["text"].as_str() {
                     out.push_str(t);
                 }
+            } else if v["type"] == "response.output_text.delta" {
+                // xAI Responses 的正文增量。不认它，这条路上的一次性补全会拼出空串 ——
+                // 而且不报错，表现成「模型什么都没回」。
+                if let Some(t) = v["delta"].as_str() {
+                    out.push_str(t);
+                }
+            }
+            // Anthropic 用 message_stop、xAI Responses 用 response.completed 收流，两者都
+            // **不发 `[DONE]`**。少了这一句，唯一的完整性判据是下面那句 `!saw_done &&
+            // out.is_empty()` —— 它只在**空**的时候报错，于是一段被中途截断的非空回答会被
+            // 当成一次完整的短回答，交给 Cmd+K / 意图裁决 / 快速路由。不报错，只是答得短。
+            if v["type"] == "message_stop"
+                || v["type"] == "response.completed"
+                || v["type"] == "response.incomplete"
+            {
+                saw_done = true;
             }
         }
         if consumed > 0 {
@@ -670,19 +725,9 @@ async fn read_ai_error_body_with_limits(
 /// (`https://api.openai.com`) or a full `/chat/completions` URL. Accept all three
 /// shapes so BYOK does not fail for a harmless missing `/v1`.
 fn chat_completions_url(base_url: &str) -> Result<String, String> {
-    let base = base_url.trim().trim_end_matches('/');
-    if !(base.starts_with("http://") || base.starts_with("https://")) {
-        return Err("AI base URL must start with http:// or https://".into());
-    }
-    if base.ends_with("/chat/completions") {
-        return Ok(base.to_string());
-    }
-    let api_base = if base.ends_with("/v1") || base.contains("/v1/") {
-        base.to_string()
-    } else {
-        format!("{base}/v1")
-    };
-    Ok(format!("{api_base}/chat/completions"))
+    // 归一化逻辑整段搬进了 protocol.rs 的 OpenAI 分支（一个分支都没改），这样
+    // 「协议 → 端点」只有一处判据。下面那几条既有断言现在钉的就是那一段。
+    crate::protocol::endpoint_url(crate::protocol::Wire::OpenAi, base_url)
 }
 
 /// Relay the optional L0 server-side-assembly headers. When the JS side set
@@ -848,16 +893,21 @@ async fn post_chat_once(
         return Err(CANCELLED_AI_REQUEST.to_string());
     }
     let deadline = ResponseHeadersDeadline::new(Instant::now(), response_headers_timeout);
-    send_with_response_headers_deadline(
-        with_response_deadline_header(
-            with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
-            deadline,
-        )
-        .json(payload),
+    let mut request = with_response_deadline_header(
+        with_ide_headers(client.post(url).bearer_auth(&config.api_key), config),
         deadline,
-        cancel,
-    )
-    .await
+    );
+    // 协议要求的**附加**鉴权头。OpenAI（默认，含全部存量自定义模型）返回空表 ——
+    // 上面那行 `.bearer_auth()` 一个字节不动，请求逐字节和以前相同。
+    // Anthropic 要 x-api-key + anthropic-version：少了后者是硬 400，而只发
+    // Authorization 会让认 anthropic 口径的中转报「密钥被拒」，看着像密钥坏了。
+    for (name, value) in crate::protocol::extra_auth_headers(
+        crate::protocol::Wire::of(config.protocol.as_deref()),
+        &config.api_key,
+    ) {
+        request = request.header(name, value);
+    }
+    send_with_response_headers_deadline(request.json(payload), deadline, cancel).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1300,7 @@ mod ide_header_tests {
             model: "test-model".into(),
             max_tokens: None,
             temperature: None,
+            protocol: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             reasoning_effort: None,
@@ -1629,6 +1680,7 @@ mod stream_timeout_tests {
             model: "test-model".into(),
             max_tokens: None,
             temperature: None,
+            protocol: None,
             // 上一次给 AiConfig 加字段时没跟上，HEAD 的 lib test 整个编不过。
             ide_context_window: None,
             reasoning_effort: reasoning_effort.map(str::to_string),
@@ -1767,6 +1819,15 @@ mod stream_timeout_tests {
     }
 
     async fn run_raw_sse_body(body: Vec<u8>) -> (Result<(), String>, Vec<serde_json::Value>) {
+        // 不带协议 = 存量路径。这个文件里既有的每一条流式断言都还跑在它上面。
+        run_raw_sse_body_on_protocol(body, None).await
+    }
+
+    async fn run_raw_sse_body_on_protocol(
+        body: Vec<u8>,
+        protocol: Option<&str>,
+    ) -> (Result<(), String>, Vec<serde_json::Value>) {
+        let protocol = protocol.map(str::to_string);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1796,6 +1857,7 @@ mod stream_timeout_tests {
         });
         let mut cfg = config(None, None);
         cfg.base_url = format!("http://{address}");
+        cfg.protocol = protocol;
         let result = ai_chat_inner(
             cfg,
             vec![serde_json::json!({"role": "user", "content": "write it"})],
@@ -2768,6 +2830,106 @@ mod stream_timeout_tests {
         assert!(!events.iter().any(|event| event["kind"] == "done"));
     }
 
+    /// 真抓包形状的原生 Anthropic 流，走 `protocol: "anthropic"` 这条路，一路到前端
+    /// 事件。这条断言同时钉住三件此前不成立的事：
+    ///   1. 这条路上**没有 `data: [DONE]`** —— 收尾判据只能来自 `message_stop`，
+    ///      否则整轮会被判成"连接提前结束"并作废。
+    ///   2. 工具的 content block 下标是 2（思考 0、正文 1），而前端拿到的必须是 0。
+    ///   3. Anthropic 的 input_tokens **不含**缓存，上下文读数要把缓存加回去。
+    #[tokio::test]
+    async fn anthropic_native_stream_arrives_as_ordinary_frontend_events() {
+        let body = include_str!("../testdata/anthropic_tool_call.sse")
+            .as_bytes()
+            .to_vec();
+        let (result, events) = run_raw_sse_body_on_protocol(body, Some("anthropic")).await;
+        assert!(result.is_ok(), "没有 [DONE] 也必须算收全: {result:?}");
+        assert_eq!(
+            non_metric_kinds(&events),
+            [
+                "reasoning",
+                "reasoning",
+                "token",
+                "toolCall",
+                "toolCall",
+                "toolCall",
+                "finishReason",
+                "usage",
+                "done"
+            ]
+        );
+        let reasoning: String = events
+            .iter()
+            .filter(|e| e["kind"] == "reasoning")
+            .map(|e| e["delta"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(reasoning, "用户问东京时间，应该调用 get_time。");
+        assert_eq!(first_event_of_kind(&events, "token")["delta"], "我查一下。");
+
+        let calls: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["kind"] == "toolCall").collect();
+        assert!(
+            calls.iter().all(|c| c["index"] == 0),
+            "content block 下标不能透传成 tool_calls 下标"
+        );
+        assert_eq!(calls[0]["id"], "tooluse_1");
+        assert_eq!(calls[0]["name"], "get_time");
+        let arguments: String = calls
+            .iter()
+            .map(|c| c["arguments"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(arguments, r#"{"tz": "Asia/Tokyo"}"#);
+        serde_json::from_str::<serde_json::Value>(&arguments).unwrap();
+
+        assert_eq!(
+            first_event_of_kind(&events, "finishReason")["reason"],
+            "tool_calls"
+        );
+        // 变体名是 camelCase（enum 上的 rename_all 只改变体名），**字段名仍是 snake_case**。
+        let usage = first_event_of_kind(&events, "usage");
+        assert_eq!(usage["prompt_tokens"], 61); // 15 输入 + 46 缓存读：原生 input_tokens 不含缓存
+        assert_eq!(usage["cached_tokens"], 46);
+        assert_eq!(usage["completion_tokens"], 18);
+        assert_eq!(usage["cache_creation_tokens"], 0);
+        // Anthropic 把思考算进 output_tokens，不单独报思考 token —— 字符数是这条线路上
+        // 唯一真实可核对的思考量，不拿它冒充 token。
+        assert_eq!(usage["reasoning_tokens"], 0);
+        assert_eq!(usage["thinking_chars"], 22);
+    }
+
+    /// 铁律：**没有协议字段的存量自定义模型，行为逐字不变。**
+    /// 同一段 OpenAI SSE，三种 protocol 取值（缺省 / "openai" / 一个无意义的字符串）
+    /// 必须产生完全相同的一串前端事件。
+    #[tokio::test]
+    async fn absent_and_unknown_protocol_behave_exactly_like_today() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let strip = |events: Vec<serde_json::Value>| {
+            events
+                .into_iter()
+                .filter(|e| e["kind"] != "streamMetric")
+                .collect::<Vec<_>>()
+        };
+        let (baseline_result, baseline) = run_raw_sse_body(body.clone()).await;
+        let (openai_result, openai) =
+            run_raw_sse_body_on_protocol(body.clone(), Some("openai")).await;
+        let (unknown_result, unknown) =
+            run_raw_sse_body_on_protocol(body, Some("не-протокол")).await;
+        assert!(baseline_result.is_ok());
+        assert_eq!(openai_result, baseline_result);
+        assert_eq!(unknown_result, baseline_result);
+        let baseline = strip(baseline);
+        assert!(!baseline.is_empty());
+        assert_eq!(strip(openai), baseline);
+        assert_eq!(strip(unknown), baseline);
+    }
+
     #[tokio::test]
     async fn malformed_json_before_done_rejects_complete_tool_argument_prefix() {
         let arguments = r#"{"path":"src/main.js","content":"prefix"}"#;
@@ -2826,7 +2988,8 @@ async fn ai_chat_inner(
     on_event: Channel<AiEvent>,
 ) -> Result<(), String> {
     let timeouts = StreamTimeouts::for_config(&config);
-    let url = chat_completions_url(&config.base_url)?;
+    let wire = crate::protocol::Wire::of(config.protocol.as_deref());
+    let url = crate::protocol::endpoint_url(wire, &config.base_url)?;
     let stream_started = Instant::now();
     // Register cancellation before DNS/connect/header wait. Previously registration
     // happened only after headers arrived, so Stop could not interrupt the exact hang
@@ -2890,6 +3053,21 @@ async fn ai_chat_inner(
     // Prompt-cache breakpoints are route capabilities. The Michael gateway adds them only after
     // selecting a native Anthropic connection; the desktop does not guess from model names or
     // mutate the stable prefix.
+
+    // 上面这一整段构造出来的是 **OpenAI 形状**的请求体。自定义模型选了别的协议时，
+    // 在这里翻一次形状 —— 而 `Wire::OpenAi` 下 translate_request 是恒等变换，
+    // 存量路径发出去的字节和以前完全一样。
+    let payload = match crate::protocol::translate_request(wire, &payload) {
+        Ok(payload) => payload,
+        Err(message) => {
+            // 翻译失败最常见的原因是历史里有一个参数坏掉的工具调用。宁可在这里说清楚，
+            // 也不要把一个残缺的请求发出去换回一句上游的通用 400。
+            let _ = on_event.send(AiEvent::Error {
+                message: message.clone(),
+            });
+            return Err(message);
+        }
+    };
 
     let client = &*HTTP;
     let resp_result = post_chat_once(
@@ -2968,6 +3146,9 @@ async fn ai_chat_inner(
     // JSON fragments later in `input_json_delta`. Retain it so every fragment is
     // a complete ToolCall event for both the agent and ordinary-chat consumers.
     let mut native_anthropic_tools: HashMap<u32, (String, String)> = HashMap::new();
+    // 上游线协议解码器。OpenAI 兼容（网关线路 + 所有存量自定义模型）→ None，
+    // 下面的帧一律原样进既有解析块。
+    let mut decoder = crate::protocol::StreamDecoder::for_wire(wire);
     // 首个有效输出前持续上报字节心跳：只发一次 firstChunk 会让前端永远显示首包字节数，
     // 用户无法区分"上游断了"和"模型还在深思/排队"（prefill 阶段不吐任何 token）。
     let mut last_bytes_metric_at = Instant::now();
@@ -3092,228 +3273,267 @@ async fn ai_chat_inner(
                     return Err(message);
                 }
             };
-            // Usage normally rides the FINAL chunk (choices may be empty there).
-            // Cached-prompt tokens are reported differently per provider — take
-            // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
-            // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
-            // style `cache_read_input_tokens`.
-            if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
-                let completion = usage["completion_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
-                    .unwrap_or(0);
-                let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
-                let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                let cached = usage["prompt_tokens_details"]["cached_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
-                    .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
-                    .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
-                    .or(cache_read)
-                    .unwrap_or(0);
-                let prompt_raw = usage["prompt_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
-                    .unwrap_or(0);
-                // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
-                // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
-                // so add them — otherwise `cached / prompt` reads as >100%.
-                let prompt = if cache_read.is_some() {
-                    prompt_raw + cached + cache_creation
-                } else {
-                    prompt_raw
-                };
-                // 思考 token 的字段名各家不一样，全都认一遍：
-                //   OpenAI / 兼容渠道 → completion_tokens_details.reasoning_tokens
-                //   Anthropic 原生    → output_tokens_details.reasoning_tokens
-                //   部分聚合渠道会平铺成顶层 reasoning_tokens
-                let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
-                    .as_u64()
-                    .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
-                    .or_else(|| usage["reasoning_tokens"].as_u64())
-                    .unwrap_or(0);
-                let thinking_chars = usage["thinking_chars"].as_u64().unwrap_or(0);
-                if prompt > 0 || completion > 0 {
-                    let _ = on_event.send(AiEvent::Usage {
-                        prompt_tokens: prompt as u32,
-                        completion_tokens: completion as u32,
-                        cached_tokens: cached as u32,
-                        cache_creation_tokens: cache_creation as u32,
-                        reasoning_tokens: reasoning as u32,
-                        thinking_chars: thinking_chars as u32,
-                    });
+            // ── 上游线协议翻译 ───────────────────────────────────────────────
+            //
+            // decoder 为 None（OpenAI 兼容 —— 网关线路和所有存量自定义模型）时这里是
+            // `vec![v]`，也就是把上游帧原样交给下面那个解析块，中间没有任何代码：
+            // 「默认 openai 一行行为都不变」是结构上成立的，不是靠小心。
+            //
+            // 非 OpenAI 协议：原生帧被翻成零或多个 OpenAI chunk 再进同一个块，于是新协议
+            // 白拿这一整套 —— 正文 / 四种形状的思考 / 工具分片重组 / usage 归一化 /
+            // finish_reason 归一化 / 停滞看门狗。翻译本身是纯函数，测试在 protocol.rs 里
+            // 按输入断言输出，不碰网络。
+            //
+            // 顺带解释下面那个块里的原生 Anthropic 分支为什么不用关掉：翻出来的 chunk
+            // 只有 `object`/`choices`，没有 `type` 键，那些分支对它天然不成立。走
+            // Wire::OpenAi 的中转若真发原生帧，仍旧由那些分支接住 —— 和今天一样。
+            let frames: Vec<serde_json::Value> = match decoder.as_mut() {
+                None => vec![v],
+                Some(decoder) => match decoder.push_event(&v) {
+                    Ok(frames) => frames,
+                    Err(message) => {
+                        let _ = on_event.send(AiEvent::Error {
+                            message: message.clone(),
+                        });
+                        return Err(message);
+                    }
+                },
+            };
+            for v in frames {
+                // Usage normally rides the FINAL chunk (choices may be empty there).
+                // Cached-prompt tokens are reported differently per provider — take
+                // whichever field is present: OpenAI/DeepSeek `prompt_tokens_details
+                // .cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, or Anthropic-
+                // style `cache_read_input_tokens`.
+                if let Some(usage) = v.get("usage").filter(|u| u.is_object()) {
+                    let completion = usage["completion_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["output_tokens"].as_u64()) // Anthropic
+                        .unwrap_or(0);
+                    let cache_read = usage["cache_read_input_tokens"].as_u64(); // Anthropic
+                    let cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                    let cached = usage["prompt_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64()) // DeepSeek
+                        .or_else(|| usage["cached_content_token_count"].as_u64()) // Gemini (OpenAI-compat)
+                        .or_else(|| usage["cachedContentTokenCount"].as_u64()) // Gemini (native)
+                        .or(cache_read)
+                        .unwrap_or(0);
+                    let prompt_raw = usage["prompt_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["input_tokens"].as_u64()) // Anthropic
+                        .unwrap_or(0);
+                    // OpenAI/DeepSeek: `prompt_tokens` already INCLUDES cached tokens.
+                    // Anthropic: `input_tokens` EXCLUDES cached (reported separately),
+                    // so add them — otherwise `cached / prompt` reads as >100%.
+                    let prompt = if cache_read.is_some() {
+                        prompt_raw + cached + cache_creation
+                    } else {
+                        prompt_raw
+                    };
+                    // 思考 token 的字段名各家不一样，全都认一遍：
+                    //   OpenAI / 兼容渠道 → completion_tokens_details.reasoning_tokens
+                    //   Anthropic 原生    → output_tokens_details.reasoning_tokens
+                    //   部分聚合渠道会平铺成顶层 reasoning_tokens
+                    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
+                        .or_else(|| usage["reasoning_tokens"].as_u64())
+                        .unwrap_or(0);
+                    let thinking_chars = usage["thinking_chars"].as_u64().unwrap_or(0);
+                    if prompt > 0 || completion > 0 {
+                        let _ = on_event.send(AiEvent::Usage {
+                            prompt_tokens: prompt as u32,
+                            completion_tokens: completion as u32,
+                            cached_tokens: cached as u32,
+                            cache_creation_tokens: cache_creation as u32,
+                            reasoning_tokens: reasoning as u32,
+                            thinking_chars: thinking_chars as u32,
+                        });
+                    }
                 }
-            }
-            // Direct Anthropic Messages API streaming uses native event objects.
-            // The gateway generally normalizes them to OpenAI chunks, but direct
-            // routes must not discard visible thinking/text merely because they
-            // bypass that normalization. `message_stop` is Anthropic's [DONE].
-            if v["type"].as_str() == Some("message_stop") {
-                send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
-                let _ = on_event.send(AiEvent::Done);
-                return Ok(());
-            }
-            if native_anthropic_event_has_real_progress(&v) && !sent_first_progress_metric {
-                progress.record(Instant::now());
-                sent_first_progress_metric = true;
-                send_stream_metric(
-                    &on_event,
-                    stream_started,
-                    "firstProgress",
-                    Some(raw_stream_bytes),
-                );
-            } else if native_anthropic_event_has_real_progress(&v) {
-                progress.record(Instant::now());
-            }
-            match v["type"].as_str() {
-                Some("content_block_start")
-                    if v["content_block"]["type"].as_str() == Some("tool_use") =>
-                {
-                    if let Some(index) = v["index"].as_u64().and_then(|raw| u32::try_from(raw).ok())
+                // Direct Anthropic Messages API streaming uses native event objects.
+                // The gateway generally normalizes them to OpenAI chunks, but direct
+                // routes must not discard visible thinking/text merely because they
+                // bypass that normalization. `message_stop` is Anthropic's [DONE].
+                if v["type"].as_str() == Some("message_stop") {
+                    send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
+                    let _ = on_event.send(AiEvent::Done);
+                    return Ok(());
+                }
+                if native_anthropic_event_has_real_progress(&v) && !sent_first_progress_metric {
+                    progress.record(Instant::now());
+                    sent_first_progress_metric = true;
+                    send_stream_metric(
+                        &on_event,
+                        stream_started,
+                        "firstProgress",
+                        Some(raw_stream_bytes),
+                    );
+                } else if native_anthropic_event_has_real_progress(&v) {
+                    progress.record(Instant::now());
+                }
+                match v["type"].as_str() {
+                    Some("content_block_start")
+                        if v["content_block"]["type"].as_str() == Some("tool_use") =>
                     {
-                        let id = v["content_block"]["id"].as_str().unwrap_or("").to_string();
-                        let name = v["content_block"]["name"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        native_anthropic_tools.insert(index, (id.clone(), name.clone()));
-                        if !id.is_empty() || !name.is_empty() {
-                            let _ = on_event.send(AiEvent::ToolCall {
-                                index,
-                                id,
-                                name,
-                                arguments: String::new(),
-                            });
-                        }
-                    }
-                }
-                Some("content_block_delta") => match v["delta"]["type"].as_str() {
-                    Some("thinking_delta") => {
-                        if let Some(thinking) = v["delta"]["thinking"]
-                            .as_str()
-                            .filter(|text| !text.is_empty())
+                        if let Some(index) = v["index"].as_u64().and_then(|raw| u32::try_from(raw).ok())
                         {
-                            let _ = on_event.send(AiEvent::Reasoning {
-                                delta: thinking.to_string(),
-                            });
-                        }
-                    }
-                    Some("text_delta") => {
-                        if let Some(text) =
-                            v["delta"]["text"].as_str().filter(|text| !text.is_empty())
-                        {
-                            let _ = on_event.send(AiEvent::Token {
-                                delta: text.to_string(),
-                            });
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if let (Some(index), Some(arguments)) = (
-                            v["index"].as_u64().and_then(|raw| u32::try_from(raw).ok()),
-                            v["delta"]["partial_json"]
+                            let id = v["content_block"]["id"].as_str().unwrap_or("").to_string();
+                            let name = v["content_block"]["name"]
                                 .as_str()
-                                .filter(|text| !text.is_empty()),
-                        ) {
-                            let (id, name) = native_anthropic_tools
-                                .get(&index)
-                                .cloned()
-                                .unwrap_or_default();
-                            let _ = on_event.send(AiEvent::ToolCall {
-                                index,
-                                id,
-                                name,
-                                arguments: arguments.to_string(),
+                                .unwrap_or("")
+                                .to_string();
+                            native_anthropic_tools.insert(index, (id.clone(), name.clone()));
+                            if !id.is_empty() || !name.is_empty() {
+                                let _ = on_event.send(AiEvent::ToolCall {
+                                    index,
+                                    id,
+                                    name,
+                                    arguments: String::new(),
+                                });
+                            }
+                        }
+                    }
+                    Some("content_block_delta") => match v["delta"]["type"].as_str() {
+                        Some("thinking_delta") => {
+                            if let Some(thinking) = v["delta"]["thinking"]
+                                .as_str()
+                                .filter(|text| !text.is_empty())
+                            {
+                                let _ = on_event.send(AiEvent::Reasoning {
+                                    delta: thinking.to_string(),
+                                });
+                            }
+                        }
+                        Some("text_delta") => {
+                            if let Some(text) =
+                                v["delta"]["text"].as_str().filter(|text| !text.is_empty())
+                            {
+                                let _ = on_event.send(AiEvent::Token {
+                                    delta: text.to_string(),
+                                });
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let (Some(index), Some(arguments)) = (
+                                v["index"].as_u64().and_then(|raw| u32::try_from(raw).ok()),
+                                v["delta"]["partial_json"]
+                                    .as_str()
+                                    .filter(|text| !text.is_empty()),
+                            ) {
+                                let (id, name) = native_anthropic_tools
+                                    .get(&index)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let _ = on_event.send(AiEvent::ToolCall {
+                                    index,
+                                    id,
+                                    name,
+                                    arguments: arguments.to_string(),
+                                });
+                            }
+                        }
+                        _ => {}
+                    },
+                    // Anthropic reports why it stopped on `message_delta`, using its own
+                    // vocabulary (`max_tokens` / `end_turn` / `tool_use` / `stop_sequence`).
+                    Some("message_delta") => {
+                        if let Some(reason) = v["delta"]["stop_reason"]
+                            .as_str()
+                            .filter(|reason| !reason.is_empty())
+                        {
+                            let _ = on_event.send(AiEvent::FinishReason {
+                                reason: normalize_finish_reason(reason).to_string(),
                             });
                         }
                     }
                     _ => {}
-                },
-                // Anthropic reports why it stopped on `message_delta`, using its own
-                // vocabulary (`max_tokens` / `end_turn` / `tool_use` / `stop_sequence`).
-                Some("message_delta") => {
-                    if let Some(reason) = v["delta"]["stop_reason"]
-                        .as_str()
-                        .filter(|reason| !reason.is_empty())
-                    {
-                        let _ = on_event.send(AiEvent::FinishReason {
-                            reason: normalize_finish_reason(reason).to_string(),
+                }
+                let delta = &v["choices"][0]["delta"];
+                if progress.record_delta(delta, Instant::now()) && !sent_first_progress_metric {
+                    sent_first_progress_metric = true;
+                    send_stream_metric(
+                        &on_event,
+                        stream_started,
+                        "firstProgress",
+                        Some(raw_stream_bytes),
+                    );
+                }
+                // Thinking / reasoning stream. **形状不止一种，字符串只是其中最简单的那种。**
+                //
+                // 原来这里是 `delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str())`
+                // ——两处都是 as_str()、没有 else 分支、不打日志。于是任何非字符串形状都被
+                // 静默丢弃：事件不发、卡片不出、日志不留，和"模型压根没思考"长得一模一样。
+                //
+                // 真实存在的另外三种形状：
+                //   · `reasoning: { text: "…" }` / `{ content: "…" }` —— 部分中转把它包成对象
+                //   · `reasoning_details: [{ type:"reasoning.text", text:"…" }, …]` —— 这是
+                //     **OpenRouter 现行的规范载荷**，而本仓库的模型目录正是抓 OpenRouter 的
+                //     （见 server/src/model_catalog.rs 的 CATALOG_URL），却全仓一个字都没认过
+                //   · 上面两者的数组形式（分片推理）
+                //
+                // 认全它们不需要按厂商分叉：按形状取文本，取不到就当没有。
+                if let Some(rt) = reasoning_text_from_delta(delta) {
+                    if !rt.is_empty() {
+                        let _ = on_event.send(AiEvent::Reasoning { delta: rt });
+                    }
+                }
+                if let Some(text) = delta["content"].as_str() {
+                    if !text.is_empty() {
+                        let _ = on_event.send(AiEvent::Token {
+                            delta: text.to_string(),
                         });
                     }
                 }
-                _ => {}
-            }
-            let delta = &v["choices"][0]["delta"];
-            if progress.record_delta(delta, Instant::now()) && !sent_first_progress_metric {
-                sent_first_progress_metric = true;
-                send_stream_metric(
-                    &on_event,
-                    stream_started,
-                    "firstProgress",
-                    Some(raw_stream_bytes),
-                );
-            }
-            // Thinking / reasoning stream. **形状不止一种，字符串只是其中最简单的那种。**
-            //
-            // 原来这里是 `delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str())`
-            // ——两处都是 as_str()、没有 else 分支、不打日志。于是任何非字符串形状都被
-            // 静默丢弃：事件不发、卡片不出、日志不留，和"模型压根没思考"长得一模一样。
-            //
-            // 真实存在的另外三种形状：
-            //   · `reasoning: { text: "…" }` / `{ content: "…" }` —— 部分中转把它包成对象
-            //   · `reasoning_details: [{ type:"reasoning.text", text:"…" }, …]` —— 这是
-            //     **OpenRouter 现行的规范载荷**，而本仓库的模型目录正是抓 OpenRouter 的
-            //     （见 server/src/model_catalog.rs 的 CATALOG_URL），却全仓一个字都没认过
-            //   · 上面两者的数组形式（分片推理）
-            //
-            // 认全它们不需要按厂商分叉：按形状取文本，取不到就当没有。
-            if let Some(rt) = reasoning_text_from_delta(delta) {
-                if !rt.is_empty() {
-                    let _ = on_event.send(AiEvent::Reasoning { delta: rt });
+                if let Some(tcs) = delta["tool_calls"].as_array() {
+                    for tc in tcs {
+                        let index = match streamed_tool_call_index(tc) {
+                            Ok(index) => index,
+                            Err(message) => {
+                                let _ = on_event.send(AiEvent::Error { message });
+                                let _ = on_event.send(AiEvent::Done);
+                                return Ok(());
+                            }
+                        };
+                        let id = tc["id"].as_str().unwrap_or("").to_string();
+                        let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                        let args = tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        if !id.is_empty() || !name.is_empty() || !args.is_empty() {
+                            let _ = on_event.send(AiEvent::ToolCall {
+                                index,
+                                id,
+                                name,
+                                arguments: args,
+                            });
+                        }
+                    }
                 }
-            }
-            if let Some(text) = delta["content"].as_str() {
-                if !text.is_empty() {
-                    let _ = on_event.send(AiEvent::Token {
-                        delta: text.to_string(),
+                // Sibling of `delta`, not part of it: it arrives on the final chunk, where
+                // `delta` is typically `{}`. `length` here is the provider telling us the
+                // response was cut off — the client rejects any tool call in that turn.
+                if let Some(reason) = v["choices"][0]["finish_reason"]
+                    .as_str()
+                    .filter(|reason| !reason.is_empty())
+                {
+                    let _ = on_event.send(AiEvent::FinishReason {
+                        reason: normalize_finish_reason(reason).to_string(),
                     });
                 }
             }
-            if let Some(tcs) = delta["tool_calls"].as_array() {
-                for tc in tcs {
-                    let index = match streamed_tool_call_index(tc) {
-                        Ok(index) => index,
-                        Err(message) => {
-                            let _ = on_event.send(AiEvent::Error { message });
-                            let _ = on_event.send(AiEvent::Done);
-                            return Ok(());
-                        }
-                    };
-                    let id = tc["id"].as_str().unwrap_or("").to_string();
-                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                    let args = tc["function"]["arguments"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                        let _ = on_event.send(AiEvent::ToolCall {
-                            index,
-                            id,
-                            name,
-                            arguments: args,
-                        });
-                    }
-                }
-            }
-            // Sibling of `delta`, not part of it: it arrives on the final chunk, where
-            // `delta` is typically `{}`. `length` here is the provider telling us the
-            // response was cut off — the client rejects any tool call in that turn.
-            if let Some(reason) = v["choices"][0]["finish_reason"]
-                .as_str()
-                .filter(|reason| !reason.is_empty())
+            // Anthropic 用 message_stop、xAI Responses 用 response.completed 收流 ——
+            // **两者都不发 `data: [DONE]`**。上面那个哨兵分支等不到它，于是这条流会一路
+            // 走到 TCP EOF，被判成「连接提前结束」并整轮作废。收尾判据只能由解码器给。
+            if decoder
+                .as_ref()
+                .is_some_and(crate::protocol::StreamDecoder::stream_complete)
             {
-                let _ = on_event.send(AiEvent::FinishReason {
-                    reason: normalize_finish_reason(reason).to_string(),
-                });
+                send_stream_metric(&on_event, stream_started, "done", Some(raw_stream_bytes));
+                let _ = on_event.send(AiEvent::Done);
+                return Ok(());
             }
         }
         if consumed > 0 {
