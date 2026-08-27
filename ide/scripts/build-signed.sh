@@ -93,7 +93,14 @@ echo "签名身份：$APPLE_SIGNING_IDENTITY"
 # 所以下面每一处路径都得跟着走。原来是三处硬编码 target/release/…：不改的话指定架构构建会
 # 「成功但什么也找不到」——脚本对着本机架构的旧产物做校验，甚至给出通过的结论。
 TARGET="${MRDAYONE_TARGET:-}"
-TARGET_DIR="target${TARGET:+/$TARGET}/release"
+# 产物根目录要认 CARGO_TARGET_DIR。
+#
+# 写死相对的 `target/` 有个静默后果：重定向 target 目录（复用缓存、或在 git worktree 里
+# 构建）时，下面每一处校验都对着一个**不存在**的路径去找，于是「更新产物签名」那道闸
+# 直接报「没有找到本次的更新产物」——而构建其实成功了，产物好好躺在真正的 target 里。
+# 这个脚本别处一直在骂的那种失败模式（退出码说失败、产物却在），发生在它自己身上。
+_TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+TARGET_DIR="${_TARGET_ROOT}${TARGET:+/$TARGET}/release"
 [ -n "$TARGET" ] && echo "目标架构：$TARGET（产物落在 $TARGET_DIR/bundle/）" || echo "目标架构：本机"
 
 # 先扫掉上一次没收干净的 DMG 中间产物。
