@@ -298,6 +298,20 @@ fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
 
 #[cfg(not(target_os = "macos"))]
 fn resolve_target_pid(target: &AxTarget) -> Result<Option<i64>, String> {
+    // **给了 app 却按名字找不到，必须硬报错，不能静默忽略。**
+    // 上一版直接 `Ok(target.pid.filter(...))` —— app 参数整个被丢掉，然后底层无条件读
+    // **前台窗口**（很可能就是 IDE 自己）。macOS 那一支同样的调用是硬报错，
+    // 而这里返回的是一个「看起来完全正常的错误答案」：回执里连目标名字都不出现，
+    // 模型无从察觉，接着就拿这批元素去 ui_click —— 点在另一个应用上。
+    // 宁可让它响地失败，也不要给一份安静的假数据。
+    if target.pid.filter(|p| *p > 0).is_none() {
+        if let Some(name) = target.app.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return Err(format!(
+                "这个平台上不能按名字（「{name}」）定位窗口，只能读**当前前台窗口**。\
+                 请先用 window.activate 把目标窗口切到前台再读，或者直接传 pid。"
+            ));
+        }
+    }
     Ok(target.pid.filter(|p| *p > 0))
 }
 
@@ -858,6 +872,20 @@ fn read_ui_snapshot(pid: Option<i64>) -> UiSnapshot {
     };
 
     // 6s for complex apps (all windows, all roles, more elements).
+    // **读管道必须和等待并行。** 先轮询等它退出、退出后才 read_to_string 的写法，
+    // 在管道缓冲被写满时会死锁：子进程阻塞在写上、永远不退出，于是必然走到超时分支。
+    // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出这个病），
+    // 大约 40 个 UI 元素就写满 —— 稍微复杂一点的窗口结构性读不出来，而超时文案还会
+    // 把模型引向「这个应用没有可访问性树」这个错误结论。写法照 tasks.rs 那份：
+    // 读端丢线程，主循环只管等和超时。
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<String>();
+    if let Some(mut so) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = so.read_to_string(&mut b);
+            let _ = tx_out.send(b);
+        });
+    }
     let deadline = Instant::now() + Duration::from_millis(6000);
     loop {
         match child.try_wait() {
@@ -874,10 +902,11 @@ fn read_ui_snapshot(pid: Option<i64>) -> UiSnapshot {
         }
     }
 
-    let mut s = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut s);
-    }
+    // 进程已经退出（上面的循环只在退出时 break），读线程随即收到 EOF。给一个短等待上界
+    // 而不是无限 recv：读线程理论上不会卡，但一个卡住的线程不该让整个调用挂死。
+    let s = rx_out
+        .recv_timeout(Duration::from_millis(2000))
+        .unwrap_or_default();
     serde_json::from_str::<UiSnapshot>(s.trim()).unwrap_or(UiSnapshot {
         read_error: Some("osascript 输出不是合法快照 JSON".into()),
         ..Default::default()
@@ -956,6 +985,20 @@ ConvertTo-Json -Compress -Depth 4 -InputObject @{pid=$tp;app=$tn;elements=@($out
         Ok(c) => c,
         Err(_) => return (Vec::new(), None, Some("powershell 起不来".into())),
     };
+    // **读管道必须和等待并行。** 先轮询等它退出、退出后才 read_to_string 的写法，
+    // 在管道缓冲被写满时会死锁：子进程阻塞在写上、永远不退出，于是必然走到超时分支。
+    // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出这个病），
+    // 大约 40 个 UI 元素就写满 —— 稍微复杂一点的窗口结构性读不出来，而超时文案还会
+    // 把模型引向「这个应用没有可访问性树」这个错误结论。写法照 tasks.rs 那份：
+    // 读端丢线程，主循环只管等和超时。
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<String>();
+    if let Some(mut so) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = so.read_to_string(&mut b);
+            let _ = tx_out.send(b);
+        });
+    }
     let deadline = Instant::now() + Duration::from_millis(6000);
     loop {
         match child.try_wait() {
@@ -976,10 +1019,11 @@ ConvertTo-Json -Compress -Depth 4 -InputObject @{pid=$tp;app=$tn;elements=@($out
             Err(_) => return (Vec::new(), None, Some("等待 powershell 时出错".into())),
         }
     }
-    let mut s = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut s);
-    }
+    // 进程已经退出（上面的循环只在退出时 break），读线程随即收到 EOF。给一个短等待上界
+    // 而不是无限 recv：读线程理论上不会卡，但一个卡住的线程不该让整个调用挂死。
+    let s = rx_out
+        .recv_timeout(Duration::from_millis(2000))
+        .unwrap_or_default();
     let t = s.trim();
     // 脚本现在固定回一个 {pid, app, elements} 的对象。以前回的是裸数组，还得靠
     // 「开头是不是 {」来猜 PowerShell 有没有把单元素数组塌成对象——那个启发式

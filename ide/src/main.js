@@ -611,7 +611,13 @@ async function tauriBackend() {
     writeTextFile: (path, content) => core.invoke("write_text_file", { path, content }),
     writeTextFileIfUnchanged: (path, expectedContent, content) => core.invoke("write_text_file_if_unchanged", { path, expectedContent, content }),
     deleteTextFileIfUnchanged: (path, expectedContent) => core.invoke("delete_text_file_if_unchanged", { path, expectedContent }),
-    homeDir: () => core.invoke("home_dir"),
+    // 同一个对象里 readDir / searchInProject 都过了 _toPosix，只有这一行漏了。
+    // 后端 home_dir() 读的是 HOME 或 USERPROFILE，Windows 上只有后者、值是
+    // `C:\Users\张三`（反斜杠）。原样存进 _cachedHomeDir 之后，_resolveRel 拼出
+    // `C:\Users\张三/skills/x.md`，而那条判「是不是绝对路径」的正则要求冒号后面是
+    // **正斜杠** —— 判据为假，整串被当成相对路径去拼工作区根。模型写 `~/…` 存技能
+    // 会以一条难懂的 OS 错误失败。
+    homeDir: async () => _toPosix(await core.invoke("home_dir")),
     createFile: (path) => core.invoke("create_file", { path }),
     createDir: (path) => core.invoke("create_dir", { path }),
     copyPath: (from, to) => core.invoke("copy_path", { from, to }),
@@ -4474,6 +4480,12 @@ function renderBreakpointDecorations() {
 }
 
 function showDebugLocation(path, line) {
+  // 调试适配器回的是**原生格式**的路径：Windows 上是 `C:\proj\app.js`，debugpy 还会
+  // 把盘符小写。而 IDE 内部的路径全是正斜杠、大小写按磁盘真实拼法 —— 下面那句
+  // `activePath === debugStopLocation.path` 是**严格字符串相等**，原样存下就永远不成立：
+  // Windows 上停在断点时黄色当前行高亮一次都不会出现，标签页标题还会变成整条绝对路径。
+  // _coherentFilePath 会把它归一到已打开文件的那份拼法（正是为这种场景写的）。
+  path = _coherentFilePath(path);
   debugStopLocation = { path, line };
   Promise.resolve(openFile(path, basename(path))).then((ok) => {
     if (!ok) return;

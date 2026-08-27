@@ -68,8 +68,17 @@ pub struct DapConfig {
 // stdio). python/go/lldb have clean stdio adapters; node realistically needs
 // vscode-js-debug, so its default is a placeholder users override in the
 // advanced launcher.
+/// Windows 上 `python3` 通常不存在：python.org 的包只产出 `python.exe`，而 PATH 上
+/// 那个叫 `python3.exe` 的多半是微软商店的「应用执行别名」—— 跑它会弹商店页面，
+/// 调试器表现成「点了没反应」。`lsp.rs` 的 DEFAULT_PYTHON_NAMES 早就按平台分了名字，
+/// 这里是漏下的第二处（调试面板下拉框和 .vscode/launch.json 两条路都落在这儿）。
+#[cfg(windows)]
+const DEFAULT_PYTHON_CMD: &str = "python";
+#[cfg(not(windows))]
+const DEFAULT_PYTHON_CMD: &str = "python3";
+
 const KNOWN_ADAPTERS: &[(&str, &str, &[&str])] = &[
-    ("python", "python3", &["-m", "debugpy.adapter"]),
+    ("python", DEFAULT_PYTHON_CMD, &["-m", "debugpy.adapter"]),
     ("go", "dlv", &["dap"]),
     ("lldb", "lldb-dap", &[]),
     ("node", "js-debug-adapter-stdio", &[]),
@@ -151,7 +160,10 @@ pub fn dap_start(
     if let Some(ref cwd) = config.cwd {
         builder.current_dir(cwd);
     }
-    #[cfg(not(windows))]
+    // PATH 两个平台都要设。这里以前关在 cfg(not(windows)) 里，而子进程继承的是**这个
+    // 进程**的 PATH —— GUI 启动的应用拿到的那份很窄：nvm / volta / 用户级 npm 前缀全不在
+    // 里面，于是适配器就算被拉起来，它自己再去找 node/python 也找不到。
+    // lsp.rs:334 和 mcp.rs:1180 都已经把这个 cfg 删掉并写了同样的理由，这里是漏下的第三处。
     builder.env("PATH", process_util::augmented_path(config.cwd.as_deref()));
 
     let mut child = builder

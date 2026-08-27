@@ -25,6 +25,19 @@ fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<Stri
         .spawn()
         .map_err(|e| format!("{program} 启动失败: {e}"))?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    // **读管道必须和等待并行**（同 tasks.rs 的写法）。先等退出、退出后才读的写法，
+    // 在管道缓冲写满时会死锁：子进程阻塞在写上、永远不退出，必然走到超时分支。
+    // Windows 的匿名管道默认只有 4096 字节（Unix 是 65536，所以 mac 上看不出来），
+    // 输出稍多就写满。而这里的超时文案说的是「可能在等系统弹权限框」——
+    // 那会把排查引向完全错误的方向。
+    let (tx_o, rx_o) = std::sync::mpsc::channel::<String>();
+    let (tx_e, rx_e) = std::sync::mpsc::channel::<String>();
+    if let Some(mut so) = child.stdout.take() {
+        std::thread::spawn(move || { let mut b = String::new(); let _ = so.read_to_string(&mut b); let _ = tx_o.send(b); });
+    }
+    if let Some(mut se) = child.stderr.take() {
+        std::thread::spawn(move || { let mut b = String::new(); let _ = se.read_to_string(&mut b); let _ = tx_e.send(b); });
+    }
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -39,14 +52,8 @@ fn run_cmd_bounded(program: &str, args: &[&str], timeout_ms: u64) -> Result<Stri
             Err(e) => return Err(format!("{e}")),
         }
     }
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut out);
-    }
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_string(&mut err);
-    }
+    let out = rx_o.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
+    let err = rx_e.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
     let out = out.trim().to_string();
     if out.is_empty() && !err.trim().is_empty() {
         return Err(err.trim().to_string());

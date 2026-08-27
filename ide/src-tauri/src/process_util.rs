@@ -387,8 +387,15 @@ fn windows_command_is_explicit(cmd: &str) -> bool {
 
 /// `npx` + PATHEXT → `["npx", "npx.COM", "npx.EXE", "npx.BAT", "npx.CMD", …]`。
 ///
-/// 裸名字排第一：PATH 上偶尔真的躺着一个无扩展名的可执行文件。PATHEXT 是用户可改的，
-/// 空的时候给一份和 Windows 默认一致的兜底。
+/// **扩展名排在前，裸名字垫底。** 上一版把裸名字放第一，理由是"PATH 上偶尔真的躺着
+/// 一个无扩展名的可执行文件"——那个理由本身没错，错在顺序上的代价不对称：
+/// npm 每次都在同一个目录里同时写三个文件（`npx`、`npx.cmd`、`npx.ps1`），
+/// 那个**无扩展名的是 sh 脚本**，CreateProcessW 根本跑不了它。裸名字排第一 =
+/// 每一个 npm 装的工具都优先解析到一个跑不起来的文本文件，
+/// 而这段代码本来就是为了修「npm 系工具找不到」才写的，前功尽弃。
+/// 反过来把它垫底：无扩展名的真可执行文件仍然找得到（只是最后才轮到它），
+/// 而 npm/gem 那一族直接命中 .CMD/.BAT。两种情况都能用，代价小的那种排前面。
+/// PATHEXT 是用户可改的，空的时候给一份和 Windows 默认一致的兜底。
 fn windows_command_candidates(cmd: &str, pathext: &str) -> Vec<String> {
     let parse = |raw: &str| -> Vec<String> {
         raw.split(';')
@@ -404,8 +411,9 @@ fn windows_command_candidates(cmd: &str, pathext: &str) -> Vec<String> {
     if exts.is_empty() {
         exts = parse(".COM;.EXE;.BAT;.CMD");
     }
-    std::iter::once(cmd.to_string())
-        .chain(exts.into_iter().map(|e| format!("{cmd}{e}")))
+    exts.into_iter()
+        .map(|e| format!("{cmd}{e}"))
+        .chain(std::iter::once(cmd.to_string()))
         .collect()
 }
 
@@ -955,9 +963,12 @@ mod windows_resolution_tests {
     #[test]
     fn npm_installed_tools_get_their_cmd_extension() {
         let got = windows_command_candidates("npx", ".COM;.EXE;.BAT;.CMD");
-        assert_eq!(got, vec!["npx", "npx.COM", "npx.EXE", "npx.BAT", "npx.CMD"]);
-        // 裸名字必须排第一：PATH 上偶尔真的躺着无扩展名的可执行文件。
-        assert_eq!(got[0], "npx");
+        assert_eq!(got, vec!["npx.COM", "npx.EXE", "npx.BAT", "npx.CMD", "npx"]);
+        // 裸名字必须**垫底**而不是排第一。npm 在同一个目录里同时写 `npx`、`npx.cmd`、
+        // `npx.ps1`，其中无扩展名的那个是 sh 脚本 —— 排第一就等于每次都先解析到一个
+        // CreateProcessW 跑不了的文本文件，这段代码要修的正是这个病。
+        assert_eq!(got.last().map(String::as_str), Some("npx"), "裸名字必须垫底：{got:?}");
+        assert_eq!(got[0], "npx.COM", "扩展名候选必须排在裸名字前面：{got:?}");
         // 这三个是真实会被找的：npm/gem 装出来的就是它们。
         for want in ["npx.CMD", "npx.BAT"] {
             assert!(got.iter().any(|c| c == want), "少了 {want}：{got:?}");
