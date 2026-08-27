@@ -119,3 +119,29 @@ jobs:
       # sidecar 是**独立 crate**，Tauri 不会顺带编它，所以必须单独查一次。
       - name: Compile-check the automation sidecar for Windows
         run: cargo check --manifest-path automation-framework/Cargo.toml --all-targets
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # 这 2748 条测试**从来没有在 Windows 上跑过一次**：ide-package.yml 里那一步带着
+      # `if: runner.os != 'Windows'`，而那条流水线本来就只能手动触发。
+      #
+      # ⚠️ 这一步是**故意**允许失败的，而且这是个明确的半步、不是终点：
+      # 没有人知道它今天是红是绿，而把一条状态未知的检查直接设成硬门禁，会让所有 PR
+      # 从明天起全部卡住 —— 那不是「发现问题」，那是「换一种方式坏掉」。
+      # 先让它把真实状态**打印出来**，第一次跑完有人分诊过之后，
+      # **就该把 continue-on-error 删掉、变成硬门禁**。
+      #
+      # 和被本次一并修掉的 release-preflight 那句「静默跳过」的区别在于：
+      # 那一条是**假装通过**（跳过之后照样打印「✅ 全部通过」），
+      # 这一条是**如实标注**（GitHub 上会显示成带警告的通过，日志里是完整的失败清单）。
+      - name: Run frontend logic tests on Windows (informational until triaged)
+        continue-on-error: true
+        run: node --test test/*.test.mjs
