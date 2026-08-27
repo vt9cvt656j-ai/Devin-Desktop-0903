@@ -9675,6 +9675,9 @@ test("a novice's vague sentence flows through the real chain into professional d
   const contextFingerprint = load("_aiIntentContextFingerprint");
   const normalizeVerdict = load("_normalizeAiIntentVerdict", aiIntentNormalizeDeps(dims, intentText, intentList));
   const aiIntent = load("_aiIntentProfile", {
+    // 2026-08-27 新增的线路闸：内置提示词不出网关（见 test/ip-does-not-leave-gateway.test.mjs）。
+    // 这里桩成恒真，把这条测试隔离在它本来要测的那一层上。
+    _ipSafeRoute: () => true,
     inTauri: true,
     _AI_INTENT_DIMENSIONS: dims,
     _aiIntentCache: new Map(),
@@ -9782,6 +9785,9 @@ test("intent foreground timeout leaves the physical request alive and safely ado
   const commits = [];
   const lateVerdict = { semantic: { goal: "继续修复" }, engineering: {}, implementation: true };
   const profile = load("_aiIntentProfile", {
+    // 2026-08-27 新增的线路闸：内置提示词不出网关（见 test/ip-does-not-leave-gateway.test.mjs）。
+    // 这里桩成恒真，把这条测试隔离在它本来要测的那一层上。
+    _ipSafeRoute: () => true,
     inTauri: true,
     _AI_INTENT_DIMENSIONS: [],
     _aiIntentCache: cache,

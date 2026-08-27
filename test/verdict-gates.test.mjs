@@ -102,6 +102,9 @@ test("缓存与会话状态的准入同判：半份裁决既不缓存也不落�
     const cache = new Map();
     const commits = [];
     const profile = load("_aiIntentProfile", {
+    // 2026-08-27 新增的线路闸：内置提示词不出网关（见 test/ip-does-not-leave-gateway.test.mjs）。
+    // 这里桩成恒真，把这条测试隔离在它本来要测的那一层上。
+    _ipSafeRoute: () => true,
       _AI_INTENT_DIMENSIONS: DIMS,
       _aiIntentCache: cache,
       _aiIntentInflight: new Map(),

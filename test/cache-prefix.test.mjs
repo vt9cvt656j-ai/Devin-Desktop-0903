@@ -156,12 +156,15 @@ test("the tool hint is argument-free and byte-stable", () => {
   assert.match(grabCode("_buildToolHint"), /^function _buildToolHint\(\)/);
 });
 
-test("the tool hint rides in the system prefix on both routes, not in the per-turn user tail", () => {
+test("the tool hint rides in the system prefix on both GATEWAY routes, never on a custom endpoint", () => {
   const send = grabCode("sendPrompt");
   // 非 L0：拼进开场 system 消息。fullPrompt 那一行的组成被别的测试钉着，所以追加在装配点。
   assert.match(send, /const _toolHint = \(effectiveMode === "agent"\) \? _buildToolHint\(\) : "";/);
-  assert.match(send, /\{ role: "system", content: fullPrompt \+ _toolHint \}/,
-    "the hint must be part of the system message the whole run reuses");
+  // 2026-08-27：这一行加了线路闸。工具直觉表 + 完整能力名录是内置 IP，**不出网关** ——
+  // 走用户自己的中转时它会原样落在他的服务器日志里。缓存前缀这件事本身没变（仍然在
+  // 开场 system 里、仍然一轮只 build 一次），变的是自定义端点那条路上它是空串。
+  assert.match(send, /\{ role: "system", content: fullPrompt \+ \(_ipSafeRoute\(config\) \? _toolHint : ""\) \}/,
+    "the hint must be part of the system message the whole run reuses（且不出网关）");
   // 当轮动态前导里不再有它：那是每轮的新后缀，放那儿永远不命中，折叠开场时还会整段消失。
   const preamble = /const _contextPreamble = ([^;]+);/.exec(send)?.[1] || "";
   assert.ok(preamble.length > 0);
