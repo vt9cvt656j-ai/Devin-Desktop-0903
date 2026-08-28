@@ -127,16 +127,24 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
   //
   // 判据是「只许降不许涨」：每搬完一批就把这个数改小。改**大**必须在提交信息里说明为什么。
   //
-  // 现值 351：tool-guides.js 的 TOOL_METADATA（143 个工具 ×
+  // 现值 369，**从发布构建量的**（GitHub Actions 的 ide-package.yml，commit 61ca559）。
+  //
+  // 别拿本地 `npm run build` 的数当基准：同一份源码，本地开发构建量到 351、发布构建 369。
+  // 差的是产出的块（main-*/overlay-*）数量和切分 —— 发布路径上更多探针被命中。
+  // 我为此白烧了三轮 CI，把这条写在这儿免得下一个人重来。
+  //
+  // 内容：tool-guides.js 的 TOOL_METADATA（143 个工具 ×
   // usage_note/example_call/triggers/use_cases）整份还在客户端。
-  const LEAK_BUDGET = 351;
+  const LEAK_BUDGET = 369;
   assert.ok(leaks.length <= LEAK_BUDGET,
     `发布包里查到 ${leaks.length} 条工具说明文本，比上限 ${LEAK_BUDGET} 多了 `
     + `${leaks.length - LEAK_BUDGET} 条 —— 有人往客户端加了新的工具说明。\n`
     + `样例：\n  ${leaks.slice(0, 5).join("\n  ")}\n`
     + "这些是网关该持有的东西，客户端一份都不该带。");
   // 搬完一批却忘了收紧上限，等于把门重新放松。降下来就要当场钉住。
-  assert.ok(leaks.length >= LEAK_BUDGET - 20,
+  // 窗口下沿 -25：既能兜住「本地开发构建比发布构建少数十几条」这个已知差值，
+  // 又能在真的搬走一批之后逼人收紧上限。
+  assert.ok(leaks.length >= LEAK_BUDGET - 25,
     `实际只剩 ${leaks.length} 条，远低于上限 ${LEAK_BUDGET} —— 搬迁推进了，`
     + `请把 LEAK_BUDGET 改成 ${leaks.length}（目标 0），否则这道门会一直松着。`);
 });
