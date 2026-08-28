@@ -185,44 +185,14 @@ pub struct BuyReq {
     pub price_id: uuid::Uuid,
 }
 
-/// POST /api/orders — a logged-in user creates an order for a product (the
-/// IDE-facing buy endpoint). Stays 'pending' until a gateway callback or an
-/// admin manual confirm grants it. Amount is taken from the server-side price.
-pub async fn create_order(
-    State(state): State<AppState>,
-    claims: Claims,
-    Json(req): Json<BuyReq>,
-) -> ApiResult<Json<Order>> {
-    let uid = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::unauthorized("令牌损坏"))?;
-    let price = sqlx::query_as::<_, Price>("SELECT * FROM prices WHERE id = $1 AND active = true")
-        .bind(req.price_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::bad("商品不存在或已下架"))?;
-    let order = sqlx::query_as::<_, Order>(
-        "INSERT INTO orders (user_id, email, price_id, kind, plan, duration_days, credits_cents, amount_cents, method) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'manual') RETURNING *",
-    )
-    .bind(uid)
-    .bind(&claims.email)
-    .bind(price.id)
-    .bind(&price.kind)
-    .bind(&price.plan)
-    .bind(price.duration_days)
-    .bind(price.credits_cents)
-    .bind(price.amount_cents)
-    .fetch_one(&state.db)
-    .await?;
-    crate::realtime::record_event(
-        &state,
-        Some(uid),
-        "order_created",
-        json!({ "email": claims.email, "amount_cents": price.amount_cents, "label": price.label }),
-    )
-    .await;
-    Ok(Json(order))
-}
-
+// 手工下单（POST /api/orders）已删除（2026-08-26）。
+//
+// 它是「确认收款」的另一半：造一笔 method='manual'、status='pending' 的订单，等人来点确认。
+// 确认那一半删掉之后，它造出来的订单**永远付不了款**，只会在收款页堆一堆假的未支付。
+//
+// 删之前确认过没人调：ide/src、admin-ui、account-ui 三个前端全仓 grep `api/orders` 零命中，
+// 真实购买走的是 /api/billing/checkout → Stripe → webhook。库里 59 笔订单也全是 method='stripe'，
+// 唯一那笔 manual 是 2026-06-24 的测试单。
 /// GET /api/admin/orders — all orders (admin).
 pub async fn admin_list_orders(
     State(state): State<AppState>,
@@ -296,6 +266,22 @@ mod tests {
         assert!(
             body.contains("status = 'canceled'") && !body.contains("status = 'paid'"),
             "取消订单只能写 canceled",
+        );
+
+        // 手工下单也一并没了 —— 它是「确认收款」的另一半，留着只会造出永远付不了款的订单。
+        assert!(
+            !src.contains("pub async fn create_order"),
+            "手工下单被加回来了：它造的订单没有任何路径能变成已支付",
+        );
+        // 但 Stripe 那条真实购买路径必须还在。
+        let main_rs = include_str!("main.rs");
+        assert!(
+            main_rs.contains("/api/billing/checkout"),
+            "真实购买路径被误删了",
+        );
+        assert!(
+            !main_rs.contains("post(pay::create_order)"),
+            "手工下单的路由还挂着",
         );
 
         // 控制台那一侧：按钮和它调的接口都得没有，否则界面上还留着一个必然 404 的按钮。

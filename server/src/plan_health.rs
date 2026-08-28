@@ -58,6 +58,10 @@ struct ChannelMix {
     name: String,
     host: String,
     usd_per_cny: f64,
+    /// 这条连接的倍率。**它夹在「用户被扣的额度」和「我们付给中转的钱」中间**：
+    /// 扣用户的 = 上游价 × 倍率，所以我们的成本 = 扣用户的 ÷ 倍率。
+    /// 漏掉这一步，倍率 8 的连接成本会被算高 8 倍，倍率 0.2 的会被算低 5 倍。
+    rate: f64,
     requests: i64,
     raw_cents: i64,
     cny: Option<f64>,
@@ -85,6 +89,10 @@ pub async fn admin_plan_health(
     //
     // 按「用户 × 有活跃的那一天」聚合再取百分位，而不是直接对请求取百分位：
     // 定价关心的是「一个人一天烧多少」，不是「一次请求花多少」。
+    //
+    // 滤掉走免费池的那些行（free_milli_points_spent > 0）：它们的 cost_cents 记的是
+    // requested_cost，**没有从任何余额里扣走**。算「额度能撑多久」时把它们算进来，
+    // 等于让免费额度去消耗套餐额度，撑用天数会被系统性低估。线上占 1.8% 的行。
     let burn = sqlx::query_as::<_, (Option<i64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>)>(
         "WITH payer AS ( \
            SELECT DISTINCT u.id FROM users u \
@@ -94,6 +102,7 @@ pub async fn admin_plan_health(
            SELECT m.user_id, m.created_at::date AS day, sum(m.cost_cents) AS c, count(*) AS reqs \
            FROM model_usage m JOIN payer p ON p.id = m.user_id \
            WHERE m.created_at > now() - ($1 || ' days')::interval \
+             AND m.free_milli_points_spent = 0 \
            GROUP BY 1, 2 \
          ), pu AS ( \
            SELECT user_id, count(*)::float8 AS active_days, avg(c) AS per_day, sum(reqs) AS reqs \
@@ -128,30 +137,39 @@ pub async fn admin_plan_health(
     //
     // 这一段是整个页面的关键。成本不该由「运营手选的那个渠道」决定，而该由
     // **流量实际落在哪** 决定。join 走 base_url 的 host —— 和 channel_rates.host 同一个键。
-    let mix = sqlx::query_as::<_, (String, Option<String>, Option<f64>, i64, Option<i64>)>(
+    let mix = sqlx::query_as::<_, (String, Option<String>, Option<f64>, f64, i64, Option<i64>)>(
         "WITH u AS ( \
-           SELECT mu.cost_cents, m.label, substring(m.base_url from '://([^/]+)') AS host \
+           SELECT mu.cost_cents, m.label, m.rate, \
+                  substring(m.base_url from '://([^/]+)') AS host \
            FROM model_usage mu JOIN models m ON m.id::text = mu.model_id::text \
            WHERE mu.created_at > now() - ($1 || ' days')::interval \
          ) \
-         SELECT u.label, u.host, max(cr.usd_per_cny), count(*)::bigint, sum(u.cost_cents)::bigint \
+         SELECT u.label, u.host, max(cr.usd_per_cny), u.rate, count(*)::bigint, \
+                sum(u.cost_cents)::bigint \
          FROM u LEFT JOIN channel_rates cr ON cr.host = u.host \
-         GROUP BY 1, 2 ORDER BY 5 DESC NULLS LAST",
+         GROUP BY 1, 2, 4 ORDER BY 6 DESC NULLS LAST",
     )
     .bind(WINDOW_DAYS.to_string())
     .fetch_all(&state.db)
     .await?;
 
-    let total_raw: i64 = mix.iter().map(|r| r.4.unwrap_or(0)).sum();
+    let total_raw: i64 = mix.iter().map(|r| r.5.unwrap_or(0)).sum();
     // 折人民币时**只算得出价的那部分**：一条没填购买价的线，它的消耗不能当成 0 块钱，
     // 否则整体成本会被系统性低估。它单独计数，前端要把这个缺口说出来。
     let mut priced_raw: i64 = 0;
     let mut priced_cny = 0.0_f64;
     let channels: Vec<ChannelMix> = mix
         .iter()
-        .map(|(label, host, rate, reqs, raw)| {
+        .map(|(label, host, buy, mult, reqs, raw)| {
             let raw = raw.unwrap_or(0);
-            let cny = rate.filter(|r| *r > 0.0).map(|r| raw as f64 / 100.0 / r);
+            // 先 ÷ 倍率还原成**我们真正付给中转的美元**，再 ÷ 购买价折人民币。
+            // 这两步的顺序和 models.rs 的 project_quota_package 一致：
+            // provider_usd = quota_raw / multiplier; cny = provider_usd / usd_per_cny。
+            let upstream = if *mult > 0.0 { raw as f64 / 100.0 / mult } else { 0.0 };
+            let cny = buy
+                .filter(|r| *r > 0.0)
+                .filter(|_| *mult > 0.0)
+                .map(|r| upstream / r);
             if let Some(c) = cny {
                 priced_raw += raw;
                 priced_cny += c;
@@ -159,7 +177,8 @@ pub async fn admin_plan_health(
             ChannelMix {
                 name: label.clone(),
                 host: host.clone().unwrap_or_default(),
-                usd_per_cny: rate.unwrap_or(0.0),
+                usd_per_cny: buy.unwrap_or(0.0),
+                rate: *mult,
                 requests: *reqs,
                 raw_cents: raw,
                 cny,
@@ -169,13 +188,17 @@ pub async fn admin_plan_health(
         .collect();
 
     // 综合购买价：真实消耗的美元额度 ÷ 真实花掉的人民币。它才是「¥1 实际买到多少美元额度」。
+    // 综合购买价：**¥1 实际买到多少「用户额度美元」**。分子是扣用户的额度，分母是我们
+    // 真花掉的人民币（已经过了倍率和各站购买价）。套餐额度是用「用户额度」计的，
+    // 所以拿它去折算套餐成本，单位才对得上。
     let blended = if priced_cny > 0.0 { Some(priced_raw as f64 / 100.0 / priced_cny) } else { None };
-    let best = channels.iter().map(|c| c.usd_per_cny).fold(0.0_f64, f64::max);
-    let worst = channels
-        .iter()
-        .filter(|c| c.usd_per_cny > 0.0)
-        .map(|c| c.usd_per_cny)
-        .fold(f64::INFINITY, f64::min);
+    // 「最好 / 最差」也走同一个口径：¥1 买到多少用户额度美元 = 购买价 × 倍率。
+    // 只比购买价是不够的 —— 倍率 8 的连接哪怕挂在最贵的站上，单位额度也很便宜。
+    let effective = |c: &ChannelMix| {
+        if c.usd_per_cny > 0.0 && c.rate > 0.0 { Some(c.usd_per_cny * c.rate) } else { None }
+    };
+    let best = channels.iter().filter_map(effective).fold(0.0_f64, f64::max);
+    let worst = channels.iter().filter_map(effective).fold(f64::INFINITY, f64::min);
 
     // ---- 3. 套餐表：额度、售价、成本、能撑多久 ----
     let plans = sqlx::query_as::<_, (String, i64, i64, i32, Option<i64>, Option<String>)>(
@@ -223,8 +246,23 @@ pub async fn admin_plan_health(
         })
         .collect();
 
+    // 记成 0 分的请求占多少。这不是噪声，是**日耗被系统性低估**的度量：
+    // 线路被删、模型在该线路没有价目条目、以及订阅用户额度见底后由运营吸收的超支，
+    // 三种都会让这一行记 0 分而 token 照跑。线上实测 20.9%。
+    let zero_cost_share: Option<f64> = sqlx::query_scalar(
+        "SELECT count(*) FILTER (WHERE cost_cents = 0)::float8 / NULLIF(count(*), 0) \
+         FROM model_usage WHERE created_at > now() - ($1 || ' days')::interval",
+    )
+    .bind(WINDOW_DAYS.to_string())
+    .fetch_one(&state.db)
+    .await?;
+
+    let measured = measured_upstream_per_visible_usd(&state).await?;
+
     Ok(Json(json!({
         "denominator": denominator,
+        "zero_cost_share": zero_cost_share,
+        "measured": measured,
         "window_days": WINDOW_DAYS,
         "enough_sample": enough,
         "min_payers": MIN_PAYERS,
@@ -236,4 +274,317 @@ pub async fn admin_plan_health(
         "unpriced_raw_cents": total_raw - priced_raw,
         "plans": rows,
     })))
+}
+
+/// 探针每轮采样之间，同一个站的余额掉了多少 —— **实测**，不经过任何价目表。
+///
+/// # 为什么这个数比推算的可信
+///
+/// 页面另一处的成本是推出来的：面值 × 663 ÷ 线路倍率。那条链子里的 `off_in/off_out`
+/// 是**你挂出去的售价**，不是中转的进价（线上有目录 $5、你挂 $15 的），所以 ÷倍率 只除掉了
+/// 两层加价里的一层。而余额掉账是钱真的从账户里少掉的数，没有这一层偏差。
+///
+/// # 三个必须做对的地方，做错任何一个数就完全不能看
+///
+/// 1. **同一个站的多个令牌共用一个钱包。** 实测 hanhegufei 5 个 key、mhapi 4 个 key，
+///    余额逐位相同。所以一个站只能取**一条**序列，否则消耗会翻 4-5 倍。
+/// 2. **不能按 taken_at 去重。** 同站各路由各自打时间戳，差 1-2 秒，按时间分组根本合不到
+///    一起 —— 第一版就是这么算出 8 倍的。这里改成先给每个站钉死一个 endpoint_id。
+/// 3. **只累加下降的那一段。** 中途充值会让余额跳上去，`GREATEST(prev - cur, 0)` 把充值
+///    排除在外；反过来累加上升段就得到充值额，用来交叉验算。
+///
+/// # 只回总量，不回分站
+///
+/// 分站的比值是**污染的**：额度按线路的 base_url 归属，而请求会 failover 到别的站的出口去，
+/// 于是「这个站掉的钱」和「归到这个站的额度」不是同一批请求。实测 mhapi 掉了 $21.84 却
+/// 一分额度都没归到它名下。总量上这些错配互相抵消，分站不行。
+async fn measured_upstream_per_visible_usd(
+    state: &AppState,
+) -> Result<Option<serde_json::Value>, AppError> {
+    // 探针**串过台**：开头两轮（2026-08-25 22:13 和 22:24）里，hanhegufei 的 Claude 路由和
+    // zyz 的 GPT 路由报了**一模一样**的余额 162.35690952 —— 小数点后八位相同，不可能是巧合，
+    // 是探针刚起来时把一家的余额安到了另一家头上。
+    //
+    // 这种读数一旦被选中当基线，会凭空多出一大截"掉账"（那两条序列的真实起点差 73 美元）。
+    // `dup` 把"同一轮里被两个不同站同时报出的余额"整个剔掉 —— 判据是现象本身，
+    // 不用去猜是哪一家串到哪一家。
+    //
+    // 顺带给挑序列补一个确定的次序：同一个站下五条路由的快照数经常打平（都是 70），
+    // 只按 n DESC 的话选中哪条是随机的 —— 而其中一条恰好是被串台污染的那条。
+    // 今天碰巧选的是干净的 deepseek，那是运气，不是设计。
+    //
+    // 窗口不能对**所有**站取交集：探针上线时间不一样，一个几乎不跑量的站晚开 16 小时，
+    // 就会把公共窗口从 21 小时压成 5.6 小时（实测踩过，压完还触发了下面的最短窗口闸，
+    // 于是整块数字消失）。所以先按掉账额把占比不到 1% 的站剔掉，再对剩下的取交集，
+    // 并把剔掉的份额回报出去 —— 剔掉多少必须看得见，不能悄悄扔。
+    let row: Option<(f64, f64, i64, f64, f64)> = sqlx::query_as(
+        "WITH ep AS ( \
+           SELECT substring(COALESCE(e.base_url, m.base_url) from 'https?://([^/]+)') AS host, \
+                  b.endpoint_id, b.taken_at, b.remaining_usd, \
+                  lag(b.remaining_usd) OVER (PARTITION BY b.endpoint_id ORDER BY b.taken_at) AS prev \
+           FROM endpoint_balance b \
+           LEFT JOIN route_endpoints e ON e.id = b.endpoint_id \
+           LEFT JOIN models m ON m.id = b.endpoint_id \
+           WHERE COALESCE(e.base_url, m.base_url) IS NOT NULL \
+         ), host_span AS ( \
+           SELECT host, min(taken_at) AS lo, max(taken_at) AS hi, \
+                  count(DISTINCT endpoint_id) AS series \
+           FROM ep GROUP BY host HAVING count(*) >= 8 \
+         ), per_ep AS ( \
+           SELECT host, endpoint_id, \
+                  COALESCE(sum(GREATEST(prev - remaining_usd, 0)), 0) AS drawn \
+           FROM ep GROUP BY host, endpoint_id HAVING count(*) >= 8 \
+         ), per_host AS ( \
+           SELECT p.host, \
+                  percentile_cont(0.5) WITHIN GROUP (ORDER BY p.drawn) AS drawn, \
+                  s.lo, s.hi \
+           FROM per_ep p JOIN host_span s ON s.host = p.host \
+           GROUP BY p.host, s.lo, s.hi \
+         ), tot AS (SELECT NULLIF(sum(drawn), 0) AS all_drawn FROM per_host), \
+         big AS (SELECT h.* FROM per_host h, tot WHERE h.drawn >= 0.01 * tot.all_drawn), \
+         span AS (SELECT max(lo) AS lo, min(hi) AS hi FROM big), \
+         win_ep AS ( \
+           SELECT e.host, e.endpoint_id, \
+                  COALESCE(sum(GREATEST(e.prev - e.remaining_usd, 0)), 0) AS drawn \
+           FROM ep e JOIN big g ON g.host = e.host, span s \
+           WHERE e.taken_at BETWEEN s.lo AND s.hi \
+           GROUP BY e.host, e.endpoint_id \
+         ), up AS ( \
+           SELECT COALESCE(sum(d), 0) AS usd FROM ( \
+             SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY drawn) AS d \
+             FROM win_ep GROUP BY host \
+           ) z \
+         ), q AS ( \
+           SELECT COALESCE(sum(u.cost_cents), 0)::float8 AS raw_cents, count(*) AS reqs \
+           FROM model_usage u, span s WHERE u.created_at BETWEEN s.lo AND s.hi \
+         ) \
+         SELECT up.usd, q.raw_cents, q.reqs, \
+                EXTRACT(epoch FROM (s.hi - s.lo)) / 3600.0, \
+                COALESCE((SELECT sum(drawn) FROM big) / NULLIF((SELECT all_drawn FROM tot), 0), 0) \
+         FROM up, q, span s",
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some((upstream_usd, raw_cents, reqs, hours, covered_share)) = row else {
+        return Ok(None);
+    };
+    // 窗口太短或者这段时间根本没人用，算出来的比值是噪声，不如不给。
+    // 探针 2026-08-25 才上线，所以这个 None 会持续到攒够一天为止 —— 那是对的，
+    // 拿 3 小时的样本去定套餐额度比没有更糟。
+    let denominator = crate::settings::raw_cents_per_credit_usd() as f64;
+    let visible_usd = raw_cents / denominator.max(1.0);
+    if hours < 6.0 || visible_usd <= 0.0 || upstream_usd <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "upstream_usd": upstream_usd,
+        "visible_usd": visible_usd,
+        "requests": reqs,
+        "hours": hours,
+        // 参与计算的那些站占全部掉账的多少。剔掉的是不到 1% 的小站，但份额要看得见。
+        "covered_share": covered_share,
+        // 每 1 美元面值额度，真的从中转账户里掉了多少上游美元。
+        "upstream_per_visible_usd": upstream_usd / visible_usd,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_PAYERS, WINDOW_DAYS};
+
+    /// 生产代码那一段的源文本。断言必须切掉测试模块 —— 否则断言会匹配到自己写的
+    /// 字面量，整条测试恒真或恒假（本会话已经踩过一次）。
+    fn prod_src() -> &'static str {
+        let whole = include_str!("plan_health.rs");
+        whole
+            .split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .expect("plan_health.rs 应该有测试模块")
+    }
+
+    /// 面值分母全站只有一个源（settings.rs 的 DEFAULT_RAW_CENTS_PER_CREDIT_USD）。
+    ///
+    /// 这里再写一份 663 不会报错，只会让「运营在后台把分母改了」这件事对这一屏无效 ——
+    /// 于是定价页算出来的面值额度和用户实际看到的对不上，而两边都不报错。
+    #[test]
+    fn the_denominator_is_never_written_down_here() {
+        let src = prod_src();
+        for (i, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            assert!(
+                !code.contains("663"),
+                "plan_health.rs:{} 又硬编码了一份面值分母：{}",
+                i + 1,
+                line.trim(),
+            );
+        }
+        assert!(
+            src.contains("crate::settings::raw_cents_per_credit_usd()"),
+            "没有从 settings 取分母",
+        );
+    }
+
+    /// 人民币成本 = 真实分 ÷ 100 ÷ usd_per_cny。**除，不是乘。**
+    ///
+    /// usd_per_cny 的含义是「¥1 能买到多少美元额度」，所以它越大越便宜。写成乘法的话，
+    /// 最便宜的渠道会算出最高的成本，整张表的结论正好反过来 —— 而且数字看着依然「合理」，
+    /// 不会有任何地方报错。
+    #[test]
+    fn cost_divides_by_the_purchase_rate_never_multiplies() {
+        let src = prod_src();
+        assert!(
+            src.contains("*total as f64 / 100.0 / rate"),
+            "套餐成本不再是「真实分 ÷ 100 ÷ 购买价」",
+        );
+        // 渠道成本要走两步：先 ÷ 倍率还原成我们付给中转的美元，再 ÷ 购买价折人民币。
+        // 漏掉倍率那一步，倍率 8 的连接成本会被算高 8 倍、倍率 0.2 的会被算低 5 倍，
+        // 而两种都不会报错 —— 只是定价结论整个反过来。
+        assert!(
+            src.contains("raw as f64 / 100.0 / mult"),
+            "渠道成本漏了「÷ 倍率」那一步",
+        );
+        assert!(src.contains(".map(|r| upstream / r)"), "还原成上游美元之后没有再 ÷ 购买价");
+        // 和 models.rs 那份权威实现同一个顺序，别让两处漂开。
+        let authoritative = include_str!("models.rs");
+        assert!(
+            authoritative.contains("let provider_usd_capacity = quota_raw_usd / multiplier;")
+                && authoritative.contains("let channel_cost_cny = provider_usd_capacity / usd_per_cny;"),
+            "models.rs 的成本口径变了，plan_health 得跟着改",
+        );
+        // 综合购买价是「买到的美元额度 ÷ 花掉的人民币」，方向和上面一致。
+        assert!(
+            src.contains("priced_raw as f64 / 100.0 / priced_cny"),
+            "综合购买价的方向变了",
+        );
+    }
+
+    /// 样本不够就**不给百分位**，而不是给一个看着像数的噪声。
+    ///
+    /// 这一屏是拿来定价的：三五个人的 p90 会让运营按一个不存在的规律去调额度。
+    /// 「不知道」必须显示成不知道。
+    #[test]
+    fn a_thin_sample_never_pretends_to_be_a_distribution() {
+        assert!(MIN_PAYERS >= 5, "样本下限太低，p90 会是噪声");
+        assert!(WINDOW_DAYS >= 14, "窗口太短，撑不起「一个付费用户一天烧多少」");
+        let src = prod_src();
+        assert!(
+            src.contains("if enough && per_day > 0.0"),
+            "「能撑几天」没有被样本量闸住",
+        );
+        assert!(
+            src.contains("\"enough_sample\": enough"),
+            "前端拿不到样本够不够这个事实，就没法把「不知道」显示成不知道",
+        );
+    }
+
+    /// 「能撑几天」是**活跃日**，套餐是**自然日**，两者不能直接比。
+    ///
+    /// 线上付费用户的活跃天数中位数只有个位数，而套餐是 30 天的 —— 直接比的话
+    /// 几乎每一档都被判成「偏紧」，而那个判定会直接推着人去加额度（这一屏正是给人
+    /// 定额度用的）。所以前端必须先按占空比折算成自然日。
+    #[test]
+    fn days_are_compared_in_the_same_unit() {
+        let ui = include_str!("../admin-ui/src/components/PlanHealthTab.tsx");
+        let code: String = ui
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("toCalendarDays("),
+            "少了活跃日→自然日的换算",
+        );
+        assert!(
+            !code.contains("p.lasts_p50_days < p.days")
+                && !code.contains("p.lasts_p90_days > p.days * 2"),
+            "还在拿活跃日直接和自然日比",
+        );
+        // 换算要用到的两个数服务端得下发。
+        let src = prod_src();
+        assert!(src.contains("\"active_days_p50\"") || src.contains("active_days_p50"));
+        assert!(src.contains("\"window_days\": WINDOW_DAYS"));
+    }
+
+    /// 实测口径的三个坑，每一个做错都会让数字整体翻倍，而且不会报错。
+    ///
+    /// 这三条都是真踩出来的：第一版按 `taken_at` 去重，算出 8 倍；发现同站多令牌共用一个
+    /// 钱包（hanhegufei 5 个 key、mhapi 4 个 key 余额逐位相同）之后才改成一站一条序列。
+    #[test]
+    fn the_measured_cost_counts_each_wallet_once() {
+        let src = prod_src();
+        let at = src
+            .find("async fn measured_upstream_per_visible_usd")
+            .expect("实测口径的函数没了");
+        let end = src[at..].find("\n#[cfg(test)]").map(|i| at + i).unwrap_or(src.len());
+        let body = &src[at..end];
+
+        // 一个站一个数，取**这个站各条探针序列的中位数**。
+        //
+        // 不能挑一条了事：实测 hanhegufei 五条序列里，智普/Grok/deepseek 都是 98.09，
+        // 而 Claude 那条是 171.28 —— 它开头两轮报的是 zyz 的余额（162.35690952，
+        // 小数点后八位和 zyz 逐位相同），探针刚起来时串了台。五条序列快照数还打平，
+        // 挑哪条全看排序的运气，选中被污染那条就多算 73 美元。
+        // 中位数对「五条里坏一条」是稳的，也不用去猜是哪一家串到哪一家。
+        assert!(
+            body.contains("percentile_cont(0.5) WITHIN GROUP (ORDER BY drawn)"),
+            "没有按站取中位数 —— 挑单条序列会被串台的那条带偏，而挑中哪条是随机的",
+        );
+        // 充值不能算成消耗，只累加下降段。
+        assert!(
+            body.contains("GREATEST(prev - remaining_usd, 0)"),
+            "把充值也累加进消耗了",
+        );
+        // 样本太短就不给数，而不是给一个噪声。
+        assert!(body.contains("hours < 6.0"), "没有最短窗口闸，3 小时的样本会被当成结论");
+        // 分站比值是污染的（额度按线路归属、请求会 failover 到别站出口），只回总量。
+        assert!(
+            !body.contains("\"per_host\""),
+            "回了分站数据 —— 那个比值是污染的，实测 mhapi 掉了钱却一分额度都没归到它名下",
+        );
+
+        let ui = include_str!("../admin-ui/src/components/PlanHealthTab.tsx");
+        assert!(ui.contains("upstream_per_visible_usd"), "页面没用实测值");
+        assert!(ui.contains("不经过任何价目表"), "页面没说清实测和推算的区别");
+    }
+
+    /// 两个方向相反的偏差必须一起下发，页面才说得清「这是区间不是准数」。
+    ///
+    /// * 日耗**偏低**：20% 的请求记 0 分（线路已删 / 该线路没配这个模型的价 /
+    ///   订阅用户额度见底后超支由运营吸收），token 照跑但不计入。
+    /// * 成本**偏高**：扣用户的额度里含两层加价（线路倍率 + 每个模型自己挂的单价，
+    ///   线上有目录 $5 挂 $15 的），这里只除掉了倍率那一层。
+    ///
+    /// 只披露一边比两边都不披露更糟 —— 那会让人以为另一边是准的。
+    #[test]
+    fn both_biases_are_reported_not_just_the_convenient_one() {
+        let src = prod_src();
+        assert!(
+            src.contains("\"zero_cost_share\": zero_cost_share"),
+            "没有下发「记 0 分的请求占多少」，页面就说不出日耗是下限",
+        );
+        let ui = include_str!("../admin-ui/src/components/PlanHealthTab.tsx");
+        assert!(ui.contains("日耗是下限") && ui.contains("成本是上限"), "页面没有把两个偏差都说出来");
+        assert!(ui.contains("zero_cost_share"), "页面没有用那个占比");
+    }
+
+    /// 没填购买价的那部分消耗**不能当成 0 块钱**。
+    ///
+    /// 把它算进分母会系统性低估成本：一条没填价的线跑了三成流量，整体成本就凭空少三成，
+    /// 而页面上不会有任何异样。所以它单独计数，并且要下发给前端去说明。
+    #[test]
+    fn traffic_without_a_price_is_reported_not_counted_as_free() {
+        let src = prod_src();
+        assert!(
+            src.contains("\"unpriced_raw_cents\": total_raw - priced_raw"),
+            "没有把「没填价的那部分消耗」单独下发",
+        );
+        assert!(
+            src.contains("if let Some(c) = cny {") && src.contains("priced_raw += raw;"),
+            "折人民币时没有只累加得出价的那部分",
+        );
+    }
 }

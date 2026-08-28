@@ -3463,6 +3463,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "serdeprobe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "serialize-to-javascript"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

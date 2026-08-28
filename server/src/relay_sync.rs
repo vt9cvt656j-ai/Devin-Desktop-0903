@@ -42,6 +42,14 @@ use crate::AppState;
 /// 太密只是给对方添压力。抓涨价靠的是**每一轮都和上一轮比**，不是靠轮次密。
 const SYNC_EVERY: Duration = Duration::from_secs(6 * 3600);
 
+/// 亏本看守按新进价重算多久的真实用量。
+///
+/// 提成常量是因为它有**三个**引用：这里的 SQL、下发给控制台的字段、以及控制台表头
+/// 那句「按新进价把最近 N 天的真实用量重算一遍」。原来后两处各抄了一个 7 ——
+/// 窗口改成 14 的话页面会继续宣称是 7 天，而那句话是运维判断「为什么这条被停/没被停」
+/// 时唯一的判据说明。
+const MARGIN_WINDOW_DAYS: i64 = 7;
+
 /// 涨多少算「值得报警」。
 ///
 /// 30%：低于这个数的波动可能只是中转在调汇率或者我们分组变了，天天报会被静音；
@@ -71,7 +79,7 @@ async fn sync_endpoint(
     console_token: &str,
 ) {
     let det = relay_adapter::detect(base_url).await;
-    let prices = relay_adapter::fetch_pricing(&det, base_url, console_token).await;
+    let (prices, price_why) = relay_adapter::fetch_pricing(&det, base_url, api_key, console_token).await;
     let balance = relay_adapter::fetch_balance(&det, base_url, api_key, console_token).await;
 
     // 先把变动抓出来，再覆盖 —— 顺序反了就再也比不出涨没涨。
@@ -203,7 +211,10 @@ async fn sync_endpoint(
 
     // 充值套餐：拿得到就存，拿不到（没令牌 / 这家没开充值）就不动库存的。
     // **空手回不清表** —— 和价目同一条规矩：一次拉不到不该把已知的事实抹掉。
-    let plans = relay_adapter::fetch_topup_plans(&det, base_url, console_token).await;
+    let (plans, topup_reason) = relay_adapter::fetch_topup_plans(&det, base_url, console_token).await;
+    if !topup_reason.is_empty() {
+        tracing::debug!(endpoint = %endpoint_id, host = %base_url, reason = %topup_reason, "充值套餐没拉到");
+    }
     for p in &plans {
         let _ = sqlx::query(
             "INSERT INTO endpoint_topup_plan \
@@ -227,24 +238,39 @@ async fn sync_endpoint(
     }
 
     let ready = !prices.is_empty();
+    // 没拿到价时，通用退路的原因**一定要接到最后**。
+    //
+    // 下面第三支（`det.note` 非空）会把探测阶段那句话直接当成结论，而自研网关、
+    // 被挡住的面板恰好都走这一支 —— 于是「密钥被拒」和「回了 40 个模型但没有 pricing
+    // 字段」这种能直接指路的信息全被盖掉，页面上只剩一句「只能手工录」。
+    let with_why = |base: String| -> String {
+        if ready || price_why.is_empty() || base.contains(&price_why) {
+            return base;
+        }
+        if base.is_empty() { price_why.clone() } else { format!("{base}；{price_why}") }
+    };
     let note = if ready {
         det.note.clone()
     } else if det.family == Family::Unknown {
-        det.note.clone()
+        with_why(det.note.clone())
     } else if !det.note.is_empty() {
-        det.note.clone()
+        with_why(det.note.clone())
     } else if det.family.can_fetch_pricing() {
         // 「要手工录」这句话 2026-08-26 起不再成立：抓不到价目时对账会按
         // **OpenRouter 官方价 × 这个出口的倍率**推算（见 reconcile::derived_price）。
         // 留着旧文案会让人以为这几个出口的成本是空的，而实际上它们已经有数了 ——
         // 一句过期的待办比没有待办更糟。
-        "这家有价目接口但这次没拉到（多半是站长把它关了）—— \
-         对账已按 OpenRouter 官方价 × 倍率推算；把倍率填准，或手工录真价会更准"
-            .into()
-    } else {
         format!(
-            "{} 没有公开的价目接口 —— 对账按 OpenRouter 官方价 × 倍率推算；\
-             把倍率填准，或手工录真价会更准",
+            "专用价目接口没拉到（多半是站长把它关了）；{price_why} —— \
+             对账已按 OpenRouter 官方价 × 倍率推算；把倍率填准，或手工录真价会更准"
+        )
+    } else {
+        // 这里说「没有专用接口」而不是「没有价目接口」：通用那条路
+        // （带密钥问 /v1/models 读 pricing）**每一家都试过了**，这句话必须如实反映
+        // 试过什么，否则运维会以为还有一条没试的路。
+        format!(
+            "{} 没有专用价目接口；{price_why} —— \
+             对账按 OpenRouter 官方价 × 倍率推算；把倍率填准，或手工录真价会更准",
             det.family.label()
         )
     };
@@ -252,14 +278,15 @@ async fn sync_endpoint(
     let _ = sqlx::query(
         "INSERT INTO endpoint_adapter \
            (endpoint_id, route_id, family, matched_by, note, quota_per_unit, priced_models, \
-            balance_ok, balance_text, accounting_ready, synced_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now(), now()) \
+            balance_ok, balance_text, accounting_ready, topup_reason, synced_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now(), now()) \
          ON CONFLICT (endpoint_id) DO UPDATE SET \
            route_id = EXCLUDED.route_id, family = EXCLUDED.family, \
            matched_by = EXCLUDED.matched_by, note = EXCLUDED.note, \
            quota_per_unit = EXCLUDED.quota_per_unit, priced_models = EXCLUDED.priced_models, \
            balance_ok = EXCLUDED.balance_ok, balance_text = EXCLUDED.balance_text, \
-           accounting_ready = EXCLUDED.accounting_ready, synced_at = now(), updated_at = now()",
+           accounting_ready = EXCLUDED.accounting_ready, \
+           topup_reason = EXCLUDED.topup_reason, synced_at = now(), updated_at = now()",
     )
     .bind(endpoint_id)
     .bind(route_id)
@@ -271,6 +298,7 @@ async fn sync_endpoint(
     .bind(balance.is_some())
     .bind(balance.as_ref().map(|b| b.text.clone()).unwrap_or_default())
     .bind(ready)
+    .bind(&topup_reason)
     .execute(&state.db)
     .await;
 
@@ -326,13 +354,14 @@ async fn check_margin_after_change(
                     SUM(prompt_tokens)::bigint AS prompt_tokens, \
                     SUM(completion_tokens)::bigint AS completion_tokens, \
                     SUM(cached_tokens)::bigint AS cached_tokens \
-             FROM endpoint_model_usage WHERE day > current_date - 7 GROUP BY endpoint_id, model_id \
+             FROM endpoint_model_usage WHERE day > current_date - $2::int GROUP BY endpoint_id, model_id \
          ) u \
          JOIN endpoint_auto_price p \
            ON p.endpoint_id = u.endpoint_id AND p.model_id = u.model_id \
          WHERE u.endpoint_id = $1",
     )
     .bind(endpoint_id)
+    .bind(MARGIN_WINDOW_DAYS as i32)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -583,6 +612,11 @@ pub struct AdapterRow {
     pub balance_text: String,
     pub accounting_ready: bool,
     pub blocked_reason: String,
+    /// 充值套餐为什么没拉到。空 = 拉到了。
+    ///
+    /// 有它才分得清「这家没配控制台令牌」（运营去填一下）和「这家接口变了」（我们改代码）——
+    /// 在这之前两者都只表现为一张空表。而没有充值套餐就没有真实进价，人民币成本只能手填。
+    pub topup_reason: String,
     pub auto_guard: bool,
     pub margin_floor_pct: f64,
     pub synced_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -650,6 +684,15 @@ pub async fn admin_list(
                 "balance_text": a.map(|x| x.balance_text.clone()).unwrap_or_default(),
                 "accounting_ready": a.map(|x| x.accounting_ready).unwrap_or(false),
                 "blocked_reason": a.map(|x| x.blocked_reason.clone()).unwrap_or_default(),
+                "topup_reason": a.map(|x| x.topup_reason.clone()).unwrap_or_default(),
+                // 判据留在服务端。前端原来拿 `family !== "未知"` 和
+                // `topup_reason.includes("控制台令牌")` 去比中文字面量 —— 服务端把
+                // Family::Unknown 的显示名改一个字，或者把「令牌被拒」那句措辞调一下，
+                // 页面上的计数就静默错位，而两边都不会报错。
+                "family_known": a.map(|x| x.family != crate::relay_adapter::Family::Unknown.label()).unwrap_or(false),
+                "topup_needs_token": a
+                    .map(|x| x.topup_reason.starts_with("没配控制台令牌"))
+                    .unwrap_or(false),
                 // 没同步过的行也按默认值报「开」—— 库里那一行还不存在，
                 // 但看守确实是开的，报「关」会让人以为没在保护。
                 "auto_guard": a.map(|x| x.auto_guard).unwrap_or(true),
@@ -660,13 +703,24 @@ pub async fn admin_list(
         }
     }
 
+    // 取最近 60 条给页面画，**同时**把真实总数一起下发。
+    //
+    // 原来只给这 60 条，页面拿 `changes.length` 当「价格异动 N」的指标 —— 那不是条数，
+    // 是 LIMIT 撞出来的天花板。线上真实是 11666 条，页面一直写着 60，而且翻页条也说「共 60 条」，
+    // 一页就翻完，看起来像「最近没什么异动」。
+    const CHANGE_LIMIT: i64 = 60;
     let changes: Vec<ChangeRow> = sqlx::query_as(
         "SELECT endpoint_id, model_id, old_input, new_input, old_output, new_output, pct, acted, at \
-         FROM endpoint_price_change ORDER BY at DESC LIMIT 60",
+         FROM endpoint_price_change ORDER BY at DESC LIMIT $1",
     )
+    .bind(CHANGE_LIMIT)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
+    let changes_total: i64 = sqlx::query_scalar("SELECT count(*) FROM endpoint_price_change")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
     #[derive(sqlx::FromRow, serde::Serialize)]
     struct PlanRow {
@@ -707,6 +761,11 @@ pub async fn admin_list(
     Ok(Json(serde_json::json!({
         "rows": out,
         "changes": changes,
+        // 真实总数，不是上面那 60 条的长度 —— 页面拿 length 当指标会把 LIMIT 说成事实。
+        "changes_total": changes_total,
+        "change_limit": CHANGE_LIMIT,
+        // 亏本看守的窗口。页面表头那句说明照它写，别再各抄一个 7。
+        "margin_window_days": MARGIN_WINDOW_DAYS,
         "topup_plans": plans,
         "topups": topups,
     })))
@@ -1124,6 +1183,49 @@ mod tests {
         assert!(
             body.contains("tokio::spawn"),
             "同步在请求里同步跑 —— 十几个上游几十秒，前端会超时然后用户重复点",
+        );
+    }
+
+    /// 拉不到价时，**为什么**拉不到必须传到界面上。
+    ///
+    /// 「密钥被拒(401)」「回了 40 个模型但一个 pricing 字段都没有」「有 pricing 但
+    /// 数字对不上每 token 的量级」是三件完全不同的事：第一件去换密钥、第二件去
+    /// 手工录、第三件是解析要改。压成一句「只能手工录」就只能瞎试。
+    ///
+    /// 尤其是 `det.note` 非空那一支 —— 自研网关和被挡住的面板都走它，
+    /// 如果它直接当结论返回，原因就永远出不来。
+    #[test]
+    fn the_reason_pricing_failed_reaches_the_console() {
+        let me = include_str!("relay_sync.rs");
+        let at = me.find("let ready = !prices.is_empty();").expect("说明那段不见了");
+        // 结构边界，不是固定窗口。按 `at + N` 切会两头出事：函数一变长就不再守住尾部
+        // （而且照样是绿的），中文源码里还会直接切在汉字中间 panic —— 两样都踩过。
+        let end = me[at..].find("\n    let _ = sqlx::query(").expect("说明那段的结尾不见了");
+        let seg = &me[at..at + end];
+        // 三条分支都要接上原因，一条都不能直接把 det.note 当结论。
+        // 四条分支各有各的接法：两条把 det.note 包进 with_why，另两条直接把
+        // {price_why} 插进自己的 format!。**四条都要接**，漏一条就有一族出口
+        // 永远看不到原因，而且看不出来漏了。
+        assert_eq!(
+            seg.matches("with_why(det.note.clone())").count(),
+            2,
+            "有分支把 det.note 直接当结论了 —— 那一支上的出口永远看不到原因",
+        );
+        // 3 = 两条 format! 分支各一处，加上 with_why 闭包自己拼接那一处。
+        assert_eq!(
+            seg.matches("{price_why}").count(),
+            3,
+            "有 format! 分支没把原因插进去",
+        );
+        // 已经拿到价时不许再拼原因（那时候没有原因可言）。
+        assert!(
+            seg.contains("if ready || price_why.is_empty() || base.contains(&price_why) {"),
+            "拿到价了还在往说明里拼原因",
+        );
+        // 原因必须真的是从取价那边回来的，不是这边编的。
+        assert!(
+            me.contains("let (prices, price_why) = relay_adapter::fetch_pricing("),
+            "没有从取价那边把原因接出来",
         );
     }
 }

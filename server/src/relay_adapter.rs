@@ -40,6 +40,13 @@ pub enum Family {
     OneApiFork(String),
     /// OpenRouter。价目公开，余额用调用密钥。
     OpenRouter,
+    /// 自研网关（不是任何开源面板的分支）。带上认出来的牌子 —— 来自它自己在
+    /// 401 文案里点名的密钥前缀（`sk-teamo-*` 这种），那是编译进去的常量。
+    ///
+    /// 这一类**没有**公开价目接口可言（每家自己写的），所以价目一律手工录。
+    /// 但认出来仍然有意义：界面上「自研网关 / teamo」和「未知」是两句话 ——
+    /// 前者是「这家就是这样，别再等它自动」，后者是「我没探明白，可能还有救」。
+    Custom(String),
     /// 探过了，但对不上任何已知指纹。**不是「还没探」**，见 `Detection::note`。
     Unknown,
 }
@@ -52,6 +59,7 @@ impl Family {
             Family::OneApi => "one-api".into(),
             Family::OneApiFork(n) => format!("one-api 系 / {n}"),
             Family::OpenRouter => "openrouter".into(),
+            Family::Custom(n) => format!("自研网关 / {n}"),
             Family::Unknown => "未知".into(),
         }
     }
@@ -70,11 +78,19 @@ impl Family {
             _ if s.starts_with("one-api 系 / ") => {
                 Family::OneApiFork(s.trim_start_matches("one-api 系 / ").to_string())
             }
+            _ if s.starts_with("自研网关 / ") => {
+                Family::Custom(s.trim_start_matches("自研网关 / ").to_string())
+            }
             _ => Family::Unknown,
         }
     }
 
-    /// 这一家能不能自动拉到价目。`false` 的必须退回手填，而且界面要说清楚原因。
+    /// 这一家有没有**专用**价目接口。
+    ///
+    /// `false` 不等于「拉不到」：`fetch_pricing` 对每一家都还会再走一条通用路
+    /// （带调用密钥问 `/v1/models`，按 OpenRouter 约定读 pricing）。这个函数只
+    /// 决定界面上那句话该怎么说 —— 「有接口但没拉到」和「本来就没有专用接口」
+    /// 是两句不同的话，前者该去找站长开，后者该去手工录。
     pub fn can_fetch_pricing(&self) -> bool {
         matches!(self, Family::Sub2Api | Family::NewApi | Family::OpenRouter)
     }
@@ -187,8 +203,10 @@ pub async fn detect(base_url: &str) -> Detection {
     // 判据是 /v1/usage 未鉴权时那句**逐字硬编码**的错误文案。它同时点名了三种
     // 接受的鉴权头，全网只有 sub2api 这么写。比 /api/v1/settings/public 的键集
     // 更硬：键集会随版本增删，这句话是编译进去的。
-    if let Some((code, body)) = get(&http, &format!("{root}/v1/usage"), None).await {
-        if code == 401 && body.contains("\"API_KEY_REQUIRED\"") && body.contains("x-goog-api-key")
+    // 这一份回应下面还要用（认自研网关靠的就是它 401 里点名的密钥前缀），所以留着。
+    let usage = get(&http, &format!("{root}/v1/usage"), None).await;
+    if let Some((code, body)) = usage.as_ref() {
+        if *code == 401 && body.contains("\"API_KEY_REQUIRED\"") && body.contains("x-goog-api-key")
         {
             return Detection {
                 family: Family::Sub2Api,
@@ -216,21 +234,41 @@ pub async fn detect(base_url: &str) -> Detection {
     // 这是整个 one-api 家族唯一稳定的免鉴权入口，one-api / new-api / Veloera /
     // done-hub / shell-api 全都有且字段名一致。拿到之后再按 data 的键集分家。
     let status = get(&http, &format!("{root}/api/status"), None).await;
-    let Some((200, sbody)) = status else {
-        return unknown(
-            "既不是 sub2api（/v1/usage 没回它那句独有文案），\
-             /api/status 也拿不到 —— 这家的价目要手工录",
-        );
+    // SPA 兜底路由会让任何未知路径回 200 HTML。**200 不代表接口存在**，
+    // 这一条是实测踩出来的（线上三家都这样），所以要真解析成 JSON 才算数。
+    let sv = match &status {
+        Some((200, b)) => serde_json::from_str::<serde_json::Value>(b).ok(),
+        _ => None,
     };
-    let Ok(sv) = serde_json::from_str::<serde_json::Value>(&sbody) else {
-        // SPA 兜底路由会让任何未知路径回 200 HTML。**200 不代表接口存在**，
-        // 这一条是实测踩出来的（线上三家都这样）。
-        return unknown("/api/status 回的不是 JSON（多半是 SPA 的兜底页），认不出来");
-    };
-    let data = sv.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let data = sv
+        .as_ref()
+        .and_then(|v| v.get("data").cloned())
+        .unwrap_or(serde_json::Value::Null);
     let qpu = data.get("quota_per_unit").and_then(|x| x.as_f64());
+
+    // **不是 one-api 系 —— 但别在这里就放弃。**
+    //
+    // 上一版走到这里一律回「未知」，于是线上两家明明有很硬的指纹却被归到认不出：
+    //   · llm.ohub.vip：/api/* 全部 403 `{"success":false,"message":"无效的请求，验证码错误"}`
+    //     —— 那个信封就是 one-api 系的标准形状，只是面板接口被验证码挡住了；
+    //   · api.teamorouter.com：自研网关，401 文案里点名 `sk-teamo-*`，还带 trace_id。
+    //
+    // 「认不出」和「认出来了但拉不到价目」是两句完全不同的话：前者让人以为还有救、
+    // 会反复去点重探；后者直接告诉他去手工录，或者去把那道验证码关掉。
     if qpu.is_none() {
-        return unknown("/api/status 里没有 quota_per_unit，不是 one-api 系");
+        if let Some(d) = gated_one_api(&status, now) {
+            return d;
+        }
+        if let Some(d) = custom_gateway(usage.as_ref(), now) {
+            return d;
+        }
+        if let Some(d) = openai_compatible(&http, &root, now).await {
+            return d;
+        }
+        return unknown(
+            "既不是 sub2api（/v1/usage 没回它那句独有文案），/api/status 也拿不到、\
+             /v1/models 认不出牌子 —— 这家的价目要手工录",
+        );
     }
     let has = |k: &str| data.get(k).is_some();
 
@@ -320,21 +358,265 @@ pub async fn detect(base_url: &str) -> Detection {
     }
 }
 
+/// one-api 系，但**面板接口被挡住了**。
+///
+/// 线上 llm.ohub.vip 就是这个形状：`/api/status`、`/api/pricing`、`/api/user/self`
+/// 一律 403 `{"success":false,"message":"无效的请求，验证码错误"}`。那个
+/// `success + message` 信封是 one-api 全家的标准回包形状（前面几步已经把 sub2api、
+/// OpenRouter、new-api 都排除掉了，走到这里还回这个信封的基本就是这一族）。
+///
+/// 判成「未知」是浪费信息：它其实是可识别的，只是**价目要人去把那道验证码关掉**
+/// 或者手工录。把原话原样带出来，让人一眼看见拦住的是什么。
+fn gated_one_api(status: &Option<(u16, String)>, now: i64) -> Option<Detection> {
+    let (code, body) = status.as_ref()?;
+    if *code == 200 {
+        return None;
+    }
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if v.get("success")?.as_bool()? {
+        return None;
+    }
+    let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("").trim();
+    if msg.is_empty() {
+        return None;
+    }
+    Some(Detection {
+        family: Family::OneApiFork("面板被挡住".into()),
+        matched_by: format!("/api/status 回 {code}，信封是 one-api 系的 success/message 形状"),
+        note: format!(
+            "面板接口被挡住了（原话：{msg}）—— 价目和余额都读不到。\
+             多半是站点开了人机校验；关掉它、或者手工录价目",
+        ),
+        quota_per_unit: None,
+        detected_at: now,
+    })
+}
+
+/// 自研网关：靠它自己在 401 文案里点名的**密钥前缀**认牌子。
+///
+/// 线上 api.teamorouter.com：
+/// `{"error":{"message":"Missing auth credential. Provide x-api-key: sk-teamo-* or ...",
+///   "type":"missing_auth_credential"},"trace_id":"..."}`
+///
+/// `sk-<牌子>-` 是编译进那家网关的常量（密钥都得带这个前缀才认），站长改不了，
+/// 和 one-api 系那几个 user-id 头一样硬。认出来不能自动拉价目 —— 自研的每家都不一样，
+/// 没有共同接口可拉 —— 但能把「未知」换成一句确定的话。
+fn custom_gateway(usage: Option<&(u16, String)>, now: i64) -> Option<Detection> {
+    let (_, body) = usage?;
+    // 得是 JSON 错误信封，不是随便一个含 sk- 的 HTML 页 —— 下面这串 `?` 就是判据：
+    // 解析不了 JSON、或者没有 error.message，一律不认。
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let text = v.get("error")?.get("message")?.as_str()?;
+    let brand = key_prefix_brand(text)?;
+    Some(Detection {
+        family: Family::Custom(brand.clone()),
+        matched_by: format!("/v1/usage 的报错点名密钥前缀 sk-{brand}-（自研网关的编译期常量）"),
+        note: "自研网关，没有面板价目接口".into(),
+        quota_per_unit: None,
+        detected_at: now,
+    })
+}
+
+/// 从一句报错里抠出 `sk-<牌子>-` 的牌子部分。
+///
+/// 只认 `sk-x-` 这种**两段**的（`sk-teamo-*`）。单段的 `sk-xxxx` 是 OpenAI 通用形状，
+/// 抠出来的会是别人的随机串，那比认不出更糟 —— 会给一个自信的错牌子。
+fn key_prefix_brand(text: &str) -> Option<String> {
+    let at = text.find("sk-")?;
+    let rest = &text[at + 3..];
+    let brand: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .collect();
+    // 后面必须紧跟第二个连字符，否则它就是普通的 sk-<随机串>，认不得牌子。
+    if brand.is_empty() || brand.len() > 24 || !rest[brand.len()..].starts_with('-') {
+        return None;
+    }
+    Some(brand)
+}
+
+/// 最后一档：至少确认它是个 OpenAI 兼容网关，牌子取模型的 `owned_by`。
+///
+/// `/v1/models` 是这一行唯一的通用入口。拿到就说明「能对话、但面板认不出」，
+/// 比「未知」多一句确定的话；拿不到才是真的什么都不知道。
+async fn openai_compatible(http: &reqwest::Client, root: &str, now: i64) -> Option<Detection> {
+    let (code, body) = get(http, &format!("{root}/v1/models"), None).await?;
+    if code != 200 {
+        return None;
+    }
+    let v = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    if v.get("object")?.as_str()? != "list" {
+        return None;
+    }
+    let brand = v
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("owned_by")
+        .and_then(|x| x.as_str())
+        .filter(|x| !x.is_empty() && x.len() <= 24)
+        .unwrap_or("未标牌子")
+        .to_string();
+    Some(Detection {
+        family: Family::Custom(brand),
+        matched_by: "/v1/models 回 OpenAI 形状的模型表，牌子取 owned_by".into(),
+        note: "只认出是个 OpenAI 兼容网关，面板接口认不出 —— 价目要手工录".into(),
+        quota_per_unit: None,
+        detected_at: now,
+    })
+}
+
 // ---------------------------------------------------------------- 价目
 
 /// 按家族把真实价目拉下来，归一成「美元每 token」。
 ///
 /// 拉不到就回空 Vec，**不回猜的值**。调用方据此退回手填，界面上会写明原因。
-pub async fn fetch_pricing(det: &Detection, base_url: &str, console_token: &str) -> Vec<RelayPrice> {
-    let Some(http) = client() else { return Vec::new() };
+/// 回 (价目, 通用退路没拿到价的原因)。
+///
+/// 那句原因不是装饰：「密钥被拒」「回了 40 个模型但一个 pricing 字段都没有」
+/// 「有 pricing 但数字对不上每 token 的量级」是三件完全不同的事 ——
+/// 第一件去换密钥、第二件去手工录、第三件是这边解析要改。分不清就只能瞎试。
+pub async fn fetch_pricing(
+    det: &Detection,
+    base_url: &str,
+    api_key: &str,
+    console_token: &str,
+) -> (Vec<RelayPrice>, String) {
+    let Some(http) = client() else { return (Vec::new(), "建不出 HTTP 客户端".into()) };
     let root = site_root(base_url);
-    match det.family {
+    let by_family = match &det.family {
         Family::Sub2Api => sub2api_pricing(&http, &root, console_token).await,
-        Family::NewApi => new_api_pricing(&http, &root, det.quota_per_unit.unwrap_or(500_000.0)).await,
+        // one-api 系的分支多数是 new-api 的下游，`/api/pricing` 那条路照样可能通。
+        // 试一次的成本是一个往返，形状对不上就回空 —— 而不试就是白白放弃一整族。
+        Family::NewApi | Family::OneApi | Family::OneApiFork(_) => {
+            new_api_pricing(&http, &root, det.quota_per_unit.unwrap_or(500_000.0), console_token)
+                .await
+        }
         // OpenRouter 传原始 base_url，别传 site_root —— 理由见 openrouter_pricing。
         Family::OpenRouter => openrouter_pricing(&http, base_url).await,
-        _ => Vec::new(),
+        Family::Custom(_) | Family::Unknown => Vec::new(),
+    };
+    if !by_family.is_empty() {
+        return (by_family, String::new());
     }
+    // 专用接口没拿到 —— **再走一条通用的**：带上调用密钥问 `/v1/models`。
+    //
+    // 这一条对自研网关是唯一的路（每家自己写的面板没有共同接口），对面板被关掉
+    // 或被人机校验挡住的站也是退路。OpenRouter 的 `/v1/models` 回包里带 pricing，
+    // 这个约定被抄得很广 —— 抄字段名的基本也抄了单位（美元每 token）。
+    openai_models_pricing(&http, &root, api_key).await
+}
+
+/// 通用退路：`GET /v1/models`，按 OpenRouter 的约定读价。
+///
+/// # 只认得出单位的才认，认不出的一律不要
+///
+/// 各家字段名五花八门：`input_price`、`prompt_price`、`price_in`……而它们的**单位**
+/// 有的是每 token、有的是每百万 token，从字段名根本分不出来。猜错就是差一百万倍
+/// 而看起来完全正常的数字 —— 那比没有价目糟得多，因为对账会一脸自信地报出来。
+///
+/// 所以这里只认 OpenRouter 那套确切的字段名（`pricing.prompt` / `pricing.completion`
+/// 及其 input/output 别名），它们的单位是**美元每 token**，抄这个字段名的基本
+/// 也在抄这个单位。再加一道量级闸：每 token 单价必须小于 0.001 美元（＝每百万
+/// token 一千美元）。一个每百万 token 计价的数（比如 5.0）会被这道闸直接挡掉，
+/// 而不是被当成天价悄悄记进去。
+async fn openai_models_pricing(
+    http: &reqwest::Client,
+    root: &str,
+    api_key: &str,
+) -> (Vec<RelayPrice>, String) {
+    let mut out = Vec::new();
+    if api_key.trim().is_empty() {
+        return (out, "这个出口没配调用密钥，/v1/models 问不了".into());
+    }
+    let resp = get(http, &format!("{root}/v1/models"), Some(api_key)).await;
+    let Some((code, body)) = resp else {
+        return (out, "/v1/models 连不上".into());
+    };
+    if code != 200 {
+        return (out, format!("/v1/models 回 {code}（密钥被拒或这家没这条路由）"));
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return (out, "/v1/models 回的不是 JSON".into());
+    };
+    let Some(items) = v.get("data").and_then(|d| d.as_array()) else {
+        return (out, "/v1/models 回的 JSON 里没有 data 数组".into());
+    };
+    // 数一数「有 pricing 字段但被单位闸挡掉」的有几个 —— 这一类和「压根没有 pricing」
+    // 要分开报：前者说明这家其实给了价，只是形状／单位我们还认不出，值得来改解析。
+    let mut has_field = 0usize;
+    let mut unit_rejected = 0usize;
+
+    for it in items {
+        let Some(name) = it.get("id").and_then(|x| x.as_str()) else { continue };
+        let Some(pr) = it.get("pricing") else { continue };
+        has_field += 1;
+        let input = per_token(pr, &["prompt", "input"]);
+        let output = per_token(pr, &["completion", "output"]);
+        if input.is_none() || output.is_none() {
+            unit_rejected += 1;
+        }
+        // **输出价必须是正数**才收。回包里 pricing 字段存在但全是 0 的站不少
+        // （字段占位、没填），照收就是把成本记成零 —— 那正是「亏损显示成盈利」
+        // 的那个方向。宁可这家没有价，也不要一份零。
+        let (Some(input), Some(output)) = (input, output) else { continue };
+        if !(output > 0.0) {
+            continue;
+        }
+        out.push(RelayPrice {
+            model: name.to_string(),
+            prices: UnitPrices {
+                input,
+                output,
+                cache_read: per_token(pr, &["input_cache_read", "cache_read"]),
+                cache_write: per_token(pr, &["input_cache_write", "cache_write"]),
+                per_request: None,
+            },
+            group: None,
+            group_multiplier: 1.0,
+            source: "/v1/models 的 pricing 字段（OpenRouter 约定，美元每 token）".into(),
+        });
+    }
+    let why = if !out.is_empty() {
+        String::new()
+    } else if has_field == 0 {
+        format!("/v1/models 回了 {} 个模型，但一个都没带 pricing 字段", items.len())
+    } else if unit_rejected > 0 {
+        format!(
+            "/v1/models 里有 {has_field} 个模型带 pricing，但数字对不上「美元每 token」的量级 —— \
+             多半是每百万 token 计价。没有换算依据，不猜"
+        )
+    } else {
+        format!("/v1/models 里 {has_field} 个模型的 pricing 输出价都是 0，当作没有价")
+    };
+    (out, why)
+}
+
+/// 从 pricing 对象里按名字取一个**每 token 美元**的价。
+///
+/// 字符串和数字都收（OpenRouter 回的是字符串）。超出量级闸的一律当认不出 ——
+/// 那多半是每百万 token 的数字，收进来会差一百万倍。
+fn per_token(pr: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    /// 每 token 一千分之一美元 = 每百万 token 一千美元。真实模型不可能到这个价，
+    /// 到了就说明这个数不是「每 token」。
+    const MAX_PER_TOKEN_USD: f64 = 0.001;
+    for k in keys {
+        // 这里必须 `continue` 而不是 `?`：`?` 是从**整个函数**返回，第一个别名不存在
+        // 就再也轮不到第二个 —— 别名那条路会整个失效，而且不报错。
+        let Some(raw) = pr.get(*k) else { continue };
+        let n = raw
+            .as_f64()
+            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+        if let Some(n) = n {
+            if n.is_finite() && (0.0..MAX_PER_TOKEN_USD).contains(&n) {
+                return Some(n);
+            }
+            // 有这个字段但数字对不上单位 —— **别退而求其次去试下一个别名**，
+            // 那会拿另一个字段的数配上这个字段的语义。整项作废。
+            return None;
+        }
+    }
+    None
 }
 
 /// sub2api：价目在「模型广场」，**站长开了就完全公开**，一个凭据都不用。
@@ -419,12 +701,26 @@ fn collect_sub2api_groups(v: &serde_json::Value, source: &str, out: &mut Vec<Rel
 ///
 /// **quota_per_unit 必须按站取，不能写死 500000。** 调研发现 metapi 那个项目把某个
 /// 分支的除数写成了 1000000，全站成本差一倍 —— 而那个数字看起来完全正常。
-async fn new_api_pricing(http: &reqwest::Client, root: &str, quota_per_unit: f64) -> Vec<RelayPrice> {
+async fn new_api_pricing(
+    http: &reqwest::Client,
+    root: &str,
+    quota_per_unit: f64,
+    console_token: &str,
+) -> Vec<RelayPrice> {
     let mut out = Vec::new();
     if quota_per_unit <= 0.0 {
         return out; // 除数无效，宁可不给价
     }
-    let Some((200, body)) = get(http, &format!("{root}/api/pricing"), None).await else {
+    // 先不带凭据问一次（多数站是公开的），403 再带控制台令牌重问一次。
+    //
+    // 线上 wecodex.lol 就卡在这里：不带凭据回 `{"message":"pricing is disabled"}`，
+    // 而那道开关拦的是**匿名**访问 —— 登录态下同一条路可能是通的。不重试一次
+    // 就等于把一家有价目的站当成没有。
+    let mut resp = get(http, &format!("{root}/api/pricing"), None).await;
+    if !matches!(resp, Some((200, _))) && !console_token.trim().is_empty() {
+        resp = get(http, &format!("{root}/api/pricing"), Some(console_token)).await;
+    }
+    let Some((200, body)) = resp else {
         return out;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { return out };
@@ -568,19 +864,40 @@ pub async fn fetch_topup_plans(
     det: &Detection,
     base_url: &str,
     console_token: &str,
-) -> Vec<TopupPlan> {
-    if det.family != Family::Sub2Api || console_token.trim().is_empty() {
-        return Vec::new();
+) -> (Vec<TopupPlan>, String) {
+    // 空手回的时候必须说清是**哪一条**路径断的。
+    //
+    // 五条失败路径原来一律 `return Vec::new()`，一行日志都不留，于是
+    // `endpoint_topup_plan` 是空表 —— 而空表有五种完全不同的原因，处置也完全不同：
+    // 「没配控制台令牌」是运营去后台填一下，「接口回的形状变了」是我们要改代码。
+    // 分不出来的时候，两种都只能干等着。
+    if det.family != Family::Sub2Api {
+        return (Vec::new(), format!("这家是 {} 不是 sub2api，没有充值套餐接口", det.family.label()));
     }
-    let Some(http) = client() else { return Vec::new() };
+    if console_token.trim().is_empty() {
+        return (Vec::new(), "没配控制台令牌 —— 充值套餐接口要它，配上就能自动算出真实进价".into());
+    }
+    let Some(http) = client() else {
+        return (Vec::new(), "HTTP 客户端建不起来".into());
+    };
     let root = site_root(base_url);
-    let Some((200, body)) =
-        get(&http, &format!("{root}/api/v1/payment/plans"), Some(console_token.trim())).await
-    else {
-        return Vec::new();
+    let got = get(&http, &format!("{root}/api/v1/payment/plans"), Some(console_token.trim())).await;
+    let body = match got {
+        Some((200, b)) => b,
+        Some((code, _)) => {
+            return (
+                Vec::new(),
+                match code {
+                    401 | 403 => format!("控制台令牌被拒（HTTP {code}），多半过期了"),
+                    404 => "这家没有 /api/v1/payment/plans 这个接口".into(),
+                    _ => format!("充值套餐接口回 HTTP {code}"),
+                },
+            );
+        }
+        None => return (Vec::new(), "充值套餐接口连不上".into()),
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return Vec::new();
+        return (Vec::new(), "充值套餐接口回的不是 JSON".into());
     };
     // 套餐数组可能在 data、data.plans、data.items 或顶层。逐个试 ——
     // 写死一条路径的话，换个版本就整表拉不到，而表现只是「没有套餐」。
@@ -589,7 +906,9 @@ pub async fn fetch_topup_plans(
         .find_map(|k| v.get("data").and_then(|d| d.get(*k)).and_then(|x| x.as_array()))
         .or_else(|| v.get("data").and_then(|d| d.as_array()))
         .or_else(|| v.as_array());
-    let Some(arr) = arr else { return Vec::new() };
+    let Some(arr) = arr else {
+        return (Vec::new(), "回的 JSON 里找不到套餐数组（这家换版本了？）".into());
+    };
 
     let mut out = Vec::new();
     for (i, p) in arr.iter().enumerate() {
@@ -627,7 +946,14 @@ pub async fn fetch_topup_plans(
             },
         });
     }
-    out
+    // 一档都没解析出来也要说清楚：接口通、JSON 也对，但每一档都缺付款金额，
+    // 那是字段名对不上，不是「这家没有充值套餐」。
+    let reason = if out.is_empty() {
+        format!("接口通，但 {} 档里一档都没认出付款金额（字段名换了？）", arr.len())
+    } else {
+        String::new()
+    };
+    (out, reason)
 }
 
 // ---------------------------------------------------------------- 余额
@@ -712,6 +1038,47 @@ pub async fn fetch_balance(
             }
             None
         }
+        // 自研网关：**试一次 `/v1/usage`**，别直接放弃。
+        //
+        // 这条路是 OpenAI 生态的既成惯例，很多自研网关照着实现了（sub2api 那一支
+        // 就是这么查的），而它只要一个调用密钥、我们本来就有。拿不到就如实空手回 ——
+        // 认不出面板不等于余额一定查不到，反过来也一样。
+        Family::Custom(_) => {
+            let mut resp = get(&http, &format!("{root}/v1/usage"), Some(api_key)).await?;
+            // 400 = 路由在、密钥认了，但请求缺东西。OpenAI 那套 `/v1/usage` 要日期区间，
+            // 抄这条路由的网关多半也要。线上 teamorouter 就卡在这里：不带参数回 400，
+            // 而它是这家唯一的账户接口（其余 /v1/balance、/v1/credits 全是 404）。
+            if resp.0 == 400 {
+                let today = chrono::Utc::now().date_naive();
+                let from = today - chrono::Duration::days(30);
+                let url = format!("{root}/v1/usage?start_date={from}&end_date={today}");
+                if let Some(r2) = get(&http, &url, Some(api_key)).await {
+                    resp = r2;
+                }
+            }
+            let (code, body) = resp;
+            if code != 200 {
+                tracing::info!(host = %root, %code, "[balance-shape] 自研网关 /v1/usage 不是 200（带日期区间也重试过了）");
+                return None;
+            }
+            let v = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+            let got = pick_money(&v, "/v1/usage");
+            if got.is_none() {
+                // 200 了却认不出金额。把**字段名**记下来（只记名字，不记值 ——
+                // 值里可能有账号信息）。下一步该怎么解析，全看这一行。
+                // 认不出就说认不出，而不是让这家的余额永远空白且看不出为什么。
+                let keys: Vec<&str> = v
+                    .as_object()
+                    .map(|o| o.keys().map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                tracing::info!(
+                    host = %root,
+                    keys = %keys.join(","),
+                    "[balance-shape] 自研网关 /v1/usage 回了 200 但认不出金额字段"
+                );
+            }
+            got
+        }
         Family::Unknown => None,
     }
 }
@@ -735,7 +1102,10 @@ fn pick_money(v: &serde_json::Value, source: &str) -> Option<Balance> {
     };
     for o in scopes {
         let left = num(o, &["balance", "remaining", "limit_remaining", "credit", "credits"]);
-        let used = num(o, &["used", "usage", "total_used", "used_quota", "consumed"]);
+        // `total_usage` 是 OpenAI 那套 /v1/usage 的字段名（单位是**分**），
+        // 抄这条路由的网关多半也抄了字段名。放在最后：前面几个都是余额单位，
+        // 只有认不出时才轮到它。
+        let used = num(o, &["used", "usage", "total_used", "used_quota", "consumed", "total_usage"]);
         if left.is_none() && used.is_none() {
             continue;
         }
@@ -937,7 +1307,7 @@ mod tests {
             }
             assert_eq!(det.family, want, "{url} 认错了");
 
-            let prices = fetch_pricing(&det, url, "").await;
+            let (prices, _why) = fetch_pricing(&det, url, "", "").await;
             println!("  无凭据拉到 {} 条价目", prices.len());
             // OpenRouter 的价目是公开的，拉到 0 条一定是我们这边拼错了 URL。
             if want == Family::OpenRouter {
@@ -967,6 +1337,55 @@ mod tests {
     /// 每档充值各自定价，¥50 和 ¥200 两档的到账金额常常不成比例 —— 取平均会把
     /// 「哪一档划算」这件事整个抹平，而那正是这张表唯一的用途。
     #[test]
+    /// 拉不到充值套餐时，**必须说清是哪一条路径断的**。
+    ///
+    /// 五条失败路径原来一律 `return Vec::new()`，一行日志都不留，于是
+    /// `endpoint_topup_plan` 是空表 —— 而空表有五种完全不同的原因，处置也完全不同：
+    /// 「没配控制台令牌」是运营去后台填一下，「接口回的形状变了」是我们改代码。
+    /// 分不出来的时候两种都只能干等着，而这一格空着就意味着人民币成本只能手填。
+    #[test]
+    fn every_way_the_topup_fetch_can_fail_says_which_one() {
+        let src = include_str!("relay_adapter.rs");
+        let at = src
+            .find("pub async fn fetch_topup_plans(")
+            .expect("fetch_topup_plans 改名了");
+        let end = src[at..]
+            .find("\n// ---------------------------------------------------------------- 余额")
+            .map(|i| at + i)
+            .expect("找不到函数结尾");
+        // **先把注释剥掉再断言。** 函数体里那段解释性注释本身就写着「没配控制台令牌」，
+        // 不剥的话，把真正的提示语删空这条测试照样绿 —— 变异测试当场翻出来的。
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+        // 返回类型必须带上原因，否则调用方无从记录。
+        assert!(
+            body.contains("-> (Vec<TopupPlan>, String)"),
+            "空手回的时候没带上原因",
+        );
+        // 五条路径逐条点名。少一条就是又多了一种「空表，不知道为什么」。
+        for (needle, what) in [
+            ("不是 sub2api", "家族不对"),
+            ("没配控制台令牌", "缺令牌"),
+            ("HTTP", "接口非 200"),
+            ("不是 JSON", "回的不是 JSON"),
+            ("找不到套餐数组", "JSON 形状变了"),
+        ] {
+            assert!(body.contains(needle), "{what}这条失败路径没说明原因");
+        }
+        // 光返回不算数，得真的落到库里让人看见。
+        let sync = include_str!("relay_sync.rs");
+        assert!(
+            sync.contains("topup_reason = EXCLUDED.topup_reason"),
+            "原因没写进 endpoint_adapter，页面上还是看不见",
+        );
+        let ui = include_str!("../admin-ui/src/pages/Adapters.tsx");
+        assert!(ui.contains("充值套餐没拉到："), "页面没把原因显示出来");
+    }
+
     fn the_topup_rate_is_per_plan_not_a_single_exchange_rate() {
         let cheap = TopupPlan {
             key: "a".into(), name: "小额".into(), price: 50.0, currency: "CNY".into(),
@@ -1029,6 +1448,209 @@ mod tests {
         assert!(
             body.contains("fold(f64::NEG_INFINITY, f64::max)"),
             "分组倍率没取最大值 —— 低估成本会把亏损显示成盈利",
+        );
+    }
+
+    /// 「认不出」和「认出来了但拉不到」是两句不同的话。
+    ///
+    /// 上一版走到 `/api/status` 拿不到就一律回未知，线上两家因此被归到认不出：
+    /// llm.ohub.vip 的 /api/* 全被人机校验挡住，api.teamorouter.com 是自研网关。
+    /// 两家都有很硬的指纹 —— 判成未知会让人以为还有救，反复去点重探。
+    #[test]
+    fn a_gated_one_api_panel_is_still_identified() {
+        // 线上 llm.ohub.vip 的原样回包。
+        let st = Some((403u16, r#"{"success":false,"message":"无效的请求，验证码错误"}"#.to_string()));
+        let d = gated_one_api(&st, 0).expect("被挡住的 one-api 面板没认出来");
+        assert!(matches!(d.family, Family::OneApiFork(_)));
+        // 拦住的原话必须原样带出来，否则运维不知道该去关哪道开关。
+        assert!(d.note.contains("验证码错误"), "拦截原话被吞了");
+        assert!(!d.matched_by.is_empty(), "没说靠什么认的");
+
+        // 200 的走正常那条路，不该被这一条截胡。
+        assert!(gated_one_api(&Some((200, r#"{"success":true}"#.into())), 0).is_none());
+        // success 为真 = 不是错误信封。
+        assert!(gated_one_api(&Some((403, r#"{"success":true,"message":"x"}"#.into())), 0).is_none());
+        // 没有 message 的空信封认不出内容，不硬认。
+        assert!(gated_one_api(&Some((403, r#"{"success":false}"#.into())), 0).is_none());
+        // HTML 兜底页不是 JSON。
+        assert!(gated_one_api(&Some((403, "<html>403</html>".into())), 0).is_none());
+        assert!(gated_one_api(&None, 0).is_none());
+    }
+
+    /// 自研网关靠它自己点名的密钥前缀认牌子。
+    #[test]
+    fn a_custom_gateway_is_named_by_its_key_prefix() {
+        // 线上 api.teamorouter.com 的原样回包。
+        let u = (
+            401u16,
+            r#"{"error":{"message":"Missing auth credential. Provide x-api-key: sk-teamo-* or Authorization: Bearer <token>.","type":"missing_auth_credential","code":401},"trace_id":"x"}"#
+                .to_string(),
+        );
+        let d = custom_gateway(Some(&u), 0).expect("自研网关没认出来");
+        assert_eq!(d.family, Family::Custom("teamo".into()));
+        assert_eq!(d.family.label(), "自研网关 / teamo");
+        // 存库再读回来必须还是同一个牌子，否则两个页面上会是两个家族。
+        assert_eq!(Family::from_label(&d.family.label()), d.family);
+
+        // 不是 JSON 错误信封的一律不认。
+        assert!(custom_gateway(Some(&(401, "sk-teamo-abc".into())), 0).is_none());
+        assert!(custom_gateway(Some(&(401, r#"{"detail":"nope"}"#.into())), 0).is_none());
+        // **合法 JSON、也含 sk-xxx-，但不是错误信封** —— 这一条才真正拦住「随便在
+        // 哪个字段里看到密钥前缀就认牌子」。少了它，判据可以退化成全文找 sk-，
+        // 而那会在别人的文档页、示例响应上认出一个自信的错牌子。
+        assert!(
+            custom_gateway(Some(&(200, r#"{"detail":"请用 sk-teamo- 开头的密钥"}"#.into())), 0)
+                .is_none(),
+            "不是错误信封也认了牌子",
+        );
+        assert!(custom_gateway(None, 0).is_none());
+    }
+
+    /// 抠牌子只认 `sk-<牌子>-` 这种两段的。
+    ///
+    /// 单段的 `sk-xxxxxxxx` 是 OpenAI 的通用密钥形状，抠出来是别人的随机串 ——
+    /// 那会给出一个**自信的错牌子**，比认不出更糟：页面上「靠什么认的」这一列
+    /// 存在的全部意义就是让人能判断结论可不可信。
+    #[test]
+    fn only_a_two_segment_key_prefix_names_a_brand() {
+        assert_eq!(key_prefix_brand("Provide x-api-key: sk-teamo-* or ..."), Some("teamo".into()));
+        assert_eq!(key_prefix_brand("需要 sk-abc123- 开头"), Some("abc123".into()));
+        // 单段：OpenAI 通用形状，不认。
+        assert_eq!(key_prefix_brand("your key sk-proj9x8y7z should start"), None);
+        assert_eq!(key_prefix_brand("sk-"), None);
+        // 没有 sk- 的不认。
+        assert_eq!(key_prefix_brand("missing credential"), None);
+        // 太长的不是牌子，是随机串。
+        assert_eq!(key_prefix_brand("sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"), None);
+    }
+
+    /// 认不出的时候，`Unknown` 那句话必须说清楚**试过什么**。
+    ///
+    /// 这一列不是装饰：认错比认不出更糟，因为认错会拉到一份别家的价目还很自信。
+    /// 说清试过什么，才能判断结论可不可信。
+    #[test]
+    fn the_detection_ladder_does_not_give_up_early() {
+        let me = include_str!("relay_adapter.rs");
+        // 三条新指纹必须真的挂在阶梯上 —— 写了函数没接进去等于没写。
+        for shape in [
+            "if let Some(d) = gated_one_api(&status, now) {",
+            "if let Some(d) = custom_gateway(usage.as_ref(), now) {",
+            "if let Some(d) = openai_compatible(&http, &root, now).await {",
+        ] {
+            assert!(me.contains(shape), "新指纹没接进阶梯（缺 `{shape}`）");
+        }
+        // 老那句「/api/status 也拿不到 —— 这家的价目要手工录」不能再是**第一时间**
+        // 就回的：它现在只该出现在三条都没中之后。
+        let at = me.find("if qpu.is_none() {").expect("阶梯的分叉点不见了");
+        let tail = &me[at..];
+        let give_up = tail.find("return unknown(").expect("兜底那句不见了");
+        for shape in ["gated_one_api(", "custom_gateway(", "openai_compatible("] {
+            let pos = tail.find(shape).unwrap_or(usize::MAX);
+            assert!(pos < give_up, "`{shape}` 排在了放弃之后 —— 它永远不会被走到");
+        }
+    }
+
+    /// 400 要带日期区间重试一次。
+    ///
+    /// OpenAI 那套 `/v1/usage` 要 start_date/end_date，抄这条路由的网关多半也要。
+    /// 线上 teamorouter 就卡在这儿：路由在（无效密钥回 401 不是 404）、真密钥回 400，
+    /// 而它是这家**唯一**的账户接口（/v1/balance、/v1/credits、/v1/me 全是 404）。
+    /// 不重试就等于这家的余额永远读不到，而余额读不到就没法标定进价。
+    #[test]
+    fn a_400_is_retried_with_a_date_range() {
+        let all = include_str!("relay_adapter.rs");
+        let me = &all[..all.find("\n#[cfg(test)]").unwrap_or(all.len())];
+        assert!(
+            me.contains("if resp.0 == 400 {"),
+            "400 没有带日期区间重试 —— 这家的余额会永远读不到",
+        );
+        assert!(
+            me.contains("/v1/usage?start_date={from}&end_date={today}"),
+            "重试时没带 OpenAI 那套日期参数",
+        );
+        // OpenAI 的 /v1/usage 回的是 total_usage，得认。
+        assert!(
+            me.contains("\"total_usage\""),
+            "不认 total_usage —— 抄 OpenAI 那条路由的网关回的就是它",
+        );
+    }
+
+    /// 单位认不出来就宁可不要。
+    ///
+    /// 各家 `/v1/models` 里价目字段的名字五花八门，而**单位**从名字分不出来：
+    /// 有的每 token、有的每百万 token。猜错是差一百万倍、却看起来完全正常的数字 ——
+    /// 比没有价目糟得多，因为对账会一脸自信地报出来。
+    #[test]
+    fn a_price_whose_unit_is_unclear_is_dropped() {
+        let per_tok = serde_json::json!({"prompt": "0.000005", "completion": "0.000025"});
+        assert_eq!(per_token(&per_tok, &["prompt", "input"]), Some(0.000005));
+        assert_eq!(per_token(&per_tok, &["completion", "output"]), Some(0.000025));
+        // 数字型也收（不是所有站都回字符串）。
+        assert_eq!(per_token(&serde_json::json!({"input": 1.5e-6}), &["prompt", "input"]), Some(1.5e-6));
+        // 别名：没有 prompt 就看 input。
+        assert_eq!(per_token(&serde_json::json!({"input": "0.000003"}), &["prompt", "input"]), Some(0.000003));
+        // 免费模型是 0，合法。
+        assert_eq!(per_token(&serde_json::json!({"prompt": "0"}), &["prompt"]), Some(0.0));
+
+        // **每百万 token 的数字被挡掉**，不会被当成天价每 token 悄悄记进去。
+        assert_eq!(per_token(&serde_json::json!({"prompt": 5.0}), &["prompt"]), None);
+        assert_eq!(per_token(&serde_json::json!({"prompt": "15"}), &["prompt"]), None);
+        // 负数、非数、缺字段。
+        assert_eq!(per_token(&serde_json::json!({"prompt": -1.0}), &["prompt"]), None);
+        assert_eq!(per_token(&serde_json::json!({"prompt": "免费"}), &["prompt"]), None);
+        assert_eq!(per_token(&serde_json::json!({"other": 1.0}), &["prompt"]), None);
+
+        // 第一个别名存在但单位不对时**不许退到第二个别名** —— 那是拿另一个字段的数
+        // 配上这个字段的语义，两个都错还互相掩护。
+        assert_eq!(
+            per_token(&serde_json::json!({"prompt": 5.0, "input": 0.000005}), &["prompt", "input"]),
+            None,
+            "第一个别名单位不对时退到了第二个",
+        );
+    }
+
+    /// 通用取价必须真的挂在分派里，而且**每一家**都走得到。
+    ///
+    /// 这条路对自研网关是唯一的路（每家自己写的面板没有共同接口），
+    /// 对面板被关掉或被人机校验挡住的站是退路。写了函数没接进去等于没写。
+    #[test]
+    fn every_family_falls_back_to_the_generic_price_probe() {
+        let me = include_str!("relay_adapter.rs");
+        let at = me.find("pub async fn fetch_pricing(").expect("分派函数不见了");
+        let body = &me[at..at + me[at..].find("\n}\n").expect("函数没结尾")];
+        // 退路在专用接口之后无条件走一遍，不是挂在某个 family 分支下面。
+        assert!(
+            body.contains("if !by_family.is_empty() {\n        return (by_family, String::new());\n    }")
+                && body.contains("openai_models_pricing(&http, &root, api_key).await"),
+            "通用取价没有作为兜底无条件走一遍 —— 自研网关会一直没有价",
+        );
+        // one-api 系也要试一次 /api/pricing，不能整族放弃。
+        // 钉的是**这条 arm 真的去取价**，不只是 arm 头存在：只匹配 arm 头的话，
+        // 把它的实现换成 `Vec::new()` 测试照样绿，而那一族就再也拿不到价了。
+        assert!(
+            body.contains(
+                "Family::NewApi | Family::OneApi | Family::OneApiFork(_) => {\n            \
+                 new_api_pricing(&http, &root, det.quota_per_unit.unwrap_or(500_000.0), console_token)"
+            ),
+            "one-api 系没真去问 /api/pricing —— 那一族的分支多数是 new-api 下游",
+        );
+        // 密钥必须真的传进去，否则 /v1/models 一律 401。
+        assert!(
+            me.contains("get(http, &format!(\"{root}/v1/models\"), Some(api_key)).await"),
+            "问 /v1/models 时没带调用密钥 —— 拿到的只会是 401",
+        );
+    }
+
+    /// pricing 字段全是 0 的站不许收。
+    ///
+    /// 「字段占位但没填」在中转里很常见。照收就是把成本记成零，而那正是
+    /// 「亏损显示成盈利」的那个方向 —— 单向偏差，比缺数据危险。
+    #[test]
+    fn a_zero_output_price_is_not_a_price() {
+        let me = include_str!("relay_adapter.rs");
+        assert!(
+            me.contains("if !(output > 0.0) {\n            continue;\n        }"),
+            "输出价为 0 的模型被收进来了 —— 成本会被记成零",
         );
     }
 }

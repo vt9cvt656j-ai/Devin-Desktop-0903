@@ -1243,10 +1243,16 @@ async fn send_purchase_receipt(state: &AppState, uid: uuid::Uuid, session: &str)
     if !state.cfg.mail_enabled() {
         return;
     }
+    // 判据是 `charged_cents IS NULL`，不是「等于 0」。
+    //
+    // 原来是 `NULLIF(o.charged_cents, 0)`：整单优惠券会产生一笔**真实的 0 元**收款，
+    // 那条 NULLIF 把它当成「没记录收了多少」，于是回执上印的是目录标价 ——
+    // 客户明明一分没付，收到的邮件写着 ¥295。
+    // 「收了 0 元」和「没记录收了多少」是两件事，只有 NULL 表示后者。
     let row: Option<(String, Option<String>, Option<i32>, i64, i64, Option<String>, uuid::Uuid)> =
         sqlx::query_as(
             "SELECT COALESCE(o.email, u.email), o.plan, o.duration_days, o.credits_cents, \
-                    COALESCE(NULLIF(o.charged_cents, 0), o.amount_cents), o.charged_currency, o.id \
+                    COALESCE(o.charged_cents, o.amount_cents), o.charged_currency, o.id \
                FROM orders o LEFT JOIN users u ON u.id = o.user_id \
               WHERE o.stripe_session_id = $1 LIMIT 1",
         )

@@ -229,6 +229,9 @@ struct ModelUsage {
     completion_tokens: i64,
     cached_tokens: i64,
     cache_creation_tokens: i64,
+    /// `prompt_tokens` 含不含 `cached_tokens`。跟着回执走，事后反推不出来。
+    /// 老行（这一列上线前的）是 NULL，见 `prompt_is_inclusive` 的兜底。
+    prompt_includes_cached: Option<bool>,
 }
 
 #[derive(sqlx::FromRow, Clone)]
@@ -290,6 +293,34 @@ pub struct ReconRow {
     pub active: bool,
     pub calls: i64,
     pub revenue_usd: f64,
+    /// 收入和成本**折成人民币**。页面上真正该看的是这两个。
+    ///
+    /// # 为什么必须折
+    ///
+    /// 上面那两个 `*_usd` 不是同一种「美元」，直接相减是量纲错误：
+    ///
+    /// * `revenue_usd` 是**真实计费分 ÷ 100**（`compute_cost` 里 `官方价 × 100 × 线路 rate`），
+    ///   它的量纲由**线路自带地址那家**的充值汇率定；
+    /// * `cost_usd` 是「真实 token × 这个出口的进价」，而进价无论是人工录的还是
+    ///   按倍率推的，单位都是**这个出口那家中转的余额面值** —— 那个 `$` 不是美元。
+    ///
+    /// 两家的充值汇率差多少，减出来的毛利就错多少倍。线上实测：清衍挂在 Claude 线路下，
+    /// 线路自带那家 ¥1 买 1 面值、清衍 ¥1 买 10 面值，于是成本被放大了 10 倍，
+    /// 页面显示「收 $4.46 / 花 $10.89 / 毛利 -144%」—— 而清衍换算后每花掉一美元官方价
+    /// 只要 ¥0.65，比自带地址还便宜。**同一条流水，两个相反的结论。**
+    ///
+    /// 顺带解释了为什么有些行看着正常：出口和自带地址在同一家时两边同倍放大，
+    /// 百分比恰好抵消。只有跨家的行会炸，而那正是多路由要用的行。
+    ///
+    /// 换算口径和 `plan_health` 里那条单位链一字一样：人民币 = 真实分 ÷ 100 ÷ 充值汇率。
+    ///
+    /// **两家里有一家没填汇率就都是 None**，不拿另一家的顶上 —— 那会得到一个
+    /// 看起来精确的错数字，而且没有任何地方会报错。
+    pub revenue_cny: Option<f64>,
+    pub cost_cny: Option<f64>,
+    pub margin_cny: Option<f64>,
+    /// 折不出来的时候说清楚是**哪一家**没填汇率，否则运维不知道该去填谁。
+    pub fx_note: String,
     /// 真实成本 = Σ(真实 token × 录入单价)。
     ///
     /// **只有这个出口用过的模型全都录了价才有值。** 少录一个就是 None ——
@@ -301,12 +332,16 @@ pub struct ReconRow {
     pub unpriced_models: Vec<String>,
     /// 这一行的成本里，有多少美元是按「官方价 × 倍率」推出来的。
     pub derived_cost_usd: f64,
+    /// 推算部分折人民币。
+    pub derived_cost_cny: Option<f64>,
     /// 这一行的调用/收入来自**按出口聚合的老表**（那段流量发生在按模型记账上线之前）。
     /// 成本拆不出来不是因为没录价，是因为没有模型维度可以乘单价。
     pub legacy_only: bool,
     /// 余额读数差出来的成本。和上面那个各自独立，用来**互相印证** ——
     /// 两个都有而且对不上，说明单价录错了或者中转在按另一份价目表收费。
     pub cost_by_balance_usd: Option<f64>,
+    /// 余额口径折人民币。余额读数天生就是那家中转的面值单位，同样要折。
+    pub cost_by_balance_cny: Option<f64>,
     pub balance_basis: Option<&'static str>,
     pub balance_note: String,
     /// 按模型展开。界面点开一行就是它，也是录价的地方。
@@ -389,9 +424,38 @@ fn derived_price(endpoint_id: uuid::Uuid, model_id: &str, ratio: f64) -> Option<
 /// 后果不是随机误差，是**系统性单向偏差**：收入那一侧一直算了写入
 /// （`compute_cost` 里的 write_tok），成本这一侧当 0，于是毛利被高估，
 /// 而且缓存命中率越高的模型账面越漂亮、实际越亏。
+/// 这一份用量的 `prompt_tokens` 含不含缓存读。
+///
+/// 有记录就照记录（写进库的那一刻从回执上读到的，见 `BillTokens`）。
+/// 老行没有这一列，只能推：`cached > prompt` 在「含」的形状下**不可能**发生，
+/// 出现了就一定是 Anthropic 形状；同理 Anthropic 才会单独报缓存写入。
+/// 两个都不成立就按「含」算 —— 那是这一列上线之前的行为，不制造新的偏差。
+fn prompt_is_inclusive(u: &ModelUsage) -> bool {
+    if let Some(v) = u.prompt_includes_cached {
+        return v;
+    }
+    !(u.cached_tokens > u.prompt_tokens || u.cache_creation_tokens > 0)
+}
+
+/// # 两家的回执形状不一样，夹一刀会把缓存读整段丢掉
+///
+/// 上一版写的是 `cached = min(cached, prompt)`。对 OpenAI 形状（prompt 含缓存读）
+/// 是对的；对 Anthropic 形状（prompt **不**含）就把超出的部分全丢了。
+/// 线上实测最近 7 天：claude-fable-5 输入 764,233 / 缓存读 10,818,782，
+/// claude-opus-5 输入 569,259 / 缓存读 6,436,239 —— 一共 1590 万个缓存读 token
+/// 从成本里消失，还顺带把那几十万新鲜输入按缓存价算了。
+///
+/// 偏差是**单向**的：成本低估、毛利高估，缓存命中率越高错得越狠。计费那边
+/// （`compute_cost`）一直是按形状分开算的，只有对账这一侧在夹刀 —— 于是同一批
+/// token，收钱按一套算、算成本按另一套算。
 fn model_cost_usd(u: &ModelUsage, p: &ModelPrice) -> f64 {
-    let cached = u.cached_tokens.max(0).min(u.prompt_tokens.max(0));
-    let fresh = (u.prompt_tokens.max(0) - cached) as f64;
+    let (fresh, cached) = if prompt_is_inclusive(u) {
+        let cached = u.cached_tokens.max(0).min(u.prompt_tokens.max(0));
+        ((u.prompt_tokens.max(0) - cached) as f64, cached)
+    } else {
+        // Anthropic 形状：prompt 就是新鲜输入，缓存读是另外一份，不相减也不夹。
+        (u.prompt_tokens.max(0) as f64, u.cached_tokens.max(0))
+    };
     let cached_price = p.cached_per_mtok.unwrap_or(p.input_per_mtok);
     let write_price = p
         .cache_write_per_mtok
@@ -432,7 +496,8 @@ pub async fn admin_reconciliation(
                 SUM(prompt_tokens)::bigint     AS prompt_tokens, \
                 SUM(completion_tokens)::bigint AS completion_tokens, \
                 SUM(cached_tokens)::bigint     AS cached_tokens, \
-                SUM(cache_creation_tokens)::bigint AS cache_creation_tokens \
+                SUM(cache_creation_tokens)::bigint AS cache_creation_tokens, \
+                bool_and(prompt_includes_cached)   AS prompt_includes_cached \
          FROM endpoint_model_usage \
          WHERE day > current_date - $1::int \
          GROUP BY endpoint_id, model_id",
@@ -556,14 +621,19 @@ pub async fn admin_reconciliation(
         );
         // 多带一个倍率：抓不到价目时要靠它从官方价推算（见 derived_price）。
         // 线路自带地址没有这一列，按 1.0 —— 那正是「我按官方价进货」的意思。
-        let mut targets: Vec<(uuid::Uuid, String, bool, bool, f64)> =
-            vec![(r.id, format!("{}（自带地址）", r.label), true, true, 1.0)];
+        let mut targets: Vec<(uuid::Uuid, String, bool, bool, f64, String)> =
+            vec![(r.id, format!("{}（自带地址）", r.label), true, true, 1.0, r.base_url.clone())];
         for e in eps.get(&r.id).into_iter().flatten() {
             let label = if e.label.trim().is_empty() { "未命名出口".to_string() } else { e.label.clone() };
-            targets.push((e.id, label, false, e.active, e.cost_ratio));
+            targets.push((e.id, label, false, e.active, e.cost_ratio, e.base_url.clone()));
         }
 
-        for (id, label, is_own, active, ratio) in targets {
+        // 收入折人民币用的是**线路自带地址那家**的汇率：`revenue_usd` 来自
+        // `compute_cost` 的「官方价 × 线路 rate」，而线路的 rate 是照着自带地址那家
+        // 的价目定的，所以它的量纲属于那一家。成本则各折各家。
+        let rev_rate = crate::relay_rates::usd_per_cny(&r.base_url);
+
+        for (id, label, is_own, active, ratio, base_url) in targets {
             let used = by_ep.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
             let mut models: Vec<ModelRow> = Vec::new();
             let mut unpriced: Vec<String> = Vec::new();
@@ -627,6 +697,26 @@ pub async fn admin_reconciliation(
             let margin = row_cost.map(|c| revenue - c);
             let (bal_cost, bal_basis, _samples, bal_note) = balance_cost(edges.get(&id));
 
+            // 折人民币。两家的汇率缺一不可 —— 拿另一家顶上会得到一个看起来精确的错数字。
+            let cost_rate = crate::relay_rates::usd_per_cny(&base_url);
+            let fx_note = match (rev_rate, cost_rate) {
+                (Some(_), Some(_)) => String::new(),
+                (None, Some(_)) => format!("线路自带地址那家（{}）还没填充值汇率，收入折不出人民币", host_of(&r.base_url)),
+                (Some(_), None) => format!("这个出口那家（{}）还没填充值汇率，成本折不出人民币", host_of(&base_url)),
+                (None, None) => format!(
+                    "两家都没填充值汇率（{} 和 {}），这一行折不出人民币",
+                    host_of(&r.base_url),
+                    host_of(&base_url)
+                ),
+            };
+            let rev_cny = rev_rate.filter(|v| *v > 0.0).map(|v| revenue / v);
+            let to_cny = |x: f64| cost_rate.filter(|v| *v > 0.0).map(|v| x / v);
+            let cost_cny = row_cost.and_then(to_cny);
+            let margin_cny = match (rev_cny, cost_cny) {
+                (Some(a), Some(b)) => Some(a - b),
+                _ => None,
+            };
+
             rows.push(ReconRow {
                 endpoint_id: id,
                 route_id: r.id,
@@ -639,12 +729,23 @@ pub async fn admin_reconciliation(
                 revenue_usd: revenue,
                 cost_usd: row_cost,
                 margin_usd: margin,
-                // 收入是 0 时毛利率没有意义（分母为零），不报 0% —— 那读起来像「打平」。
-                margin_pct: margin.filter(|_| revenue > 0.0).map(|m| m / revenue * 100.0),
+                revenue_cny: rev_cny,
+                cost_cny,
+                margin_cny,
+                fx_note,
+                // 毛利率必须用**折过的**两个数算。用原来那两个算出来的百分比是错的：
+                // 分子分母不是同一种货币，线上清衍那一行就是这么变成 -144% 的。
+                // 折不出来时不报百分比 —— 宁可空着，也不给一个方向都可能相反的数。
+                margin_pct: margin_cny
+                    .zip(rev_cny)
+                    .filter(|(_, rev)| *rev > 0.0)
+                    .map(|(m, rev)| m / rev * 100.0),
                 unpriced_models: unpriced,
                 derived_cost_usd: derived_cost,
+                derived_cost_cny: to_cny(derived_cost),
                 legacy_only: legacy_hit.is_some(),
                 cost_by_balance_usd: bal_cost,
+                cost_by_balance_cny: bal_cost.and_then(to_cny),
                 balance_basis: bal_basis,
                 balance_note: bal_note,
                 models,
@@ -653,8 +754,11 @@ pub async fn admin_reconciliation(
     }
 
     // 亏得最狠的排最前：这一页是用来发现问题的，不是用来浏览的。
-    // 没有毛利数的（价没录全）沉到最后，而不是混在中间冒充打平。
-    rows.sort_by(|a, b| match (a.margin_usd, b.margin_usd) {
+    // 没有毛利数的（价没录全、或者汇率没填）沉到最后，而不是混在中间冒充打平。
+    //
+    // 按**折过的**人民币毛利排。按 margin_usd 排的话，一个跨中转的出口只因为它那家
+    // 汇率大就被顶到「亏得最狠」的第一位 —— 线上清衍就是这么排到榜首的，而它其实赚钱。
+    rows.sort_by(|a, b| match (a.margin_cny, b.margin_cny) {
         (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -667,6 +771,16 @@ pub async fn admin_reconciliation(
     let counted: Vec<&ReconRow> = rows.iter().filter(|r| r.cost_usd.is_some()).collect();
     let cost_total: f64 = counted.iter().filter_map(|r| r.cost_usd).sum();
     let counted_revenue: f64 = counted.iter().map(|r| r.revenue_usd).sum();
+    // 合计的人民币口径只加**两边都折得出来**的行。少折一家就把那一行整个排除，
+    // 而不是拿没折的数混进来 —— 混进去的话合计的单位就不成立了。
+    let fx_ok: Vec<&ReconRow> = rows
+        .iter()
+        .filter(|r| r.cost_cny.is_some() && r.revenue_cny.is_some())
+        .collect();
+    let cost_total_cny: f64 = fx_ok.iter().filter_map(|r| r.cost_cny).sum();
+    let revenue_total_cny: f64 = fx_ok.iter().filter_map(|r| r.revenue_cny).sum();
+    // 有多少行因为汇率没填而进不了人民币合计。不报的话合计会看起来是全量的。
+    let fx_missing = rows.len() - fx_ok.len();
     // 还差多少个模型没录价 —— 这是「离能看真数还有多远」的唯一进度条。
     let unpriced_total: usize = rows.iter().map(|r| r.unpriced_models.len()).sum();
 
@@ -686,6 +800,12 @@ pub async fn admin_reconciliation(
             "unpriced_models": unpriced_total,
             // 合计里有多少是推算的。分开报，让「实测覆盖了多少」一眼可见。
             "derived_cost_usd": counted.iter().map(|r| r.derived_cost_usd).sum::<f64>(),
+            "revenue_cny": revenue_total_cny,
+            "cost_cny": cost_total_cny,
+            "margin_cny": revenue_total_cny - cost_total_cny,
+            "fx_rows": fx_ok.len(),
+            "fx_missing_rows": fx_missing,
+            "derived_cost_cny": fx_ok.iter().filter_map(|r| r.derived_cost_cny).sum::<f64>(),
         },
     })))
 }
@@ -700,6 +820,182 @@ pub struct SavePriceReq {
     pub cached_per_mtok: Option<f64>,
     #[serde(default)]
     pub note: String,
+}
+
+/// 批量录价的请求。
+#[derive(serde::Deserialize)]
+pub struct BulkPriceReq {
+    pub endpoint_id: uuid::Uuid,
+    /// 一行一个模型，随便什么分隔符。见 `parse_price_lines`。
+    pub text: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// 从粘贴的文本里解析出 (模型, 输入, 输出, 缓存读, 缓存写)。
+///
+/// # 为什么需要它
+///
+/// 自研网关（线上 api.teamorouter.com，挂了 9 个出口）**没有任何可拉的价目接口** ——
+/// 它的价目只在自己前端里动态渲染，服务端拿不到；被人机校验挡住的面板同理。
+/// 对这些站手工录是唯一的路，而原来的表单一次只能填一个模型、而且只对**已经有流量**
+/// 的模型才出现 —— 一个还没跑过的新出口一条都填不进去。那等于「只能手工录」这句话
+/// 在实现上是空的。
+///
+/// # 解析口径
+///
+/// 单位一律是**美元每百万 token**，和界面上那句「进价（$ / 百万 token）」一致，
+/// 也和 `endpoint_model_price` 的列一致。这一点必须在界面上写死写明 ——
+/// 单位靠猜是这套账里最贵的一类错。
+///
+/// 每行取第一个字段当模型名，后面的数字依次是 输入 / 输出 / 缓存读 / 缓存写。
+/// 至少要有输入和输出两个数，否则这一行**报错回去**，不静默跳过 ——
+/// 粘 30 行进去只存了 12 行而不说，比什么都没存糟。
+pub fn parse_price_lines(text: &str) -> (Vec<(String, f64, f64, Option<f64>, Option<f64>)>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut bad = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        // **千分位逗号必须先挡掉。** 逗号在这里同时是字段分隔符和千分位符号，
+        // 两种含义分不开：`1,250` 到底是「1 和 250 两个字段」还是「一千二百五」？
+        // 猜任何一种都会静默产生一个看起来完全正常的错数字。所以不猜，退回去让人
+        // 把逗号去掉 —— 一次多问一句，好过一张错的价目表。
+        if has_thousands_comma(line) {
+            bad.push(format!(
+                "第 {} 行「{}」：数字里的逗号分不清是千分位还是分隔符，请去掉千分位逗号",
+                i + 1,
+                trunc(line)
+            ));
+            continue;
+        }
+        // 分隔符什么都收：制表、逗号（半角全角）、顿号、竖线、多个空格。
+        // 从中转后台直接框选复制过来的多半是制表符或多空格。
+        let parts: Vec<&str> = line
+            .split(|c: char| c == '\t' || c == ',' || c == '，' || c == '、' || c == '|' || c.is_whitespace())
+            .filter(|x| !x.trim().is_empty())
+            .collect();
+        let Some((name, rest)) = parts.split_first() else { continue };
+        let name = name.trim();
+        let nums: Vec<f64> = rest.iter().filter_map(|x| parse_money(x)).collect();
+        if name.is_empty() || nums.len() < 2 {
+            bad.push(format!("第 {} 行「{}」：认不出「模型名 输入价 输出价」这三样", i + 1, trunc(line)));
+            continue;
+        }
+        // 负数一定是填错了。放进去成本会变成负数，那一行会显示成「毛利高于收入」。
+        if nums.iter().any(|v| *v < 0.0 || !v.is_finite()) {
+            bad.push(format!("第 {} 行「{}」：价格不能是负数", i + 1, trunc(line)));
+            continue;
+        }
+        // 每百万 token 上万美元一定是单位填错了（多半把「每 token」的数填进来了，
+        // 或者把人民币当美元）。挡住并说清楚，而不是收下一个天价。
+        if nums.iter().any(|v| *v > 10_000.0) {
+            bad.push(format!(
+                "第 {} 行「{}」：单价超过每百万 token 一万美元，多半是单位填错了",
+                i + 1,
+                trunc(line)
+            ));
+            continue;
+        }
+        out.push((
+            name.to_string(),
+            nums[0],
+            nums[1],
+            nums.get(2).copied(),
+            nums.get(3).copied(),
+        ));
+    }
+    (out, bad)
+}
+
+/// 有没有 `1,250` 这种千分位写法：数字、逗号、紧跟正好三位数字、再后面不是数字。
+fn has_thousands_comma(line: &str) -> bool {
+    let b: Vec<char> = line.chars().collect();
+    for i in 0..b.len() {
+        if b[i] != ',' || i == 0 || !b[i - 1].is_ascii_digit() {
+            continue;
+        }
+        let d: Vec<char> = b[i + 1..].iter().copied().take_while(|c| c.is_ascii_digit()).collect();
+        if d.len() == 3 && !b.get(i + 4).is_some_and(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 一个字段里的钱。收 `$1.25`、`0.28/M`、`￥3`（符号只是被剥掉，
+/// **不做币种换算** —— 换算要汇率，而这里没有，猜一个是错的）。
+fn parse_money(s: &str) -> Option<f64> {
+    let t: String = s
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if t.is_empty() || t == "-" || t == "." {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+fn trunc(s: &str) -> String {
+    // 按**字符**截，不按字节 —— 按字节切会在中文中间断开直接 panic。
+    let t: String = s.chars().take(28).collect();
+    if t.chars().count() < s.chars().count() { format!("{t}…") } else { t }
+}
+
+/// `POST /api/admin/endpoint-prices/bulk` —— 一次录一个出口的一整张价目表。
+pub async fn admin_bulk_prices(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(req): Json<BulkPriceReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    admin_only(&claims)?;
+    let (rows, bad) = parse_price_lines(&req.text);
+    if rows.is_empty() {
+        return Err(AppError::bad(if bad.is_empty() {
+            "没解析出任何一行".to_string()
+        } else {
+            format!("一行都没认出来：\n{}", bad.join("\n"))
+        }));
+    }
+    let mut saved = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for (model, inp, outp, cached, cache_write) in rows {
+        let r = sqlx::query(
+            "INSERT INTO endpoint_model_price \
+               (endpoint_id, model_id, input_per_mtok, output_per_mtok, cached_per_mtok, \
+                cache_write_per_mtok, note) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (endpoint_id, model_id) DO UPDATE SET \
+               input_per_mtok = EXCLUDED.input_per_mtok, \
+               output_per_mtok = EXCLUDED.output_per_mtok, \
+               cached_per_mtok = EXCLUDED.cached_per_mtok, \
+               cache_write_per_mtok = EXCLUDED.cache_write_per_mtok, \
+               note = EXCLUDED.note, \
+               updated_at = now()",
+        )
+        .bind(req.endpoint_id)
+        .bind(model.trim())
+        .bind(inp)
+        .bind(outp)
+        .bind(cached)
+        .bind(cache_write)
+        .bind(req.note.trim())
+        .execute(&state.db)
+        .await;
+        match r {
+            Ok(_) => saved += 1,
+            // 写失败逐条报出来。整批回滚会让「29 条对的」也白填，
+            // 而静默吞掉会让人以为全存上了。
+            Err(e) => failed.push(format!("{model}：{e}")),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "saved": saved,
+        "skipped": bad,
+        "failed": failed,
+    })))
 }
 
 /// `POST /api/admin/endpoint-prices` —— 录一个出口上某个模型的真实进价。
@@ -928,11 +1224,44 @@ async fn account_rates(state: &AppState, days: i64) -> Vec<AccountRate> {
         //   · 缓存读按全价算 —— 高估（实测 grok-4.6 七百万输入里四百万是缓存读）；
         //   · 缓存写完全不算 —— 低估，而它常常是成本大头。
         // 同一个「成本」有两份实现，这是这个仓库里反复吃亏的那种形状。
+        // 先量**定价覆盖率**：这一段时间里，有多少 token 是我们真的知道单价的。
+        //
+        // 下面那条 predicted 是内连接 endpoint_auto_price —— 没抓到价的模型对分子贡献 0，
+        // 而分母（余额掉账）覆盖这个账户的**全部**消耗。于是「我们没录价」会显示成
+        // 「中转多收了 2383%」，页面还把原因穷举成「中转按另一份价收费 / 我们的表过期了」，
+        // 真实原因根本不在其中 —— 这是在拿自己的缺口去指控对方。
+        //
+        // 出口明细那一侧早就有相反的规矩：`row_cost = unpriced.is_empty().then_some(cost)`，
+        // 注释写着「少录一个模型的价，整行成本就是未知」，还有测试钉着。
+        // 账户这一侧照抄同一条规矩，仓库里就只有一条口径而不是两条。
+        let coverage: Option<(f64, i64, i64)> = sqlx::query_as(
+            "SELECT COALESCE(SUM(u.prompt_tokens + u.completion_tokens) \
+                      FILTER (WHERE p.model_id IS NOT NULL), 0)::float8 \
+                    / NULLIF(SUM(u.prompt_tokens + u.completion_tokens), 0), \
+                    count(DISTINCT u.model_id) FILTER (WHERE p.model_id IS NULL), \
+                    count(DISTINCT u.model_id) \
+             FROM endpoint_model_usage u \
+             LEFT JOIN endpoint_auto_price p \
+               ON p.endpoint_id = u.endpoint_id AND p.model_id = u.model_id \
+             WHERE u.endpoint_id = ANY($1) AND u.day > current_date - $2::int",
+        )
+        .bind(&ids)
+        .bind(days as i32)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        let (priced_share, unpriced_models, total_models) =
+            coverage.unwrap_or((0.0, 0, 0));
+
+        // 输入怎么拆成「新鲜 + 缓存读」必须和 `model_cost_usd` 同一套判据：
+        // 两家回执形状不同，硬夹 `LEAST(cached, prompt)` 会把 Anthropic 那边超出的
+        // 缓存读整段丢掉（线上 7 天 1590 万个 token）。判据在 `prompt_is_inclusive`，
+        // 这里是它的 SQL 版本，逐字对应：有记录照记录，没记录才按两个不可能条件推。
         let predicted: Option<f64> = sqlx::query_scalar(
             "SELECT SUM( \
-                 GREATEST(u.prompt_tokens - LEAST(u.cached_tokens, u.prompt_tokens), 0) \
-                   * p.input_per_mtok \
-                 + LEAST(u.cached_tokens, u.prompt_tokens) \
+                 s.fresh_tokens * p.input_per_mtok \
+                 + s.cache_read_tokens \
                    * COALESCE(p.cached_per_mtok, p.input_per_mtok) \
                  + u.cache_creation_tokens \
                    * COALESCE(p.cache_write_per_mtok, p.input_per_mtok * 1.25) \
@@ -941,6 +1270,16 @@ async fn account_rates(state: &AppState, days: i64) -> Vec<AccountRate> {
              FROM endpoint_model_usage u \
              JOIN endpoint_auto_price p \
                ON p.endpoint_id = u.endpoint_id AND p.model_id = u.model_id \
+             CROSS JOIN LATERAL (SELECT COALESCE(u.prompt_includes_cached, \
+                   NOT (u.cached_tokens > u.prompt_tokens \
+                        OR u.cache_creation_tokens > 0)) AS incl) x \
+             CROSS JOIN LATERAL (SELECT \
+                 CASE WHEN x.incl \
+                      THEN GREATEST(u.prompt_tokens - LEAST(u.cached_tokens, u.prompt_tokens), 0) \
+                      ELSE GREATEST(u.prompt_tokens, 0) END AS fresh_tokens, \
+                 CASE WHEN x.incl \
+                      THEN LEAST(u.cached_tokens, u.prompt_tokens) \
+                      ELSE GREATEST(u.cached_tokens, 0) END AS cache_read_tokens) s \
              WHERE u.endpoint_id = ANY($1) AND u.day > current_date - $2::int",
         )
         .bind(&ids)
@@ -988,8 +1327,27 @@ async fn account_rates(state: &AppState, days: i64) -> Vec<AccountRate> {
             .map(|d| (chrono::Utc::now().date_naive() - d).num_days() + 1)
             .unwrap_or(0);
         let short = covered_days > 0 && covered_days < days as i64;
+        // 价没录全就**不给这个百分比**。
+        //
+        // 分子只算得出有价那部分，分母是全部消耗 —— 差多少完全取决于我们漏录了多少，
+        // 和中转怎么收费无关。给一个这样算出来的数，等于拿自己的缺口去指控对方。
+        // 这条和出口明细的 `unpriced.is_empty().then_some(cost)` 是同一条规矩。
+        let priced_enough = priced_share >= 0.999;
+        let (predicted, gap) = if priced_enough {
+            (predicted, gap)
+        } else {
+            (None, None)
+        };
+
         let note = if !note.is_empty() {
             note
+        } else if !priced_enough && total_models > 0 {
+            format!(
+                "{total_models} 个模型里有 {unpriced_models} 个没抓到价，\
+                 只覆盖了 {:.0}% 的 token —— 剩下那部分的成本算不出来，这一段没法对账。\
+                 差的不是中转，是我们自己的价目",
+                priced_share * 100.0,
+            )
         } else if total == 0 {
             "这段时间这个账户没有任何 token 消耗，反推不出单价".into()
         } else if short {
@@ -1022,6 +1380,19 @@ async fn account_rates(state: &AppState, days: i64) -> Vec<AccountRate> {
 ///
 /// 返回 (成本, 口径, 采样点数, 说明)。成本为 None 时说明里一定有一句话 ——
 /// 「这里没有数字」和「为什么没有」必须一起给，否则面板上一片横杠没人知道该做什么。
+/// 只取域名，用来在提示里指名道姓说是哪一家没填汇率。
+/// 不回完整 URL：查询串里可能有人把密钥写在了地址上。
+fn host_of(base_url: &str) -> String {
+    base_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 fn balance_cost(e: Option<&BalanceEdge>) -> (Option<f64>, Option<&'static str>, i64, String) {
     let Some(e) = e else {
         return (None, None, 0, "这个出口还没有余额读数（多数中转的余额接口认的是控制台令牌，不是调用密钥）".into());
@@ -1115,6 +1486,9 @@ mod tests {
             // 老的这几条测试都是「没有缓存写入」的形态 —— 补 0 之后它们的期望值
             // 一个字都不用改，这正说明这次改动没动到任何一条没有写入的账。
             cache_creation_tokens: 0,
+            // 这几条测的是 OpenAI 形状（prompt 含缓存读），也就是这个夹刀本来就正确的
+            // 那一半。显式写出来，免得哪天默认值一变，它们静默换了被测对象。
+            prompt_includes_cached: Some(true),
         }
     }
 
@@ -1135,6 +1509,166 @@ mod tests {
     /// `prompt_tokens` 是**含**缓存命中的总输入（各家 usage 帧都是这个口径）。
     /// 不减直接乘输入价，命中率高的模型成本会被高估好几倍 —— 而缓存价通常只有输入价
     /// 的十分之一，正是它让「同一段对话第二轮便宜得多」成立。
+    #[test]
+    fn anthropic_cache_reads_are_not_clamped_away() {
+        // Anthropic 形状：prompt **不含**缓存读。线上 claude-opus-5 就是这个样子
+        // （最近 7 天：输入 569,259、缓存读 6,436,239）。
+        let mut u = usage(30, 80_310, 100);
+        u.prompt_includes_cached = Some(false);
+        let p = price(5.0, 25.0, Some(0.5));
+
+        // 新鲜输入 30 个按输入价，缓存读 80,310 个按缓存价 —— 一个都不许丢。
+        let want = (30.0 * 5.0 + 80_310.0 * 0.5 + 100.0 * 25.0) / 1_000_000.0;
+        assert!((model_cost_usd(&u, &p) - want).abs() < 1e-12, "缓存读被夹掉了");
+
+        // 夹刀版本会算成：cached=min(80310,30)=30、fresh=0，也就是只认 30 个
+        // 缓存 token，8 万个凭空消失。确认新写法确实比它大得多。
+        let clamped = (30.0 * 0.5 + 100.0 * 25.0) / 1_000_000.0;
+        assert!(model_cost_usd(&u, &p) > clamped * 1.5, "还在按夹刀算");
+
+        // OpenAI 形状（prompt 含缓存读）一个字不能变 —— 那一半本来就是对的。
+        let mut o = usage(1_000, 400, 100);
+        o.prompt_includes_cached = Some(true);
+        let want_o = (600.0 * 5.0 + 400.0 * 0.5 + 100.0 * 25.0) / 1_000_000.0;
+        assert!((model_cost_usd(&o, &p) - want_o).abs() < 1e-12, "OpenAI 那一半被改坏了");
+    }
+
+    /// 没有记录形状的老行只能推，而推的判据必须是**不可能反过来**的那两个。
+    #[test]
+    fn an_old_row_without_the_flag_is_inferred_not_guessed() {
+        // cached > prompt 在「含缓存」的形状下不可能发生 —— 出现了就一定是 Anthropic。
+        let mut a = usage(30, 80_310, 0);
+        a.prompt_includes_cached = None;
+        assert!(!prompt_is_inclusive(&a), "cached 超过 prompt 还当成含缓存 —— 那一段会被夹掉");
+
+        // 只有 Anthropic 会单独报缓存写入。
+        let mut b = usage(1_000, 100, 0);
+        b.prompt_includes_cached = None;
+        b.cache_creation_tokens = 500;
+        assert!(!prompt_is_inclusive(&b));
+
+        // 两个都不成立 → 按「含」算，也就是这一列上线之前的行为，不制造新偏差。
+        let mut c = usage(1_000, 100, 0);
+        c.prompt_includes_cached = None;
+        assert!(prompt_is_inclusive(&c));
+
+        // 有记录时**记录说了算**，不许被推翻 —— 推只是老行的兜底。
+        let mut d = usage(1_000, 100, 0);
+        d.prompt_includes_cached = Some(false);
+        assert!(!prompt_is_inclusive(&d), "存着的形状被推理覆盖了");
+    }
+
+    /// 账单核对那条 SQL 必须和 `model_cost_usd` 用**同一套**拆法。
+    ///
+    /// 两处分叉的话，一边说成本 X、另一边说 Y，而「差额」那一栏正是拿它们相减的。
+    #[test]
+    fn the_predicted_sql_splits_input_the_same_way() {
+        let body = fn_body(&src(), "async fn account_rates(");
+        assert!(
+            body.contains("COALESCE(u.prompt_includes_cached,"),
+            "predicted 那条 SQL 没看回执形状 —— Anthropic 的缓存读会被夹掉",
+        );
+        assert!(
+            body.contains("ELSE GREATEST(u.cached_tokens, 0) END AS cache_read_tokens"),
+            "predicted 在 Anthropic 形状下还在夹 cached",
+        );
+        assert!(
+            body.contains("ELSE GREATEST(u.prompt_tokens, 0) END AS fresh_tokens"),
+            "predicted 在 Anthropic 形状下还在拿 prompt 减 cached",
+        );
+        // 推理兜底两边逐字一致，否则老行在两处会被判成不同形状。
+        assert!(
+            body.contains("NOT (u.cached_tokens > u.prompt_tokens"),
+            "老行的推理判据和 prompt_is_inclusive 对不上",
+        );
+    }
+
+    #[test]
+    fn the_two_dollar_signs_are_not_the_same_currency() {
+        // 这条测的是**量纲**，不是某个数值。
+        //
+        // 收入 `revenue_usd` 来自 compute_cost 的「官方价 × 100 × 线路 rate」，量纲属于
+        // **线路自带地址那家**；成本 `cost_usd` 是「真实 token × 这个出口的进价」，而进价
+        // 无论人工录的还是按倍率推的，单位都是**这个出口那家中转的余额面值**。
+        // 两家充值汇率差多少，直接相减出来的毛利就错多少倍。
+        //
+        // 线上真实数据：清衍挂在 Claude 线路下，自带那家 ¥1 买 1 面值、清衍 ¥1 买 10 面值。
+        // 页面曾显示「收 $4.46 / 花 $10.89 / 毛利 -$6.43（-144%）」，而清衍换算后
+        // 每花掉一美元官方价只要 ¥0.65，比自带地址还便宜。同一条流水两个相反结论。
+        let body = fn_body(&src(), "pub async fn admin_reconciliation(");
+
+        // 收入折的是**线路**那家，成本折的是**出口**那家 —— 两个基准必须分开取。
+        assert!(
+            body.contains("let rev_rate = crate::relay_rates::usd_per_cny(&r.base_url);"),
+            "收入没按线路自带那家的汇率折 —— 它的量纲就是那一家的",
+        );
+        assert!(
+            body.contains("let cost_rate = crate::relay_rates::usd_per_cny(&base_url);"),
+            "成本没按这个出口那家的汇率折 —— 跨中转的行会整整错一个汇率的倍数",
+        );
+        assert!(
+            body.contains("crate::relay_rates::usd_per_cny(&r.base_url)")
+                && body.contains("crate::relay_rates::usd_per_cny(&base_url)"),
+            "两个基准取成同一家了 —— 那等于没折",
+        );
+
+        // 毛利率必须用折过的算。这是页面上最显眼、也最容易被信以为真的那个数。
+        assert!(
+            body.contains("margin_pct: margin_cny"),
+            "毛利率还在拿两种货币相减的结果算 —— 那个百分比连正负号都可能是反的",
+        );
+        // 排序也得按折过的，否则一个赚钱的跨中转出口会被顶到「亏得最狠」榜首。
+        assert!(
+            body.contains("rows.sort_by(|a, b| match (a.margin_cny, b.margin_cny) {"),
+            "还在按未折算的毛利排序 —— 汇率大的那家会假装亏得最狠",
+        );
+
+        // 缺一家就都不给，不拿另一家顶上。
+        assert!(
+            body.contains("(Some(a), Some(b)) => Some(a - b),"),
+            "缺一边汇率时还在算毛利 —— 那是个看起来精确的错数字",
+        );
+        // 正面钉形状，不列禁用词：兜底的写法有无数种（unwrap_or / unwrap_or_default /
+        // unwrap_or_else / 提前赋个默认值……），黑名单挡不住，而漏掉一种的后果是
+        // 「没填汇率的站凭空显示成成本极低」——最该拦的恰好是这一种。
+        for shape in [
+            "let rev_cny = rev_rate.filter(|v| *v > 0.0).map(|v| revenue / v);",
+            "let to_cny = |x: f64| cost_rate.filter(|v| *v > 0.0).map(|v| x / v);",
+        ] {
+            assert!(
+                body.contains(shape),
+                "汇率缺失没有如实变成「算不出」（缺 `{shape}`）—— 一旦被兜底成某个默认值，\
+                 没填汇率的站会凭空显示成成本极低，而且没有任何地方会报错",
+            );
+        }
+    }
+
+    /// 前端不能再打 `$`。
+    ///
+    /// 服务端折好了人民币，前端要是还读 `*_usd` 那几个字段、还打美元符号，
+    /// 这一屏就一个字都没变好 —— 而且不会有任何地方报错。
+    #[test]
+    fn the_console_shows_the_converted_numbers() {
+        let ui = include_str!("../admin-ui/src/pages/Reconcile.tsx");
+        for shape in [
+            "{cny(r.revenue_cny)}",
+            "{cny(r.cost_cny)}",
+            "{cny(r.margin_cny)}",
+            "const losing = r.margin_cny !== null && r.margin_cny < 0;",
+            "value={cny(t.margin_cny)}",
+        ] {
+            assert!(
+                ui.contains(shape),
+                "出口明细那一屏还在显示未折算的数（缺 `{shape}`）",
+            );
+        }
+        // 折不出来时必须指名道姓说是哪一家没填，否则只看到一排「—」不知道去填谁。
+        assert!(
+            ui.contains("{r.fx_note}"),
+            "汇率缺失的原因没显示出来 —— 运维不知道该去补哪一家",
+        );
+    }
+
     #[test]
     fn cached_input_is_billed_at_the_cache_rate_not_the_input_rate() {
         // 100 万输入里 90 万命中缓存，输入 $3/M、缓存 $0.3/M、输出 $15/M，输出 10 万。
@@ -1349,6 +1883,7 @@ mod tests {
             completion_tokens: 1152,
             cached_tokens: 0,
             cache_creation_tokens: 61_634,
+            prompt_includes_cached: Some(true),
         };
         let p = ModelPrice {
             endpoint_id: uuid::Uuid::nil(),
@@ -1606,5 +2141,99 @@ mod tests {
         for banned in ["cost_est", "cost_ratio / r.rate", "revenue * cost_ratio"] {
             assert!(!s.contains(banned), "估算又回来了：{banned}");
         }
+    }
+
+    /// 粘贴录价：**认不出的行必须报出来**，不能静默跳过。
+    ///
+    /// 粘 30 行进去只存了 12 行而不说，比一条都没存糟得多 —— 后者你知道要重来，
+    /// 前者你以为填完了，而对账会拿那 18 个缺口按推算值顶上，看起来一切正常。
+    #[test]
+    fn pasted_prices_report_every_line_they_could_not_read() {
+        let (ok, bad) = parse_price_lines(
+            "claude-opus-5\t5\t25\n\
+             gpt-5.6-sol, 1.25, 10, 0.125\n\
+             deepseek-v4-flash $0.28 $0.42\n\
+             \n\
+             # 这是注释\n\
+             这一行没有价格\n\
+             坏价 -1 5\n\
+             单位错了 5000000 1\n",
+        );
+        assert_eq!(ok.len(), 3, "该认的没认出来");
+        assert_eq!(ok[0], ("claude-opus-5".into(), 5.0, 25.0, None, None));
+        assert_eq!(ok[1], ("gpt-5.6-sol".into(), 1.25, 10.0, Some(0.125), None));
+        assert_eq!(ok[2], ("deepseek-v4-flash".into(), 0.28, 0.42, None, None));
+
+        // 三种坏行都要各报一条，一条都不许吞。
+        assert_eq!(bad.len(), 3, "认不出的行没有全部报出来：{bad:?}");
+        assert!(bad.iter().any(|b| b.contains("没有价格")), "缺价那行没报");
+        assert!(bad.iter().any(|b| b.contains("负数")), "负价那行没报");
+        assert!(bad.iter().any(|b| b.contains("单位")), "天价那行没报");
+        // 报错要指出是第几行，否则 30 行里找不到是哪一条。
+        assert!(bad.iter().all(|b| b.starts_with("第 ")), "没说是第几行：{bad:?}");
+
+        // 空行和注释不算错，也不该被报出来。
+        assert!(!bad.iter().any(|b| b.contains("注释")));
+    }
+
+    /// 粘贴录价必须在**没有流量的出口**上也能用。
+    ///
+    /// 上一版 `ModelDetail` 在没有调用记录时直接返回一句话就完了，于是一个还没跑过
+    /// 的新出口一条价都填不进去 —— 而自研网关（没有任何可拉的价目接口）恰恰只能靠
+    /// 手工录。那等于「只能手工录」这句话在实现上是空的。
+    #[test]
+    fn the_paste_box_reaches_endpoints_with_no_traffic() {
+        let ui = include_str!("../admin-ui/src/pages/Reconcile.tsx");
+        // 空态那一支里必须也挂着粘贴框。
+        let at = ui.find("if (row.models.length === 0) {").expect("空态分支不见了");
+        let branch = &ui[at..at + 700.min(ui.len() - at)];
+        assert!(
+            branch.contains("<BulkPrices row={row} onSaved={onSaved} />"),
+            "没有流量的出口上没有粘贴框 —— 自研网关一条价都填不进去",
+        );
+        // 单位必须写在界面上。靠猜单位是这套账里最贵的一类错。
+        assert!(
+            ui.contains("美元 / 百万 token"),
+            "粘贴框没写清单位 —— 填成每 token 会差一百万倍",
+        );
+        // 认不出的行要逐条显示，不能只报一个成功数。
+        assert!(
+            ui.contains("{result.skipped.map((x) => (") && ui.contains("{result.failed.map((x) => ("),
+            "跳过和失败的行没有逐条列出来 —— 人会以为填完了",
+        );
+        // 后端那条路由要存在。
+        let main = include_str!("main.rs");
+        assert!(
+            main.contains("\"/api/admin/endpoint-prices/bulk\", post(reconcile::admin_bulk_prices)"),
+            "批量录价的路由没挂上",
+        );
+    }
+
+    /// 中文行截断按字符，不按字节 —— 按字节切会在汉字中间断开直接 panic。
+    #[test]
+    fn a_bad_chinese_line_does_not_panic() {
+        let (ok, bad) = parse_price_lines("这是一行很长很长很长很长很长很长很长很长的中文没有任何价格数字在里面");
+        assert!(ok.is_empty());
+        assert_eq!(bad.len(), 1);
+    }
+
+    /// 钱的符号只剥不换算。
+    #[test]
+    fn a_currency_symbol_is_stripped_never_converted() {
+        // 剥符号：$1.25 就是 1.25。
+        let (ok, _) = parse_price_lines("m $1.25 $10");
+        assert_eq!(ok[0].1, 1.25);
+        // **千分位逗号被拒绝，不是被猜。** 逗号在这里同时是分隔符和千分位，
+        // 猜哪一种都会静默给出一个看起来正常的错数字（`1,250` 读成 1）。
+        let (ok, bad) = parse_price_lines("m 1,250 2,500");
+        assert!(ok.is_empty(), "千分位那行被猜着读进去了");
+        assert!(bad[0].contains("千分位"), "没说清为什么拒绝：{bad:?}");
+        // 但普通的逗号分隔照常能用 —— 只有「数字,三位数字」那个形状才算歧义。
+        let (ok, _) = parse_price_lines("m,1.25,10");
+        assert_eq!(ok[0], ("m".into(), 1.25, 10.0, None, None));
+        // **人民币符号不做汇率换算** —— 换算要汇率，这里没有，猜一个就是错的。
+        // 剥成同一个数字，单位由界面上那句「$ / 百万 token」负责说清。
+        let (ok, _) = parse_price_lines("m ￥3 ￥9");
+        assert_eq!(ok[0].1, 3.0);
     }
 }

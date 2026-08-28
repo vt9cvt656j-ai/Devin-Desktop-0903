@@ -23,6 +23,11 @@ pub struct ChannelRate {
     pub id: uuid::Uuid,
     pub name: String,
     pub usd_per_cny: f64,
+    /// 这条汇率对应哪个中转域名。**空 = 假想渠道**，选路和成本都不会用到它
+    /// （迁移 20260863 原话）。控制台必须能看见这个空，否则「渠道A · ¥1 买 $10」
+    /// 看起来和真实渠道一模一样，而它一条生产流量都没承载过 ——
+    /// 定价试算默认选中的正是它，于是那一屏永远算出来是赚的。
+    pub host: String,
     pub note: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,

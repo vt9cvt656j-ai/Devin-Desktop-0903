@@ -166,6 +166,12 @@ pub struct SiteUser {
 }
 
 /// GET /api/admin/relay-rates
+/// 混合配比看多久的真实用量。
+///
+/// 提成常量是因为页面上有两处文案照着它写（「自己最近 N 天真实跑出来的」「最近 N 天 M 次调用」）。
+/// 窗口改了而文案没改的话，页面会拿一段不存在的时间去为一个数字背书。
+const MIX_WINDOW_DAYS: i64 = 30;
+
 pub async fn admin_list(
     State(state): State<AppState>,
     claims: Claims,
@@ -282,6 +288,7 @@ pub async fn admin_list(
         "sites": rows.len(),
         "with_rate": known,
         "all_known": known == rows.len() && !rows.is_empty(),
+        "mix_window_days": MIX_WINDOW_DAYS,
     })))
 }
 
@@ -607,8 +614,9 @@ pub async fn admin_model_prices(
     let mix: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT model_id, SUM(prompt_tokens)::bigint, SUM(completion_tokens)::bigint, \
                 SUM(cached_tokens)::bigint, SUM(calls)::bigint \
-         FROM endpoint_model_usage WHERE day >= current_date - 30 GROUP BY model_id",
+         FROM endpoint_model_usage WHERE day >= current_date - $1::int GROUP BY model_id",
     )
+    .bind(MIX_WINDOW_DAYS as i32)
     .fetch_all(&state.db)
     .await?;
     let mix: HashMap<String, (i64, i64, i64, i64)> = mix

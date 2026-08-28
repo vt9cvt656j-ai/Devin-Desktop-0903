@@ -149,6 +149,72 @@ pub async fn record_fail(state: &AppState, route_id: Uuid, status: u16) {
         .await;
 }
 
+/// 把这一次尝试的**真实结果**记进库：哪条线路、哪个模型、成没成、多快。
+///
+/// # 和 model_health / Redis 连败计数的区别
+///
+/// `model_health` 探的是不带凭据的 GET —— 「门在不在」，密钥过期和额度用尽它一律报绿
+/// （实测「Claude 强力版」前门可达 99.93%，而真实成功在 43 小时前）。
+/// Redis 那个连败计数按线路、没有模型维度、没有历史，算不出成功率。
+///
+/// 这里记的是**真实流量的结果**，而且成功和失败记在同一张表里 —— 成功那一半原本就有
+/// （model_usage 每次扣费写一行），缺的一直是失败，于是分母永远少一块。
+///
+/// # 不等它写完
+///
+/// 和 `spawn_ok` 一样 tokio::spawn 出去。派单路径上一个 await 都不加：
+/// 观测失败绝不能让用户多等一毫秒。写不进去的后果只是这一格「不知道」，
+/// 而「不知道」不会被判成绿。
+pub fn spawn_attempt(
+    state: &AppState,
+    endpoint_id: Uuid,
+    model_id: &str,
+    ok: bool,
+    status: Option<u16>,
+    ttfb_ms: Option<u64>,
+) {
+    if model_id.trim().is_empty() {
+        return;
+    }
+    let st = state.clone();
+    let model = model_id.to_string();
+    // 成功才累加耗时：失败那次的耗时是「等超时等了多久」，混进平均值会让一条
+    // 一直超时的线路看起来「很慢但在服务」，而它其实一次都没成。
+    let (ms_sum, ms_n) = match (ok, ttfb_ms) {
+        (true, Some(ms)) => (ms.min(600_000) as i64, 1i64),
+        _ => (0, 0),
+    };
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            "INSERT INTO route_attempt \
+               (day, endpoint_id, model_id, ok_calls, fail_calls, last_status, ttfb_ms_sum, ttfb_ms_n, last_ok_at, last_fail_at) \
+             VALUES (current_date, $1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
+               ok_calls    = route_attempt.ok_calls   + EXCLUDED.ok_calls, \
+               fail_calls  = route_attempt.fail_calls + EXCLUDED.fail_calls, \
+               last_status = COALESCE(EXCLUDED.last_status, route_attempt.last_status), \
+               ttfb_ms_sum = route_attempt.ttfb_ms_sum + EXCLUDED.ttfb_ms_sum, \
+               ttfb_ms_n   = route_attempt.ttfb_ms_n   + EXCLUDED.ttfb_ms_n, \
+               last_ok_at   = GREATEST(route_attempt.last_ok_at,   EXCLUDED.last_ok_at), \
+               last_fail_at = GREATEST(route_attempt.last_fail_at, EXCLUDED.last_fail_at), \
+               updated_at  = now()",
+        )
+        .bind(endpoint_id)
+        .bind(&model)
+        .bind(if ok { 1i64 } else { 0 })
+        .bind(if ok { 0i64 } else { 1 })
+        .bind(status.map(|s| s as i32))
+        .bind(ms_sum)
+        .bind(ms_n)
+        // 成功写一列、失败写另一列，各记各的时刻。排序读的是**较晚的那个** ——
+        // 也就是这个出口最近一次真实结果到底是活是死。
+        .bind(if ok { Some(chrono::Utc::now()) } else { None })
+        .bind(if ok { None } else { Some(chrono::Utc::now()) })
+        .execute(&st.db)
+        .await;
+    });
+}
+
 /// 记一次成功，**不等它写完**。
 ///
 /// 派单路径上一个 await 都不加：观测失败绝不能让用户多等一毫秒，也绝不能把一次请求
@@ -947,6 +1013,82 @@ pub fn spawn(state: AppState) {
 }
 
 #[cfg(test)]
+mod real_outcome_tests {
+    /// 真实结果必须**成功和失败都记**，否则成功率的分母永远缺一块。
+    ///
+    /// 在这之前：成功那一半有（model_usage 每次扣费写一行），失败只进 Redis 的一个
+    /// 按线路连败计数 —— 没有模型维度、没有历史、30 天 TTL。于是「这条线路好不好」
+    /// 只能问 model_health，而它探的是**不带凭据的 GET**：密钥过期、额度用尽、模型下架
+    /// 一律报绿。实测「Claude 强力版」前门可达 99.93%，真实成功在 43 小时前。
+    #[test]
+    fn every_attempt_lands_in_the_table_win_or_lose() {
+        let src = include_str!("models.rs");
+        let at = src.find("\n        'routes: for candidate in ordered_candidates").expect("换线循环没了");
+        // 终点必须是**真的存在**的锚点。上一版写的是 `\n    let (mut resp`，
+        // 而 models.rs 里根本没有那一行 —— 于是切片一路切到文件尾，
+        // 只是碰巧后面没有别的记录点，这条测试才一直是绿的。
+        // 换成循环后面紧跟的那个 match，并且**找不到就当场失败**，不再默默滑到文件尾。
+        let end = src[at + 1..]
+            .find("\n        match (success, selected_conn) {")
+            .map(|i| at + 1 + i)
+            .expect("换线循环的结尾锚点不见了 —— 切片会一路滑到文件尾，这条测试就废了");
+        let body: String = src[at..end]
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 一个成功点 + 三个失败点，四处都得记。少一处，成功率就偏。
+        // 用**这一处特有的形状**去数，不要数裸的 "false," —— 那一大段里到处都是它，
+        // 第一版就是这么把 3 数成 8 的。
+        let fails = body.matches("&model_id, false,").count();
+        assert_eq!(
+            body.matches("spawn_attempt(").count(),
+            4,
+            "尝试结果的记录点不是 4 个了 —— 成功 1 处、失败 3 处，少一处成功率就算偏",
+        );
+        assert_eq!(fails, 3, "失败那三处不是都记成 false 了");
+        assert!(
+            body.contains("Some(send_started.elapsed().as_millis() as u64)"),
+            "成功时没记耗时 —— 那「哪条快」就还是没有数据",
+        );
+
+        // 失败不许带耗时：那是「等超时等了多久」，混进平均会让一条一次都没成的线路
+        // 看起来「只是慢」。
+        // 只看**生产代码**那一段：下面两条断言的字面量就写在本文件的测试模块里，
+        // 不切掉的话把真正的代码改坏它照样绿（变异测试第五次抓到同一个形状）。
+        let whole = include_str!("route_health.rs");
+        let me = whole
+            .split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .expect("route_health.rs 里应该有测试模块");
+        assert!(
+            me.contains("(true, Some(ms)) => (ms.min(600_000) as i64, 1i64)"),
+            "耗时不再是只在成功时累加",
+        );
+        // 写入不许挡住派单。**断言要切到 spawn_attempt 自己的函数体里** ——
+        // 隔壁 spawn_ok 里有一模一样的 `tokio::spawn(async move {`，
+        // 只在全文件里找的话，把这一处改成同步照样绿（变异测试抓到的）。
+        let f = me
+            .split_once("pub fn spawn_attempt(")
+            .map(|(_, rest)| rest)
+            .expect("spawn_attempt 改名了");
+        let f = &f[..f.find("\n}").unwrap_or(f.len())];
+        assert!(
+            f.contains("tokio::spawn(async move {"),
+            "落库写成同步的了 —— 观测绝不能让用户多等",
+        );
+        assert!(
+            !f.contains("await;\n    let"),
+            "派单路径上多了 await",
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1280,7 +1422,13 @@ mod tests {
             .split(&format!("{}(candidate.health_id());", "mark_route_stall"))
             .nth(1)
             .expect("派单路径上的 mark_route_stall 不见了");
-        let after = &stall_site[..stall_site.len().min(600)];
+        // 按**结构**取，不按固定字节数。原来是 `.min(600)`，而这个块里后来又插了一次
+        // 「把结果落库」的调用，600 字节就把 spawn_stall_recovery 挤出了窗口 ——
+        // 测试红在一个它并不关心的位置上（今天就这么翻了一次）。
+        // 固定窗口更坏的一面是**静默**：代码变长之后它会悄悄守不到尾部。
+        let after = &stall_site[..stall_site
+            .find("route_failed_transient = true;")
+            .unwrap_or_else(|| stall_site.len())];
         assert!(
             after.contains("spawn_stall_recovery(&state, candidate.clone())"),
             "卡死之后没有起恢复探针，恢复判定仍由用户的真实请求付费",
