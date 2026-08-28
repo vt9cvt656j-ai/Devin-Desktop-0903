@@ -1283,12 +1283,57 @@ fn route_goes_to_the_back(route_count: usize, cooled: bool, mutes: bool, stalled
 ///
 /// 正常情况就是按请求形态算出来的上限；只有当这条线路最近整整卡满过一次时，才压到
 /// 短探测预算。注意这是**减少**耐心，不是跳过 —— 请求照发，上游恢复了就照常拿到结果。
-fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
-    if route_recently_stalled(route_id, now) {
-        base.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT)
-    } else {
-        base
+/// 每条线路**自己**的正常首字节时间（指数滑动平均，毫秒）。
+///
+/// # 为什么需要它
+///
+/// 卡顿的惩罚原来是一个**常数** —— 被判过一次之后，接下来 120 秒只给
+/// `CHAT_UPSTREAM_STALLED_PROBE_WAIT`（25 秒）耐心。可这条路上首字节时间是随**输入规模**
+/// 涨的：预填 6 万 token 的缓存写和预填 2 千 token 完全不是一个量级。
+///
+/// 生产实测（2026-08-28，route_attempt 当日均值）：同一批 claude 线路的**平均**首字节
+/// 落在 7.9s ~ 19.8s，最慢那条 19,813ms / 22 次。25 秒对它只剩 5 秒余量 —— 尾部随便一超
+/// 就再次被判卡顿、再压 120 秒。于是「慢」被当成「坏」，而惩罚又让它更容易再被判慢：
+/// **自我强化**。流量因此持续在多条线路间轮换，而每换一次上游那份提示词缓存就整份重写
+/// （写价是读价的 12.5 倍，见 CHAT_ROUTE_AFFINITY）。
+///
+/// 所以惩罚要按**这条线路自己的正常速度**给，而不是拍一个全局常数。
+static ROUTE_HEADER_EWMA_MS: LazyLock<Mutex<HashMap<uuid::Uuid, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 新样本的权重。0.25 = 大约四次请求换掉一半的记忆：快到能跟上线路真的变慢/变快，
+/// 慢到不会被单次抖动带走。
+const ROUTE_HEADER_EWMA_ALPHA: f64 = 0.25;
+
+fn record_route_header_ms(route_id: uuid::Uuid, ms: u128) {
+    if ms == 0 { return; }
+    if let Ok(mut m) = ROUTE_HEADER_EWMA_MS.lock() {
+        let e = m.entry(route_id).or_insert(ms as f64);
+        *e = *e * (1.0 - ROUTE_HEADER_EWMA_ALPHA) + (ms as f64) * ROUTE_HEADER_EWMA_ALPHA;
     }
+}
+
+fn route_header_ewma(route_id: uuid::Uuid) -> Option<Duration> {
+    let m = ROUTE_HEADER_EWMA_MS.lock().ok()?;
+    m.get(&route_id).map(|ms| Duration::from_millis(*ms as u64))
+}
+
+fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
+    if !route_recently_stalled(route_id, now) {
+        return base;
+    }
+    // 惩罚按这条线路自己的正常首字节给：**三倍**它的均值，下限仍是那个常数
+    // （没有样本时、或者这条线路本来就很快时，行为和以前逐字相同），上限是完整预算。
+    //
+    // 为什么是三倍：均值 19.8s 的那条线路，三倍 ≈ 59s 会被 base（57s）夹住，也就是
+    // 「不再额外惩罚」—— 这正是想要的：一条正常就要 20 秒的线路，不该因为慢被当成坏。
+    // 而均值 7.9s 的那条得到 ~24s，仍落在常数附近，短探测的原意（失败得起、别把客户端
+    // 的重试预算一次烧光）没有被削弱。
+    let floor = CHAT_UPSTREAM_STALLED_PROBE_WAIT;
+    let scaled = route_header_ewma(route_id)
+        .map(|avg| avg.saturating_mul(3))
+        .unwrap_or(floor);
+    base.min(scaled.max(floor))
 }
 
 fn thinking_clip_active(id: uuid::Uuid) -> bool {
@@ -10840,6 +10885,10 @@ pub async fn chat_completions(
                                 );
                                 // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
                                 clear_route_stall(candidate.health_id());
+                                // 记下这条线路**自己**的正常首字节，卡顿惩罚按它来定
+                                // （见 ROUTE_HEADER_EWMA_MS）：常数惩罚会把一条正常就要
+                                // 20 秒的线路反复判成坏的。
+                                record_route_header_ms(candidate.health_id(), header_ms);
                                 // 记住这段会话走通的是哪条线路。下一轮它的提示词缓存在这条
                                 // 线路的上游是热的，换到别处等于按 1.25× 重写一遍。
                                 route_affinity_set(route_affinity_key, candidate.id);
@@ -21612,6 +21661,87 @@ mod audit_20260822_tests {
     /// `effective_billing(c, mid).2`，而那一位是 `mode == "free"` —— 一个**枚举**，
     /// 和价格无关。于是运维把倍率填成 0、以为开了一条免费线路，非会员照样吃
     /// 「请先开通会员或充值额度」。
+    /// **卡顿惩罚要按这条线路自己的速度给，不是拍一个常数。**
+    ///
+    /// 生产实测（2026-08-28）：同一批 claude 线路的**平均**首字节落在 7.9s ~ 19.8s。
+    /// 而被判卡顿之后的短探测预算是固定 25 秒 —— 对均值 19.8s 的那条只剩 5 秒余量，
+    /// 尾部随便一超就再次被判卡顿、再压 120 秒。「慢」被当成「坏」，而惩罚又让它更容易
+    /// 再被判慢：自我强化。流量因此持续轮换，每换一次上游那份提示词缓存整份重写。
+    ///
+    /// 判据是**行为**：慢线路必须拿到明显多于常数的耐心；快线路的行为不许被改动；
+    /// 没有样本时必须逐字退回常数。
+    #[test]
+    fn stall_penalty_scales_with_the_route_own_first_byte_time() {
+        let base = super::STANDARD_MAX_HEADER_WAIT;
+        let slow = uuid::Uuid::from_u128(0xAA);
+        let fast = uuid::Uuid::from_u128(0xBB);
+        let never = uuid::Uuid::from_u128(0xCC);
+        let now = std::time::Instant::now();
+
+        // 把三条都标成刚卡顿过，否则走的是「不惩罚」那一支
+        super::mark_route_stall(slow);
+        super::mark_route_stall(fast);
+        super::mark_route_stall(never);
+
+        // 没有样本 → 必须和以前逐字相同
+        assert_eq!(
+            super::header_wait_for_route(base, never, now),
+            base.min(super::CHAT_UPSTREAM_STALLED_PROBE_WAIT),
+            "没有首字节样本时行为变了 —— 这一层不该在没有证据时自作主张"
+        );
+
+        // 均值 ~19.8s 的慢线路：三倍会被 base 夹住，也就是不再额外惩罚
+        for _ in 0..12 { super::record_route_header_ms(slow, 19_800); }
+        let slow_wait = super::header_wait_for_route(base, slow, now);
+        assert!(
+            slow_wait > super::CHAT_UPSTREAM_STALLED_PROBE_WAIT,
+            "一条正常就要 19.8 秒的线路仍然只给 {:?} —— 它会被反复判成坏的",
+            slow_wait
+        );
+
+        // 均值 ~7.9s 的快线路：三倍 ≈ 24s，仍在常数附近，短探测的原意没被削弱
+        for _ in 0..12 { super::record_route_header_ms(fast, 7_900); }
+        let fast_wait = super::header_wait_for_route(base, fast, now);
+        assert!(
+            fast_wait <= super::CHAT_UPSTREAM_STALLED_PROBE_WAIT + std::time::Duration::from_secs(2),
+            "快线路的惩罚被放松了 {:?} —— 短探测是为了「失败得起」，不该跟着一起变宽",
+            fast_wait
+        );
+        assert!(slow_wait > fast_wait, "慢线路没有拿到比快线路更多的耐心，这一层等于没生效");
+
+        // 没被标记卡顿的线路：一律拿完整预算，不受这份记忆影响。
+        //
+        // **用快线路来断言，不能用慢的。** 变异实测：拿 slow 断言时这一条是恒真的 ——
+        // 3×19.8s 本来就超过 base，min 之后照样等于 base，于是「惩罚漏到正常线路」这个
+        // 变异不会被抓到。fast 的 3×7.9s ≈ 24s 落在 base 之下，漏出来才看得见。
+        super::clear_route_stall(fast);
+        assert_eq!(
+            super::header_wait_for_route(base, fast, now), base,
+            "没在卡顿记号里的线路被削了预算 —— 惩罚漏到了正常线路上"
+        );
+    }
+
+    /// **成功路径必须真的记录首字节样本。**
+    ///
+    /// 上一条测的是 `header_wait_for_route` 本身，它自己往表里塞样本。变异实测：把生产
+    /// 代码里那句 `record_route_header_ms(...)` 整个删掉，上一条**照样绿** —— 而没有样本
+    /// 时整个自适应就退回常数，等于这个功能不存在。所以调用点要单独守。
+    ///
+    /// 判据落在源码上（这一层没有可注入的接缝），但守的是**接线**而不是「代码长什么样」：
+    /// 删掉那一行就会红，改个变量名不会。
+    #[test]
+    fn the_success_path_actually_feeds_the_first_byte_average() {
+        let src = include_str!("models.rs");
+        let clear_at = src
+            .find("clear_route_stall(candidate.health_id());")
+            .expect("成功钩子不见了 —— 这条门失去锚点");
+        let window = &src[clear_at..(clear_at + 700).min(src.len())];
+        assert!(
+            window.contains("record_route_header_ms(candidate.health_id(), header_ms)"),
+            "成功路径不再记录首字节 —— 自适应惩罚拿不到样本，整个退回常数，等于没做"
+        );
+    }
+
     /// **会话粘性：换线之后落到哪，必须稳定。**
     ///
     /// 四条 claude 线路是四个不同的上游、四份独立的提示词缓存。用户选的那条一冷却，请求
