@@ -215,6 +215,74 @@ const CANARY_MAX_PER_ROUND: usize = 4;
 /// 单次探测的耐心。远短于派单路径的 57 秒：这里只问「接不接得通」，不等模型思考。
 const CANARY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 每条线路每分钟最多花在「你还活着吗」上的输入 token。
+///
+/// # 为什么频率要按价定，而不是所有线路一个数
+///
+/// 探活发的是同一件东西：`"hi"` + `max_tokens=1`，两个 token 的提示。老实的上游就
+/// 照这个记账 —— 生产 `endpoint_probe_usage` 七天实测，Claude 强力版每发 **8** 个
+/// token、智普 **13**、Claude **36**。但同一发请求：
+///
+/// ```text
+///   GPT / gpt-5.6-sol        4,555 / 发
+///   deepseek / v4-flash      2,685 / 发
+///   Grok / grok-4.5          1,343 / 发
+/// ```
+///
+/// 中转给两个字的提示词计了四千多个 token。这不是我们能改的事实，但**可以不按同一个
+/// 频率去撞它**：这三条一周烧掉 897K 输入 token，占全部探活开销的 93%。
+///
+/// 所以「多久算有新鲜证据」不再是一个常数，而是由这条线路自己的报价决定：
+/// 便宜的线路一点不受影响（8 token/发 的线路要 32 秒才用掉这份预算，远短于基础间隔），
+/// 贵的线路自动探得稀 —— 稀到和便宜线路花一样的钱为止。
+const CANARY_TOKENS_PER_MIN: f64 = 15.0;
+
+/// 再贵也不能稀到没意义。
+///
+/// 这个上限只对**当前判定为 ok** 的线路生效（见 `canary_fresh_window_secs`）。坏的、
+/// 降级的、没被碰过的线路一律走基础间隔 —— 需要探活的时候恰恰就是这些时候，
+/// 省这笔钱等于把监控关掉。
+const CANARY_MAX_FRESH_SECS: i64 = 6 * 60 * 60;
+
+/// 每条线路一发探活实际被计了多少输入 token（指数滑动平均）。
+///
+/// 只在**上游真的回了 usage** 时更新（见 `note_probe_usage` 的零值早退）。失败的探活
+/// 拿不到 usage，记 0 会把一条贵线路洗成便宜的，然后它又开始每 15 分钟被探一次。
+static ROUTE_PROBE_COST_EWMA: LazyLock<Mutex<std::collections::HashMap<Uuid, f64>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+const PROBE_COST_ALPHA: f64 = 0.3;
+
+fn record_probe_cost(route_id: Uuid, prompt_tokens: i64) {
+    if prompt_tokens <= 0 {
+        return;
+    }
+    if let Ok(mut m) = ROUTE_PROBE_COST_EWMA.lock() {
+        let e = m.entry(route_id).or_insert(prompt_tokens as f64);
+        *e = *e * (1.0 - PROBE_COST_ALPHA) + (prompt_tokens as f64) * PROBE_COST_ALPHA;
+    }
+}
+
+fn probe_cost(route_id: Uuid) -> Option<f64> {
+    let m = ROUTE_PROBE_COST_EWMA.lock().ok()?;
+    m.get(&route_id).copied()
+}
+
+/// 这条线路多久之内有过证据就不用再探。
+///
+/// **进程刚起来时表是空的 —— 这时退回基础间隔**，也就是改动前的行为。宁可多探几发，
+/// 也不要凭一个还不存在的报价把线路静音。
+fn canary_fresh_window_secs(route_id: Uuid, state_word: &str) -> i64 {
+    // 只有「确实还好」的线路才配省这笔钱。degraded / error / unknown 一律全速探。
+    if state_word != "ok" {
+        return CANARY_SKIP_IF_FRESH_SECS;
+    }
+    let Some(cost) = probe_cost(route_id) else {
+        return CANARY_SKIP_IF_FRESH_SECS;
+    };
+    let secs = (cost / CANARY_TOKENS_PER_MIN * 60.0).round() as i64;
+    secs.clamp(CANARY_SKIP_IF_FRESH_SECS, CANARY_MAX_FRESH_SECS)
+}
+
 fn canary_enabled() -> bool {
     std::env::var("ROUTE_CANARY").ok().as_deref() != Some("0")
 }
@@ -233,6 +301,8 @@ fn note_probe_usage(
     if model_id.is_empty() || (tokens.prompt == 0 && tokens.completion == 0) {
         return; // 上游没回 usage —— 记一行全 0 只会稀释判据
     }
+    // 这条线路每发探活到底要多少钱 —— 下一轮据此决定还探不探（见 CANARY_TOKENS_PER_MIN）。
+    record_probe_cost(route_id, tokens.prompt);
     let db = state.db.clone();
     let model = model_id.to_string();
     tokio::spawn(async move {
@@ -752,9 +822,12 @@ pub fn spawn(state: AppState) {
             let mut probed = 0usize;
             for m in &routes {
                 let h = snapshot(&state, m.id).await;
+                let now = now_secs();
+                // 窗口按这条线路自己的探活报价定：贵的探得稀，便宜的和以前一样。
+                let window = canary_fresh_window_secs(m.id, classify(&h, now));
                 let fresh = h
                     .last_attempt_at
-                    .is_some_and(|t| now_secs().saturating_sub(t) < CANARY_SKIP_IF_FRESH_SECS);
+                    .is_some_and(|t| now.saturating_sub(t) < window);
 
                 // 有新鲜的真实流量就不探 —— 那是免费且更真实的证据。
                 if !fresh && canary_enabled() && probed < CANARY_MAX_PER_ROUND {
@@ -1198,5 +1271,133 @@ mod tests {
             "连败阈值 {FAILING_STREAK} 在 20% 的常态失败率下误报概率 {false_alarm:.4}，太高了",
         );
         assert!(FAILING_STREAK >= 3, "太小的话一次偶发抖动就报警，几次之后告警就被静音");
+    }
+
+    // ── 探活按价定频（2026-08-28）──────────────────────────────────────────────
+    //
+    // 起因是生产 endpoint_probe_usage 的七天实测：同一发 `"hi"` + max_tokens=1，
+    // 老实的上游记 8–36 个 token，GPT 线路记 4,555、deepseek 记 2,685、Grok 记 1,343。
+    // 三条线路占掉全部探活开销的 93%。
+
+    fn rid(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    /// 贵的线路必须探得比便宜的稀 —— 这是整个改动的目的。
+    #[test]
+    fn an_expensive_route_is_probed_less_often_than_a_cheap_one() {
+        let cheap = rid(11);
+        let dear = rid(12);
+        // 生产实测的两端：Claude 强力版 8 / 发，GPT 4,555 / 发。
+        for _ in 0..8 {
+            super::record_probe_cost(cheap, 8);
+        }
+        for _ in 0..8 {
+            super::record_probe_cost(dear, 4_555);
+        }
+
+        let cheap_w = super::canary_fresh_window_secs(cheap, "ok");
+        let dear_w = super::canary_fresh_window_secs(dear, "ok");
+
+        assert_eq!(
+            cheap_w, CANARY_SKIP_IF_FRESH_SECS,
+            "便宜线路的节奏被动了 —— 这个改动不该让老实的上游探得更少",
+        );
+        assert!(
+            dear_w > cheap_w * 4,
+            "4,555 token 一发的线路和 8 token 一发的线路探得一样勤（{dear_w}s vs {cheap_w}s）\
+             —— 那 93% 的开销一分没省",
+        );
+        assert!(
+            dear_w <= CANARY_MAX_FRESH_SECS,
+            "再贵也不能稀到没意义：{dear_w}s 超过了上限",
+        );
+    }
+
+    /// **只有确实还好的线路才配省这笔钱。**
+    ///
+    /// 反过来做的话就是把监控关掉：一条正在坏的贵线路会因为「探它太贵」而几小时不被碰，
+    /// 而需要证据的时刻恰恰就是这时候。恢复也一样探不出来。
+    #[test]
+    fn only_a_healthy_route_may_skip_probes() {
+        let r = rid(13);
+        for _ in 0..8 {
+            super::record_probe_cost(r, 4_555);
+        }
+        assert!(
+            super::canary_fresh_window_secs(r, "ok") > CANARY_SKIP_IF_FRESH_SECS,
+            "前提没成立：这条线路本来就该被拉长窗口，否则下面三条断言是恒真的",
+        );
+        for word in ["degraded", "error", "unknown"] {
+            assert_eq!(
+                super::canary_fresh_window_secs(r, word),
+                CANARY_SKIP_IF_FRESH_SECS,
+                "状态是 {word} 的线路被省掉了探活 —— 正在坏/正在恢复的时候反而不看了",
+            );
+        }
+    }
+
+    /// 进程刚起来时报价表是空的 —— 必须退回改动前的节奏，不能凭一个还不存在的
+    /// 报价把线路静音。这是「没查到」不等于「很便宜」的同一条老规矩。
+    #[test]
+    fn an_unpriced_route_keeps_the_old_cadence() {
+        assert_eq!(
+            super::canary_fresh_window_secs(rid(14), "ok"),
+            CANARY_SKIP_IF_FRESH_SECS,
+            "没有任何报价样本时窗口被改了 —— 重启后的第一轮会按一个凭空的数决定探不探",
+        );
+    }
+
+    /// 失败的探活拿不到 usage。把它当成 0 记进去，会把一条贵线路一路洗成便宜的，
+    /// 然后它又回到每 15 分钟一发 —— 省钱的机制被自己的失败样本吃掉。
+    #[test]
+    fn a_failed_probe_must_not_wash_an_expensive_route_cheap() {
+        let r = rid(15);
+        for _ in 0..8 {
+            super::record_probe_cost(r, 4_555);
+        }
+        let before = super::canary_fresh_window_secs(r, "ok");
+        for _ in 0..40 {
+            super::record_probe_cost(r, 0);
+        }
+        assert_eq!(
+            super::canary_fresh_window_secs(r, "ok"),
+            before,
+            "40 次失败探活（usage 为 0）把这条线路的报价冲淡了",
+        );
+    }
+
+    /// 上面四条测的都是函数本身，而它们自己往表里塞样本、自己调用窗口函数。
+    /// 生产里那两个调用点如果不存在，四条**照样全绿**：一个没人调的省钱机制省不下一分钱。
+    /// 所以这一条钉的是调用点确实在。
+    #[test]
+    fn the_probe_loop_and_the_usage_hook_are_actually_wired_in() {
+        let src = include_str!("route_health.rs");
+        // **先把测试模块整块切掉。** 变异实测：不切的话，下面那句 contains 的窗口是
+        // `&code[loop_at..]` —— 一路吃到文件末尾，于是它匹配到的是**这个测试自己**写
+        // 的那串字面量。把生产代码里的调用整个换掉，断言照样绿。
+        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        // 断言跑的是源文本，而注释里会引用被改掉的旧代码 —— 先把注释剥掉。
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let loop_at = code
+            .find("let mut tick = tokio::time::interval(CANARY_EVERY);")
+            .expect("巡检循环不见了");
+        let loop_body = &code[loop_at..];
+        assert!(
+            loop_body.contains("canary_fresh_window_secs(m.id, classify(&h, now))"),
+            "巡检循环没有按线路取窗口 —— 定价函数写了但没人用，贵线路照旧每 15 分钟一发",
+        );
+
+        let hook_at = code.find("fn note_probe_usage(").expect("用量钩子不见了");
+        let hook_body = &code[hook_at..hook_at + 1_200];
+        assert!(
+            hook_body.contains("record_probe_cost(route_id, tokens.prompt)"),
+            "没人把探活的实际报价喂回去 —— 表永远是空的，窗口函数永远退回基础间隔",
+        );
     }
 }
