@@ -26,7 +26,13 @@ import { fnSource } from "./helpers/source.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DIST = join(HERE, "../dist/assets");
 // 发布流水线必须置位。缺了它，「dist 不在就跳过」会把这条测试变成一条**恒绿**的门。
-const REQUIRED = process.env.IDE_RELEASE_CHECK === "1" || process.env.CI === "true";
+//
+// **只认显式标志，不认裸的 CI=true。** 这条流水线的顺序是「先跑测试、再构建」
+// （.github/workflows/ide-package.yml：Run frontend logic tests 在 Build installable
+// desktop bundle 之前），所以那一轮里 dist 天然不存在 —— 拿 CI=true 当发布路径，
+// 会让每一次打包都在测试步就红，而它想守的那件事（产物里有没有 IP）根本还没发生。
+// 正确落点是构建**之后**的独立一步，那一步显式置 IDE_RELEASE_CHECK=1。
+const REQUIRED = process.env.IDE_RELEASE_CHECK === "1";
 
 function appChunks() {
   if (!existsSync(DIST)) return [];
