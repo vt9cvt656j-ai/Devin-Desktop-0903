@@ -2987,7 +2987,7 @@ pub async fn admin_model_estimate(
         model.output_price,
         model.cache_read_price,
         model.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
         model.cache_disabled,);
     let calls = req.calls as f64;
     let provider_usd_total = provider_usd_per_call * calls;
@@ -3993,7 +3993,16 @@ pub async fn chat(
     }
 
     // bill on success: per_call flat fee, or real token usage × official price × 倍率.
-    let (model_in, model_out) = model_price_override(&model.model_prices, &chosen);
+    // **必须用带 Option 的那个版本。** `model_price_override` 是
+    // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+    // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+    // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+    //
+    // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+    // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+    // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+    // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+    let model_over = model_price_override_set(&model.model_prices, &chosen);
     let usage_val = data.get("usage");
     let usage_reported = usage_is_authoritative(usage_val);
     if !usage_reported {
@@ -4010,7 +4019,7 @@ pub async fn chat(
         model.output_price,
         model.cache_read_price,
         model.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
         model.cache_disabled,);
     let mut tokens = extract_bill_tokens(
         usage_val.filter(|_| usage_reported),
@@ -11230,7 +11239,16 @@ pub async fn chat_completions(
                     .get("reasoning_effort")
                     .and_then(|v| v.as_str())
                     .is_some_and(|e| !e.is_empty() && e != "off"));
-        let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+        // **必须用带 Option 的那个版本。** `model_price_override` 是
+        // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+        // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+        // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+        //
+        // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+        // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+        // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+        // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+        let model_over = model_price_override_set(&conn.model_prices, &model_id);
         let ckey_task = ckey.clone();
         // Step-type signals must be read here: `body` is moved into the pump task below.
         let step_mode_task = step_mode(&headers);
@@ -11680,7 +11698,7 @@ pub async fn chat_completions(
                 admin_out,
                 cache_read_price,
                 cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
                 conn.cache_disabled,);
             let mut tokens = extract_bill_tokens(
                 usage_reported.then_some(&usage),
@@ -11822,7 +11840,16 @@ pub async fn chat_completions(
             if !usage_reported {
                 tracing::warn!(model = %model_id, "provider omitted authoritative usage; rate billing is zero");
             }
-            let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            // **必须用带 Option 的那个版本。** `model_price_override` 是
+            // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+            // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+            // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+            //
+            // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+            // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+            // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+            // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+            let model_over = model_price_override_set(&conn.model_prices, &model_id);
             let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(&conn, &model_id);
             free_pool = eff_free;
             free_micro = eff_micro;
@@ -11836,7 +11863,7 @@ pub async fn chat_completions(
                 conn.output_price,
                 conn.cache_read_price,
                 conn.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
                 conn.cache_disabled,);
             let mut tokens = extract_bill_tokens(
                 usage_val.filter(|_| usage_reported),
@@ -12116,7 +12143,16 @@ pub async fn responses_proxy(
         } else {
             let usage = data.get("usage");
             let usage_reported = usage_is_authoritative(usage);
-            let (model_in, model_out) = model_price_override(&conn.model_prices, &model_id);
+            // **必须用带 Option 的那个版本。** `model_price_override` 是
+            // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+            // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+            // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+            //
+            // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+            // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+            // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+            // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+            let model_over = model_price_override_set(&conn.model_prices, &model_id);
             let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(&conn, &model_id);
             let free_pool = eff_free;
             let free_micro = eff_micro;
@@ -12130,7 +12166,7 @@ pub async fn responses_proxy(
                 conn.output_price,
                 conn.cache_read_price,
                 conn.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
                 conn.cache_disabled,);
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
@@ -19983,7 +20019,16 @@ async fn bill_vision_call(
     usage: Option<&serde_json::Value>,
 ) {
     let reported = usage_is_authoritative(usage);
-    let (model_in, model_out) = model_price_override(&vconn.model_prices, "gpt-5.5");
+    // **必须用带 Option 的那个版本。** `model_price_override` 是
+    // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+    // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+    // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+    //
+    // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+    // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+    // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+    // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+    let model_over = model_price_override_set(&vconn.model_prices, "gpt-5.5");
     let cost = resolve_cost(
         &vconn.billing_mode,
         vconn.per_call_cents,
@@ -19994,7 +20039,7 @@ async fn bill_vision_call(
         vconn.output_price,
         vconn.cache_read_price,
         vconn.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
         vconn.cache_disabled,);
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
@@ -20010,7 +20055,16 @@ async fn bill_compression_call(
     usage: Option<&serde_json::Value>,
 ) {
     let reported = usage_is_authoritative(usage);
-    let (model_in, model_out) = model_price_override(&conn.model_prices, compressor_model);
+    // **必须用带 Option 的那个版本。** `model_price_override` 是
+    // `model_price_override_set(...).unwrap_or((0.0, 0.0))` —— 它把「这个模型没配价」和
+    // 「显式配成 0」抹成同一个值；下面再无条件包成 `Some(...)`，于是
+    // `effective_token_prices` 的第一分支必然命中，**官方目录那条兜底永远走不到**。
+    //
+    // 后果：新建一条线路、还没填每模型价时，它上面每一次调用都扣 0 —— 不报错、不告警，
+    // 账面上就是白送。生产实测：claude-opus-5 在 08-28 18:15 前正常扣 25~143 分，新线路
+    // 一上就全变 0，而实时目录里明明有 in=5 / out=25。
+    // 后台估价器那一处（model_price_override_set）一直是对的 —— 同一件事写了两份，漂了。
+    let model_over = model_price_override_set(&conn.model_prices, compressor_model);
     let cost = resolve_cost(
         &conn.billing_mode,
         conn.per_call_cents,
@@ -20021,7 +20075,7 @@ async fn bill_compression_call(
         conn.output_price,
         conn.cache_read_price,
         conn.cache_create_price,
-        Some((model_in, model_out)),
+        model_over,
         conn.cache_disabled,);
     let mut tokens = extract_bill_tokens(
         usage.filter(|_| reported),
@@ -21487,6 +21541,45 @@ mod audit_20260822_tests {
     /// `effective_billing(c, mid).2`，而那一位是 `mode == "free"` —— 一个**枚举**，
     /// 和价格无关。于是运维把倍率填成 0、以为开了一条免费线路，非会员照样吃
     /// 「请先开通会员或充值额度」。
+    /// **「没配每模型价」不能和「配成 0」塌缩成同一个值。**
+    ///
+    /// 生产真事（2026-08-28）：新建一条线路、每模型价还空着，它上面每一次调用都扣 0 分。
+    /// claude-opus-5 在 18:15 前正常扣 25~143 分，新线路一上就全变 0，而实时目录里明明有
+    /// in=5 / out=25。不报错、不告警，账面上就是白送。
+    ///
+    /// 病理：`model_price_override` 是 `model_price_override_set(..).unwrap_or((0.0,0.0))`，
+    /// 把「没配」压成 `(0,0)`；六个扣费点再无条件包成 `Some(..)`，于是
+    /// `effective_token_prices` 的第一分支必然命中，**下面两层（实时目录、连接级价）
+    /// 结构上永远走不到**。
+    ///
+    /// 判据用**连接级价**而不是目录价：目录是数据库里的实时表，单测里是空的，
+    /// 拿它当判据会让这条测试依赖外部状态。机制是同一个 —— `None` 必须**穿透**到下一层，
+    /// `Some((0,0))` 必须**截断**。生产上救不了命的正是这个穿透。
+    #[test]
+    fn missing_per_model_price_must_not_shadow_the_lower_price_layers() {
+        let usage = serde_json::json!({ "prompt_tokens": 10_000, "completion_tokens": 1_000 });
+        // 连接级填了价：没配每模型价时必须用它算出正数
+        let falls_through = super::compute_cost(
+            Some(&usage), "unlisted-model-xyz", 1.0, 3.0, 15.0, 0.0, 0.0, None, false,
+        );
+        assert!(
+            falls_through > 0,
+            "没配每模型价就扣 0 —— 连接级/目录价都没用上，新建线路等于白送。实得 {falls_through}"
+        );
+        // 显式配成 0 = 运维要开免费线路，必须真的是 0
+        let explicit_free = super::compute_cost(
+            Some(&usage), "unlisted-model-xyz", 1.0, 3.0, 15.0, 0.0, 0.0, Some((0.0, 0.0)), false,
+        );
+        assert_eq!(
+            explicit_free, 0,
+            "显式把每模型价配成 0（免费线路）必须真的是 0，不能掉回下面那层"
+        );
+        assert_ne!(
+            falls_through, explicit_free,
+            "「没配」和「配成 0」又塌缩成同一个值了 —— 这正是这条 bug 的形状"
+        );
+    }
+
     #[test]
     fn 倍率零的线路对零余额用户也该放行() {
         // 先钉住前提：倍率 0 时确实一分不收（换成别的实现这条会先红）。
