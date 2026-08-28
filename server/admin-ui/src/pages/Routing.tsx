@@ -105,6 +105,13 @@ type Conn = {
   per_call_micro_usd?: number;
   model_names?: unknown;
   model_prices?: unknown;
+  /**
+   * 每个在售模型的**实时 OpenRouter 目录价**，服务端每次都现取（内存目录，6 小时刷新）。
+   *
+   * 有它之后，打开一条已经配好的线路就能立刻看出「你填的」和「现价」差多少 ——
+   * 以前只有点过「拉取模型」才有价，而那是一次性的，填完就再也看不见了。
+   */
+  catalog_prices?: Record<string, { in: number; out: number; cache_read?: number | null; cache_write?: number | null }>;
   model_caps?: unknown;
   power_route?: boolean;
   model_billing?: unknown;
@@ -269,9 +276,19 @@ export type RoutingView = "routing" | "routing-groups";
 export function Routing({ view }: { view: RoutingView }) {
   const [ratioOpen, setRatioOpen] = useState(false);
   const [conns, setConns] = useState<Conn[]>([]);
+  // IDE 那个列表的真实长度。这一屏的「开放模型」照它显示，别在前端按另一套规则重算。
+  const [ideModelCount, setIdeModelCount] = useState<number | null>(null);
   const [usage, setUsage] = useState<Usage>({});
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    api.get<unknown[]>("/api/models")
+      .then((r) => { if (alive) setIdeModelCount(Array.isArray(r) ? r.length : null); })
+      .catch(() => { if (alive) setIdeModelCount(null); });
+    return () => { alive = false; };
+  }, []);
   const [busyId, setBusyId] = useState("");
   const [expanded, setExpanded] = useState("");
   // null = closed, { conn: null } = 新建, { conn } = 编辑.
@@ -348,7 +365,12 @@ export function Routing({ view }: { view: RoutingView }) {
   }
 
   const live = conns.filter(isOn);
-  const exposed = live.reduce((a, c) => a + allowedIds(c).length, 0);
+  // 「开放模型」数**从 IDE 那个接口取**，不在前端重算。
+  //
+  // 原来是 `allowedIds(c)` 求和，而 IDE 拿到的列表由服务端 list_for_client 算，
+  // 两套规则不一样（比如强力线路里「普通线路也有」的 id 会被剔掉），
+  // 于是这张卡的副标题写着「IDE 里能选到的」，数字却和 IDE 里能选到的对不上。
+  const exposed = ideModelCount;
   const labelOf = liveLabels(conns);
 
   if (view === "routing-groups") {
@@ -367,7 +389,7 @@ export function Routing({ view }: { view: RoutingView }) {
       {/* 入场错峰：标题 0，往下每段 +70ms（展示站 SectionReveal 的 Math.min(i,4)*70）。 */}
       <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat label="在转线路" value={num(live.length)} hint={`共 ${conns.length} 条连接`} />
-        <Stat label="开放模型" value={num(exposed)} hint="IDE 里能选到的" />
+        <Stat label="开放模型" value={exposed == null ? "—" : num(exposed)} hint="IDE 里能选到的" />
         <Stat label="累计调用" value={num(usage.calls)} />
         {/* cost_cents 是「按倍率结算后从用户扣掉的钱」(models.rs:2715)，不是渠道成本。 */}
         <Stat label="累计计费" value={cents(usage.spent_cents)} hint="已含倍率" />
@@ -970,6 +992,7 @@ function initialRows(c: Conn | null): Row[] {
   const prices = asMap<PriceOverride>(c.model_prices);
   const billing = asMap<BillingOverride>(c.model_billing);
   const caps = asMap<{ contexts?: number[] }>(c.model_caps);
+  const live = c.catalog_prices || {};
   return allowedIds(c).map((id) => {
     const p = prices[id] || {};
     const b = billing[id] || {};
@@ -980,18 +1003,52 @@ function initialRows(c: Conn | null): Row[] {
       id,
       on: true,
       name: names[id] || "",
-      pin: p.in ? String(p.in) : "",
-      pout: p.out ? String(p.out) : "",
+      // 0 也要显示。用 `p.in ? …` 的话，存的 0 回显成空串，再保存一次就变成「留空」
+      // ——一条配好的免费线路会在下一次编辑时**静默变回按官方价收费**。
+      pin: typeof p.in === "number" ? String(p.in) : "",
+      pout: typeof p.out === "number" ? String(p.out) : "",
       mode: ovMode(b),
       fee: micro > 0 ? String(micro / 1_000_000) : "",
       ctx: (caps[id]?.contexts || []).join(","),
+      // 存的 model_caps 里只有上下文档位、没有价，所以价单独从实时目录带过来。
+      caps: live[id]
+        ? { source: "live" as const, input_price: live[id].in, output_price: live[id].out,
+            cache_read_price: live[id].cache_read ?? null, cache_write_price: live[id].cache_write ?? null }
+        : undefined,
     };
   });
+}
+
+/**
+ * 你填的价是实时目录价的几倍。取入价和出价里**大**的那个 —— 一处离谱就够离谱了。
+ * 拿不到现价（目录里没这一款）时回 0，调用方据此不显示。
+ */
+function priceGap(r: Row): number {
+  const ci = r.caps?.input_price ?? 0;
+  const co = r.caps?.output_price ?? 0;
+  const gi = ci > 0 && nz(r.pin) > 0 ? nz(r.pin) / ci : 0;
+  const go = co > 0 && nz(r.pout) > 0 ? nz(r.pout) / co : 0;
+  return Math.max(gi, go);
 }
 
 const nz = (s: string) => {
   const n = parseFloat(s);
   return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+/**
+ * 「这一栏填了一个数」——**填 0 也算填了**。
+ *
+ * nz() 把 0 和留空塌成同一个值，那在别处没问题（它回答的是「有没有正数」），
+ * 但价格这里两者是**相反的意思**：留空 = 按官方目录价收，填 0 = 一分不收。
+ * 塌在一起的后果很具体：运维把入价出价都填 0 想开一条免费线路，保存时这一项被
+ * 整个丢掉（下面那个 filter 只收非零项），后端拿不到覆盖 → 落到官方目录价 → 照收钱。
+ */
+const priceNum = (s: string): number | null => {
+  const t = s.trim();
+  if (!t) return null;
+  const n = parseFloat(t);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 };
 
 function ConnectionDialog({
@@ -1091,7 +1148,7 @@ function ConnectionDialog({
     const on = rows.filter((r) => r.on);
     // A one-sided price override is not "half configured", it is $0 for the other side:
     // compute_cost takes the pair as soon as either number is > 0 (models.rs:2669-2673).
-    const half = on.find((r) => (nz(r.pin) > 0) !== (nz(r.pout) > 0));
+    const half = on.find((r) => (priceNum(r.pin) !== null) !== (priceNum(r.pout) !== null));
     if (conn && half) {
       setFormErr(`「${half.id}」只填了入价或出价——覆盖价是成对生效的，另一边会按 $0 计费。两个都填，或都留空用官方价。`);
       return;
@@ -1144,10 +1201,13 @@ function ConnectionDialog({
           // These three replace the whole stored map, so only keep entries for models that are
           // still exposed — config for a model you unchecked is dead weight.
           model_names: Object.fromEntries(on.filter((r) => r.name.trim()).map((r) => [r.id, r.name.trim()])),
+          // 判据是「填了没有」，不是「填的是不是正数」：入价出价都填 0 = 这个模型一分不收，
+          // 是一种**有意的定价**，必须原样发给后端。按 >0 过滤会把它整个丢掉，
+          // 后端看不到覆盖就落回官方目录价 —— 运维以为开了免费线路，用户照样被扣钱。
           model_prices: Object.fromEntries(
             on
-              .filter((r) => nz(r.pin) > 0 || nz(r.pout) > 0)
-              .map((r) => [r.id, { in: nz(r.pin), out: nz(r.pout) }]),
+              .filter((r) => priceNum(r.pin) !== null && priceNum(r.pout) !== null)
+              .map((r) => [r.id, { in: priceNum(r.pin) ?? 0, out: priceNum(r.pout) ?? 0 }]),
           ),
           model_billing: Object.fromEntries(
             on
@@ -1349,6 +1409,24 @@ function ConnectionDialog({
               <Label className="mb-0">开放的模型</Label>
               <div className="flex items-center gap-3">
                 {hint && <span className="text-xs text-muted-foreground">{hint}</span>}
+                {/*
+                  一键把这条线路上所有手填价清掉、改为跟随 OpenRouter 实时价。
+                  清掉不是「设成 0」—— 保存时 model_prices 只收非零项，空着就是没有覆盖，
+                  运行时会去查实时目录（effective_token_prices 的第二级）。
+                  所以以后 OpenRouter 降价，你跟着降，不用再手工改一遍。
+                */}
+                {rows.some((r) => nz(r.pin) > 0 || nz(r.pout) > 0) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    title="清掉这条线路上所有手填的单模型价，全部改为跟随 OpenRouter 实时价"
+                    onClick={() =>
+                      setRows((prev) => prev.map((r) => ({ ...r, pin: "", pout: "" })))
+                    }
+                  >
+                    全部用现价
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -1403,6 +1481,40 @@ function ConnectionDialog({
                       aria-label={`${r.id} 输出价`}
                       onChange={(e) => patch(r.id, { pout: e.target.value })}
                     />
+                    {/*
+                      把实时价摆到明面上。
+                      placeholder 只在输入框为空时看得见 —— 一旦填了数字，实时价就消失了，
+                      于是没人知道自己填的那个数和现在的价差了多少。线上实测差到 37 倍
+                      （deepseek-v4-flash 填 3，OpenRouter 现价 0.0795）。
+                    */}
+                    {r.caps?.input_price != null && (
+                      <div className="flex w-44 shrink-0 items-center gap-1.5 text-[11px]">
+                        {nz(r.pin) > 0 || nz(r.pout) > 0 ? (
+                          <>
+                            <span
+                              className={cn(
+                                "tabular-nums",
+                                priceGap(r) >= 2 ? "font-medium text-amber-600" : "text-muted-foreground",
+                              )}
+                              title={`OpenRouter 现价 $${r.caps.input_price}/$${r.caps.output_price} 每 1M`}
+                            >
+                              现价 {r.caps.input_price}/{r.caps.output_price}
+                              {priceGap(r) >= 1.1 && ` · 你 ${priceGap(r).toFixed(1)}×`}
+                            </span>
+                            <button
+                              type="button"
+                              className="shrink-0 rounded border border-border px-1.5 py-0.5 hover:bg-muted"
+                              title="清掉手填价，改为跟随 OpenRouter 实时价 —— 以后它降价你也跟着降"
+                              onClick={() => patch(r.id, { pin: "", pout: "" })}
+                            >
+                              用现价
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-emerald-600">跟随现价</span>
+                        )}
+                      </div>
+                    )}
                     {r.caps?.source !== "live" && (
                       <Input
                         className="h-9 w-36 shrink-0 px-2.5 text-sm"
@@ -1453,7 +1565,7 @@ function ConnectionDialog({
             <p className="mt-2 text-xs text-muted-foreground">
               「拉取可用模型」用的是已保存的密钥，刚填的新密钥要先保存才能拉。
               显示名只改 IDE 里的叫法，调用仍用原始 id。入价 / 出价要么都填、要么都留空——填了就以你填的为准（倍率照样叠加），
-              留空才按内置官方价。选「按次」的模型必须填次费，否则服务端会拒绝保存；「免费」按次费折算成每日免费点数扣，不动钱包。
+              留空才按内置官方价，**两栏都填 0 = 这个模型一分不收**（非会员、零余额也能用，和「免费」不同：那个走每日点数、点数用完就落到钱包）。选「按次」的模型必须填次费，否则服务端会拒绝保存；「免费」按次费折算成每日免费点数扣，不动钱包。
             </p>
           </div>
         )}

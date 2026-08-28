@@ -1823,16 +1823,29 @@ fn model_caps_override(model_caps: &serde_json::Value, model_id: &str) -> (Vec<i
 /// Returns (0.0, 0.0) when this model has no override — compute_cost then uses the built-in
 /// official price, then the connection-level fallback. Admin per-model prices beat both.
 pub(crate) fn model_price_override(model_prices: &serde_json::Value, model_id: &str) -> (f64, f64) {
-    match model_prices.get(model_id) {
-        Some(p) => (
-            p.get("in").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0),
-            p.get("out")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0)
-                .max(0.0),
-        ),
-        None => (0.0, 0.0),
+    model_price_override_set(model_prices, model_id).unwrap_or((0.0, 0.0))
+}
+
+/// 同上，但**区分「显式填了」和「没这一项」**。
+///
+/// 这两件事在价格上是相反的意思：没这一项 = 按内置官方目录价收；显式填 0 = 一分不收。
+/// 塌成同一个 `(0.0, 0.0)` 的后果很具体 —— 运维把入价出价都填 0 想开一条免费线路，
+/// 运行时落到目录价照收，而后台看上去配的就是 0。
+///
+/// 返回 `Some` 只要求这一项**存在**且两个字段都读得出数；缺字段仍按 0 补，
+/// 因为控制台是成对写的（只填一边有专门的校验拦着）。
+pub(crate) fn model_price_override_set(
+    model_prices: &serde_json::Value,
+    model_id: &str,
+) -> Option<(f64, f64)> {
+    let p = model_prices.get(model_id)?;
+    if !p.is_object() {
+        return None;
     }
+    Some((
+        p.get("in").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0),
+        p.get("out").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0),
+    ))
 }
 
 /// Effective billing for ONE model id on a connection: the per-model override when present,
@@ -1889,6 +1902,43 @@ fn paid_model_requires_balance(
         || rate > 0.0
         || input_price > 0.0
         || output_price > 0.0
+}
+
+/// 这条线路上跑这个模型，**这次调用会不会产生任何费用**。
+///
+/// 和 `是不是 free 模式` 是两回事，两者都要有：
+///   * `mode == "free"` —— 从**免费点数池**扣。点数是有限的，扣完就该拦。
+///   * 这里这个 —— **一分钱都不扣**，任何池子都不碰。倍率是最后一步乘数
+///     （`compute_cost` 结尾 `usd * 100.0 * rate`），倍率 0 时无论单价多少、
+///     无论用了多少 token，算出来都是 0 分。后台那个输入框下面写的就是这句
+///     「填 0 就是一分不收」。
+///
+/// 为什么要单独有它：主路径的准入门原来只认 `mode == "free"`，而那是个**枚举**、
+/// 和价格无关。运维把倍率填成 0 想开一条免费线路，非会员照样吃「请先开通会员或充值」——
+/// 而这条线路一分钱都不会收。声明（我把价格设成 0）和行为（门还是拦）分家了。
+///
+/// 判据必须走**结算那份解析**（`effective_billing_micro`），不是连接列：单模型覆盖能把
+/// 一条倍率 0 的连接上的某个模型定成 per_call 收费，而按次那笔钱**不经过倍率** ——
+/// 判成免费就会把零余额账号扣成负数。这和 `paid_model_requires_balance` 是同一条纪律。
+pub(crate) fn call_costs_nothing(model: &Model, model_id: &str) -> bool {
+    let (mode, _cents, _is_free, micro) = effective_billing_micro(model, model_id);
+    // 按次：只要真配了费用就要钱，倍率和单价都管不着它。
+    if mode == "per_call" {
+        return micro <= 0;
+    }
+    // 按量计费下，`compute_cost` 的最后一步是 `usd * 100.0 * rate`，而 usd 来自
+    // `effective_token_prices`。两条路各自都能把结果压成 0：
+    //   · 倍率 0 —— 后台那个输入框下面写着「填 0 就是一分不收」；
+    //   · 入价出价**显式填 0** —— 这个模型的单价就是 0，无论用了多少 token。
+    // 判据必须走和扣费同一个 `effective_token_prices`：单价那一侧的「显式 0」和
+    // 「留空（落官方目录价）」是相反的意思，用裸 f64 判就分不开了。
+    if model.rate <= 0.0 {
+        return true;
+    }
+    let over = model_price_override_set(&model.model_prices, model_id);
+    let (in_price, out_price, _, _) =
+        effective_token_prices(model_id, model.input_price, model.output_price, over);
+    in_price <= 0.0 && out_price <= 0.0
 }
 
 fn effective_billing_inner(model: &Model, model_id: &str) -> (String, i64, bool) {
@@ -2006,8 +2056,7 @@ fn resolve_cost(
     admin_out: f64,
     cache_read_price: f64,
     cache_create_price: f64,
-    model_in: f64,
-    model_out: f64,
+    model_over: Option<(f64, f64)>,
     cache_disabled: bool,
 ) -> i64 {
     if billing_mode == "per_call" {
@@ -2023,8 +2072,7 @@ fn resolve_cost(
         admin_out,
         cache_read_price,
         cache_create_price,
-        model_in,
-        model_out,
+        model_over,
         cache_disabled,
     )
 }
@@ -2879,10 +2927,11 @@ pub async fn admin_model_estimate(
     .await?
     .ok_or_else(|| AppError::bad("渠道汇率不存在"))?;
 
-    let (model_in, model_out) = model_price_override(&model.model_prices, model_id);
+    let model_over = model_price_override_set(&model.model_prices, model_id);
+    let (model_in, model_out) = model_over.unwrap_or((0.0, 0.0));
     // 和扣费、和下发给客户端的报价共用同一条阶梯。这里原来自己写了第三份。
     let (input_price, output_price, price_is_per_model, price_source) =
-        effective_token_prices(model_id, model.input_price, model.output_price, model_in, model_out);
+        effective_token_prices(model_id, model.input_price, model.output_price, model_over);
     if input_price <= 0.0 && output_price <= 0.0 {
         return Err(AppError::bad(
             "该模型没有可用价格，请在连接编辑里填写单模型输入/输出价",
@@ -2938,10 +2987,8 @@ pub async fn admin_model_estimate(
         model.output_price,
         model.cache_read_price,
         model.cache_create_price,
-        model_in,
-        model_out,
-        model.cache_disabled,
-    );
+        Some((model_in, model_out)),
+        model.cache_disabled,);
     let calls = req.calls as f64;
     let provider_usd_total = provider_usd_per_call * calls;
     let channel_cost_cny = provider_usd_total / usd_per_cny;
@@ -3572,11 +3619,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
                 continue;
             }
             let name = display_name_for(&m.model_names, &mid);
-            let (model_in, model_out) = model_price_override(&m.model_prices, &mid);
+            let model_over = model_price_override_set(&m.model_prices, &mid);
+            let (model_in, model_out) = model_over.unwrap_or((0.0, 0.0));
             // **和扣费共用同一个阶梯。** 这里原来自己写了一份，而且第 2、3 级和扣费是反的
             // （展示先看连接兜底价、扣费先看官方目录），于是卡片写 $3/M、账单按 $5/M 扣。
             let (input_price, output_price, price_is_per_model, price_source) =
-                effective_token_prices(&mid, m.input_price, m.output_price, model_in, model_out);
+                effective_token_prices(&mid, m.input_price, m.output_price, model_over);
             let (input_price, output_price, price_source) =
                 if input_price <= 0.0 && output_price <= 0.0 {
                     (0.0, 0.0, "unset")
@@ -3627,11 +3675,12 @@ pub async fn list_for_client(State(state): State<AppState>) -> ApiResult<Json<se
             //
             // 在 json! 外面算：宏里放不下块表达式（context_windows 那段同理）。
             let (eff_mode, eff_percall, eff_free, eff_micro) = effective_billing_micro(m, &mid);
+            // `always` 和准入门必须是**同一个判据**，否则界面说「收费」而门放行、
+            // 或者界面说「免费」而门拦人 —— 两种都是用户直接看得见的自相矛盾。
+            // `call_costs_nothing` 认三条：按次费为 0、倍率 0、单价显式填 0。
             let free_kind = if eff_free {
                 "pool"
-            } else if !paid_model_requires_balance(
-                &eff_mode, eff_percall, m.rate, input_price, output_price,
-            ) {
+            } else if call_costs_nothing(m, &mid) {
                 "always"
             } else {
                 "none"
@@ -3873,13 +3922,10 @@ pub async fn chat(
         // 老写法只看那四个连接列，于是 not_free 全假、整道余额门被跳过；而下面结算走的是
         // effective_billing_micro（认这份覆盖），实收 50 分。结果是一个零余额零套餐的账号
         // 被放行一次、credits_cents 直接扣成负数。门和结算问的必须是同一个函数。
-        let not_free = paid_model_requires_balance(
-            &_pre_mode,
-            _pre_percall,
-            model.rate,
-            model.input_price,
-            model.output_price,
-        );
+        // 和另外两个入口同一个函数。`paid_model_requires_balance` 只看连接那三列，
+        // 不认「每模型显式填 0」：一条倍率 1、连接价 3/15、但这个模型被显式定成 0/0 的线路，
+        // 它会判成收费而拦人 —— 而结算算出来是 0。同一份配置，此接口拦、彼接口放。
+        let not_free = !call_costs_nothing(&model, &chosen);
         if not_free {
             // 这条路由此前只读 credits_cents，后果有两个方向，都是真的：
             //   · 套餐有效、钱包 0 的会员在这里吃 402「额度不足，请充值」，而同一个人、
@@ -3964,10 +4010,8 @@ pub async fn chat(
         model.output_price,
         model.cache_read_price,
         model.cache_create_price,
-        model_in,
-        model_out,
-        model.cache_disabled,
-    );
+        Some((model_in, model_out)),
+        model.cache_disabled,);
     let mut tokens = extract_bill_tokens(
         usage_val.filter(|_| usage_reported),
         &chosen,
@@ -4728,14 +4772,20 @@ fn projected_provider_usd(
 /// 返回 `price_is_per_model` 是给缓存价用的：它表示这一档价是不是来自「和连接级缓存价
 /// 不同的配置层」。同层才允许用连接级缓存价，否则会出现「输入按每模型的 $15 收、缓存却按
 /// 连接级的 $3.75 收」这种混搭。
+/// 这个模型按哪一套单价计费。
+///
+/// `model_over` 是**每模型覆盖**：`Some` 表示后台为这个模型显式填了价格 —— 包括
+/// **显式填 0**，那是「这个模型一分不收」的意思，不是「没配」。上一版这里收的是两个
+/// 裸 f64、用 `> 0.0` 当「有没有覆盖」的判据，于是填 0 和留空在这一层不可分：
+/// 运维把入价出价都填 0 想开一条免费线路，判据说「没覆盖」→ 落到官方目录价 → 照收钱。
+/// 后台配的是 0、用户被扣的是目录价，而两边都不会报错。
 pub(crate) fn effective_token_prices(
     model_id: &str,
     admin_in: f64,
     admin_out: f64,
-    model_in: f64,
-    model_out: f64,
+    model_over: Option<(f64, f64)>,
 ) -> (f64, f64, bool, &'static str) {
-    if model_in > 0.0 || model_out > 0.0 {
+    if let Some((model_in, model_out)) = model_over {
         (model_in, model_out, true, "model_override")
     } else if let Some((cat_in, cat_out)) = official_price(model_id) {
         (cat_in, cat_out, true, "catalog")
@@ -4832,8 +4882,13 @@ fn compute_cost(
     admin_out: f64,
     cache_read_price: f64,
     cache_create_price: f64,
-    model_in: f64,
-    model_out: f64,
+    // **`Some` 表示后台为这个模型显式填了价格，包括显式填 0。**
+    //
+    // 上一版这里是两个裸 f64，用 `> 0.0` 当「有没有覆盖」的判据 —— 于是「填 0」和
+    // 「留空」在计价这一层不可分：运维把入价出价都填 0 想开一条免费线路，判据说
+    // 「没覆盖」→ 落到官方目录价 → 照收钱。后台配的是 0、用户被扣的是目录价，
+    // 而两边都不报错。见 `effective_token_prices`。
+    model_over: Option<(f64, f64)>,
     cache_disabled: bool,
 ) -> i64 {
     const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
@@ -4871,7 +4926,7 @@ fn compute_cost(
     // 价格来自哪一层，决定了缓存价该跟谁：来自模型（每模型覆盖或官方目录）就按模型的输入价
     // 推导；只有当输入价本身就是连接级兜底时，连接级的缓存价才是同一层配置、才该生效。
     let (off_in, off_out, price_is_per_model, _price_source) =
-        effective_token_prices(model_id, admin_in, admin_out, model_in, model_out);
+        effective_token_prices(model_id, admin_in, admin_out, model_over);
     if off_in <= 0.0 && off_out <= 0.0 {
         return 0; // no known price for this model → can't compute a real cost
     }
@@ -9822,10 +9877,34 @@ pub async fn chat_completions(
     // 选中哪条线路要等上游跑完才定，那时再拦已经晚了。所以在**尝试线路之前**收窄候选：
     // 除了免费池没有别的付款方式的人，只让走免费线路，结算就必然落在免费线路上。
     // 有余额/有套餐的用户行为不变（免费线路挂了照样回退到付费线路）。
-    let admitted_free = admit_billing(
-        free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
-        plan_active, q_total, q_window, q_weekly_cap, q_week_used,
-    )?;
+    // **一分不收的线路不该被余额门拦。**
+    //
+    // `free_here` 判的是 `mode == "free"`（从免费点数池扣），那是另一件事：点数有限、
+    // 扣完该拦。而倍率 0 的线路是**任何池子都不碰** —— compute_cost 最后一步
+    // `usd * 100.0 * rate` 乘的就是它，结果恒为 0 分。后台那个输入框下面写着
+    // 「填 0 就是一分不收」，那句话得算数：运维把倍率填成 0 开一条免费线路给所有人用，
+    // 非会员就该能用，而不是吃一句「请先开通会员或充值额度」。
+    //
+    // 判在 admit_billing **之前**：这次调用根本不产生费用，没有任何池子需要被检查，
+    // 也就没有什么可拒绝的。放行零成本的调用不会让任何账户变负 —— 结算算出来是 0。
+    let zero_cost: Vec<Model> = candidates
+        .iter()
+        .filter(|c| call_costs_nothing(c, &model_id))
+        .cloned()
+        .collect();
+    let costs_nothing_here = !zero_cost.is_empty();
+    // 没钱没套餐的人：把候选收窄到零成本那几条，结算就**必然**落在不收钱的线路上。
+    // 和下面免费池那段同一个形状 —— 选中哪条要等上游跑完才定，那时再拦已经晚了。
+    // 有余额/有套餐的用户行为不变（零成本线路挂了照样回退到付费线路）。
+    let admitted_free = if costs_nothing_here && !quota_ok && credits <= 0 {
+        candidates = zero_cost;
+        false
+    } else {
+        admit_billing(
+            free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
+            plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+        )?
+    };
     if admitted_free && !quota_ok && credits <= 0 {
         let free_only: Vec<Model> = candidates
             .iter()
@@ -11601,10 +11680,8 @@ pub async fn chat_completions(
                 admin_out,
                 cache_read_price,
                 cache_create_price,
-                model_in,
-                model_out,
-                conn.cache_disabled,
-            );
+        Some((model_in, model_out)),
+                conn.cache_disabled,);
             let mut tokens = extract_bill_tokens(
                 usage_reported.then_some(&usage),
                 &req_model,
@@ -11759,10 +11836,8 @@ pub async fn chat_completions(
                 conn.output_price,
                 conn.cache_read_price,
                 conn.cache_create_price,
-                model_in,
-                model_out,
-                conn.cache_disabled,
-            );
+        Some((model_in, model_out)),
+                conn.cache_disabled,);
             let mut tokens = extract_bill_tokens(
                 usage_val.filter(|_| usage_reported),
                 &model_id,
@@ -11865,10 +11940,15 @@ pub async fn responses_proxy(
             free_points_balance(&state, uid).await,
             effective_billing_micro(&conn, &model_id).3,
         );
-    admit_billing(
-        free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
-        plan_active, q_total, q_window, q_weekly_cap, q_week_used,
-    )?;
+    // 倍率 0 的线路一分不收，任何池子都不碰 —— 没有什么可拒绝的。
+    // 和 chat_completions 那道门同一条规则；只在这里放宽的话，同一条免费线路又会变成
+    // 「从 IDE 能用、从别的客户端说没额度」。
+    if !call_costs_nothing(&conn, &model_id) {
+        admit_billing(
+            free_fallback_to_paid(), free_here, free_pool_has_room, quota_ok, credits,
+            plan_active, q_total, q_window, q_weekly_cap, q_week_used,
+        )?;
+    }
 
     // Same per-user concurrency ceiling chat_completions uses. Without it these two
     // billed paths had no cap at all, so the bounded-overdraft guarantee that
@@ -12050,10 +12130,8 @@ pub async fn responses_proxy(
                 conn.output_price,
                 conn.cache_read_price,
                 conn.cache_create_price,
-                model_in,
-                model_out,
-                conn.cache_disabled,
-            );
+        Some((model_in, model_out)),
+                conn.cache_disabled,);
             let mut tokens =
                 extract_bill_tokens(usage.filter(|_| usage_reported), &model_id, !usage_reported);
             tokens.request_id = request_id.clone();
@@ -12438,10 +12516,29 @@ mod live_price_tests {
             code.contains("prev.map((r) => ({ ...r, pin: \"\", pout: \"\" }))"),
             "整条线路「全部用现价」的入口没了",
         );
-        // 留空 = 不写覆盖 = 运行时查实时目录。这条不能被改成写 0（写 0 会被当成覆盖）。
+        // **留空和填 0 是相反的意思，保存时必须分得开。**
+        //
+        // 留空 = 不写覆盖 = 运行时查实时目录；填 0 = 这个模型一分不收，是一种有意的定价。
+        // 判据因此是「填了没有」（priceNum 返回非 null），不是「填的是不是正数」——
+        // 上一版按 `nz(...) > 0` 过滤，把填 0 的那一项整个丢掉，后端看不到覆盖就落回
+        // 官方目录价：运维以为开了免费线路，用户照样被扣钱，而两边都不报错。
         assert!(
-            code.contains(".filter((r) => nz(r.pin) > 0 || nz(r.pout) > 0)"),
-            "保存时不再是「只收非零项」—— 清空会变成写 0，那是另一种覆盖",
+            code.contains(".filter((r) => priceNum(r.pin) !== null && priceNum(r.pout) !== null)"),
+            "保存时又按「非零」过滤了 —— 填 0 会被丢掉，免费线路静默变成按目录价收费",
+        );
+        assert!(
+            code.contains("const priceNum = (s: string): number | null =>"),
+            "没有「填了没有」这个判据 —— nz() 把 0 和留空塌成同一个值",
+        );
+        // 清空的两个入口写的仍然是空串，不是 "0"：那是「用现价」，不是「免费」。
+        assert!(
+            !code.contains(r#"pin: "0""#) && !code.contains(r#"pout: "0""#),
+            "「用现价」被写成了 0 —— 那会把整条线路改成一分不收",
+        );
+        // 回显也要认 0，否则存了 0 再打开就变回留空，下一次保存静默改回目录价。
+        assert!(
+            code.contains(r#"pin: typeof p.in === "number" ? String(p.in) : """#),
+            "回显把 0 当成了空 —— 配好的免费线路会在下一次编辑时被改回收费",
         );
     }
 }
@@ -14294,13 +14391,13 @@ mod billing_tests {
     fn free_mode_still_costs_and_maps_to_a_real_cost_mode() {
         // free + a configured per-call fee bills that flat fee (against points)
         assert_eq!(
-            resolve_cost("per_call", 3, None, "free-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            resolve_cost("per_call", 3, None, "free-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             3,
         );
         // free with no fee falls through to token billing, which with zero prices is 0 —
         // legitimately free, and the points pool is simply untouched.
         assert_eq!(
-            resolve_cost("rate", 0, None, "free-model", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            resolve_cost("rate", 0, None, "free-model", 0.0, 0.0, 0.0, 0.0, 0.0, None, false),
             0,
         );
     }
@@ -15128,10 +15225,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             20
         );
         // Even with no usage at all, per_call still charges the flat fee.
@@ -15146,15 +15241,13 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             35
         );
         // Negative per_call_cents floored to 0.
         assert_eq!(
-            resolve_cost("per_call", -5, None, "x", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            resolve_cost("per_call", -5, None, "x", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             0
         );
     }
@@ -15176,10 +15269,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             16
         );
         // per_call_cents is IGNORED in rate mode.
@@ -15194,10 +15285,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             48
         );
         // Empty/unknown mode string → treated as rate (safe default).
@@ -15212,10 +15301,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             16
         );
     }
@@ -15280,7 +15367,7 @@ mod billing_tests {
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
         });
         let cents = |model: &str, conn_write: f64| {
-            compute_cost(Some(&usage), model, 1.0, 0.0, 0.0, 0.0, conn_write, 0.0, 0.0, false)
+            compute_cost(Some(&usage), model, 1.0, 0.0, 0.0, 0.0, conn_write, None, false)
         };
         // 100 万缓存写入 token，倍率 1：应当 = 1.25 × 该模型输入价，单位美分。
         assert_eq!(cents("claude-opus-4-8", 3.75), 625, "Opus 写入应为 1.25×$5=$6.25");
@@ -15294,12 +15381,12 @@ mod billing_tests {
         );
         // 但模型没有输入价时，它仍然是兜底（否则就成了白送）。
         assert_eq!(
-            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 0.0, 0.0, 0.0, 3.75, 0.0, 0.0, false),
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 0.0, 0.0, 0.0, 3.75, None, false),
             0,
             "没有输入价也没有连接价 → 0（这是另一个已知洞，此处只固定现状）"
         );
         assert_eq!(
-            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, 0.0, 0.0, false),
+            compute_cost(Some(&usage), "some-unlisted-model", 1.0, 2.0, 8.0, 0.0, 3.75, None, false),
             375,
             "只有连接级输入价时，连接级缓存价仍然兜底"
         );
@@ -15332,7 +15419,7 @@ mod billing_tests {
         // 连接级缓存价传 0（没手填）。100 万写入 token、倍率 1 → 应当按实时 $9 = 900 分，
         // 不是推算的 500 分。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&write_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             900,
             "没手填缓存价时应当用实时目录 $9，而不是推算的 1.25×$4=$5"
         );
@@ -15343,7 +15430,7 @@ mod billing_tests {
         });
         // 缓存读实时价 $0.5 → 50 分；推算是 0.1×$4 = $0.4 = 40 分。
         assert_eq!(
-            compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&read_usage), "cache-live-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             50,
             "缓存读也要用实时 $0.5，而不是推算的 $0.4"
         );
@@ -15371,13 +15458,13 @@ mod billing_tests {
         });
         // 开缓存（cache_disabled=false）：100 万缓存写 × $6.25 = 625 分。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             625,
             "开缓存应按真实写入价收"
         );
         // 关缓存（cache_disabled=true）：缓存写不收钱 = 0（只剩那 1 个普通 input token，几乎 0）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            compute_cost(Some(&write_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, true),
             0,
             "关缓存应当缓存写一分不收"
         );
@@ -15387,14 +15474,14 @@ mod billing_tests {
             "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 0,
         });
         assert_eq!(
-            compute_cost(Some(&read_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            compute_cost(Some(&read_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, true),
             0,
             "关缓存应当缓存读也不收"
         );
         // 普通输入/输出**不受开关影响**：给 100 万普通 input，关缓存照样按 $5 收 = 500 分。
         let plain_usage = serde_json::json!({ "input_tokens": 1_000_000, "output_tokens": 0 });
         assert_eq!(
-            compute_cost(Some(&plain_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, true),
+            compute_cost(Some(&plain_usage), "cache-off-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, true),
             500,
             "关缓存不该动普通输入价"
         );
@@ -15425,13 +15512,13 @@ mod billing_tests {
         });
         // 缓存写：倍率 1.25 × 你的 $15 = $18.75 = 1875 分。照搬目录只有 625 分（少收 3×）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 15.0, 25.0, false),
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, Some((15.0, 25.0)), false),
             1875,
             "加价模型的缓存写没跟着放大——按成本价收了，少收 3 倍"
         );
         // 不加价（off_in 就用目录 $5）时，倍率 × 输入 = 目录绝对值，结果不变（625 分）。
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             625,
             "不加价时应当正好等于目录绝对值"
         );
@@ -15459,7 +15546,7 @@ mod billing_tests {
         });
         // 100 万缓存读 × 真实 $0.2 = 20 分；写死 0.1 只会算 10 分。
         assert_eq!(
-            compute_cost(Some(&read_usage), "ratio-model", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&read_usage), "ratio-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             20,
             "没用目录的真实倍率 0.2，用了写死的 0.1"
         );
@@ -15475,7 +15562,7 @@ mod billing_tests {
         });
         // claude-fable-5 输入价 $10、目录无缓存价 → 推算写入 1.25×$10 = $12.5 = 1250 分。
         assert_eq!(
-            compute_cost(Some(&usage), "claude-fable-5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&usage), "claude-fable-5", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             1250,
             "目录没有缓存价时，仍按输入价 × 倍数兜底"
         );
@@ -15494,10 +15581,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             48
         ); // ×3
         assert_eq!(
@@ -15509,10 +15594,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             16
         ); // ×1 = real cost
         assert_eq!(
@@ -15524,10 +15607,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             32
         ); // ×2
     }
@@ -15560,10 +15641,8 @@ mod billing_tests {
                 25.0,
                 0.5,
                 6.25,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             72
         );
     }
@@ -15588,7 +15667,7 @@ mod billing_tests {
         seed_catalog();
         let usage = json!({"prompt_tokens": 22000, "completion_tokens": 2000});
         assert_eq!(
-            compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(Some(&usage), "gpt-5.5", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
             17
         );
     }
@@ -15610,10 +15689,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             0
         );
         assert_eq!(
@@ -15625,10 +15702,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             // 1 而不是 3：旧硬编码表把 deepseek-v4-flash 写成 0.14/0.28，真实价是
             // 0.06146/0.12292（便宜一半多）。这条测试原本钉的是那个错价算出来的数。
             // 它真正要守的"成本随规模从 0 涨上来"仍然成立：small=0、big>0。
@@ -15650,10 +15725,8 @@ mod billing_tests {
                 10.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             6
         );
         // No catalog AND no admin price → can't know the real cost → 0.
@@ -15666,10 +15739,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             0
         );
     }
@@ -15689,10 +15760,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                1.0,
-                2.0,
-                false,
-            ),
+        Some((1.0, 2.0)),
+                false,),
             3
         );
         assert_eq!(
@@ -15704,10 +15773,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                1.0,
-                2.0,
-                false,
-            ),
+        Some((1.0, 2.0)),
+                false,),
             8
         ); // ×3 → 7.8→8
            // No override (0,0) → catalog price used (16¢), proving the override is what changed it.
@@ -15720,10 +15787,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             16
         );
     }
@@ -17216,7 +17281,7 @@ mod billing_tests {
     #[test]
     fn no_usage_is_zero() {
         assert_eq!(
-            compute_cost(None, "claude-opus-4-8", 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
+            compute_cost(None, "claude-opus-4-8", 3.0, 0.0, 0.0, 0.0, 0.0, None, false),
             0
         );
         assert_eq!(
@@ -17228,10 +17293,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             0
         );
     }
@@ -17327,10 +17390,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             16
         );
     }
@@ -17351,10 +17412,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             1
         );
     }
@@ -17373,10 +17432,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             5000
         );
     }
@@ -17398,10 +17455,8 @@ mod billing_tests {
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                0.0,
-                false,
-            ),
+        None,
+                false,),
             48
         );
     }
@@ -17579,10 +17634,8 @@ mod cache_price_tests {
             0.0,
             0.5,
             6.5,
-            0.0,
-            0.0,
-            false,
-        );
+        None,
+            false,);
         assert_eq!(c, 2, "explicit cache prices: got {}", c);
         // with cache prices = 0 → falls back to factors (read 0.1*5=0.5, write 1.25*5=6.25)
         // usd = (1000*5 + 2000*0.5 + 500*6.25 + 300*25)/1e6 = (5000+1000+3125+7500)/1e6=16625 → 1.66 → 2
@@ -17594,10 +17647,8 @@ mod cache_price_tests {
             0.0,
             0.0,
             0.0,
-            0.0,
-            0.0,
-            false,
-        );
+        None,
+            false,);
         assert_eq!(c2, 2, "factor fallback: got {}", c2);
     }
 }
@@ -17679,10 +17730,8 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
             0.0,
             0.0,
             0.0,
-            0.0,
-            0.0,
-            false,
-        );
+        None,
+            false,);
         assert_eq!(cost, 0);
     }
 }
@@ -19945,10 +19994,8 @@ async fn bill_vision_call(
         vconn.output_price,
         vconn.cache_read_price,
         vconn.cache_create_price,
-        model_in,
-        model_out,
-        vconn.cache_disabled,
-    );
+        Some((model_in, model_out)),
+        vconn.cache_disabled,);
     // 单独打标，和聊天、压缩三者在用量表里分得开。
     let mut tokens = extract_bill_tokens(usage.filter(|_| reported), "michael-vision/gpt-5.5", !reported);
     tokens.request_id = None;
@@ -19974,10 +20021,8 @@ async fn bill_compression_call(
         conn.output_price,
         conn.cache_read_price,
         conn.cache_create_price,
-        model_in,
-        model_out,
-        conn.cache_disabled,
-    );
+        Some((model_in, model_out)),
+        conn.cache_disabled,);
     let mut tokens = extract_bill_tokens(
         usage.filter(|_| reported),
         // 在用量表里单独标记，便于把压缩成本和聊天成本分开对账。
@@ -20841,7 +20886,7 @@ mod power_route_tests {
         // 目录里 claude-opus-5 = 5/25（seed_catalog 里的值）。
         // 连接填了兜底价 3/15，且没有每模型覆盖 —— 这正是出事的那种配置。
         let (disp_in, disp_out, per_model, source) =
-            effective_token_prices("claude-opus-5", 3.0, 15.0, 0.0, 0.0);
+            effective_token_prices("claude-opus-5", 3.0, 15.0, None);
         assert_eq!(
             (disp_in, disp_out),
             (5.0, 25.0),
@@ -20852,12 +20897,12 @@ mod power_route_tests {
 
         // 每模型覆盖仍然最优先。
         assert_eq!(
-            effective_token_prices("claude-opus-5", 3.0, 15.0, 15.0, 75.0).0,
+            effective_token_prices("claude-opus-5", 3.0, 15.0, Some((15.0, 75.0))).0,
             15.0,
         );
         // 目录里没有的模型才落到连接兜底价上。
         let (fb_in, _, fb_per_model, fb_src) =
-            effective_token_prices("some-model-not-in-catalog", 3.0, 15.0, 0.0, 0.0);
+            effective_token_prices("some-model-not-in-catalog", 3.0, 15.0, None);
         assert_eq!((fb_in, fb_src), (3.0, "backend"));
         assert!(!fb_per_model, "连接价和连接级缓存价是同一层，该允许混用");
     }
@@ -21432,6 +21477,95 @@ mod audit_20260822_tests {
     /// billing_mode="rate"、rate/输入价/输出价全 0 的连接上把某个模型定成收费的。老写法只看
     /// 那四个连接列 → 判成免费 → 整道余额门被跳过；而结算走 effective_billing_micro，认这份
     /// 覆盖、真扣 50 分。零余额零套餐的账号被放行一次，credits_cents 直接变负。
+    /// **复现**：倍率 0 = 一分不收，那么非会员、零余额也该能用。
+    ///
+    /// 后台那个「倍率」输入框下面写着「填 0 就是一分不收」，而 compute_cost 的最后一步
+    /// 就是 `usd * 100 * rate` —— 倍率 0 时**任何**模型、任何单价，算出来都是 0 分。
+    /// 所以一条倍率 0 的线路对用户是真免费的。
+    ///
+    /// 可主路径（IDE 走的 /v1/chat/completions）判「免费」用的是
+    /// `effective_billing(c, mid).2`，而那一位是 `mode == "free"` —— 一个**枚举**，
+    /// 和价格无关。于是运维把倍率填成 0、以为开了一条免费线路，非会员照样吃
+    /// 「请先开通会员或充值额度」。
+    #[test]
+    fn 倍率零的线路对零余额用户也该放行() {
+        // 先钉住前提：倍率 0 时确实一分不收（换成别的实现这条会先红）。
+        let usage = serde_json::json!({ "prompt_tokens": 100000, "completion_tokens": 100000 });
+        assert_eq!(
+            super::compute_cost(Some(&usage), "claude-opus-5", 0.0, 3.0, 15.0, 0.0, 0.0, None, false),
+            0,
+            "倍率 0 却算出了钱 —— 那后台那句「填 0 就是一分不收」是假的",
+        );
+        // 同一份用量，倍率 1 就是真金白银 —— 证明上面那个 0 不是因为用量为空。
+        assert!(
+            super::compute_cost(Some(&usage), "claude-opus-5", 1.0, 3.0, 15.0, 0.0, 0.0, None, false) > 0,
+        );
+
+        // **主场景：入价出价都显式填 0。**
+        //
+        // 这是用户实际会做的操作——在后台把这两栏都写成 0，期望「这个模型不收费」。
+        // 而 claude-opus-5 在内置官方目录里有价，所以「填 0」必须和「留空」分得开：
+        // 留空 = 按目录价收，填 0 = 一分不收。分不开的话运维配的是 0、用户被扣目录价。
+        let mut zero_priced = super::Model::blank();
+        zero_priced.billing_mode = "rate".into();
+        zero_priced.rate = 1.0;          // 倍率正常，钱是被单价压成 0 的
+        zero_priced.enabled_models = vec!["claude-opus-5".into()];
+        zero_priced.model_prices = serde_json::json!({ "claude-opus-5": { "in": 0.0, "out": 0.0 } });
+        assert!(
+            super::call_costs_nothing(&zero_priced, "claude-opus-5"),
+            "入价出价都填 0 没被认成免费 —— 非会员会被挡在门外，而这个模型一分钱都不收",
+        );
+        // 同一份配置，扣费也必须真的是 0（门和结算问同一个问题）。
+        let over = super::model_price_override_set(&zero_priced.model_prices, "claude-opus-5");
+        assert_eq!(
+            super::compute_cost(Some(&usage), "claude-opus-5", 1.0, 3.0, 15.0, 0.0, 0.0, over, false),
+            0,
+            "门说免费、结算却按目录价收了钱 —— 这正是「填 0 和留空分不开」的后果",
+        );
+        // 反向：**留空**（没有这一项）仍然按官方目录价收，不能被顺手改成免费。
+        // 留空时价格从别处来：内置官方目录，目录里没有就用连接级那两栏。
+        // 这里把连接级填上，好让「留空 ⇒ 有价 ⇒ 要钱」这条链在测试里是确定的，
+        // 不依赖内置目录当下收录了哪些模型。
+        let mut blank_priced = zero_priced.clone();
+        blank_priced.model_prices = serde_json::json!({});
+        blank_priced.input_price = 3.0;
+        blank_priced.output_price = 15.0;
+        assert!(
+            !super::call_costs_nothing(&blank_priced, "claude-opus-5"),
+            "留空被当成了免费 —— 那会让所有没手填价的线路一夜之间不收钱",
+        );
+
+        // 判据：一条倍率 0 的线路必须被认成「这次调用不花钱」。
+        // 单价给足，好让「倍率 0」成为它免费的**唯一**原因 —— 单价也写 0 的话，
+        // 拆掉倍率那一支这条断言照样过，等于没测（实测漏网一次）。
+        let mut free_route = super::Model::blank();
+        free_route.billing_mode = "rate".into();
+        free_route.rate = 0.0;
+        free_route.input_price = 3.0;
+        free_route.output_price = 15.0;
+        free_route.enabled_models = vec!["claude-opus-5".into()];
+        assert!(
+            super::call_costs_nothing(&free_route, "claude-opus-5"),
+            "倍率 0 的线路没被认成免费 —— 非会员会被挡在门外，而这条线路一分钱都不会收",
+        );
+
+        // 反向：倍率非 0、又有单价，就不是免费，门照旧要看余额。
+        let mut paid = free_route.clone();
+        paid.rate = 1.0;
+        paid.input_price = 3.0;
+        paid.output_price = 15.0;
+        assert!(!super::call_costs_nothing(&paid, "claude-opus-5"));
+        // 单模型覆盖成 per_call 收费的，即使连接倍率是 0 也要收 —— 那笔钱不经过倍率。
+        let mut per_call = free_route.clone();
+        per_call.model_billing = serde_json::from_value(serde_json::json!({
+            "claude-opus-5": { "mode": "per_call", "per_call_cents": 50 }
+        })).unwrap();
+        assert!(
+            !super::call_costs_nothing(&per_call, "claude-opus-5"),
+            "按次收费不经过倍率，倍率 0 挡不住它 —— 判成免费会把零余额账号扣成负数",
+        );
+    }
+
     #[test]
     fn 单模型计费覆盖的模型也必须先看余额() {
         // 连接列全是 0，解析结果是 ("per_call", 50) —— 门必须认解析结果。
@@ -21449,16 +21583,26 @@ mod audit_20260822_tests {
         assert!(!super::paid_model_requires_balance("rate", 0, 0.0, 0.0, 0.0));
         assert!(!super::paid_model_requires_balance("per_call", 0, 0.0, 0.0, 0.0));
 
-        // 接线：门必须拿结算那份解析出来的模式/单次费，而不是 model.billing_mode。
+        // 接线：这道门和另外两个入口必须是**同一个函数**。
+        //
+        // 原来它用 `paid_model_requires_balance(_pre_mode, _pre_percall, model.rate, …)`，
+        // 那已经解决了「模式/单次费要按单模型解析」那一半；但价格那一半仍然只看连接三列，
+        // 认不出「每模型显式填 0」—— 一条倍率 1、连接价 3/15、这个模型被定成 0/0 的线路，
+        // 它判成收费而拦人，可结算算出来是 0。同一份配置，此接口拦、彼接口放。
+        // `call_costs_nothing` 三条都认（按次费、倍率、显式 0 单价），三个入口共用它。
         let body = fn_body(&gateway_code(), "pub async fn chat(");
         assert!(
             !body.contains("model.billing_mode == \"per_call\""),
             "余额门又读回连接列了：单模型覆盖定价的模型会被判成免费，整道门被跳过",
         );
-        let args = call_args(&body, "paid_model_requires_balance(");
         assert!(
-            args.contains("_pre_mode") && args.contains("_pre_percall"),
-            "余额门没有用 effective_billing_micro 的结果：{args}",
+            body.contains("let not_free = !call_costs_nothing(&model, &chosen);"),
+            "这道门没和另外两个入口用同一个判据",
+        );
+        // 而且要喂**结算那个** model id（`chosen`），不是另算一份。
+        assert!(
+            call_args(&body, "call_costs_nothing(").contains("&chosen"),
+            "门和结算问的不是同一个 model id —— 刚堵上的洞会换个触发条件回来",
         );
 
         // 用对了函数还不够 —— 得喂给它**同一个 model id**。
@@ -21484,11 +21628,62 @@ mod audit_20260822_tests {
             .find("let chosen = match requested")
             .expect("model id 的那段解析不见了");
         let gate = body
-            .find("paid_model_requires_balance(")
+            .find("call_costs_nothing(")
             .expect("余额门不见了");
         assert!(
             pick < gate,
             "model id 的解析又跑到余额门后面去了：门判的和结算扣的不是同一个模型",
+        );
+    }
+
+    /// 三个准入门都必须放行「这次调用一分不收」的线路。
+    ///
+    /// 少接一处的症状很具体：同一条把入价出价填成 0 的免费线路，从 IDE 能用、从别的
+    /// 客户端说「请先开通会员或充值额度」——同一份后台配置，两个接口两种答案。
+    /// 而放行零成本调用不会让任何账户变负：结算算出来就是 0。
+    #[test]
+    fn 三个准入门都要放行一分不收的线路() {
+        let code = gateway_code();
+
+        // ① 主路径 /v1/chat/completions
+        let chat = fn_body(&code, "pub async fn chat_completions(");
+        assert!(
+            chat.contains("call_costs_nothing(c, &model_id)"),
+            "主路径没认零成本线路 —— 非会员用不了运维配的免费线路",
+        );
+        // 没钱没套餐的人必须被**收窄到**零成本那几条，否则选中哪条要等上游跑完才定，
+        // 那时结算落在收费线路上就已经晚了（和免费池那段同一个形状）。
+        assert!(
+            chat.contains("candidates = zero_cost;"),
+            "没把候选收窄到零成本线路 —— 零余额用户可能被结算到收费线路上，扣成负数",
+        );
+        // 钉**条件本身**，不只是钉那两行在不在：把条件改成 false，上面两条断言照样过
+        // （字符串都还在），而这道门就整个不生效了（实测漏网）。
+        assert!(
+            chat.contains("if costs_nothing_here && !quota_ok && credits <= 0 {"),
+            "零成本那道分支的条件被改掉了 —— 两行代码都在，门却不开",
+        );
+        // 而且这道判断必须排在 admit_billing **之前**：排在后面的话，
+        // admit_billing 已经用 `?` 把请求打回去了，后面写什么都不会执行。
+        let zero_at = chat.find("costs_nothing_here").expect("零成本判据不见了");
+        let admit_at = chat.find("admit_billing(").expect("准入门不见了");
+        assert!(
+            zero_at < admit_at,
+            "零成本判据排到 admit_billing 后面了 —— 那道门已经用 ? 把请求打回去了",
+        );
+
+        // ② /v1/responses
+        let resp = fn_body(&code, "pub async fn responses_proxy(");
+        assert!(
+            resp.contains("if !call_costs_nothing(&conn, &model_id) {"),
+            "/v1/responses 没认零成本线路 —— 同一条免费线路从这个接口用不了",
+        );
+
+        // ③ /api/models/:id/chat（旧接口）
+        let old = fn_body(&code, "pub async fn chat(");
+        assert!(
+            old.contains("let not_free = !call_costs_nothing(&model, &chosen);"),
+            "旧接口没认零成本线路",
         );
     }
 
@@ -21521,9 +21716,16 @@ mod audit_20260822_tests {
             body.contains("if eff_free {\n                \"pool\""),
             "pool 不是由 effective_billing 的 free 位判定的",
         );
+        // `always`（永远免费）和准入门必须是**同一个函数**，否则界面说「收费」而门放行、
+        // 或者界面说「免费」而门拦人 —— 两种都是用户直接看得见的自相矛盾。
         assert!(
-            body.contains("!paid_model_requires_balance("),
+            body.contains("call_costs_nothing(m, &mid)"),
             "always 的判据和准入门不是同一个",
+        );
+        let gate = fn_body(&gateway_code(), "pub async fn chat_completions(");
+        assert!(
+            gate.contains("call_costs_nothing(c, &model_id)"),
+            "准入门没用这个判据 —— 那徽标说的「永远免费」就不是门认的那件事",
         );
         // 「够不够付这一次」的判据必须由网关下发，否则客户端只能自己换算，迟早和门分家。
         assert!(
