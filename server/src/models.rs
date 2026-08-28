@@ -620,6 +620,47 @@ async fn wait_for_upstream_retry(delay: Duration, deadline: Instant) -> bool {
     true
 }
 
+/// 「这段**会话**上一次成功走的是哪条线路」。
+///
+/// # 为什么需要它
+///
+/// 出口层已经有粘性（`sticky_key`，见 route_endpoints），而**线路层没有**。于是一条对话
+/// 在两条线路之间来回跳，而四条 claude 线路是**四个不同的上游、四份独立的提示词缓存** ——
+/// 每换一次就得把整段上下文重新写进缓存。
+///
+/// 这不是"慢一点"，是钱：缓存写价是输入价的 **1.25×**、读价是 **0.1×**，
+/// 重写一次比命中贵 **12.5 倍**。生产实测（2026-08-28，10 笔）：换线 5 次，
+/// 缓存写 184,170 token vs 缓存读 86,922 —— 写进去的是读回来的两倍多。
+/// 最扎眼的一笔只输出 195 token，却花了 46¢，全在换线之后重建 24,498 token 的缓存上。
+///
+/// 附带还修一件事：两条线路的每模型价差 3.3 倍（5/25 对 15/25），用户看到的是自己选的
+/// 那一组的价，换线之后按另一组扣 —— 代码里早有注释记着这个坑（"用户看到 $2、按 $10 扣"）。
+///
+/// # 边界
+///
+/// 它只影响**换线之后落到哪**，不动用户显式选的那条（`x-ide-route`）—— 那是用户的意图，
+/// 粘性只负责让"备胎"稳定，不负责替用户改主意。健康/冷却/下架的判断也一概不绕过：
+/// 记住的那条如果正在冷却，照样跳过。
+static CHAT_ROUTE_AFFINITY: LazyLock<Mutex<HashMap<[u8; 32], (uuid::Uuid, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 粘多久。够长以覆盖一段连续对话（缓存本身在上游通常也是这个量级），
+/// 够短以免一条线路被永久钉死在一个早就换了话题的会话上。
+const ROUTE_AFFINITY_TTL: Duration = Duration::from_secs(30 * 60);
+
+fn route_affinity_get(key: &[u8; 32]) -> Option<uuid::Uuid> {
+    let mut m = CHAT_ROUTE_AFFINITY.lock().ok()?;
+    let now = Instant::now();
+    m.retain(|_, (_, at)| now.duration_since(*at) < ROUTE_AFFINITY_TTL);
+    m.get(key).map(|(id, _)| *id)
+}
+
+fn route_affinity_set(key: [u8; 32], route: uuid::Uuid) {
+    if let Ok(mut m) = CHAT_ROUTE_AFFINITY.lock() {
+        m.insert(key, (route, Instant::now()));
+    }
+}
+
 static CHAT_UPSTREAM_ROUTE_COOLDOWNS: LazyLock<Mutex<HashMap<uuid::Uuid, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -9838,6 +9879,33 @@ pub async fn chat_completions(
         }
     }
 
+    // 会话粘性：让**换线之后落到哪**保持稳定。
+    //
+    // 四条 claude 线路是四个不同的上游、四份独立的提示词缓存。用户选的那条一旦冷却，
+    // 请求就会掉到备胎上；如果每次掉到的备胎都不一样，那份上下文就得一遍遍重新写进缓存 ——
+    // 而写价是读价的 12.5 倍。这里只重排**第一位之后**的顺序：用户显式选的那条永远在最前，
+    // 粘性负责的是"备胎要稳定"，不是替用户改主意。
+    //
+    // 键用 session → run → uid 这个阶梯（和出口层那份 sticky_key 同一个），因为 run id
+    // 每条用户消息就换一次，只用它等于没有粘性 —— 出口层的注释里记着同一个教训。
+    let route_affinity_key = crate::route_endpoints::sticky_key(
+        &uid,
+        &[
+            headers.get("x-ide-session-id").and_then(|v| v.to_str().ok()),
+            headers.get("x-ide-run-id").and_then(|v| v.to_str().ok()),
+        ],
+        state.cfg.jwt_secret.as_bytes(),
+    );
+    if let Some(last) = route_affinity_get(&route_affinity_key) {
+        // 只在它不是首选时才动手；首选就是它的话本来就在最前，不用重排。
+        if let Some(at) = candidates.iter().position(|m| m.id == last) {
+            if at > 1 {
+                let picked = candidates.remove(at);
+                candidates.insert(1.min(candidates.len()), picked);
+            }
+        }
+    }
+
     let primary_conn = candidates
         .first()
         .cloned()
@@ -10772,6 +10840,9 @@ pub async fn chat_completions(
                                 );
                                 // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
                                 clear_route_stall(candidate.health_id());
+                                // 记住这段会话走通的是哪条线路。下一轮它的提示词缓存在这条
+                                // 线路的上游是热的，换到别处等于按 1.25× 重写一遍。
+                                route_affinity_set(route_affinity_key, candidate.id);
                             }
                             Err(error) => tracing::warn!(
                                 request_id = request_id.as_deref().unwrap_or(""),
@@ -21541,6 +21612,57 @@ mod audit_20260822_tests {
     /// `effective_billing(c, mid).2`，而那一位是 `mode == "free"` —— 一个**枚举**，
     /// 和价格无关。于是运维把倍率填成 0、以为开了一条免费线路，非会员照样吃
     /// 「请先开通会员或充值额度」。
+    /// **会话粘性：换线之后落到哪，必须稳定。**
+    ///
+    /// 四条 claude 线路是四个不同的上游、四份独立的提示词缓存。用户选的那条一冷却，请求
+    /// 掉到备胎上；每次掉到不同的备胎，那段上下文就得一遍遍重写进缓存 —— 而缓存写价是
+    /// 输入价的 1.25×、读价 0.1×，**重写比命中贵 12.5 倍**。
+    ///
+    /// 生产实测（2026-08-28，10 笔）：换线 5 次，缓存写 184,170 vs 缓存读 86,922。
+    /// 一笔只输出 195 token 的调用花了 46¢，全在换线后重建 24,498 token 的缓存上。
+    ///
+    /// 判据是**行为**：同一个键写进去再读出来必须是同一条；TTL 到了必须忘掉（否则一条线路
+    /// 会被永久钉死在一个早就换了话题的会话上）；不同键之间不许串。
+    #[test]
+    fn route_affinity_remembers_per_session_and_expires() {
+        let k1 = [7u8; 32];
+        let k2 = [9u8; 32];
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+
+        super::route_affinity_set(k1, a);
+        assert_eq!(
+            super::route_affinity_get(&k1),
+            Some(a),
+            "刚记下的线路读不回来 —— 粘性等于没有，每轮都可能换线重建缓存"
+        );
+        assert_eq!(
+            super::route_affinity_get(&k2),
+            None,
+            "另一个会话读到了别人的线路 —— 键串了"
+        );
+
+        super::route_affinity_set(k1, b);
+        assert_eq!(
+            super::route_affinity_get(&k1),
+            Some(b),
+            "同一个会话换了线路之后没更新 —— 粘性会把它钉在一条已经不用的线上"
+        );
+
+        // TTL：手工把时间戳推到过期之外，再读必须是 None。
+        if let Ok(mut m) = super::CHAT_ROUTE_AFFINITY.lock() {
+            let expired = std::time::Instant::now()
+                .checked_sub(super::ROUTE_AFFINITY_TTL + std::time::Duration::from_secs(1))
+                .expect("测试机的单调时钟起点太近");
+            m.insert(k1, (a, expired));
+        }
+        assert_eq!(
+            super::route_affinity_get(&k1),
+            None,
+            "过期的记录还在 —— 一条线路会被永久钉死在一个早就结束的会话上"
+        );
+    }
+
     /// **「没配每模型价」不能和「配成 0」塌缩成同一个值。**
     ///
     /// 生产真事（2026-08-28）：新建一条线路、每模型价还空着，它上面每一次调用都扣 0 分。
