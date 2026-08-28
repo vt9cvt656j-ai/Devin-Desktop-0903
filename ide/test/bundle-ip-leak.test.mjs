@@ -96,7 +96,11 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
   assert.ok(probes.size > 300,
     `只从源码里取出 ${probes.size} 条探针 —— 取探针那一步坏了，扫描结果不作数。`);
 
-  const leaks = [];
+  // **按探针去重，不按「块 × 探针」。** 上一版每个块各数一遍：同一段文本同时出现在
+  // main-*.js 的两个块里就算两次，而哪些字面量落到哪个块由代码分割决定、每次构建可能
+  // 不同 —— 于是这个数会在 351 / 355 之间抖，棘轮就没法钉住。
+  // 去重之后它是「我的源文本有多少条出现在了发布包里」，语义也更对。
+  const leakedProbes = new Map(); // 文本 -> 出处
   for (const file of chunks) {
     const src = readFileSync(file, "utf8");
     // canary：一段**必然**在包里的文本。抽取器看不见它 = 抽取器坏了，直接 throw，
@@ -106,7 +110,7 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
     const joined = strings.join(" ");
     for (const [text, where] of probes) {
       if (table.has(text) || joined.includes(text) || src.includes(text)) {
-        leaks.push(`${where}: ${JSON.stringify(text.slice(0, 48))}`);
+        leakedProbes.set(text, where);
       }
     }
     // 按体积缩放的下限：混淆产物里字面量密度很稳（本仓实测约 350 B/条）。
@@ -115,6 +119,8 @@ test("发布产物里不许出现面向模型的散文（判据在解码后的�
     assert.ok(diag.arrayLen >= floor,
       `${file}: 字符串表只有 ${diag.arrayLen} 条，按 ${src.length} 字节的体积至少该有 ${floor} 条 —— 抽取器没抓全，扫描结果不作数。`);
   }
+  const leaks = [...leakedProbes].map(([text, where]) => `${where}: ${JSON.stringify(text.slice(0, 48))}`);
+
   // **棘轮，不是开关。** 目标是 0，但把这些文本搬到服务端要分几批（网关先补上、客户端
   // 再剥，且必须一次性验收）。中间这段时间不能让这条门一直红 —— 一条永远红的门等于没门，
   // 人会学会忽略它，然后连真的回归也一起忽略。
