@@ -1275,8 +1275,14 @@ pub(crate) fn clear_route_stall(id: uuid::Uuid) {
 /// 卡死记号以前不在这里：它只压缩表头耐心，排序只看 20 秒的瞬时冷却。于是主线路
 /// 挂掉时，冷却一过（对话节奏下几乎每条消息都过了），请求又落回死线路、垫满 25 秒
 /// 才 504 —— 旁边那条健康线路从头到尾没被优先过。
-fn route_goes_to_the_back(route_count: usize, cooled: bool, mutes: bool, stalled: bool) -> bool {
-    route_count > 1 && (cooled || mutes || stalled)
+fn route_goes_to_the_back(
+    route_count: usize,
+    cooled: bool,
+    mutes: bool,
+    stalled: bool,
+    broken: bool,
+) -> bool {
+    route_count > 1 && (cooled || mutes || stalled || broken)
 }
 
 /// 这一次给这条线路多少表头耐心。
@@ -10468,7 +10474,22 @@ pub async fn chat_completions(
             let mutes = wants_thinking && route_mutes_thinking(candidate.id, now);
             // 最近卡满过表头预算的线路同理：停机期间别让每条消息都先在它上面垫 25 秒。
             let stalled = route_recently_stalled(candidate.health_id(), now);
-            if route_goes_to_the_back(route_count, cooled, mutes, stalled) {
+            // 上面三个都是**进程内**的短期标记，重启即清零、也不跨实例。这一个不同：
+            // 它是 route_health 那套跨进程裁决（连败 5 次 / 试过但从没成功过）在派单侧
+            // 的读取口。在这之前那套裁决只喂面板和告警邮件，对流量零影响 —— 生产实测当日
+            // `Claude` 和 `优惠 Claude` 两条 0 成功的线路仍被派了 49 次真实请求。
+            let broken = crate::route_health::looks_broken_cached(&state, candidate.health_id());
+            if route_goes_to_the_back(route_count, cooled, mutes, stalled, broken) {
+                if broken {
+                    tracing::info!(
+                        request_id = request_id.as_deref().unwrap_or(""),
+                        model = %model_id,
+                        route_id = %candidate.id,
+                        route_count,
+                        judged_broken_and_deprioritised = true,
+                        "route judged broken by health; trying healthier same-model routes first"
+                    );
+                }
                 if stalled {
                     tracing::info!(
                         request_id = request_id.as_deref().unwrap_or(""),
@@ -20318,14 +20339,20 @@ mod stall_routing_tests {
     #[test]
     fn a_stalled_route_goes_to_the_back_when_there_is_another_route() {
         // 只因卡死就该排后面
-        assert!(route_goes_to_the_back(2, false, false, true));
+        assert!(route_goes_to_the_back(2, false, false, true, false));
         // 原有两个判据不变
-        assert!(route_goes_to_the_back(2, true, false, false));
-        assert!(route_goes_to_the_back(2, false, true, false));
-        assert!(!route_goes_to_the_back(2, false, false, false));
+        assert!(route_goes_to_the_back(2, true, false, false, false));
+        assert!(route_goes_to_the_back(2, false, true, false, false));
+        assert!(!route_goes_to_the_back(2, false, false, false, false));
         // 只有一条线路时不动：那种情形靠短探测预算兜着，不是靠排序
-        assert!(!route_goes_to_the_back(1, false, false, true));
-        assert!(!route_goes_to_the_back(1, true, true, true));
+        assert!(!route_goes_to_the_back(1, false, false, true, false));
+        assert!(!route_goes_to_the_back(1, true, true, true, false));
+
+        // 被 route_health 判死的线路：有别的同模型线路时排到后面……
+        assert!(route_goes_to_the_back(2, false, false, false, true));
+        // ……但**只剩它一条时照发**。排除掉的话，一条线路的模型在它坏掉的那一刻
+        // 就整个不可用了，而「判死」本身可能只是上游抖了五次。
+        assert!(!route_goes_to_the_back(1, false, false, false, true));
     }
 
     /// 记号的生命周期要和排序接得上：记下就排后面，撤掉/过期就回排头。
@@ -20333,14 +20360,14 @@ mod stall_routing_tests {
     fn the_stall_mark_feeds_ordering_and_releases_on_recovery() {
         let id = uuid::Uuid::new_v4();
         let now = Instant::now();
-        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, now)));
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, now), false));
         mark_route_stall(id);
-        assert!(route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now())));
+        assert!(route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now()), false));
         clear_route_stall(id);
-        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now())));
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, Instant::now()), false));
         mark_route_stall(id);
         let expired = Instant::now() + CHAT_UPSTREAM_STALL_MEMORY + Duration::from_secs(1);
-        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, expired)));
+        assert!(!route_goes_to_the_back(2, false, false, route_recently_stalled(id, expired), false));
     }
 
     /// 后台探针探通后撤冷却：鉴权冷却也一并撤，因为同一把 key 刚刚拿到了 2xx。
@@ -20365,7 +20392,10 @@ mod stall_routing_tests {
             "route_recently_stalled"
         );
         assert!(src.contains(&read), "排序没有读卡死记号 —— 记了也白记，用户照样先撞死线路");
-        let judge = format!("if {}(route_count, cooled, mutes, stalled) {{", "route_goes_to_the_back");
+        let judge = format!(
+            "if {}(route_count, cooled, mutes, stalled, broken) {{",
+            "route_goes_to_the_back"
+        );
         assert!(src.contains(&judge), "排序没有把卡死记号喂进判据");
     }
 }

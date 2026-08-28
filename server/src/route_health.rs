@@ -164,6 +164,74 @@ pub fn spawn_fail(state: &AppState, route_id: Uuid, status: u16) {
     tokio::spawn(async move { record_fail(&st, route_id, status).await });
 }
 
+// ── 派单侧的读取口 ────────────────────────────────────────────────────────────
+//
+// # 为什么要有这一段
+//
+// 这个模块本来**只有写入方**。`models.rs` 里 `route_health::` 出现十处，全是
+// spawn_ok / spawn_fail / spawn_attempt —— 派单一次都没读过自己的裁决。于是整套
+// 「连败 5 次判死」「试过但从没成功过判死」只喂了面板和告警邮件，**对流量没有任何影响**。
+//
+// 派单实际依据的是 `route_goes_to_the_back` 里那三个**进程内**的短期标记
+// （cooled / mutes / stalled），它们随重启清零、也不跨实例共享。后果是生产实测
+// 2026-08-28 当日：`Claude` 0 成功 / 25 失败、`优惠 Claude` 0 成功 / 24 失败，
+// 两条彻底不工作的线路仍被派了 49 次真实请求。每撞一次就是一次换线，而换线要把
+// 上游那份提示词缓存整份重写（写价是读价的 12.5 倍）。
+//
+// 所以补上读取口。三条纪律：
+//
+//   · **只降权，不排除。** 和冷却、静音思考一样 —— 全部线路都判死时还得有东西可发，
+//     而且降权之后它靠探活自己走回来（探活对非 ok 线路一律全速，见
+//     `canary_fresh_window_secs`）。这两处必须一起看：降权断了真实流量，
+//     探活就是它唯一的恢复通道，两边同时省钱就等于把线路永久静音。
+//   · **热路径不查 Redis。** 派单是每请求都走的，`snapshot` 是一次 MGET 网络往返。
+//     这里只读进程内缓存，缺了就当「不知道」放行，同时丢一个后台任务去刷。
+//   · **缺省放行。** 缓存没有、Redis 挂了、刚重启 —— 一律不降权。宁可多试一条坏线路，
+//     也不要因为读不到裁决把好线路排到后面：那是拿「没查到」当「有问题」。
+
+static VERDICT_CACHE: LazyLock<Mutex<std::collections::HashMap<Uuid, (bool, Instant)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// 裁决在派单侧的保鲜期。短到线路恢复后一分钟内就能重新拿到流量，
+/// 长到不会让每个请求都去敲 Redis。
+const VERDICT_TTL: Duration = Duration::from_secs(30);
+
+/// 这条线路当前是不是被判死了。**派单热路径专用：不查 Redis、不阻塞、缺省返回 false。**
+///
+/// 返回 false 的三种情形是同一个意思——「还不知道」：缓存里没有、已经过期、
+/// 或者后台那次刷新还没回来。
+pub fn looks_broken_cached(state: &AppState, route_id: Uuid) -> bool {
+    let now = Instant::now();
+    if let Some(broken) = verdict_cached_at(route_id, now) {
+        return broken;
+    }
+    // 先占位再刷新：占位本身会让接下来 VERDICT_TTL 内的请求不再重复丢任务。
+    // 占的是 false —— 结论没回来之前不许降权。
+    verdict_remember(route_id, false, now);
+    let st = state.clone();
+    tokio::spawn(async move {
+        let h = snapshot(&st, route_id).await;
+        let broken = classify(&h, now_secs()) == "error";
+        verdict_remember(route_id, broken, Instant::now());
+    });
+    false
+}
+
+/// 缓存里还新鲜的裁决。`None` = 没有、或者已经过期 —— 两种都叫「还不知道」。
+fn verdict_cached_at(route_id: Uuid, now: Instant) -> Option<bool> {
+    let m = VERDICT_CACHE.lock().ok()?;
+    let (broken, at) = m.get(&route_id)?;
+    // `saturating_duration_since`：测试里会传一个比写入时刻**早**的 now，
+    // `duration_since` 在那种情况下会 panic。
+    (now.saturating_duration_since(*at) < VERDICT_TTL).then_some(*broken)
+}
+
+fn verdict_remember(route_id: Uuid, broken: bool, at: Instant) {
+    if let Ok(mut m) = VERDICT_CACHE.lock() {
+        m.insert(route_id, (broken, at));
+    }
+}
+
 /// 读一条线路的当前事实。Redis 读不到就返回全空 —— 全空经 `classify` 得到 "unknown"，
 /// 不会变成绿灯。
 pub async fn snapshot(state: &AppState, route_id: Uuid) -> RouteHealth {
@@ -1400,4 +1468,85 @@ mod tests {
             "没人把探活的实际报价喂回去 —— 表永远是空的，窗口函数永远退回基础间隔",
         );
     }
+
+    // ── 派单读得到裁决（2026-08-28）────────────────────────────────────────────
+    //
+    // 起因：`route_health::` 在 models.rs 里出现十处，全是写入。生产实测当日
+    // `Claude` 0 成功 / 25 失败、`优惠 Claude` 0 成功 / 24 失败，两条彻底不工作的
+    // 线路仍被派了 49 次真实请求 —— 裁决建好了，没人读。
+
+    /// 判死的线路必须能从缓存里读出来，而「没查到」必须读成「不知道」。
+    #[test]
+    fn an_unknown_verdict_reads_as_not_broken() {
+        assert_eq!(
+            super::verdict_cached_at(rid(21), Instant::now()),
+            None,
+            "没有任何裁决样本时读出了结论 —— 那是拿「没查到」当「有问题」",
+        );
+    }
+
+    /// 裁决会过期。线路修好之后必须能在**有界时间内**重新拿到流量 ——
+    /// 降权断掉的是它的真实流量，过期是它走回来的路之一。
+    #[test]
+    fn a_stale_verdict_stops_counting() {
+        let r = rid(22);
+        let t0 = Instant::now();
+        super::verdict_remember(r, true, t0);
+        assert_eq!(
+            super::verdict_cached_at(r, t0),
+            Some(true),
+            "刚写进去的裁决读不出来",
+        );
+        assert_eq!(
+            super::verdict_cached_at(r, t0 + VERDICT_TTL + Duration::from_secs(1)),
+            None,
+            "裁决永不过期 —— 一条已经修好的线路会被这份记忆一直压在后面",
+        );
+        assert!(
+            VERDICT_TTL <= Duration::from_secs(5 * 60),
+            "保鲜期太长，恢复要等太久",
+        );
+    }
+
+    /// **降权之后，探活是这条线路唯一的恢复通道。**
+    ///
+    /// 两个改动必须一起看：派单不再给判死的线路真实流量，那它就永远攒不出成功记录；
+    /// 而同一天加的探活省钱机制如果也把它跳过，这条线路就被**永久静音**了 ——
+    /// 面板上永远红着，谁都不去碰它。所以非 ok 的线路一律全速探。
+    #[test]
+    fn a_deprioritised_route_still_gets_probed_at_full_speed() {
+        let r = rid(23);
+        for _ in 0..8 {
+            super::record_probe_cost(r, 4_555); // 最贵的那条也一样
+        }
+        assert_eq!(
+            super::canary_fresh_window_secs(r, "error"),
+            CANARY_SKIP_IF_FRESH_SECS,
+            "判死的线路连探活都被省掉了 —— 派单不给它流量、探活也不碰它，永久静音",
+        );
+    }
+
+    /// 上面三条测的都是这个模块自己。派单那边如果不调用，整套东西一分钱都省不下、
+    /// 一次切换都少不了 —— 而三条**照样全绿**。所以这一条钉的是 models.rs 真的读了。
+    #[test]
+    fn the_dispatcher_actually_reads_the_verdict() {
+        let src = include_str!("models.rs");
+        // 先切掉测试模块：否则窗口会一路吃到文件末尾，匹配到测试里自己写的字面量。
+        let cut = src.find("mod audit_20260822_tests").unwrap_or(src.len());
+        let prod = &src[..cut];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("route_health::looks_broken_cached(&state, candidate.health_id())"),
+            "派单没读 route_health 的裁决 —— 连败 25 次的线路照样排在前面接客",
+        );
+        assert!(
+            code.contains("cooled || mutes || stalled || broken"),
+            "读了裁决但没接进排序判据 —— 读到一个没人用的布尔值",
+        );
+    }
+
 }
