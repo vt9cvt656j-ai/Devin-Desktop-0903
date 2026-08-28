@@ -276,6 +276,21 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      # 产物里不许出现面向模型的散文（提示词、工具用法说明、场景触发器）。
+      #
+      # **必须在构建之后**：这条流水线是先跑测试再构建，那一轮里 dist/ 还不存在。
+      # 判据建立在**解码后的字符串表**上，不是明文 grep —— 混淆器把四分之三的字面量
+      # 搬进了打乱字母表的 base64 表，`grep 【vs 替代】` 会报「干净」而表里有 68 条。
+      #
+      # IDE_RELEASE_CHECK=1 是显式的发布标志：置了它，「dist 不在」就从「跳过」变成
+      # 「红」——发布路径上「没跑」不等于「通过」。
+      - name: Verify no model-facing prose shipped in the bundle
+        shell: bash
+        working-directory: ide
+        env:
+          IDE_RELEASE_CHECK: "1"
+        run: node --test test/bundle-ip-leak.test.mjs
+
       # 验收签名的**结果**，而不是"导入步骤跑过了"。
       #
       # 上一步只能证明钥匙串里有身份；真正要保证的是打出来的 .app 的指定要求不再是
