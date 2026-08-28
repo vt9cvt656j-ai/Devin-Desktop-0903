@@ -21,6 +21,8 @@ mod game;
 mod handoff;
 mod health;
 mod shutdown;
+mod calibrate;
+mod failover;
 mod route_endpoints;
 mod route_health;
 mod integrations;
@@ -185,6 +187,10 @@ async fn main() -> anyhow::Result<()> {
     // 把存量明文敏感字段（上游 key、OAuth 令牌、提现账户/QR）加密回去。只在配了
     // FIELD_ENC_KEY 时跑，幂等，逐行条件更新。见 field_backfill.rs。
     field_backfill::spawn(state.clone());
+    // 出口密钥的确定性指纹回填。同地址不同密钥要能各挂一个出口，唯一约束因此从
+    // 「地址」改成「地址 + 密钥指纹」——而存量行的指纹 SQL 算不出来（要解密）。
+    // 幂等，只补「有密钥但还没指纹」的行。见 route_endpoints.rs。
+    route_endpoints::spawn_key_fp_backfill(state.clone());
     // 存量 api_key 明文的清除。默认**不跑**——只有显式设了 API_KEY_PURGE_PLAINTEXT=1
     // 的那一次部署才会执行，而且只清已经补齐哈希+密文的行。见 docs/OPERATIONS.md。
     api_key_store::spawn_purge(state.clone());
@@ -371,7 +377,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/billing/checkout", post(stripe::checkout))
         // Unauthenticated by design: Stripe proves itself with the signature.
         .route("/api/webhooks/stripe", post(stripe::webhook))
-        .route("/api/orders", post(pay::create_order))
         .route("/api/admin/orders", get(pay::admin_list_orders))
 
         .route(
@@ -507,6 +512,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/route-health", get(route_endpoints::admin_health))
         .route("/api/admin/reconciliation", get(reconcile::admin_reconciliation))
         .route("/api/admin/endpoint-prices", post(reconcile::admin_save_price))
+        // 批量：自研网关和被挡住的面板没有任何可拉的价目接口，手工录是唯一的路，
+        // 而一次一个模型填不完一整张表 —— 那等于「只能手工录」这句话没有落地。
+        .route("/api/admin/endpoint-prices/bulk", post(reconcile::admin_bulk_prices))
+        // **这条会花钱**：每个模型发两发真实请求，按余额差反推真实进价。
+        // 只在用户点按钮时跑，绝不进定时任务 —— 定时花钱是不能接受的。
+        .route(
+            "/api/admin/endpoint-prices/calibrate",
+            post(calibrate::admin_calibrate),
+        )
         .route("/api/admin/relay-adapters", get(relay_sync::admin_list))
         .route("/api/admin/relay-adapters/sync", post(relay_sync::admin_sync))
         .route("/api/admin/relay-adapters/guard", post(relay_sync::admin_guard))

@@ -70,11 +70,24 @@ type Endpoint = {
   base_url: string;
   has_key: boolean;
   cost_ratio: number;
+  /** 换算成「每一美元官方价花多少人民币」。null = 这家站没填充值汇率。 */
+  cost_cny: number | null;
   active: boolean;
   note: string;
   probe_ok: boolean | null;
   probe_at: string | null;
   probe_ms: number | null;
+  /** 最近 7 天真实成绩，和探测是两个来源。探测会说假话，这个不会。 */
+  real_ok: number;
+  real_fail: number;
+  real_ms: number | null;
+  real_n: number;
+  /** **派单窗口**的成败数（今天，样本不够退回 7 天）。排序读的是这两个，
+   *  不是上面那两个 7 天的成绩单 —— 两个窗口不一样，混用会让这一屏画错顺序。 */
+  rate_ok: number;
+  rate_bad: number;
+  last_ok_at: string | null;
+  last_fail_at: string | null;
   probe_note: string;
   enabled_models: string[];
   protocol: string;
@@ -90,6 +103,8 @@ type Route = {
   protocol: string;
   vendor: string;
   base_url: string;
+  /** 线路自带地址换算后的每美元官价人民币成本（倍率按 1.0 算）。null = 没填汇率。 */
+  own_cost_cny: number | null;
   active: boolean;
   model_count: number;
   models: string[];
@@ -139,22 +154,154 @@ const SLOW_FLOOR_MS = 5000;
 /**
  * 可用性档。和服务端 `availability_tier` 同一套判据。
  *
+ * **真实流量的结果盖过探测的结论。** 探测是合成的：拿一个模型发一句话，20 秒不回
+ * 就判死。可 20 秒超时和「这个出口打不通」是两件事 —— 线上「梦幻API」三个出口探测
+ * 全部 20001ms 判死，同一天接了 241 次真实请求全成功，而它们正是最便宜的几个。
+ * 所以有新鲜的真实结果就按真实结果排；两边都有就听较晚的那个。真实失败同样算数，
+ * 只认成功的话出口一失败就再也拿不到流量、也就永远翻不了身。
+ *
  * 「测通了，但那是三天前的事」算没证据，不算测通 —— 陈旧的好消息不是好消息。
  * 没记时间的老行按新鲜处理，否则升级那一刻所有出口一起降档。
  */
-function tier(probeOk: boolean | null, probeAt: string | null, now: number): number {
-  if (probeOk === false) return 2;
-  if (probeOk === null) return 1;
-  if (!probeAt) return 0;
-  const t = Date.parse(probeAt);
+function tier(e: Pick<Endpoint, "probe_ok" | "probe_at" | "last_ok_at" | "last_fail_at">, now: number): number {
+  const freshReal = (iso: string | null): number | null => {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t) || now - t > PROBE_FRESH_SECS * 1000) return null;
+    return t;
+  };
+  const ok = freshReal(e.last_ok_at);
+  const fail = freshReal(e.last_fail_at);
+  if (ok != null && fail != null) return ok >= fail ? 0 : 2;
+  if (ok != null) return 0;
+  if (fail != null) return 2;
+
+  if (e.probe_ok === false) return 2;
+  if (e.probe_ok === null) return 1;
+  if (!e.probe_at) return 0;
+  const t = Date.parse(e.probe_at);
   if (!Number.isFinite(t)) return 0;
   return now - t <= PROBE_FRESH_SECS * 1000 ? 0 : 1;
+}
+
+/**
+ * 判「慢不慢」拿哪个耗时。和服务端 `effective_ms` 同一套判据：**有真实流量就用真实的。**
+ *
+ * 探测只发一句 hi、只用一个模型、一轮一个样本；真实流量量的是用户实际等的那一段。
+ * 线上这两个数差得很远（Grok 那个 0.005 倍的出口：探测 19551ms、真实 27556ms）。
+ * 样本不够就退回探测 —— 一两次的均值被一个离群值就能拽走，而这个数会决定降不降级。
+ */
+const MIN_REAL_SAMPLES = 5;
+
+function effectiveMs(e: Pick<Endpoint, "real_ms" | "real_n" | "probe_ms">): number | null {
+  if (e.real_n >= MIN_REAL_SAMPLES && e.real_ms != null && e.real_ms > 0) return e.real_ms;
+  return e.probe_ms;
+}
+
+/**
+ * 这个出口靠不靠谱。和服务端 `is_reliable` 同一套判据。
+ *
+ * 低于这条线的整体排到靠谱的那批**后面**，价钱再便宜也不行 —— 因为省下的那点钱
+ * 换来的是用户多卡一次。线上实测那组：寒鹤 99% / ¥0.20 对 自带地址 73% / ¥0.10，
+ * 纯按钱算是后者划算（失败不花钱），但那 27% 的失败是「卡满整段预算才失败」。
+ *
+ * 样本不够一律算靠谱：没有证据不构成降级理由。
+ */
+const MIN_RATE_SAMPLES = 8;
+const RELIABLE_FLOOR = 0.9;
+
+function isReliable(e: Pick<Endpoint, "rate_ok" | "rate_bad">): boolean {
+  return !confidentlyBelowFloor(e.rate_ok, e.rate_ok + e.rate_bad);
+}
+
+/**
+ * 「有把握它的真实成功率低于 RELIABLE_FLOOR」吗。和服务端 `confidently_below_floor`
+ * 同一套判据：精确的单侧二项检验，P < 5% 才算有把握。
+ *
+ * 不用「成功数/总数 >= 0.9」直判，是因为小样本会被噪声牵着走 —— 线上真出现过
+ * 8/9 = 89% 被判成不靠谱，而九次错一次说不明任何事。也不用 Wilson 上界：
+ * 它在 p̂ 贴 0 那一端过激，第一发就失败的新出口会当场被判死。
+ */
+function confidentlyBelowFloor(ok: number, total: number): boolean {
+  if (total <= 0 || ok < 0) return false;
+  const n = total;
+  const k = Math.min(ok, total);
+  const p = RELIABLE_FLOOR;
+  if (k / n >= p) return false;
+  // 全程在对数空间算：直接递推 pmf 的话 (1-p)^n 在 n≈300 以上就下溢成 0，
+  // 尾概率算成 0，于是 890/1000（89%，和 90% 没有显著差别）会被判成不靠谱。
+  const logp = Math.log(p);
+  const logq = Math.log(1 - p);
+  const step = (i: number) => Math.log((n - i + 1) / i) + logp - logq;
+  let lp = n * logq;
+  let maxLp = lp;
+  for (let i = 1; i <= k; i++) {
+    lp += step(i);
+    if (lp > maxLp) maxLp = lp;
+  }
+  lp = n * logq;
+  let sum = Math.exp(lp - maxLp);
+  for (let i = 1; i <= k; i++) {
+    lp += step(i);
+    sum += Math.exp(lp - maxLp);
+  }
+  return maxLp + Math.log(sum) < Math.log(0.05);
+}
+
+/**
+ * 综合得分：**越小越先用**。和服务端 `endpoint_score` 同一套判据。
+ *
+ *   得分 = 进价 × (1 / 成功率) × √(首字延迟 / 同线路最快)
+ *
+ * `1/成功率`：一次失败的代价是白等一个来回，平均两次才成 = 代价翻倍。
+ * `√(延迟倍数)`：慢要罚但不该压过价钱；首字延迟本身抖得厉害，线性会让排序天天翻。
+ * 两个惩罚都有证据门槛和上限。
+ *
+ * 这个得分只在**同一个可靠性档内**决定先后 —— 跨档由 isReliable 那道闸说了算。
+ */
+const MIN_RATE = 0.2;
+const MAX_SLOW_PENALTY = 3;
+
+function endpointScore(
+  cost: number,
+  e: Pick<Endpoint, "rate_ok" | "rate_bad" | "real_ms" | "real_n" | "probe_ms">,
+  bestMs: number | null,
+): number {
+  let score = Number.isFinite(cost) && cost > 0 ? cost : 1;
+  const total = e.rate_ok + e.rate_bad;
+  if (total >= MIN_RATE_SAMPLES) {
+    score /= Math.min(1, Math.max(MIN_RATE, e.rate_ok / total));
+  }
+  const ms = effectiveMs(e);
+  if (ms != null && ms > 0 && bestMs != null && bestMs > 0) {
+    score *= Math.min(MAX_SLOW_PENALTY, Math.sqrt(Math.max(1, ms / bestMs)));
+  }
+  return score;
 }
 
 /** 慢得离谱。和服务端 `is_egregiously_slow` 同一套判据：两个条件必须同时成立。 */
 function egregiouslySlow(ms: number | null, bestMs: number | null): boolean {
   if (ms == null || bestMs == null || !(bestMs > 0)) return false;
   return ms >= SLOW_FLOOR_MS && ms >= SLOW_FACTOR * bestMs;
+}
+
+/**
+ * 排序里「便宜」这一维到底比什么。和服务端 `expand()` 里那段换算同一套判据。
+ *
+ * **倍率不能跨站比。** 它的单位是那家中转自己的余额单位，而一块钱能买到多少余额
+ * 各家差几十倍。线上就有这个形状：GPT 线路上「梦幻API 0.15 倍」看着比「WE API
+ * 0.16 倍」便宜，换算之后是每美元官价 ¥0.15 对 ¥0.016 —— 差十倍，而且方向是反的。
+ *
+ * **全有全无**：这条线路上只要有一个站没填汇率（线路自带地址也算），整条线路退回
+ * 按倍率排。把没填的当成 1.0 顶上去是最糟的选择 —— 一个纯粹「没填」的站会凭空排
+ * 到前面，而且没有任何地方会报错。这和「没查到 ≠ 没有」是同一条规矩。
+ */
+function costKeys(r: Route, live: Endpoint[]): { own: number; of: (e: Endpoint) => number } {
+  const all = [r.own_cost_cny, ...live.map((e) => e.cost_cny)];
+  if (all.every((v): v is number => v != null && Number.isFinite(v))) {
+    return { own: r.own_cost_cny as number, of: (e) => e.cost_cny as number };
+  }
+  return { own: 1, of: (e) => e.cost_ratio };
 }
 
 /**
@@ -169,22 +316,26 @@ function ordered(r: Route): Array<Endpoint | null> {
   // 「慢不慢」是**相对同线路最快的那个**说的，一个出口自己看不出来。基准只取还活着的
   // 候选：一个已知打不通的出口耗时没有意义，拿它当基准会让所有人显得「不慢」。
   const bestMs = live
-    .filter((e) => tier(e.probe_ok, e.probe_at, now) < 2)
-    .map((e) => e.probe_ms)
+    .filter((e) => tier(e, now) < 2)
+    .map((e) => effectiveMs(e))
     .filter((v): v is number => v != null && v > 0)
     .reduce<number | null>((a, v) => (a == null ? v : Math.min(a, v)), null);
 
+  const cost = costKeys(r, live);
   const rows: Array<{ k: [number, number, number]; v: Endpoint | null }> = [
     // 线路自带的地址按第 0 档算，不是「还没测过」：它是在任的那个，今天所有流量都从它走。
     // 走「还没测过」的话，一个原价的备用中转只要测通就会把直连顶掉 —— 同价位凭空多一跳。
     // 它在探测表里没有行，所以也没有耗时，因此永远不会被判「慢」。
     // 判据和服务端 own_order_key 一致。
-    { k: [0, 0, 1], v: null },
+    // 线路自带地址在 route_attempt 里的成败记在**线路 id** 下，这一屏拿不到，
+    // 所以它按「没有样本」算 —— 也就是算靠谱、不罚。和服务端一致（那边同样
+    // 给自带地址塞的是 (0, 0)）。宁可不罚，不猜。
+    { k: [0, 0, cost.own], v: null },
     ...live.map((e) => ({
       k: [
-        tier(e.probe_ok, e.probe_at, now),
-        egregiouslySlow(e.probe_ms, bestMs) ? 1 : 0,
-        e.cost_ratio,
+        tier(e, now),
+        isReliable(e) ? 0 : 1,
+        endpointScore(cost.of(e), e, bestMs),
       ] as [number, number, number],
       v: e,
     })),
@@ -199,11 +350,11 @@ function slowOnThisRoute(r: Route, e: Endpoint | null): boolean {
   const now = Date.now();
   const live = r.endpoints.filter((x) => x.active);
   const bestMs = live
-    .filter((x) => tier(x.probe_ok, x.probe_at, now) < 2)
-    .map((x) => x.probe_ms)
+    .filter((x) => tier(x, now) < 2)
+    .map((x) => effectiveMs(x))
     .filter((v): v is number => v != null && v > 0)
     .reduce<number | null>((a, v) => (a == null ? v : Math.min(a, v)), null);
-  return egregiouslySlow(e.probe_ms, bestMs);
+  return egregiouslySlow(effectiveMs(e), bestMs);
 }
 
 /**
@@ -265,6 +416,37 @@ function SchedBadge({ sched, retryIn }: { sched: string; retryIn: number | null 
     <Badge variant="outline" className="shrink-0 border-destructive/40 text-destructive">
       <PauseCircle /> {label}
       {mins != null && ` · ${mins} 分钟后再试`}
+    </Badge>
+  );
+}
+
+/**
+ * 最近 7 天真实流量的成绩：成功率 + 成功那些的平均首字。
+ *
+ * 「哪个快、哪个稳」只有真实流量答得上来 —— 探测一个出口只发一句话、只用一个模型，
+ * 而且它超时就判死，答不了这个问题。没有样本就明说没有，不拿探测的数字冒充。
+ */
+function RealBadge({ ok, fail, ms }: { ok: number; fail: number; ms: number | null }) {
+  const total = ok + fail;
+  if (total === 0) {
+    return (
+      <Badge variant="outline" className="shrink-0 text-muted-foreground" title="最近 7 天没有真实请求走过这个出口——不是坏，是没样本。排序此时退回看探测。">
+        无真实流量
+      </Badge>
+    );
+  }
+  const rate = (ok / total) * 100;
+  // 判据和排序一致：最近一次真实结果说了算，所以这里的颜色只反映成功率高低，
+  // 不去重复排序那套档位——两套颜色叠在一起反而看不出谁在起作用。
+  const good = rate >= 95;
+  return (
+    <Badge
+      variant="outline"
+      className={good ? "shrink-0 border-success/40 text-success" : "shrink-0 border-warning/40 text-warning"}
+      title={`最近 7 天真实请求：成功 ${ok} 次、失败 ${fail} 次${ms != null ? `，成功那些平均首字 ${ms}ms` : "，没有可用的耗时样本"}。排序用的就是这一栏，探测只在没有真实流量时才作数。`}
+    >
+      真实 {rate.toFixed(rate >= 99.95 || rate === 0 ? 0 : 1)}% · {total}次
+      {ms != null ? ` · ${ms}ms` : ""}
     </Badge>
   );
 }
@@ -458,12 +640,16 @@ export function RouteEndpoints() {
   /// 编辑出口时要知道它属于哪条线路 —— 那条线路开放的模型就是这个出口的可选范围。
   const routeOf = (id: string) => list.find((r) => r.id === id);
   const extra = list.reduce((n, r) => n + r.endpoints.length, 0);
+  // 数的是**生效判据**的档，不是探测原始结论：一个探测超时但今天真实成功过的出口
+  // 排序里是好的，这里再把它记成「打不通」，两处就会对不上，运维照着去修一个
+  // 根本没坏的出口。判据统一在 tier()。
+  const tierNow = Date.now();
   const broken = list.reduce(
-    (n, r) => n + r.endpoints.filter((e) => e.probe_ok === false).length,
+    (n, r) => n + r.endpoints.filter((e) => e.active && tier(e, tierNow) === 2).length,
     0,
   );
   const untested = list.reduce(
-    (n, r) => n + r.endpoints.filter((e) => e.probe_ok === null).length,
+    (n, r) => n + r.endpoints.filter((e) => e.active && tier(e, tierNow) === 1).length,
     0,
   );
 
@@ -599,8 +785,22 @@ export function RouteEndpoints() {
                                     {e.has_key ? "自带密钥" : "用线路的密钥"}
                                     {/* 只承载一部分模型是个容易忘的设置：设完就再也看不见，
                                         然后某天有人问「为什么这个便宜出口没被用上」。 */}
+                                    {/*
+                                      分子分母不是同一个集合：分子是这个出口自己声明有哪些货
+                                      （可以包含线路本身没有的），分母是线路开放的模型数。
+                                      于是会出现 3/2 这种分子大于分母的显示（线上 OHub 挂在
+                                      deepseek 线路下就是）。只数**真正落在这条线路上的那部分**。
+                                    */}
                                     {e.enabled_models.length > 0 &&
-                                      ` · 只有 ${e.enabled_models.length}/${r.model_count} 个模型`}
+                                      (() => {
+                                        const onRoute = e.enabled_models.filter((m) =>
+                                          (r.models || []).includes(m),
+                                        ).length;
+                                        const extra = e.enabled_models.length - onRoute;
+                                        return ` · 只承载 ${onRoute}/${r.model_count} 个模型${
+                                          extra > 0 ? `（另有 ${extra} 个不在这条线路上）` : ""
+                                        }`;
+                                      })()}
                                     {e.capacity != null && ` · 容量 ${e.capacity}`}
                                     {e.protocol ? ` · ${e.protocol} 协议` : ""}
                                     {!e.active ? " · 已停用" : ""}
@@ -611,9 +811,42 @@ export function RouteEndpoints() {
                                 )}
                               </p>
                             </div>
-                            <Badge variant={e && e.cost_ratio < 1 ? "success" : "outline"}>
-                              {ratioText(e ? e.cost_ratio : 1)}
-                            </Badge>
+                            {/*
+                              线路自带的地址**没有 cost_ratio 这个东西**（models 表没这一列），
+                              原来对它显示 `进价 1×`，和隔壁真出口的 `1.1×` `0.15×` 长得一模一样，
+                              看起来像"这条线路的进价是 1 倍"——那是个常量，不是读来的。
+                            */}
+                            {e ? (
+                              // 三元的每一支只能是一个表达式 —— 加同级徽章必须套片段。
+                              <>
+                              <Badge variant={e.cost_ratio < 1 ? "success" : "outline"}>
+                                {ratioText(e.cost_ratio)}
+                              </Badge>
+                              {/*
+                                倍率旁边必须给出换算后的数，否则这一栏是误导的：
+                                线上「梦幻API 0.15 倍」看着比「WE API 0.16 倍」便宜，
+                                换算之后是 ¥0.15 对 ¥0.016，差十倍而且方向反了。
+                                排序比的就是这个换算后的数。
+                              */}
+                              <Badge
+                                variant="outline"
+                                className="shrink-0 text-muted-foreground"
+                                title={
+                                  e.cost_cny == null
+                                    ? "这家站还没填充值汇率，算不出真实成本。这条线路上只要有一个没填，整条线路就退回按倍率排——而倍率跨站不可比。"
+                                    : "每花掉一美元官方价，你实际付多少人民币。倍率只在同一家中转内部可比，跨站要看这个数——排序比的就是它。"
+                                }
+                              >
+                                {e.cost_cny == null
+                                  ? "汇率没填"
+                                  : `¥${e.cost_cny < 0.01 ? e.cost_cny.toFixed(4) : e.cost_cny.toFixed(3)}/官价$1`}
+                              </Badge>
+                              </>
+                            ) : (
+                              <Badge variant="outline" title="线路自带的地址没有单独的进价系数，排序时按 1 处理">
+                                进价未设
+                              </Badge>
+                            )}
                             <SchedBadge
                               sched={e ? e.sched : r.sched}
                               retryIn={e ? e.retry_in : r.retry_in}
@@ -622,6 +855,13 @@ export function RouteEndpoints() {
                               // 三元的每一支只能是一个表达式 —— 加同级徽章必须套片段。
                               <>
                               <ProbeBadge ok={e.probe_ok} ms={e.probe_ms} note={e.probe_note} />
+                              {/*
+                                真实成绩挨着探测徽章放。探测判死而真实一直成功是线上
+                                实际发生过的事（梦幻API：探测 20001ms 超时，当天 241 次
+                                真实请求全成），只显示探测的话那个红是误导人的。
+                                排序读的也是这一栏，不是探测。
+                              */}
+                              <RealBadge ok={e.real_ok} fail={e.real_fail} ms={e.real_ms} />
                               {/*
                                 降级必须看得见。不标出来的话，一个便宜出口莫名其妙
                                 排在第三位，运维只会以为排序坏了 —— 而它是被判「慢」
@@ -743,6 +983,10 @@ export function RouteEndpoints() {
                   placeholder="https://xxx.com/v1"
                   onChange={(ev) => setDraft({ ...draft, base_url: ev.target.value })}
                 />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  同一个地址可以挂多个出口——一个账号一把密钥。它们各有各的余额和限速，
+                  额度耗尽或密钥失效时自动换下一个。只有地址和密钥都一样才算重复。
+                </p>
               </div>
               <div>
                 <Label htmlFor="e-key">密钥</Label>
@@ -888,7 +1132,12 @@ export function RouteEndpoints() {
                     <div className="mt-1.5 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs">
                       <span className="text-muted-foreground">这条线路怎么计费：</span>
                       <b>
-                        {r.billing_mode === "per_call" ? "按次" : "按 Token"} × {r.rate} 倍
+                        {/*
+                          按次计费**不乘倍率** —— cost_for 里 per_call 那一支直接
+                          return per_call_cents，走不到 `usd * 100 * rate` 那行。
+                          原来两种模式都写「× N 倍」，按次那一档是假的。
+                        */}
+                        {r.billing_mode === "per_call" ? "按次（不乘倍率）" : `按 Token × ${r.rate} 倍`}
                       </b>
                       {r.cache_disabled && <span className="text-muted-foreground">（缓存不收钱）</span>}
                       <span className="text-muted-foreground">
@@ -1054,8 +1303,12 @@ export function RouteEndpoints() {
                   你付给中转的<b>进价</b>在「模型对账」里填，两者不是一回事 ——
                   把进价填到这儿会当场改掉客户账单。
                   全勾 = 承载这条线路的全部模型（以后线路加了新模型也自动跟着有）。
-                  取消勾选的模型不会被派到这个出口——转卖商之间的货不一样，
-                  派过去只会撞一个 404，而每个请求只有 2 次机会。
+                  取消勾选的模型不会被派到这个出口——转卖商之间的货不一样，派过去只会撞一个 404。
+                  {/*
+                    原来这里还有半句「而每个请求只有 2 次机会」。那道闸已经拆了：
+                    网关侧现在是时间预算（同一份文件 53 行和 507 行都在讲「挂多少个就能用多少个，
+                    换几个出口由时间决定不由次数决定」）。一句过期的限制会让人不敢多挂出口。
+                  */}
                 </p>
               </div>
 

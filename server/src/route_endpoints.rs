@@ -116,6 +116,234 @@ pub struct Endpoint {
     /// 而 api_key 是 `sk-` 开头的调用密钥。实测线上三家中转都是这个情况。
     #[sqlx(default)]
     pub balance_token: String,
+    /// 最近一次**真实成功**／**真实失败**的时刻，从 `route_attempt` 连出来的，
+    /// 不是这张表自己的列。排序拿它当「执行事实」用，见 `availability_tier`。
+    #[sqlx(default)]
+    pub last_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sqlx(default)]
+    pub last_fail_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 最近 7 天**真实成功**请求的首字毫秒累加值和样本数。
+    /// 和 `last_*_at` 一样是从 `route_attempt` 连出来的，不是这张表自己的列。
+    ///
+    /// 存「和 + 个数」而不是算好的平均：`SUM()` 在 Postgres 里回的是 NUMERIC，
+    /// 再做除法还是 NUMERIC，而这一行按 `i64` 解码 —— 类型对不上时
+    /// `load_for_routes` 的兜底是**返回空**，于是所有出口凭空消失、多路由整个静默
+    /// 关掉，界面上什么都不报，只有一行 WARN。踩过一次，真上线了才发现。
+    /// 所以这个文件里每一处 `SUM(` 都必须显式 `::bigint`，有测试守着。
+    #[sqlx(default)]
+    pub real_sum: Option<i64>,
+    #[sqlx(default)]
+    pub real_n: Option<i64>,
+    /// 最近这段时间的**真实成败次数**。选路的第三个维度：成功率。
+    ///
+    /// 窗口是「最近 24 小时，样本不够就退回 7 天」—— 一天一刷，昨天的坏运气不会
+    /// 压着今天，而流量稀的出口也不会因为样本太少被一两次失败判死。
+    #[sqlx(default)]
+    pub real_ok: Option<i64>,
+    #[sqlx(default)]
+    pub real_bad: Option<i64>,
+}
+
+/// 算成功率**惩罚**（不是那道可靠性闸）要几个样本才作数。
+///
+/// 一两次失败说明不了什么 —— 不设门槛的话，一个刚上线、第一发正好撞上上游抖动的
+/// 出口会被打成 0% 然后再也拿不到流量，也就永远翻不了身。
+///
+/// 那道闸走的是另一套判据（`is_reliable` 的置信上界），它自带小样本保护，
+/// 不需要这个常量。
+pub const MIN_RATE_SAMPLES: i64 = 8;
+
+/// 成功率再低也按这个数算惩罚。
+///
+/// 不封底的话，一个 2% 成功率的出口惩罚是 50 倍，而它可能只是刚好赶上一次上游全挂；
+/// 封在 20% 上，最狠也就是 5 倍 —— 足够把它排到后面，又不至于永久除名
+/// （真的死了会被 tier 挡在最后，那是另一道闸）。
+pub const MIN_RATE: f64 = 0.2;
+
+/// 慢惩罚的上限。四倍慢 → 两倍惩罚（开方），再慢也不超过这个数。
+pub const MAX_SLOW_PENALTY: f64 = 3.0;
+
+/// 「这个出口基本靠谱」的线。低于它的一律排到靠谱的那批**后面**，价钱再便宜也不行。
+///
+/// # 为什么是闸，不是乘数
+///
+/// 纯按钱算，先撞便宜的那个是划算的：失败不花钱，只花时间。线上那组真数字 ——
+/// 自带地址 ¥0.10 / 73%，寒鹤 ¥0.20 / 99% —— 先撞前者的期望花费是 ¥0.127，
+/// 比一直用后者的 ¥0.20 省。乘法惩罚（1/成功率）算出来也是前者胜。
+///
+/// **但那笔账没算用户的时间。** 那 27% 的失败在日志里是「上游卡满整段预算才失败」
+/// （`upstream stalled before response headers`），不是秒失败。为省几分钱让四分之一
+/// 的请求先卡一次，这个交易对一个卖流畅体验的产品是亏的。
+///
+/// 所以低于这条线的出口整体靠后：十次里坏一次以上，用户是能感觉到的；
+/// 高于这条线，差异已经是噪声，让价钱去决定。
+///
+/// 它**不是**除名 —— 靠谱的那批全打不通时，它们照样会被用到。
+pub const RELIABLE_FLOOR: f64 = 0.9;
+
+/// 这个出口靠不靠谱。`false` = 排到靠谱的那批后面。
+///
+/// # 判的是「有把握它不行」，不是「这次算出来不行」
+///
+/// 直接拿 `成功数 / 总数 >= 0.9` 判会被小样本的噪声牵着走：线上真出现过
+/// **deepseek 自带地址 8/9 = 89%** 被判成不靠谱 —— 九次里错一次而已，那是噪声，
+/// 不是证据。而被判一次的后果是拿不到流量，也就更难攒出样本翻身。
+///
+/// 判据见 `confidently_below_floor`：只有当「它其实是好的、只是运气差」这个解释
+/// 站不住时，才降级。这和这个文件里那条一贯的规矩是同一件事：
+/// **没有证据不构成降级理由。**
+pub fn is_reliable(ok: i64, bad: i64) -> bool {
+    let total = ok.saturating_add(bad);
+    if total <= 0 {
+        return true;
+    }
+    !confidently_below_floor(ok, total)
+}
+
+/// 「有把握它的真实成功率低于 `RELIABLE_FLOOR`」吗。
+///
+/// 精确的**单侧二项检验**：假设真实成功率就是那条线（90%），算出「跑 n 次、成功不超过
+/// 观察到的这么少次」的概率。这个概率小于 5% 才算有把握 —— 也就是说，只有当
+/// 「它其实是好的、只是运气差」这个解释站不住时，才降级。
+///
+/// # 为什么不用置信区间
+///
+/// 试过 Wilson 上界，它在 p̂ 贴 0 的那一端过激：0 成 1 败算出来的上界是 0.79，
+/// 于是**第一发就失败的新出口当场被判死**。而真实成功率哪怕是 90%，错一次的概率
+/// 也有 10% —— 那不是证据。精确检验给的是 P=0.1，不判，这才对。
+///
+/// 实际效果（都是线上真数字）：
+/// ```text
+///   0/1           P=0.10   → 靠谱（错一次说明不了什么）
+///   0/3           P=0.001  → 不靠谱（真是 90% 的话连错三次几乎不可能）
+///   8/9   = 89%   P=0.61   → 靠谱（九次错一次是噪声）
+///   80/90 = 89%   P=0.36   → 靠谱（离 90% 不够远，样本再多也没意义）
+///   32/44 = 73%   P≈1e-5   → 不靠谱
+///   54/81 = 67%   P≈1e-12  → 不靠谱
+///   190/192= 99%  P≈1.0    → 靠谱
+/// ```
+///
+/// 小样本天然被放过，不用另拍一个「至少几次」的门槛。这就是
+/// **没有证据不构成降级理由** 在数字上的样子。
+pub fn confidently_below_floor(ok: i64, total: i64) -> bool {
+    if total <= 0 || ok < 0 {
+        return false;
+    }
+    let n = total as f64;
+    let k = ok.min(total) as f64;
+    let p = RELIABLE_FLOOR;
+    // 观察到的比例已经不低于那条线 → 尾概率至少一半，怎么都算不出「有把握」。
+    if k / n >= p {
+        return false;
+    }
+    // **全程在对数空间算。**
+    //
+    // 直接递推 pmf 会在 n 一大就死：pmf(0) = (1-p)^n，n=1000 时是 1e-1000，
+    // f64 下溢成 0，之后每一项乘什么都还是 0，尾概率算出来是 0 ——
+    // 于是 890/1000（89%，统计上和 90% 没有显著差别）会被判成「有把握它不行」。
+    // 而这个系统里几百上千的样本几天就攒到了，不是理论问题。
+    let logp = p.ln();
+    let logq = (1.0 - p).ln();
+    let step = |i: f64| ((n - i + 1.0) / i).ln() + logp - logq;
+
+    // 第一遍找最大项，第二遍以它为基准求和（log-sum-exp）——
+    // 这样每一项都在 exp 表示得下的范围里。
+    let mut lp = n * logq;
+    let mut max_lp = lp;
+    let mut i = 1.0;
+    while i <= k {
+        lp += step(i);
+        if lp > max_lp {
+            max_lp = lp;
+        }
+        i += 1.0;
+    }
+    let mut lp = n * logq;
+    let mut sum = (lp - max_lp).exp();
+    let mut i = 1.0;
+    while i <= k {
+        lp += step(i);
+        sum += (lp - max_lp).exp();
+        i += 1.0;
+    }
+    let log_tail = max_lp + sum.ln();
+    log_tail < 0.05f64.ln()
+}
+
+/// 一个出口的综合得分：**越小越先用**。
+///
+/// # 为什么不是「便宜的先用」
+///
+/// 线上实测（grok-4.6，同一天）：
+/// ```text
+///   寒鹤的小破站   149 成 / 2 败 = 99%   ¥0.20
+///   Grok 自带地址   32 成 /12 败 = 73%   ¥0.10
+/// ```
+/// 老排序只看「能用档 / 慢不慢 / 便宜」，而「能用档」判的是**最近一次**是成是败 ——
+/// 它分不出 99% 和 73%，两个都算活着。于是便宜的自带地址排在前面，每四发废一发，
+/// 那一发的时间用户白等。用户最早提的就是这件事：分不清谁稳。
+///
+/// # 三个维度怎么合成一个数
+///
+/// ```text
+///   得分 = 进价 × (1 / 成功率) × √(首字延迟 / 同线路最快)
+/// ```
+///
+/// * `1 / 成功率`：一次失败的代价是**白等一个来回**。平均要发两次才成的出口，
+///   等同于把一次请求的代价翻倍 —— 所以它必须便宜一半才值得排在前面。
+/// * `√(延迟倍数)`：慢要罚，但不该压过价钱。四倍慢罚两倍，八倍慢罚 2.8 倍。
+///   用开方而不是线性，是因为首字延迟本身抖动很大，线性会让排序天天翻烧饼。
+///
+/// 两个惩罚都有**证据门槛**：样本不够就不罚（`MIN_RATE_SAMPLES`），也都有上限，
+/// 免得一次抖动把一个好出口永久除名。这和这个文件里其它地方一条规矩：
+/// **没有证据不构成降级理由**。
+///
+/// 这个得分只在**同一个可靠性档内**决定先后 —— 跨档由 `is_reliable` 那道闸说了算，
+/// 理由见它自己那段：便宜换来的是用户多卡一次，那笔账不划算。
+pub fn endpoint_score(cost: f64, ok: i64, bad: i64, ms: Option<i32>, best_ms: Option<f64>) -> f64 {
+    let mut score = if cost.is_finite() && cost > 0.0 { cost } else { 1.0 };
+
+    let total = ok.saturating_add(bad);
+    if total >= MIN_RATE_SAMPLES {
+        let rate = (ok as f64 / total as f64).clamp(MIN_RATE, 1.0);
+        score /= rate;
+    }
+
+    if let (Some(ms), Some(best)) = (ms, best_ms) {
+        if ms > 0 && best > 0.0 {
+            let ratio = (ms as f64 / best).max(1.0);
+            score *= ratio.sqrt().min(MAX_SLOW_PENALTY);
+        }
+    }
+    score
+}
+
+impl Endpoint {
+    /// 真实成功请求的平均首字毫秒。样本为 0 就是没有。
+    pub fn real_ttfb_ms(&self) -> Option<i64> {
+        match (self.real_sum, self.real_n) {
+            (Some(sum), Some(n)) if n > 0 => Some(sum / n),
+            _ => None,
+        }
+    }
+}
+
+/// 判「慢不慢」该拿哪个耗时。**有真实流量就用真实的。**
+///
+/// 探测只发一句 `hi`、只用一个模型、一轮一个样本；真实流量量的是用户实际等的那一段。
+/// 线上这两个数差得很远：Grok 那个 0.005 倍的出口探测 19551ms、真实 27556ms。
+///
+/// 样本少于 `MIN_REAL_SAMPLES` 就不算数 —— 一两次的均值被一个离群值就能拽走，
+/// 而这个数会决定一个出口要不要被降级。宁可退回探测，也不拿噪声当证据。
+pub const MIN_REAL_SAMPLES: i64 = 5;
+
+pub fn effective_ms(real_ms: Option<i64>, real_n: Option<i64>, probe_ms: Option<i32>) -> Option<i32> {
+    if real_n.unwrap_or(0) >= MIN_REAL_SAMPLES {
+        if let Some(ms) = real_ms.filter(|v| *v > 0) {
+            return Some(ms.min(i32::MAX as i64) as i32);
+        }
+    }
+    probe_ms
 }
 
 /// 探测结论的保质期。
@@ -144,11 +372,35 @@ pub const SLOW_FLOOR_MS: f64 = 5_000.0;
 /// 是同一条规矩。
 ///
 /// 「测通了但那是三天前的事」也算没证据 —— 见 `PROBE_FRESH_SECS`。
+///
+/// **真实流量的结果盖过探测的结论。** 探测是合成的：它拿一个模型发一句话，
+/// 20 秒不回就判死（`PROBE_TIMEOUT_SECS`）。可 20 秒超时和「这个出口打不通」
+/// 根本是两件事 —— 线上实测「梦幻API」三个出口探测全部 20001ms 判死，同一天
+/// 它接了 241 次真实请求并且都成功了。而它们恰好是最便宜的几个（进价系数
+/// 0.15 / 0.24，还活着的那些是 0.6），于是多路由省钱的效果基本没兑现。
+///
+/// 所以只要**新鲜的真实结果**在，就按真实结果排：最近一次是成功 → 最好档，
+/// 最近一次是失败 → 最差档。真实失败同样算数 —— 只认成功的话，出口一失败被埋
+/// 就再也拿不到流量、也就再也刷新不了成功记录，永远埋着。
 pub fn availability_tier(
     probe_ok: Option<bool>,
     probe_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_fail_at: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> u8 {
+    // 真实结果和探测结论用同一把保质期的尺：过期的真实成功也不算数。
+    let fresh_real = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.filter(|t| now.signed_duration_since(*t).num_seconds() <= PROBE_FRESH_SECS)
+    };
+    match (fresh_real(last_ok_at), fresh_real(last_fail_at)) {
+        // 两边都有：听**较晚**的那个 —— 它才是这个出口现在的样子。
+        (Some(ok), Some(fail)) => return if ok >= fail { 0 } else { 2 },
+        (Some(_), None) => return 0,
+        (None, Some(_)) => return 2,
+        // 没有真实流量可依据（新出口、或者太久没人走）→ 照旧看探测。
+        (None, None) => {}
+    }
     match probe_ok {
         Some(false) => 2,
         None => 1,
@@ -244,6 +496,13 @@ pub fn priceable(route: &Model, model_id: &str) -> bool {
 pub fn expand(
     routes: &[Model],
     by_route: &HashMap<uuid::Uuid, Vec<Endpoint>>,
+    // 线路**自带地址**最近的成败数，键是线路 id。
+    //
+    // 它的成败记在 `route_attempt` 里、用的是 `health_id()`（自带地址 = 线路 id），
+    // 而 `load_for_routes` 只连了出口那张表 —— 不单独取一次的话，自带地址永远是
+    // 「没有样本」，也就永远算靠谱。而线上最初暴露这个问题的恰好就是它：
+    // Grok 自带地址 73%，比同线路 99% 的出口还便宜，于是稳稳排第一、每四发废一发。
+    own_rates: &HashMap<uuid::Uuid, (i64, i64)>,
     model_id: &str,
 ) -> Vec<Model> {
     let mut out = Vec::with_capacity(routes.len());
@@ -268,11 +527,17 @@ pub fn expand(
         own.endpoint_id = None;
         own.endpoint_label = String::new();
         own.endpoint_cost = Some(1.0);
+        // 每个候选最近的真实成败次数，和 targets 一一对应（算成功率惩罚要它）。
+        let mut rate_of: Vec<(i64, i64)> = Vec::new();
         if own_has {
             // 线路自带地址在 route_endpoints 表里没有行，探测结论无处可存，
             // 所以它没有 probe_ms —— 于是它永远不会被判「慢」。那是对的：
             // 没有证据不构成降级理由。
+            //
             targets.push((own_order_key(), None, own));
+            // 自带地址的成败从 `own_rates` 取（键是线路 id）。取不到才按「没有样本」
+            // 算 —— 那是「没有证据」，不是「零成功」。
+            rate_of.push(own_rates.get(&r.id).copied().unwrap_or((0, 0)));
         }
 
         for e in by_route.get(&r.id).into_iter().flatten() {
@@ -314,29 +579,30 @@ pub fn expand(
             m.endpoint_capacity = e.capacity;
             targets.push((
                 (
-                    availability_tier(e.probe_ok, e.probe_at, now),
-                    0, // 慢不慢，等候选收齐再填
+                    availability_tier(e.probe_ok, e.probe_at, e.last_ok_at, e.last_fail_at, now),
+                    0, // 可靠性档，等候选收齐（拿到成败数）再填
                     e.cost_ratio,
                 ),
-                e.probe_ms,
+                effective_ms(e.real_ttfb_ms(), e.real_n, e.probe_ms),
                 m,
             ));
+            rate_of.push((e.real_ok.unwrap_or(0), e.real_bad.unwrap_or(0)));
         }
 
-        // 慢得离谱的降一级 —— 这一步必须在**候选收齐之后**，因为判据是相对的：
-        // 「比同线路最快的那个慢三倍以上，而且自己也超过五秒」。
+        // 快慢这一维必须在**候选收齐之后**才算得出来，因为它是相对的：
+        // 快慢只有拿同一条线路上最快的那个当基准才有意义。
         //
         // 基准只取还活着的候选（tier < 2）：一个已知打不通的出口的耗时没有意义，
         // 拿它当基准会让所有人显得「不慢」。
+        //
+        // 用的是 `effective_ms`：有足够真实样本就是真实首字延迟，没有才退回探测。
+        // 基准和被比的那个必须同源，否则是拿真实首字去比探测耗时 —— 两把尺。
         let best_ms = targets
             .iter()
             .filter(|((tier, _, _), _, _)| *tier < 2)
             .filter_map(|(_, ms, _)| ms.map(|v| v as f64))
             .filter(|v| *v > 0.0)
             .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))));
-        for ((_, slow, _), ms, _) in targets.iter_mut() {
-            *slow = u8::from(is_egregiously_slow(*ms, best_ms));
-        }
 
         // 跨中转比价：把「相对官方价的倍数」换成「每一美元官方价实际花多少人民币」。
         //
@@ -358,19 +624,34 @@ pub fn expand(
             })
             .collect();
         if let Some(cny) = converted.filter(|v| !v.is_empty()) {
-            for ((k, _, m), c) in targets.iter_mut().zip(cny) {
+            for ((k, _, _), c) in targets.iter_mut().zip(cny) {
                 k.2 = c;
-                m.endpoint_cost = Some(c);
             }
         }
 
-        // 稳定排序：进价和探测结论都相同时，保持「线路自带的在前、其余按建立次序」，
+        // 最后一步：把「进价」换成**综合得分**（进价 × 成功率惩罚 × 慢惩罚）。
+        //
+        // 换算必须在这之后做，因为得分是拿换算后的人民币成本当底的 —— 倍率跨站不可比。
+        // 上面那段换算已经把 k.2 变成「每一美元官方价花多少人民币」了。
+        for ((k, ms, m), rates) in targets.iter_mut().zip(rate_of.iter()) {
+            let (ok, bad) = *rates;
+            // 中间那一位现在是**可靠性档**：不靠谱的整体排到靠谱的后面，价钱再便宜也不行。
+            // 它替掉了原来那个二值的「慢」—— 快慢已经并进得分里，而「稳不稳」
+            // 是用户真正能感觉到的那一维，值得单占一级。
+            k.1 = u8::from(!is_reliable(ok, bad));
+            k.2 = endpoint_score(k.2, ok, bad, *ms, best_ms);
+            // endpoint_cost 是给 `overflow_weight`（首选被限流时挑替补）用的，
+            // 那也是一次跨出口比较，得用同一把尺，否则两处对「谁更划算」的判断会打架。
+            m.endpoint_cost = Some(k.2);
+        }
+
+        // 稳定排序：得分相同时保持「线路自带的在前、其余按建立次序」，
         // 免得每次请求随机换一个出口 —— 那会把上游的提示词缓存全部打散。
         targets.sort_by(|a, b| {
             a.0 .0
-                .cmp(&b.0 .0) // 能用的在前
-                .then(a.0 .1.cmp(&b.0 .1)) // 不慢的在前
-                .then(a.0 .2.partial_cmp(&b.0 .2).unwrap_or(std::cmp::Ordering::Equal)) // 便宜的在前
+                .cmp(&b.0 .0) // 还活着的在前（真死的排最后）
+                .then(a.0 .1.cmp(&b.0 .1)) // 靠谱的在前
+                .then(a.0 .2.partial_cmp(&b.0 .2).unwrap_or(std::cmp::Ordering::Equal)) // 得分小的在前
         });
         out.extend(targets.into_iter().map(|(_, _, m)| m));
     }
@@ -507,6 +788,42 @@ pub fn hrw_pick(key: &[u8; 32], set: &[(uuid::Uuid, f64, f64)]) -> Option<usize>
 }
 
 /// 取一批线路的出口，按 `route_id` 分好。
+/// 线路**自带地址**最近的成败数，键是线路 id。窗口和出口那边逐字一致：
+/// 今天，样本不够退回 7 天。
+///
+/// 单独一次查询而不是并进 `load_for_routes`：那个查的是 route_endpoints，
+/// 自带地址在那张表里根本没有行。
+pub async fn load_own_rates(
+    db: &sqlx::PgPool,
+    route_ids: &[uuid::Uuid],
+) -> HashMap<uuid::Uuid, (i64, i64)> {
+    if route_ids.is_empty() {
+        return HashMap::new();
+    }
+    let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT endpoint_id, \
+                CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                     THEN COALESCE(SUM(ok_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                     ELSE COALESCE(SUM(ok_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                END, \
+                CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                     THEN COALESCE(SUM(fail_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                     ELSE COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                END \
+         FROM route_attempt WHERE endpoint_id = ANY($1) GROUP BY endpoint_id",
+    )
+    .bind(route_ids)
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        // 取不到就当没有样本 —— 也就是不罚。缺证据不构成降级理由，
+        // 而让整轮派单失败的代价比少一个惩罚大得多。
+        tracing::warn!(error = %e, "自带地址成败数读取失败，本轮不按成功率降级");
+        Vec::new()
+    });
+    rows.into_iter().map(|(id, ok, bad)| (id, (ok, bad))).collect()
+}
+
 pub async fn load_for_routes(
     db: &sqlx::PgPool,
     route_ids: &[uuid::Uuid],
@@ -515,8 +832,28 @@ pub async fn load_for_routes(
         return HashMap::new();
     }
     let rows: Vec<Endpoint> = sqlx::query_as(
-        "SELECT * FROM route_endpoints WHERE route_id = ANY($1) AND active = true \
-         ORDER BY cost_ratio, created_at",
+        // 连 route_attempt 是为了把「最近一次真实成功／失败」带出来给排序用。
+        // 按出口聚合（那张表还按天和模型分行），LEFT JOIN 保证没有流量记录的
+        // 出口照样出现 —— 缺证据不构成排除理由。
+        "SELECT e.*, a.last_ok_at, a.last_fail_at, a.real_sum, a.real_n, a.real_ok, a.real_bad FROM route_endpoints e \
+         LEFT JOIN (SELECT endpoint_id, MAX(last_ok_at) AS last_ok_at, \
+                           MAX(last_fail_at) AS last_fail_at, \
+                           COALESCE(SUM(ttfb_ms_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint AS real_sum, \
+                           COALESCE(SUM(ttfb_ms_n)   FILTER (WHERE day >= current_date - 6), 0)::bigint AS real_n, \
+                           -- 成功率的窗口是「今天，样本不够退回 7 天」：一天一刷，
+                           -- 昨天的坏运气不压着今天；而流量稀的出口也不会因为样本太少
+                           -- 被一两次失败判死。判据 MIN_RATE_SAMPLES 在 Rust 那边。
+                           CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                                THEN COALESCE(SUM(ok_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                                ELSE COALESCE(SUM(ok_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                           END AS real_ok, \
+                           CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                                THEN COALESCE(SUM(fail_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                                ELSE COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                           END AS real_bad \
+                    FROM route_attempt GROUP BY endpoint_id) a ON a.endpoint_id = e.id \
+         WHERE e.route_id = ANY($1) AND e.active = true \
+         ORDER BY e.cost_ratio, e.created_at",
     )
     .bind(route_ids)
     .fetch_all(db)
@@ -557,6 +894,10 @@ pub fn note_endpoint_usage(
     // 实测一次调用里它能是新鲜输入的一百六十倍（381 vs 61,634）。不记的话对账
     // 只能把它当 0 —— 「中转收了」低估、毛利高估，而且缓存命中率越高错得越多。
     cache_creation: i64,
+    // `prompt` 含不含 `cached`。**只有收到回执的那一刻知道**，事后从数字反推不出来
+    // （cached < prompt 时两种形状完全同形）。不带过来的话，对账只能硬夹一刀
+    // `min(cached, prompt)`，把 Anthropic 那边超出的缓存读整段丢掉 —— 成本单向低估。
+    prompt_includes_cached: bool,
 ) {
     let db = state.db.clone();
     // 分转微美元。看板要看得见「三分钱」这种量级，按分存会全是 0。
@@ -598,8 +939,9 @@ pub fn note_endpoint_usage(
             let r = sqlx::query(
                 "INSERT INTO endpoint_model_usage \
                    (day, endpoint_id, route_id, model_id, calls, revenue_micro_usd, \
+                    prompt_includes_cached, \
                     prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens) \
-                 VALUES (current_date, $1, $2, $3, 1, $4, $5, $6, $7, $8) \
+                 VALUES (current_date, $1, $2, $3, 1, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (day, endpoint_id, model_id) DO UPDATE SET \
                    calls = endpoint_model_usage.calls + 1, \
                    revenue_micro_usd = endpoint_model_usage.revenue_micro_usd + EXCLUDED.revenue_micro_usd, \
@@ -608,12 +950,20 @@ pub fn note_endpoint_usage(
                    cached_tokens = endpoint_model_usage.cached_tokens + EXCLUDED.cached_tokens, \
                    cache_creation_tokens = endpoint_model_usage.cache_creation_tokens \
                      + EXCLUDED.cache_creation_tokens, \
+                   -- 一天一行会聚合多次调用。只要有一次是 Anthropic 形状就整行按
+                   -- Anthropic 算（bool_and），和 models.rs 里那句
+                   -- `COALESCE(bool_and(prompt_includes_cached), true)` 同一个口径。
+                   -- 反过来会把混合情况判成「含缓存」，又回到低估成本那个方向。
+                   prompt_includes_cached = \
+                     COALESCE(endpoint_model_usage.prompt_includes_cached, true) \
+                     AND EXCLUDED.prompt_includes_cached, \
                    updated_at = now()",
             )
             .bind(endpoint_id)
             .bind(route_id)
             .bind(&model)
             .bind(micro)
+            .bind(prompt_includes_cached)
             .bind(prompt)
             .bind(completion)
             .bind(cached)
@@ -970,6 +1320,141 @@ pub(crate) fn looks_like_a_real_completion(text: &str) -> bool {
         })
 }
 
+/// SSE 的**第一帧**看着像不像一个真的对话流。
+///
+/// 和非流式那个是两种形状，不能混用：流式第一帧是 `data: {...}` 包着一个 delta
+/// （OpenAI 系）或者 `event: message_start`（Anthropic 系），拿
+/// `looks_like_a_real_completion` 去判它一律不通过。
+///
+/// 依然判形状而不是「有回应就算通」：转卖网关的错误页也会回 200，只认「有字节」
+/// 的话那种站会被探成绿灯，然后接管真实流量、每一发都失败。
+pub(crate) fn looks_like_a_real_stream(head: &str) -> bool {
+    if head.contains("event: message_start") || head.contains("event: response.created") {
+        return true;
+    }
+    head.split("data:").skip(1).any(|frame| {
+        let line = frame.trim().lines().next().unwrap_or("").trim();
+        // `[DONE]` 这一支是显式写出来的意图，不是承重墙：下面 JSON 解析失败后的
+        // 兜底本来也挡得住它（变异测过，删掉这行测试不红）。留着是为了让「结束帧
+        // 不算生成过内容」这件事在代码里看得见。
+        if line.is_empty() || line.starts_with("[DONE]") {
+            return false;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => {
+                v.get("choices").is_some_and(|c| c.is_array())
+                    || v.get("delta").is_some()
+                    || v.get("type").is_some()
+                    || v.get("usage").is_some()
+            }
+            // 第一个 chunk 不保证切在帧边界上，半截 JSON 解析不出来很正常。
+            // 解析失败不等于假，退回认这几个键出现过。
+            Err(_) => {
+                line.contains("\"choices\"") || line.contains("\"delta\"") || line.contains("\"type\"")
+            }
+        }
+    })
+}
+
+/// 流式探的结论：要么定了，要么这家压根不认流式、得退回非流式再试一遍。
+enum StreamProbe {
+    Decided(ProbeOutcome),
+    Unsupported,
+}
+
+/// 发一个流式请求，只等**第一帧**，拿到就断开。
+///
+/// 超时单独用 `tokio::time::timeout` 圈住每一步，而不是靠 client 上的整体超时：
+/// 整体超时管的是「整个响应读完」，那正是这里不想等的那段。
+async fn probe_streaming(req: reqwest::RequestBuilder, started: std::time::Instant) -> StreamProbe {
+    let ms = |s: std::time::Instant| s.elapsed().as_millis().min(i32::MAX as u128) as i32;
+    let dur = std::time::Duration::from_secs(PROBE_TIMEOUT_SECS);
+
+    let mut resp = match tokio::time::timeout(dur, req.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            // 连不上／TLS 坏了是**这个出口**的毛病，不是流式的毛病，就地定案。
+            // 错误原文不能进 note：reqwest 的错误链会带完整 URL，查询串里可能有密钥。
+            let why = if e.is_connect() {
+                "连不上（域名或端口不对）".to_string()
+            } else if e.is_timeout() {
+                format!("超过 {PROBE_TIMEOUT_SECS} 秒没有回应")
+            } else {
+                "请求没发出去".to_string()
+            };
+            return StreamProbe::Decided(ProbeOutcome { ok: false, ms: ms(started), note: why });
+        }
+        Err(_) => {
+            return StreamProbe::Decided(ProbeOutcome {
+                ok: false,
+                ms: ms(started),
+                note: format!("超过 {PROBE_TIMEOUT_SECS} 秒没有回应"),
+            })
+        }
+    };
+
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        // 这几个码有可能是「不认 stream 这个参数」，也有可能是请求体本身不对。
+        // 分不出来，所以退回非流式再判一次，让原来那套给结论，不在这儿猜。
+        if matches!(status, 400 | 404 | 422 | 501) {
+            return StreamProbe::Unsupported;
+        }
+        let why = match status {
+            401 | 403 => "密钥被拒（401/403）".to_string(),
+            429 => "被限流（429）".to_string(),
+            402 => "余额不足（402）".to_string(),
+            500..=599 => format!("上游自己出错（{status}）"),
+            _ => format!("上游返回 {status}"),
+        };
+        return StreamProbe::Decided(ProbeOutcome { ok: false, ms: ms(started), note: why });
+    }
+
+    // 攒到看得出形状为止。第一个 chunk 可能只是几个字节的心跳（有的网关先发一个
+    // `: ping`），所以不能拿到一个 chunk 就下结论。上限保证不会把整段生成读完。
+    let mut head = String::new();
+    loop {
+        match tokio::time::timeout(dur, resp.chunk()).await {
+            Ok(Ok(Some(b))) => {
+                head.push_str(&String::from_utf8_lossy(&b));
+                if looks_like_a_real_stream(&head) {
+                    return StreamProbe::Decided(ProbeOutcome {
+                        ok: true,
+                        ms: ms(started),
+                        note: String::new(),
+                    });
+                }
+                if head.len() > 8 * 1024 {
+                    break;
+                }
+            }
+            // 流走完了还没出现对话的形状 —— 回了 200 却不是 SSE，多半是转卖网关的
+            // 错误页。这种最该拦：探绿之后它会接管真实流量，然后每一发都失败。
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                return StreamProbe::Decided(ProbeOutcome {
+                    ok: false,
+                    ms: ms(started),
+                    note: format!("超过 {PROBE_TIMEOUT_SECS} 秒没有回应"),
+                })
+            }
+        }
+    }
+
+    // 200 但一帧对话形状都没有：如果它压根不是 SSE（比如回了一整个 JSON），
+    // 那有可能只是这家不认 stream 参数、把它当普通请求处理了 —— 交给非流式那套
+    // 去判，它认得完整响应的形状。
+    if looks_like_a_real_completion(head.trim()) {
+        return StreamProbe::Unsupported;
+    }
+    StreamProbe::Decided(ProbeOutcome {
+        ok: false,
+        ms: ms(started),
+        note: "回了 200 但不是对话响应（可能是转卖网关的错误页）".into(),
+    })
+}
+
 pub async fn probe_once(
     http: &reqwest::Client,
     route: &Model,
@@ -1021,15 +1506,38 @@ pub async fn probe_once(
         }),
     };
 
-    let mut req = http.post(&url).json(&body);
-    req = if anthropic {
-        req.header("x-api-key", api_key_plain)
-            .header("anthropic-version", "2023-06-01")
-    } else {
-        req.header("authorization", format!("Bearer {api_key_plain}"))
+    let build = |body: &serde_json::Value| {
+        let r = http.post(&url).json(body);
+        if anthropic {
+            r.header("x-api-key", api_key_plain)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            r.header("authorization", format!("Bearer {api_key_plain}"))
+        }
     };
 
-    let resp = match req.send().await {
+    // **先流式探，只等第一帧。**
+    //
+    // 非流式探推理模型是探不出来的：`max_tokens: 1` 拦不住思考，模型要把整段思考
+    // 走完才吐第一个字节，20 秒（`PROBE_TIMEOUT_SECS`）根本不够。线上实测「梦幻API」
+    // 三个出口（探的是 gpt-5.6-sol / deepseek-v4-flash / claude-fable-5）全部卡在
+    // 20001ms 判死，而同一天它接了 241 次真实请求全部成功 —— 探测在说假话，且假红的
+    // 正好是最便宜的那几个出口，于是多路由该省的钱一分没省。
+    //
+    // 顺带让「多快」这个数变得有意义：量到的是首字延迟，就是用户真正等的那一段，
+    // 而不是「生成完一整句要多久」。
+    let mut streamed = body.clone();
+    if let Some(o) = streamed.as_object_mut() {
+        o.insert("stream".into(), serde_json::Value::Bool(true));
+    }
+    match probe_streaming(build(&streamed), started).await {
+        StreamProbe::Decided(o) => return o,
+        // 这家不认流式（有的转卖网关只转发非流式）。退回原来那套走一遍 ——
+        // 拿「不支持流式」当「打不通」会把一个好出口判死。
+        StreamProbe::Unsupported => {}
+    }
+
+    let resp = match build(&body).send().await {
         Ok(r) => r,
         Err(e) => {
             // 连不上／超时／TLS 坏了。这里**不能**把错误原文塞进 note：reqwest 的错误链
@@ -1502,6 +2010,35 @@ pub struct EndpointOut {
     pub sched: &'static str,
     /// 下架的话，还有多少秒去试下一次。
     pub retry_in: Option<u64>,
+    /// 最近 7 天的**真实**成绩：成功数、失败数、成功那些的平均首字毫秒。
+    ///
+    /// 探测会说假话 —— 它 20 秒不回就判死，而慢不等于打不通。线上实测「梦幻API」
+    /// 三个出口探测全部超时判死，同一天接了 241 次真实请求全部成功，而它们正是
+    /// 最便宜的几个。红徽章旁边必须同时看得见真实成绩，否则那个红是误导。
+    pub real_ok: i64,
+    pub real_fail: i64,
+    pub real_ms: Option<i64>,
+    /// 换算成「每一美元官方价实际花多少人民币」。**排序真正比的是这个数，不是倍率。**
+    ///
+    /// 倍率只在同一家中转内部可比 —— 它的单位是那家中转的余额单位，而一块钱能买到
+    /// 多少余额各家差几十倍。线上就有这个形状：GPT 线路上「梦幻API 0.15 倍」看着比
+    /// 「WE API 0.16 倍」便宜，换算之后是 ¥0.15 对 ¥0.016 —— 差十倍，而且方向反了。
+    ///
+    /// None = 这家站没填充值汇率，算不出来。这条线路上只要有一个算不出来，整条线路
+    /// 就退回按倍率排（服务端的**全有全无**规则），前端也必须照做。
+    pub cost_cny: Option<f64>,
+    /// 真实耗时的样本数。前端判「慢不慢」要它 —— 样本不够就退回看探测。
+    pub real_n: i64,
+    /// **派单那个窗口**的成败数（今天，样本不够退回 7 天）。
+    ///
+    /// 和上面 `real_ok`/`real_fail` 那两个 7 天的数**不是一回事**：那两个是给人看的
+    /// 成绩单，这两个是排序真正读的。不分开的话，这一屏画出来的顺序和真正发生的
+    /// 会在「今天刚变坏」的出口上对不上，而且看不出来。
+    pub rate_ok: i64,
+    pub rate_bad: i64,
+    /// 最近一次真实成功／失败的时刻。排序真正读的是这两个，见 `availability_tier`。
+    pub last_ok_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_fail_at: Option<chrono::DateTime<chrono::Utc>>,
     /// 真实流量的结论：ok / degraded / error / unknown。和探测是两个来源，都要看得见。
     pub live: String,
 }
@@ -1514,6 +2051,9 @@ pub struct RouteOut {
     /// 厂商标识（anthropic / openai / deepseek / …），前端据此挑图标。空 = 认不出来。
     pub vendor: &'static str,
     pub base_url: String,
+    /// 线路自带地址换算后的「每一美元官方价花多少人民币」。倍率固定按 1.0 算
+    /// （它是在任的那个，`own_order_key` 也是这么定的）。None = 这家站没填汇率。
+    pub own_cost_cny: Option<f64>,
     pub active: bool,
     pub model_count: usize,
     /// 这条线路开放的模型 id。
@@ -1790,6 +2330,45 @@ pub async fn admin_list(
     .await?;
     let now = chrono::Utc::now().timestamp();
 
+    // 每个出口最近 7 天的真实成绩。7 天而不是当天：出口多了以后单日样本很薄，
+    // 一天只走了三次的出口算不出成功率。时刻列不设窗口 —— 「最近一次成功」本来
+    // 就该是最近一次，由 `availability_tier` 那把保质期的尺去判它算不算数。
+    #[allow(clippy::type_complexity)]
+    let attempts: Vec<(uuid::Uuid, i64, i64, i64, i64, Option<i64>, Option<i64>, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT endpoint_id, \
+                    COALESCE(SUM(ok_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint, \
+                    COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint, \
+                    CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                         THEN COALESCE(SUM(ok_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                         ELSE COALESCE(SUM(ok_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                    END, \
+                    CASE WHEN COALESCE(SUM(ok_calls + fail_calls) FILTER (WHERE day = current_date), 0)::bigint >= 8 \
+                         THEN COALESCE(SUM(fail_calls) FILTER (WHERE day = current_date), 0)::bigint \
+                         ELSE COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
+                    END, \
+                    COALESCE(SUM(ttfb_ms_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint, \
+                    COALESCE(SUM(ttfb_ms_n)   FILTER (WHERE day >= current_date - 6), 0)::bigint, \
+                    MAX(last_ok_at), MAX(last_fail_at) \
+             FROM route_attempt GROUP BY endpoint_id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    #[allow(clippy::type_complexity)]
+    let real: HashMap<uuid::Uuid, (i64, i64, i64, i64, Option<i64>, i64, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)> = attempts
+        .into_iter()
+        .map(|(id, ok, fail, rok, rbad, sum, n, ok_at, fail_at)| {
+            // 平均只在成功那些里算 —— 失败的耗时压根没累加（超时的 20 秒混进来
+            // 会把一个健康出口的均值直接拉成「慢得离谱」）。分母为 0 就是没有。
+            let ms = match (sum, n) {
+                (Some(sum), Some(n)) if n > 0 => Some(sum / n),
+                _ => None,
+            };
+            (id, (ok, fail, rok, rbad, ms, n.unwrap_or(0), ok_at, fail_at))
+        })
+        .collect();
+
     let mut by_route: HashMap<uuid::Uuid, Vec<Endpoint>> = HashMap::new();
     for e in eps {
         by_route.entry(e.route_id).or_default().push(e);
@@ -1802,6 +2381,10 @@ pub async fn admin_list(
         let mut list = Vec::new();
         for e in by_route.remove(&r.id).unwrap_or_default() {
             let h = crate::route_health::snapshot(&state, e.id).await;
+            let cost_cny = crate::relay_rates::usd_per_cny(&e.base_url)
+                .and_then(|r| crate::relay_rates::cny_per_official_usd(e.cost_ratio, r));
+            let (real_ok, real_fail, rate_ok, rate_bad, real_ms, real_n, last_ok_at, last_fail_at) =
+                real.get(&e.id).copied().unwrap_or((0, 0, 0, 0, None, 0, None, None));
             list.push(EndpointOut {
                 id: e.id,
                 route_id: e.route_id,
@@ -1815,6 +2398,15 @@ pub async fn admin_list(
                 probe_at: e.probe_at,
                 probe_ms: e.probe_ms,
                 probe_note: e.probe_note,
+                real_ok,
+                real_fail,
+                real_ms,
+                real_n,
+                rate_ok,
+                rate_bad,
+                cost_cny,
+                last_ok_at,
+                last_fail_at,
                 enabled_models: e.enabled_models,
                 protocol: e.protocol,
                 capacity: e.capacity,
@@ -1829,6 +2421,8 @@ pub async fn admin_list(
             protocol: r.protocol.clone(),
             vendor: vendor_of(&r.provider, &crate::models::allowed_ids(r), &r.base_url),
             base_url: r.base_url.clone(),
+            own_cost_cny: crate::relay_rates::usd_per_cny(&r.base_url)
+                .and_then(|rate| crate::relay_rates::cny_per_official_usd(1.0, rate)),
             active: r.active,
             model_count: crate::models::allowed_ids(r).len(),
             models: crate::models::allowed_ids(r),
@@ -2109,14 +2703,21 @@ pub async fn admin_save(
         Some(id) => {
             // 密钥空着 = 沿用原值。这一步必须在 UPDATE 之外先取出来，
             // 不然一次「只改地址」的保存会把密钥清成空。
-            let keep: Option<(String, String)> = sqlx::query_as(
-                "SELECT api_key, balance_token FROM route_endpoints WHERE id = $1",
+            let keep: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT api_key, balance_token, key_fp FROM route_endpoints WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
-            let Some((keep, keep_tok)) = keep else {
+            let Some((keep, keep_tok, keep_fp)) = keep else {
                 return Err(AppError::bad("这个出口不存在"));
+            };
+            // 指纹必须和密钥同进同退：密钥沿用原值时指纹也沿用，否则一次「只改地址」的
+            // 保存会把指纹清空，这一行就变成「空密钥」参与去重 —— 而它其实有密钥。
+            let key_fp = if req.api_key.trim().is_empty() {
+                keep_fp
+            } else {
+                key_fingerprint(&req.api_key)
             };
             let stored = if req.api_key.trim().is_empty() {
                 keep
@@ -2133,7 +2734,7 @@ pub async fn admin_save(
                 "UPDATE route_endpoints SET route_id = $2, label = $3, base_url = $4, \
                  api_key = $5, cost_ratio = $6, active = $7, note = $8, \
                  enabled_models = $9, protocol = $10, capacity = $11, \
-                 balance_token = $12, updated_at = now() \
+                 balance_token = $12, key_fp = $13, updated_at = now() \
                  WHERE id = $1",
             )
             .bind(id)
@@ -2148,6 +2749,7 @@ pub async fn admin_save(
             .bind(&protocol)
             .bind(capacity)
             .bind(&stored_tok)
+            .bind(&key_fp)
             .execute(&state.db)
             .await
             .map_err(dup_url)?;
@@ -2166,8 +2768,8 @@ pub async fn admin_save(
             };
             sqlx::query_scalar(
                 "INSERT INTO route_endpoints (route_id, label, base_url, api_key, cost_ratio, \
-                 active, note, enabled_models, protocol, capacity, balance_token) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id",
+                 active, note, enabled_models, protocol, capacity, balance_token, key_fp) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id",
             )
             .bind(req.route_id)
             .bind(&label)
@@ -2180,6 +2782,7 @@ pub async fn admin_save(
             .bind(&protocol)
             .bind(capacity)
             .bind(&stored_tok)
+            .bind(key_fingerprint(&req.api_key))
             .fetch_one(&state.db)
             .await
             .map_err(dup_url)?
@@ -2257,10 +2860,103 @@ async fn merge_route_pricing(
 fn dup_url(e: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(db) = &e {
         if db.code().as_deref() == Some("23505") {
-            return AppError::bad("这条线路下已经有同样的中转地址了");
+            // 判据是「地址 **且** 密钥都一样」——同地址不同密钥是正当的（同一家转卖商的
+            // 几个账号，各有各的余额和限速），所以话要说准，不然运维会以为同址账号
+            // 根本挂不上去，而那正是故障转移最有价值的一种。
+            return AppError::bad(
+                "这条线路下已经有一个地址和密钥都相同的出口了。\
+                 同一个地址挂多个账号是可以的——换一把密钥即可；\
+                 两个都不填密钥（沿用线路自己那把）算同一个上游。",
+            );
         }
     }
     AppError::from(e)
+}
+
+/// 密钥的**确定性指纹**，用于「同地址同密钥算重复」这条唯一约束。
+///
+/// 为什么不能直接对 `api_key` 列建唯一索引：那一列是密文，而 field_crypto 每次加密都用
+/// 新的随机 nonce，同一把密钥两次写入得到两段不同的密文 —— 索引永远不会命中，
+/// 等于没有约束。
+///
+/// 存的是哈希不是明文：这一列会出现在备份、日志和 `SELECT *` 里，而 API 密钥是高熵
+/// 随机串，sha256 不可逆。域分隔前缀防的是拿别处同样算法的哈希来比对。
+///
+/// 空密钥（= 沿用线路自己那把）映射成空串，**不是**空串的哈希：这样「同地址 + 两边都
+/// 不填密钥」仍然撞唯一索引 —— 那确实是同一个上游粘了两遍。
+pub fn key_fingerprint(plaintext: &str) -> String {
+    let key = plaintext.trim();
+    if key.is_empty() {
+        return String::new();
+    }
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut h = Sha256::new();
+    h.update(b"mrday-route-endpoint-key/v1\n");
+    h.update(key.as_bytes());
+    let digest = h.finalize();
+    // 取前 16 字节 = 32 位十六进制。128 位对「同一条线路下有没有撞上」这件事绰绰有余，
+    // 而列短一点，索引和备份都省事。
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// 存量行的指纹回填。
+///
+/// 迁移建完索引时所有旧行的 `key_fp` 都是空串（SQL 解不了密）。它们两两之间地址本就
+/// 不同，所以那一刻不会误判；但**新加**一个同址同密钥的出口时，`''` 和真指纹不相等，
+/// 重复就漏过去了。所以要把旧行补齐。
+///
+/// 幂等、逐行条件更新，和 field_backfill 同一套路数。只补「有密钥但还没指纹」的行；
+/// 空密钥的行 key_fp 本来就该是空串，不动。
+pub fn spawn_key_fp_backfill(state: AppState) {
+    tokio::spawn(async move {
+        // 让迁移和主要初始化先过去。它不急。
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let rows: Vec<(uuid::Uuid, String)> = match sqlx::query_as(
+            "SELECT id, api_key FROM route_endpoints WHERE key_fp = '' AND api_key <> ''",
+        )
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "出口密钥指纹回填：读不出来（下次启动再试）");
+                return;
+            }
+        };
+        let mut done = 0u64;
+        for (id, stored) in rows {
+            // 走 model_key，和这张表所有别的解密同一条路（它内部就是 MODEL_KEY_CTX）。
+            //
+            // 刻意**不用** decrypt_or_raw：那个在解不开时返回**密文本身**，于是会算出一个
+            // 稳定但错误的指纹并永久存进库 —— 同一把密钥的两行密文不同、指纹也就不同，
+            // 重复照样漏过去，而且再也没有征兆。model_key 解不开返回空串，
+            // 下面那句 `fp.is_empty()` 直接跳过，留到下次启动（密钥修好之后）再补。
+            // 遗留明文行不受影响：decrypt 对没有 fc1: 前缀的值原样返回 Ok。
+            let plain = crate::models::model_key(&stored);
+            let fp = key_fingerprint(&plain);
+            if fp.is_empty() {
+                continue;
+            }
+            // 条件更新：只在仍然是空指纹时写，避免和正常的保存路径打架。
+            match sqlx::query("UPDATE route_endpoints SET key_fp = $2 WHERE id = $1 AND key_fp = ''")
+                .bind(id)
+                .bind(&fp)
+                .execute(&state.db)
+                .await
+            {
+                Ok(r) => done += r.rows_affected(),
+                Err(e) => tracing::warn!(error = %e, %id, "出口密钥指纹回填：这一行没写进去"),
+            }
+        }
+        if done > 0 {
+            tracing::info!(rows = done, "出口密钥指纹回填完成");
+        }
+    });
 }
 
 /// `POST /api/admin/route-endpoints/:id/probe` —— 手动测一个出口。
@@ -2445,6 +3141,128 @@ pub async fn admin_delete(
 mod tests {
     use super::*;
 
+    /// 同一个中转地址挂多个账号，必须能各挂一个出口。
+    ///
+    /// 原来的唯一索引是 `(route_id, lower(base_url))`，把「同地址、不同密钥」也一起挡了。
+    /// 那是完全正当的用法：同一家转卖商开几个账号是常态，每个账号有自己的余额、限速、
+    /// 封禁状态 —— 而且恰恰是故障转移最有价值的那种（额度耗尽、密钥失效都是**按密钥**
+    /// 发生的，换密钥能救、换地址救不了）。运维手上几个同址账号一个都用不上。
+    #[test]
+    fn the_same_relay_with_different_keys_is_not_a_duplicate() {
+        let a = key_fingerprint("sk-account-one");
+        let b = key_fingerprint("sk-account-two");
+        assert_ne!(a, b, "两把不同的密钥指纹相同 —— 同址多账号还是挂不上");
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), 32, "指纹长度不该变（列宽和索引都按它算）");
+
+        // 确定性：同一把密钥两次算出来必须一样，否则唯一约束永远不命中。
+        // 这正是不能直接对密文列建索引的原因 —— field_crypto 每次用新的随机 nonce。
+        assert_eq!(a, key_fingerprint("sk-account-one"));
+        // 前后空白不算差别（表单里粘贴常带一个换行）。
+        assert_eq!(a, key_fingerprint("  sk-account-one\n"));
+
+        // 真正的重复仍然要拦：同地址 + 都不填密钥 = 同一个上游粘了两遍。
+        assert_eq!(key_fingerprint(""), "");
+        assert_eq!(key_fingerprint("   "), "");
+
+        // 存的是哈希不是明文：这一列会进备份、日志和 SELECT *。
+        assert!(!a.contains("sk-"), "指纹里带上了密钥原文");
+    }
+
+    /// 唯一约束、写入路径、回填三处必须说的是同一件事。
+    ///
+    /// 少任何一处这道约束就静默失效：索引还在「地址」上 → 同址多账号仍然挂不上；
+    /// 写入不算指纹 → 所有行都是空指纹，同址同密钥反而挡不住；
+    /// 不回填 → 存量行永远是空指纹，拿它去和新行的真指纹比，重复漏过去。
+    #[test]
+    fn the_uniqueness_criterion_is_wired_in_all_three_places() {
+        let migration = include_str!("../migrations/20260870_route_endpoint_key_fp.sql");
+        assert!(
+            migration.contains("(route_id, lower(base_url), key_fp)"),
+            "唯一索引没把密钥指纹算进去 —— 同址多账号仍然挂不上"
+        );
+        assert!(
+            migration.contains("DROP INDEX IF EXISTS idx_route_endpoints_unique_url"),
+            "旧的「只按地址」那条索引没删 —— 它还在，新索引救不了"
+        );
+
+        let raw = include_str!("route_endpoints.rs");
+        // 边界按**行首的那个属性**找，不用 rfind("#[cfg(test)]")：那个字符串在本测试
+        // 自己的源码里也出现（就是这一行），rfind 会锚到它身上，于是切出来的"产品代码"
+        // 反而把整段测试包了进去 —— 下面每一条反向断言都会被自己的文本喂到。
+        let src = &raw[..raw.find("\n#[cfg(test)]\nmod ").map(|i| i + 1).unwrap_or(raw.len())];
+        assert!(
+            src.contains("key_fp) \\\n                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"),
+            "新建出口没写指纹 —— 所有新行都是空指纹，同址同密钥反而挡不住"
+        );
+        assert!(src.contains("key_fp = $13"), "改出口没写指纹");
+        // SQL 里有这一列，不等于**绑进去的是指纹**。绑一个空串同样编译、同样通过列名
+        // 断言，而结果是所有行都空指纹 —— 同址同密钥反而挡不住，方向正好反了。
+        assert!(
+            src.contains(".bind(key_fingerprint(&req.api_key))"),
+            "新建出口那一处绑的不是指纹"
+        );
+        assert!(
+            src.contains(".bind(&key_fp)"),
+            "改出口那一处绑的不是指纹"
+        );
+        // 改出口时「密钥空着 = 沿用原值」，指纹必须跟着沿用，否则一次「只改地址」的保存
+        // 会把指纹清空，这一行就变成「空密钥」参与去重 —— 而它其实有密钥。
+        assert!(
+            src.contains("let key_fp = if req.api_key.trim().is_empty() {\n                keep_fp\n            } else {\n                key_fingerprint(&req.api_key)\n            };"),
+            "指纹没和密钥同进同退 —— 一次「只改地址」的保存会把它清成空"
+        );
+        assert!(
+            src.contains("pub fn spawn_key_fp_backfill"),
+            "没有存量回填 —— 旧行永远是空指纹，和新行的真指纹比不出重复"
+        );
+        // 回填必须用 decrypt_or_raw：FIELD_ENC_KEY 是后配的，库里明文密文混着，
+        // 用 decrypt 的话明文行直接报错跳过，永远补不上。
+        // 回填的解密必须走 model_key：decrypt_or_raw 在解不开时返回**密文本身**，
+        // 会算出一个稳定但错误的指纹并永久存进库 —— 同一把密钥的两行密文不同、指纹
+        // 也就不同，重复照样漏过去，而且再也没有征兆。
+        assert!(
+            src.contains("let plain = crate::models::model_key(&stored);"),
+            "回填没走 model_key"
+        );
+        // 钉的是**调用形式**（带括号），不是这个名字：产品代码和这条断言自己的注释里
+        // 都逐字写着这个名字（在解释为什么不用它），按名字断言会被自己的注释喂到。
+        assert!(
+            !src.contains("decrypt_or_raw("),
+            "回填用了解不开就返回密文的那个 —— 会把密文的指纹永久存进库"
+        );
+        // 回填要挂在启动上，不然它存在也白存在。
+        let main_rs = include_str!("main.rs");
+        assert!(
+            main_rs.contains("route_endpoints::spawn_key_fp_backfill(state.clone());"),
+            "回填没有调用点"
+        );
+    }
+
+    /// 撞了唯一约束时，那句话必须说清「同址不同密钥是可以的」。
+    ///
+    /// 原文案是「这条线路下已经有同样的中转地址了」—— 运维照字面读会以为同址账号根本
+    /// 挂不上去，然后放弃，而那正是故障转移最有价值的一种配置。
+    #[test]
+    fn the_duplicate_message_says_a_different_key_is_allowed() {
+        let raw = include_str!("route_endpoints.rs");
+        // 边界按**行首的那个属性**找，不用 rfind("#[cfg(test)]")：那个字符串在本测试
+        // 自己的源码里也出现（就是这一行），rfind 会锚到它身上，于是切出来的"产品代码"
+        // 反而把整段测试包了进去 —— 下面每一条反向断言都会被自己的文本喂到。
+        let src = &raw[..raw.find("\n#[cfg(test)]\nmod ").map(|i| i + 1).unwrap_or(raw.len())];
+        // 按**结构边界**取函数体，不用固定窗口：固定窗口在函数变长时会静静地不再覆盖
+        // 被断言的那几行（而且中文会切在字符中间直接 panic）。
+        let at = src.find("fn dup_url").expect("dup_url 还在吧");
+        let end = src[at..].find("\n}\n").map(|o| at + o).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(body.contains("地址和密钥都相同"), "没说清判据是「地址 + 密钥」");
+        assert!(body.contains("换一把密钥即可"), "没告诉运维下一步怎么办");
+        assert!(
+            !body.contains("已经有同样的中转地址了"),
+            "还是旧文案 —— 会让人以为同址账号挂不上"
+        );
+    }
+
     /// 这个模块的源码（不含测试），用来钉住那些「读起来对、但一改就静默失效」的地方。
     fn src() -> String {
         let all = include_str!("route_endpoints.rs");
@@ -2468,6 +3286,12 @@ mod tests {
         Endpoint {
             id: uuid::Uuid::new_v4(),
             balance_token: String::new(),
+            last_ok_at: None,
+            last_fail_at: None,
+            real_sum: None,
+            real_n: None,
+            real_ok: None,
+            real_bad: None,
             route_id: uuid::Uuid::nil(),
             label: String::new(),
             base_url: url.into(),
@@ -2500,7 +3324,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(r.id, vec![ep(0.05, Some(true), "https://mhapi.net")]);
         let first = |routes: &[Model]| -> String {
-            expand(routes, &map, "claude-opus-5")
+            expand(routes, &map, &HashMap::new(), "claude-opus-5")
                 .into_iter()
                 .map(|m| m.base_url)
                 .next()
@@ -2575,22 +3399,332 @@ mod tests {
     #[test]
     fn cheaper_endpoint_goes_first_but_only_when_it_works() {
         let now = chrono::Utc::now();
-        // 排序键三级：(能用档, 慢不慢, 价钱)。
-        let k = |ok, slow: u8, cost: f64| (availability_tier(ok, Some(now), now), slow, cost);
+        // 派单真正用的排序键是 **(能用档, 综合得分)** —— 不是「档 / 慢 / 价」三级。
+        // 这条测试跟着改了：拿旧三元组测出来的顺序和真正发生的不是一回事，
+        // 而它照样会绿。
+        let k = |ok, cost: f64| {
+            (
+                availability_tier(ok, Some(now), None, None, now),
+                endpoint_score(cost, 0, 0, None, None),
+            )
+        };
+        let lt = |a: (u8, f64), b: (u8, f64)| a.0 < b.0 || (a.0 == b.0 && a.1 < b.1);
 
         // 便宜且能用 → 排第一。
-        assert!(k(Some(true), 0, 0.3) < k(None, 0, 1.0));
+        assert!(lt(k(Some(true), 0.3), k(None, 1.0)));
         // 便宜但已知打不通 → 排到没测过的后面。这是最要紧的一条：反过来的话，
         // 每个请求都会先去撞那个便宜的死出口。
-        assert!(k(Some(false), 0, 0.1) > k(None, 0, 1.0));
-        assert!(k(Some(false), 0, 0.1) > k(Some(true), 0, 1.0));
-        // 同一档里才比价钱。
-        assert!(k(Some(true), 0, 0.3) < k(Some(true), 0, 0.5));
-        // 「慢得离谱」排在能用之内、比价钱之前：一个慢三倍还超过五秒的便宜出口
-        // 不该霸占首选位 —— 那正是「配了十五个，最快的那个永远轮不到」的形状。
-        assert!(k(Some(true), 0, 0.9) < k(Some(true), 1, 0.1));
-        // 但慢只在同一个可用档里说话：慢的活出口仍然好过一个已知打不通的。
-        assert!(k(Some(true), 1, 0.9) < k(Some(false), 0, 0.1));
+        assert!(lt(k(None, 1.0), k(Some(false), 0.1)));
+        assert!(lt(k(Some(true), 1.0), k(Some(false), 0.1)));
+        // 同一档里才比得分。没有任何样本时得分就是进价本身。
+        assert!(lt(k(Some(true), 0.3), k(Some(true), 0.5)));
+        // 得分再差也压不过「档」：一个慢又不稳的活出口仍然好过一个已知打不通的。
+        let slow_flaky = (0u8, endpoint_score(0.9, 5, 45, Some(30_000), Some(1_000.0)));
+        assert!(lt(slow_flaky, k(Some(false), 0.1)));
+    }
+
+    /// 成功率必须参与选路，而且是**闸**不是乘数。这是线上实测出来的缺陷。
+    ///
+    /// 2026-08-27 的 grok-4.6：
+    /// ```text
+    ///   寒鹤的小破站   149 成 / 2 败 = 99%   ¥0.20
+    ///   Grok 自带地址   32 成 /12 败 = 73%   ¥0.10
+    /// ```
+    /// 老排序只看「能用档」，而那一档判的是**最近一次**是成是败 —— 分不出 99% 和 73%，
+    /// 两个都算活着。于是便宜的自带地址排前面，每四发废一发，那一发用户白等
+    /// （日志里那是「上游卡满整段预算才失败」，不是秒失败）。
+    ///
+    /// 纯按钱算先撞便宜的是划算的（期望 ¥0.127 对 ¥0.20），乘法惩罚也是这个结论 ——
+    /// 所以这里必须是闸：那笔账没算用户的时间，而这个产品卖的就是流畅。
+    #[test]
+    fn a_flaky_endpoint_loses_to_a_reliable_one() {
+        // 就是上面那组真实数字。
+        assert!(is_reliable(149, 2), "99% 被判成不靠谱了");
+        assert!(!is_reliable(32, 12), "73% 被判成靠谱了 —— 每四发白等一发");
+        // 检验本身也要对，不然上面两条可能是碰巧的。
+        assert!(confidently_below_floor(32, 44), "73% 没被判显著");
+        assert!(!confidently_below_floor(149, 151), "99% 被判成显著偏低");
+        assert!(!confidently_below_floor(8, 9), "8/9 被判成显著偏低");
+        assert!(!confidently_below_floor(0, 0), "零样本被判成显著偏低");
+        assert!(!confidently_below_floor(10, 10), "全成功被判成显著偏低");
+        // 线上那两条真数字。
+        assert!(confidently_below_floor(54, 81));
+        assert!(confidently_below_floor(5, 11));
+
+        // **大样本不能因为浮点下溢被判死。** 直接递推 pmf 时 (1-p)^n 在 n≈300 以上
+        // 就下溢成 0，尾概率算成 0 —— 于是下面这些统计上完全正常的成绩会被判成
+        // 「有把握它不行」。这个系统几百上千的样本几天就攒到了。
+        assert!(!confidently_below_floor(890, 1000), "89%/1000 次被浮点下溢判死了");
+        assert!(!confidently_below_floor(4900, 5000), "98%/5000 次被判死了");
+        assert!(!confidently_below_floor(2900, 3000), "97%/3000 次被判死了");
+        // 但大样本里**真的**偏低的还是要判出来。
+        assert!(confidently_below_floor(800, 1000), "80%/1000 次没被判出来");
+        assert!(confidently_below_floor(850, 1000), "85%/1000 次没被判出来");
+
+        // 便宜十倍也翻不过这道闸：省下的那点钱换的是用户多卡一次。
+        assert!(!is_reliable(32, 12));
+
+        // **小样本一律算靠谱。** 判据是置信上界：证据不足时区间宽、上界高，
+        // 自然判不动。这就是「没有证据不构成降级理由」在数字上的样子。
+        assert!(is_reliable(0, 0), "一次都没跑过的被判成不靠谱");
+        assert!(is_reliable(0, 1), "一次失败就把新出口判死了 —— 真是 90% 也有一成概率错一次");
+        // 连错两次就够显著了：真是 90% 的话概率只有 1%。这是判据算出来的，不是拍的。
+        // 而且它是**降级**不是除名 —— 靠谱的那批不行时照样会走到它，
+        // 拿到一次成功（2/4）就自己恢复。
+        assert!(!is_reliable(0, 2), "连错两次还算靠谱");
+        assert!(!is_reliable(0, 3));
+        // 恢复：错二成二之后，四次里成两次就重新算靠谱了。
+        assert!(is_reliable(2, 2), "拿到成功之后没能恢复 —— 那会变成永久除名");
+        // 线上真出现过的那条：8/9 = 89%，九次错一次，是噪声不是证据。
+        assert!(is_reliable(8, 1), "8/9 = 89% 被判死了 —— 那是噪声，不是证据");
+        // 89% 离 90% 太近，样本再多也判不出差别 —— 这是对的，它本来就没差多少。
+        assert!(is_reliable(80, 10), "89% 被当成显著低于 90% 了");
+        assert!(!is_reliable(0, 30), "三十次全败还算靠谱");
+        // 但**同一档之内**由价钱和快慢说了算。
+        let a = endpoint_score(0.20, 149, 2, None, None);
+        let b = endpoint_score(0.50, 149, 2, None, None);
+        assert!(a < b, "同样靠谱时便宜的没排前面");
+    }
+
+    /// 这道闸是「靠后」，不是「除名」。
+    ///
+    /// 靠谱的那批全打不通时，不靠谱的照样得能被用到 —— 否则一次上游集体抖动
+    /// 会让整条线路直接没得走，那比慢一点糟得多。
+    #[test]
+    fn the_reliability_gate_only_demotes_never_removes() {
+        // 排序键是三级的：(能用档, 可靠性档, 得分)。不靠谱只动第二级。
+        let reliable_dead = (2u8, 0u8, 0.1_f64);
+        let flaky_alive = (0u8, 1u8, 9.9_f64);
+        assert!(flaky_alive < reliable_dead, "不靠谱但活着的，排到了已知打不通的后面");
+        // 而且第二级压不过第一级 —— 「死」永远比「不稳」严重。
+        let flaky = (0u8, 1u8, 0.1_f64);
+        let dead_cheap = (2u8, 0u8, 0.001_f64);
+        assert!(flaky < dead_cheap);
+    }
+
+    /// 样本不够就**不罚**，而且惩罚有上限。
+    ///
+    /// 不设门槛的话，一个刚上线、第一发正好撞上上游抖动的出口会被打成 0%，
+    /// 然后再也拿不到流量，也就永远翻不了身。这和这个文件里那条一贯的规矩一样：
+    /// 没有证据不构成降级理由。
+    #[test]
+    fn a_thin_sample_never_condemns_an_endpoint() {
+        // 一成一败：样本不够，得分就是进价本身，一点不罚。
+        assert_eq!(endpoint_score(0.5, 1, 1, None, None), 0.5);
+        assert_eq!(endpoint_score(0.5, 0, MIN_RATE_SAMPLES - 1, None, None), 0.5);
+        // 刚够门槛才开始罚。
+        assert!(endpoint_score(0.5, 0, MIN_RATE_SAMPLES, None, None) > 0.5);
+        // 罚有上限：全败也只按 MIN_RATE 算，不是无穷大。
+        let worst = endpoint_score(0.5, 0, 100, None, None);
+        assert!((worst - 0.5 / MIN_RATE).abs() < 1e-9, "全败的惩罚没有封底：{worst}");
+        // 慢惩罚也有上限，而且是开方的：四倍慢罚两倍。
+        let four_x = endpoint_score(1.0, 0, 0, Some(4_000), Some(1_000.0));
+        assert!((four_x - 2.0).abs() < 1e-9, "四倍慢没有罚成两倍：{four_x}");
+        let insane = endpoint_score(1.0, 0, 0, Some(10_000_000), Some(1.0));
+        assert!((insane - MAX_SLOW_PENALTY).abs() < 1e-9, "慢惩罚没有封顶：{insane}");
+        // 没有耗时证据 → 不罚。
+        assert_eq!(endpoint_score(1.0, 0, 0, None, Some(1_000.0)), 1.0);
+        assert_eq!(endpoint_score(1.0, 0, 0, Some(9_999), None), 1.0);
+    }
+
+    /// 派单排序真的读到了这个得分 —— 不然上面几条只是在测一个没人调用的函数。
+    #[test]
+    fn the_dispatch_order_uses_the_score() {
+        let me = src();
+        assert!(
+            me.contains("k.2 = endpoint_score(k.2, ok, bad, *ms, best_ms);"),
+            "派单排序没在用综合得分",
+        );
+        // 排序只比两级了：档 + 得分。中间那个二值的「慢」已经并进得分。
+        // 三级：能用档 → 可靠性档 → 得分。少任何一级都会让某一维静默失效。
+        assert!(
+            me.contains(".then(a.0 .1.cmp(&b.0 .1)) // 靠谱的在前")
+                && me.contains(".then(a.0 .2.partial_cmp(&b.0 .2).unwrap_or(std::cmp::Ordering::Equal)) // 得分小的在前"),
+            "排序少了一级 —— 那一维不会起作用",
+        );
+        assert!(
+            me.contains("k.1 = u8::from(!is_reliable(ok, bad));"),
+            "可靠性档没在填 —— 那一级恒等于 0，等于没有",
+        );
+        // 得分要拿**换算后**的人民币成本当底：倍率跨站不可比。
+        let at = me.find("k.2 = endpoint_score(").expect("得分那一步不见了");
+        let conv = me.find("k.2 = c;").expect("换算那一步不见了");
+        assert!(conv < at, "得分算在了汇率换算之前 —— 那是拿两种货币的数在比");
+    }
+
+    /// 每一处 `SUM(` 都必须显式 `::bigint`。
+    ///
+    /// Postgres 的 `SUM(bigint)` 回的是 **NUMERIC**，不是 bigint。按 `i64` 解码就会
+    /// 报类型不符，而这个文件里两处查询的兜底都是「当作没有」：
+    ///   - `load_for_routes` → 返回空 → **所有出口消失、多路由整个静默关掉**
+    ///   - `admin_list`      → 空表 → 控制台每个出口都显示「无真实流量」
+    /// 两处都不报错、不影响请求、只留一行 WARN。实测就是这么上线的，是从服务器日志里
+    /// 才发现的 —— 没有任何测试会红，因为它是运行期解码失败，不是编译期。
+    ///
+    /// 所以这道闸按**源文本**判：带 `SUM(` 的行必须同时带 `::bigint`。文件里原有的
+    /// 每一处本来就是这么写的，这条只是把已有的约定钉住。
+    #[test]
+    fn every_sum_is_cast_to_bigint() {
+        let me = src();
+        let bad: Vec<&str> = me
+            .lines()
+            .filter(|l| l.contains("SUM(") && !l.trim_start().starts_with("//"))
+            .filter(|l| !l.contains("::bigint"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "有 SUM() 没转成 bigint，解码会失败而调用处会静默当作「没有数据」：\n  {}",
+            bad.join("\n  "),
+        );
+        // 判据得真的有东西可判 —— 查询被挪走或改写法的话这条会变成恒真。
+        assert!(
+            me.lines().filter(|l| l.contains("SUM(")).count() >= 8,
+            "文件里几乎没有 SUM( 了，这道闸多半已经空转",
+        );
+    }
+
+    /// 「慢不慢」也该拿真实流量说话，不是拿探测。
+    ///
+    /// 探测一轮只有一个样本、只发一句 hi、只用一个模型。真实流量量的是用户实际等的
+    /// 那一段。线上这两个数差得很远：Grok 那个 0.005 倍的出口探测 19551ms、真实 27556ms
+    /// —— 而这个数决定它要不要被降级，也就决定最便宜的出口能不能排到前面。
+    #[test]
+    fn the_slow_check_prefers_real_latency() {
+        // 样本够 → 用真实的，哪怕探测数字好看得多。
+        assert_eq!(effective_ms(Some(27556), Some(29), Some(19551)), Some(27556));
+        // 样本不够 → 退回探测。一两次的均值不足以拿来降级一个出口。
+        assert_eq!(effective_ms(Some(300), Some(MIN_REAL_SAMPLES - 1), Some(19551)), Some(19551));
+        assert_eq!(effective_ms(Some(300), None, Some(19551)), Some(19551));
+        // 一个真实样本都没有 → 探测是唯一的证据。
+        assert_eq!(effective_ms(None, None, Some(4375)), Some(4375));
+        // 两边都没有 → 就是不知道，**不降级**。没有证据不构成降级理由。
+        assert_eq!(effective_ms(None, None, None), None);
+        assert!(!is_egregiously_slow(effective_ms(None, None, None), Some(1000.0)));
+        // 真实均值是 0（不该出现，但别让它变成「快得离谱」把别人全比下去）。
+        assert_eq!(effective_ms(Some(0), Some(99), Some(4375)), Some(4375));
+
+        // 排序真的读到了它 —— 不然上面几条只是在测一个没人调用的函数。
+        let me = src();
+        assert!(
+            me.contains("effective_ms(e.real_ttfb_ms(), e.real_n, e.probe_ms),"),
+            "派单排序还在直接用 probe_ms —— 真实耗时算了也没人用",
+        );
+    }
+
+    /// 探测必须走流式，而且只等第一帧。
+    ///
+    /// 非流式探推理模型永远探不出来：`max_tokens: 1` 拦不住思考，模型把整段思考走完
+    /// 才吐第一个字节，20 秒不够。这条一旦被改回非流式，症状是**探测全线变红**而
+    /// 代码毫无报错 —— 而且假红的是最便宜那几个出口，钱就是从这儿漏的。
+    #[test]
+    fn the_probe_streams_and_stops_at_the_first_frame() {
+        let me = src();
+        assert!(
+            me.contains(r#"o.insert("stream".into(), serde_json::Value::Bool(true));"#),
+            "探测的请求体没开流式 —— 推理模型会被一律探成超时",
+        );
+        assert!(
+            me.contains("tokio::time::timeout(dur, resp.chunk()).await"),
+            "探测没在按帧读 —— 一旦改回整段读完，等的就是「生成完要多久」而不是首字",
+        );
+        // 拿到形状就走人，不把整段生成读完。
+        assert!(
+            me.contains("if looks_like_a_real_stream(&head) {"),
+            "第一帧到了没有立刻定案",
+        );
+        // 不认流式的站必须退回非流式，不能判死。
+        assert!(
+            me.contains("StreamProbe::Unsupported => {}"),
+            "不支持流式的出口会被当成打不通判死 —— 那是把好出口错杀",
+        );
+        // 退路要真的走得通：这几个码分不出「不认 stream 参数」和「请求体本身不对」，
+        // 必须退回非流式让原来那套给结论。少了这一行，一个只转发非流式的中转会被
+        // 判成「上游返回 400」永远红着 —— 而它其实好好的。
+        assert!(
+            me.contains("if matches!(status, 400 | 404 | 422 | 501) {"),
+            "流式被拒时没有退回非流式 —— 只转发非流式的中转会被永久判死",
+        );
+    }
+
+    /// 流式第一帧照样要判**形状**，不能「有字节就算通」。
+    ///
+    /// 转卖网关的错误页也回 200。只认「有回应」的话那种站会被探成绿灯，然后按最好档
+    /// 接管真实流量，每一发都失败 —— 比探成红灯糟得多。
+    #[test]
+    fn a_200_that_is_not_a_stream_is_not_a_pass() {
+        // 真的流：OpenAI 系的 delta、Anthropic 系的事件名。
+        assert!(looks_like_a_real_stream(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+        ));
+        assert!(looks_like_a_real_stream("event: message_start\ndata: {\"type\":\"message_start\"}\n"));
+        // 半截 JSON（chunk 不保证切在帧边界上）也得认，否则健康的站被随机判死。
+        assert!(looks_like_a_real_stream("data: {\"id\":\"x\",\"choices\":[{\"delta\""));
+
+        // 不是流的一律不通过。
+        assert!(!looks_like_a_real_stream(""));
+        assert!(!looks_like_a_real_stream("<html><body>502 Bad Gateway</body></html>"));
+        assert!(!looks_like_a_real_stream("{\"error\":\"insufficient balance\"}"));
+        // 只有结束帧 = 一个字都没生成出来，不算通。
+        assert!(!looks_like_a_real_stream("data: [DONE]\n\n"));
+        // 心跳注释不是数据帧。
+        assert!(!looks_like_a_real_stream(": ping\n\n"));
+    }
+
+    /// 真实流量的结果盖过探测的结论。
+    ///
+    /// 线上实测的形状：「梦幻API」三个出口探测全部 20001ms 超时被判死，同一天却
+    /// 接了 241 次真实请求全部成功。它们又恰好是最便宜的（进价系数 0.15 / 0.24，
+    /// 还活着的那些是 0.6）—— 于是多路由该省的钱一分没省。合成探测超时和
+    /// 「这个出口打不通」是两件事，真实成功才是执行事实。
+    #[test]
+    fn a_real_success_outranks_a_failed_probe() {
+        let now = chrono::Utc::now();
+        let ago = |sec: i64| Some(now - chrono::Duration::seconds(sec));
+        let t = |ok, real_ok, real_fail| availability_tier(ok, Some(now), real_ok, real_fail, now);
+
+        // 探测判死、但刚刚真的成功过 → 最好档。这一条就是线上那个形状。
+        assert_eq!(t(Some(false), ago(60), None), 0, "探测判死盖不过真实成功");
+        // 探测没测过、真实成功过 → 一样进最好档。
+        assert_eq!(t(None, ago(60), None), 0);
+
+        // 真实失败同样算数，而且盖得过「探测说通了」—— 真实结果两个方向都硬。
+        assert_eq!(t(Some(true), None, ago(60)), 2, "真实失败盖不过探测说通了");
+
+        // 两边都有真实记录 → 听较晚的那个：它才是这个出口现在的样子。
+        assert_eq!(t(Some(false), ago(60), ago(600)), 0, "较新的真实成功该说了算");
+        assert_eq!(t(Some(true), ago(600), ago(60)), 2, "较新的真实失败该说了算");
+
+        // 真实记录过期就不算数，退回看探测 —— 和探测结论用的是同一把保质期的尺。
+        let old = Some(now - chrono::Duration::seconds(PROBE_FRESH_SECS + 60));
+        assert_eq!(t(Some(false), old, None), 2, "三小时前的成功不能继续顶着");
+        assert_eq!(t(Some(true), None, old), 0, "三小时前的失败也不该继续压着");
+    }
+
+    /// 只认真实成功会变成棘轮，所以真实失败也得记。
+    ///
+    /// 假如只有 `last_ok_at`：出口失败一次被埋到最差档 → 拿不到流量 → 刷新不了
+    /// 成功记录 → 永远埋着，连自我恢复的机会都没有。两列都在，最近一次真实结果
+    /// 才说得出它此刻是活是死。
+    #[test]
+    fn a_recovered_endpoint_can_climb_back_out() {
+        let now = chrono::Utc::now();
+        let ago = |sec: i64| Some(now - chrono::Duration::seconds(sec));
+        // 十分钟前失败过，一分钟前又成功了 → 回到最好档，不是永远背着那次失败。
+        assert_eq!(availability_tier(Some(false), Some(now), ago(60), ago(600), now), 0);
+
+        // 写法闸：两列必须都落库、都读出来。少一列就是上面那个棘轮。
+        let hs = std::fs::read_to_string("src/route_health.rs").unwrap();
+        assert!(
+            hs.contains("last_fail_at") && hs.contains("last_ok_at"),
+            "route_attempt 没在记真实成功/失败的时刻 —— 排序会退回只信探测",
+        );
+        let me = src();
+        assert!(
+            me.contains("SELECT e.*, a.last_ok_at, a.last_fail_at, a.real_sum, a.real_n"),
+            "派单装载出口时没把真实流量证据连出来 —— 那几列写了也没人读。\
+             （断言钉的是装载那句 SELECT 本身：`MAX(last_ok_at)` 在 admin_list 里也有一份，\
+             拿它当锚点的话，把装载这边删干净了测试照样绿。）",
+        );
     }
 
     /// 陈旧的「测通了」不是「测通了」。
@@ -2603,12 +3737,12 @@ mod tests {
         let now = chrono::Utc::now();
         let fresh = now - chrono::Duration::seconds(PROBE_FRESH_SECS / 2);
         let stale = now - chrono::Duration::seconds(PROBE_FRESH_SECS + 60);
-        assert_eq!(availability_tier(Some(true), Some(fresh), now), 0);
-        assert_eq!(availability_tier(Some(true), Some(stale), now), 1, "陈旧的好消息不是好消息");
-        assert_eq!(availability_tier(Some(true), None, now), 0, "没记时间的老行不该被降档");
+        assert_eq!(availability_tier(Some(true), Some(fresh), None, None, now), 0);
+        assert_eq!(availability_tier(Some(true), Some(stale), None, None, now), 1, "陈旧的好消息不是好消息");
+        assert_eq!(availability_tier(Some(true), None, None, None, now), 0, "没记时间的老行不该被降档");
         // 失败就是失败，不看新鲜度：坏消息过期不会自己变好。
-        assert_eq!(availability_tier(Some(false), Some(stale), now), 2);
-        assert_eq!(availability_tier(None, None, now), 1);
+        assert_eq!(availability_tier(Some(false), Some(stale), None, None, now), 2);
+        assert_eq!(availability_tier(None, None, None, None, now), 1);
     }
 
     /// 前端那份判据必须和这边**逐字**对齐。
@@ -2643,6 +3777,105 @@ mod tests {
         assert!(
             !ui.contains("TRIED_PER_REQUEST"),
             "前端还留着「最多试两个」的常量和文案，而那道闸已经不存在了",
+        );
+
+        // 「真实结果盖过探测」这一条也必须两边一致。它是最容易悄悄分叉的一块 ——
+        // 后端改完排序，前端那一屏照旧按探测画，于是界面上一个红徽章的出口
+        // 稳稳排在第一位，看着像排序坏了，其实是两份判据不是一份。
+        //
+        // 断言挑的是实现形状不是说明词：这段的注释里就写着 last_ok_at，
+        // 拿词去匹配会匹配到注释本身，删掉实现照样绿。
+        let code = {
+            let mut out = String::new();
+            let mut rest = ui;
+            while let Some(a) = rest.find("/*") {
+                out.push_str(&rest[..a]);
+                rest = match rest[a..].find("*/") {
+                    Some(b) => &rest[a + b + 2..],
+                    None => "",
+                };
+            }
+            out.push_str(rest);
+            out
+        };
+        for shape in [
+            "const ok = freshReal(e.last_ok_at);",
+            "const fail = freshReal(e.last_fail_at);",
+            "if (ok != null && fail != null) return ok >= fail ? 0 : 2;",
+        ] {
+            assert!(
+                code.contains(shape),
+                "前端的档位判据没在看真实流量（缺 `{shape}`）—— 它画的顺序和真正会发生的不是一回事",
+            );
+        }
+        // 可靠性那道闸和综合得分也必须两边一致。这一屏就是运维判断「谁会被先用」
+        // 的地方，判据分叉了它画的顺序就不是真正会发生的 —— 而它看起来完全正常。
+        assert_eq!(MIN_RATE_SAMPLES, 8);
+        assert_eq!(RELIABLE_FLOOR, 0.9);
+        assert_eq!(MIN_RATE, 0.2);
+        assert_eq!(MAX_SLOW_PENALTY, 3.0);
+        for shape in [
+            "const MIN_RATE_SAMPLES = 8;",
+            "const RELIABLE_FLOOR = 0.9;",
+            "const MIN_RATE = 0.2;",
+            "const MAX_SLOW_PENALTY = 3;",
+            "return !confidentlyBelowFloor(e.rate_ok, e.rate_ok + e.rate_bad);",
+            "if (k / n >= p) return false;",
+            "const step = (i: number) => Math.log((n - i + 1) / i) + logp - logq;",
+            "return maxLp + Math.log(sum) < Math.log(0.05);",
+            "score /= Math.min(1, Math.max(MIN_RATE, e.rate_ok / total));",
+            "score *= Math.min(MAX_SLOW_PENALTY, Math.sqrt(Math.max(1, ms / bestMs)));",
+            "isReliable(e) ? 0 : 1,",
+            "endpointScore(cost.of(e), e, bestMs),",
+        ] {
+            assert!(
+                code.contains(shape),
+                "前端的选路判据和服务端对不上了（缺 `{shape}`）—— 它画的顺序不是真正会发生的",
+            );
+        }
+        // 前端必须读**派单窗口**那两个数，不能拿 7 天的成绩单去算排序。
+        assert!(
+            code.contains("rate_ok: number;") && code.contains("rate_bad: number;"),
+            "前端没接派单窗口的成败数 —— 会拿另一个窗口的数画顺序",
+        );
+
+        // 「便宜」这一维比的是**换算后的人民币成本**，不是倍率。这一条前端原来是错的：
+        // 它按 cost_ratio 排，而服务端按换算值排，于是 GPT 线路上界面说首选是
+        // 「梦幻API 0.15 倍」，真正走的却是 WE API（换算后 ¥0.016 对 ¥0.15，差十倍
+        // 且方向相反）。这一屏就是运维用来判断「哪个便宜」的地方，排错了等于没有。
+        assert!(
+            code.contains("if (all.every((v): v is number => v != null && Number.isFinite(v))) {"),
+            "前端没在按换算后的成本排 —— 倍率跨站不可比，它画的顺序会是错的",
+        );
+        assert!(
+            code.contains("return { own: 1, of: (e) => e.cost_ratio };"),
+            "前端缺少「有一个站没填汇率就整条退回按倍率排」的退路 —— 服务端是全有全无的",
+        );
+        // 成本项要走换算（`cost.of(e)`），而且要包在得分里 —— 两件事一句钉住。
+        assert!(
+            code.contains("        endpointScore(cost.of(e), e, bestMs),"),
+            "前端排序键里的成本项没走换算或没进得分 —— 它画的顺序不是真正会发生的",
+        );
+        assert!(
+            code.contains("{ k: [0, 0, cost.own], v: null },"),
+            "线路自带地址还按常量 1 参与比价 —— 它也要换算，否则和出口不是一把尺",
+        );
+
+        // 「慢不慢」用哪个耗时也必须两边一致，否则这一屏画的降级和真正发生的对不上。
+        assert_eq!(MIN_REAL_SAMPLES, 5);
+        assert!(
+            code.contains("const MIN_REAL_SAMPLES = 5;"),
+            "前端的真实样本门槛和服务端对不上了",
+        );
+        assert!(
+            code.contains("if (e.real_n >= MIN_REAL_SAMPLES && e.real_ms != null && e.real_ms > 0) return e.real_ms;"),
+            "前端判快慢还在用探测耗时 —— 它画的降级和真正发生的不是一回事",
+        );
+
+        // 真实证据也要过保质期这道尺，和服务端同一个常量。
+        assert!(
+            code.contains("now - t > PROBE_FRESH_SECS * 1000) return null;"),
+            "前端的真实证据没设保质期 —— 三天前成功过的出口会一直顶在第一档",
         );
     }
 
@@ -2679,7 +3912,7 @@ mod tests {
                 ep(0.4, Some(true), "https://cheaper.example.com"),
             ],
         );
-        let urls: Vec<String> = expand(&[r], &map, "claude-opus-5").into_iter().map(|m| m.base_url).collect();
+        let urls: Vec<String> = expand(&[r], &map, &HashMap::new(), "claude-opus-5").into_iter().map(|m| m.base_url).collect();
         assert_eq!(
             urls,
             vec![
@@ -2690,13 +3923,72 @@ mod tests {
         );
     }
 
+    /// **线路自带地址的成功率也要算。** 最初暴露这个问题的就是它。
+    ///
+    /// 它的成败记在 `route_attempt` 里、键是线路 id，而装载出口那张表连不到它。
+    /// 不单独取一次的话，自带地址永远「没有样本」＝永远算靠谱 —— 于是线上
+    /// Grok 自带地址（73%，比同线路 99% 的出口便宜一半）稳稳排第一，每四发废一发。
+    /// 这条测的就是那个形状。
+    #[test]
+    fn the_direct_connection_is_judged_on_its_success_rate_too() {
+        let r = model("anthropic");
+        let mut map = HashMap::new();
+        // 贵一倍、但很稳的出口。
+        map.insert(r.id, vec![ep(2.0, Some(true), "https://reliable.example.com")]);
+
+        // 没有成绩时：自带地址便宜，排第一。这是改动前后都该成立的。
+        let urls: Vec<String> = expand(&[r.clone()], &map, &HashMap::new(), "claude-opus-5")
+            .into_iter()
+            .map(|m| m.base_url)
+            .collect();
+        assert_eq!(urls[0], "https://own.example.com", "没有成绩时便宜的自带地址就该排第一");
+
+        // 给自带地址一份 73% 的成绩（线上那个真实数字）→ 它该让位给稳的那个。
+        let mut own_rates = HashMap::new();
+        own_rates.insert(r.id, (32i64, 12i64));
+        let urls: Vec<String> = expand(&[r.clone()], &map, &own_rates, "claude-opus-5")
+            .into_iter()
+            .map(|m| m.base_url)
+            .collect();
+        assert_eq!(
+            urls[0], "https://reliable.example.com",
+            "自带地址 73% 还排在 99% 的出口前面 —— 它的成绩根本没被读到",
+        );
+
+        // 样本不够时不许判：一两次失败不构成降级理由。
+        let mut thin = HashMap::new();
+        thin.insert(r.id, (0i64, 1i64));
+        let urls: Vec<String> = expand(&[r], &map, &thin, "claude-opus-5")
+            .into_iter()
+            .map(|m| m.base_url)
+            .collect();
+        assert_eq!(urls[0], "https://own.example.com", "一次失败就把自带地址判死了");
+    }
+
+    /// 派单那一处真的把自带地址的成绩取出来并传进去了。
+    ///
+    /// 上面那条测的是 `expand` 收到成绩后的行为；这条钉的是**调用点真的去取了** ——
+    /// 少了这一步，上面那条照样全绿，而线上自带地址永远是「没有样本」。
+    #[test]
+    fn the_dispatch_path_loads_the_direct_connection_rates() {
+        let m = include_str!("models.rs");
+        assert!(
+            m.contains("let own_rates = crate::route_endpoints::load_own_rates("),
+            "派单时没去取自带地址的成绩 —— 它会永远算靠谱",
+        );
+        assert!(
+            m.contains("crate::route_endpoints::expand(&candidates, &endpoint_map, &own_rates, &model_id)"),
+            "取了成绩却没传给 expand",
+        );
+    }
+
     /// 直连不会因为「没测过」就被判到失败出口后面。
     #[test]
     fn the_direct_connection_outranks_a_broken_relay_however_cheap() {
         let r = model("anthropic");
         let mut map = HashMap::new();
         map.insert(r.id, vec![ep(0.05, Some(false), "https://broken-but-cheap.example.com")]);
-        let urls: Vec<String> = expand(&[r], &map, "claude-opus-5").into_iter().map(|m| m.base_url).collect();
+        let urls: Vec<String> = expand(&[r], &map, &HashMap::new(), "claude-opus-5").into_iter().map(|m| m.base_url).collect();
         assert_eq!(urls[0], "https://own.example.com", "一折但打不通的出口抢到了第一位");
     }
 
@@ -2704,7 +3996,7 @@ mod tests {
     fn expanding_a_route_without_endpoints_changes_nothing() {
         // 没配多路由的线路必须和今天一模一样：展开成一个出口，就是它自己。
         let r = model("anthropic");
-        let out = expand(&[r.clone()], &HashMap::new(), "claude-opus-5");
+        let out = expand(&[r.clone()], &HashMap::new(), &HashMap::new(), "claude-opus-5");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].base_url, "https://own.example.com");
         assert_eq!(out[0].api_key, "own-key");
@@ -2723,7 +4015,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(r.id, vec![ep(0.2, Some(true), "https://cheap.example.com")]);
 
-        for m in expand(&[r.clone()], &map, "claude-opus-5") {
+        for m in expand(&[r.clone()], &map, &HashMap::new(), "claude-opus-5") {
             assert_eq!(m.input_price, 3.0, "出口改动了输入价");
             assert_eq!(m.output_price, 15.0, "出口改动了输出价");
             assert_eq!(m.rate, 2.0, "出口改动了倍率");
@@ -2746,7 +4038,7 @@ mod tests {
                 ep(0.1, Some(false), "https://broken.example.com"),
             ],
         );
-        let out = expand(&[r], &map, "claude-opus-5");
+        let out = expand(&[r], &map, &HashMap::new(), "claude-opus-5");
         let urls: Vec<&str> = out.iter().map(|m| m.base_url.as_str()).collect();
         assert_eq!(
             urls,
@@ -2766,7 +4058,7 @@ mod tests {
         e.api_key = "   ".into();
         let mut map = HashMap::new();
         map.insert(r.id, vec![e]);
-        let out = expand(&[r], &map, "claude-opus-5");
+        let out = expand(&[r], &map, &HashMap::new(), "claude-opus-5");
         let cheap = out.iter().find(|m| m.base_url.contains("cheap")).unwrap();
         assert_eq!(cheap.api_key, "own-key");
     }
@@ -2785,14 +4077,14 @@ mod tests {
         map.insert(r.id, vec![only_sonnet]);
 
         // 要 sonnet：那个便宜出口能用，排第一。
-        let urls: Vec<String> = expand(&[r.clone()], &map, "claude-sonnet-5")
+        let urls: Vec<String> = expand(&[r.clone()], &map, &HashMap::new(), "claude-sonnet-5")
             .into_iter()
             .map(|m| m.base_url)
             .collect();
         assert_eq!(urls[0], "https://sonnet-only.example.com");
 
         // 要 opus：它根本不该出现在候选里。
-        let urls: Vec<String> = expand(&[r], &map, "claude-opus-5")
+        let urls: Vec<String> = expand(&[r], &map, &HashMap::new(), "claude-opus-5")
             .into_iter()
             .map(|m| m.base_url)
             .collect();
@@ -2834,14 +4126,14 @@ mod tests {
         map.insert(r.id, vec![e]);
 
         // 只有出口有的那款：候选里不该出现线路自带地址
-        let urls: Vec<String> = expand(&[r.clone()], &map, "claude-haiku-9")
+        let urls: Vec<String> = expand(&[r.clone()], &map, &HashMap::new(), "claude-haiku-9")
             .into_iter()
             .map(|m| m.base_url)
             .collect();
         assert_eq!(urls, vec!["https://extra.example.com"], "把新模型派给了没有它的直连");
 
         // 线路自己那款：出口没有它，所以只剩直连
-        let urls: Vec<String> = expand(&[r], &map, "claude-opus-5")
+        let urls: Vec<String> = expand(&[r], &map, &HashMap::new(), "claude-opus-5")
             .into_iter()
             .map(|m| m.base_url)
             .collect();
@@ -2985,7 +4277,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(r.id, vec![ep(0.2, Some(true), "https://all.example.com")]);
         for want in ["a", "b"] {
-            let urls: Vec<String> = expand(&[r.clone()], &map, want)
+            let urls: Vec<String> = expand(&[r.clone()], &map, &HashMap::new(), want)
                 .into_iter()
                 .map(|m| m.base_url)
                 .collect();
@@ -3001,7 +4293,7 @@ mod tests {
         e.protocol = "openai".into();
         let mut map = HashMap::new();
         map.insert(r.id, vec![e]);
-        let out = expand(&[r.clone()], &map, "claude-opus-5");
+        let out = expand(&[r.clone()], &map, &HashMap::new(), "claude-opus-5");
         let relay = out.iter().find(|m| m.base_url.contains("openai-style")).unwrap();
         assert_eq!(relay.protocol, "openai", "出口的协议没生效");
         assert_eq!(relay.input_price, r.input_price, "换协议顺带改了价");
@@ -3059,7 +4351,7 @@ mod tests {
         e.active = false;
         let mut map = HashMap::new();
         map.insert(r.id, vec![e]);
-        let out = expand(&[r], &map, "claude-opus-5");
+        let out = expand(&[r], &map, &HashMap::new(), "claude-opus-5");
         assert_eq!(out.len(), 1);
         assert!(out[0].base_url.contains("own"));
     }
@@ -3606,6 +4898,46 @@ mod tests {
         assert!(extra.is_empty(), "服务端有而 sprite 没有（会回一个画不出来的名字）：{extra:?}");
     }
 
+    /// 图标页上的那几个数，必须真的是「全集」。
+    ///
+    /// `VendorMark.tsx` 里有**两份**厂商清单：`MARKS`（真的有图形的那份，已经被
+    /// ICON_KEYS 和 brand-sprite.js 两头钉住）和 `VENDOR_GROUPS`（页面拿来分组渲染、
+    /// 数出「图标 149」那个数的那份）。后者没人钉。
+    ///
+    /// 两份漂开的症状：页面说「这一页就是全集，搜不到就是确实没有这家的图标」，
+    /// 而实际上有图的那家只是没被编进分组里 —— 一个自称全集的列表少了一项，
+    /// 比没有这句话糟。
+    #[test]
+    fn the_icon_page_lists_every_mark_there_is() {
+        let src = include_str!("../admin-ui/src/components/VendorMark.tsx");
+        let marks_at = src.find("const MARKS: Record<string, Mark> = {").expect("MARKS 改名了");
+        let groups_at = src.find("export const VENDOR_GROUPS").expect("VENDOR_GROUPS 改名了");
+        assert!(marks_at < groups_at, "两份清单的次序变了，下面的切片会取错");
+
+        // MARKS 的键：`  anthropic: {` 这种形状，取到 VENDOR_GROUPS 之前为止。
+        // MARKS 的键单独占一行、形如 `  anthropic: {`（值是多行对象，不在同一行）。
+        let marks: std::collections::BTreeSet<&str> = src[marks_at..groups_at]
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_end();
+                let k = t.strip_suffix(": {")?.trim_start();
+                (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric())).then_some(k)
+            })
+            .collect();
+        // VENDOR_GROUPS 的项：`{ vendor: "anthropic", name: "…" }`
+        let listed: std::collections::BTreeSet<&str> = src[groups_at..]
+            .split("vendor: \"")
+            .skip(1)
+            .filter_map(|t| t.split('"').next())
+            .collect();
+
+        assert!(marks.len() > 100, "只从 MARKS 里认出 {} 个，解析规则该改了", marks.len());
+        let missing: Vec<_> = marks.difference(&listed).collect();
+        let extra: Vec<_> = listed.difference(&marks).collect();
+        assert!(missing.is_empty(), "有图却没进图标页的分组：{missing:?}");
+        assert!(extra.is_empty(), "图标页列了没有图的厂商：{extra:?}");
+    }
+
     /// 别名只许指向**真的有图**的那些键。
     ///
     /// 别名指向一个不存在的键，等于把这一家从「中性图标」变成「一个画不出来的名字」——
@@ -4138,6 +5470,64 @@ mod tests {
         assert!(
             serde_json::from_str::<SaveReq>(r#"{"label":"x"}"#).is_err(),
             "route_id 都没有也能解开 —— 那这个结构体就不再校验任何东西了"
+        );
+    }
+}
+
+/// 改一个**已经上线跑过**的迁移文件 = 后端起不来。
+///
+/// sqlx 启动时拿文件内容算 sha384 和库里的比，对不上就拒绝启动 —— 不是跳过、
+/// 不是警告，是反复重启：
+///   `Error: migration 20260866 was previously applied but has been modified`
+///
+/// 实测踩过一次：往一个已上线的迁移末尾追加两句 ALTER，整个部署被打回，backend-green
+/// 起不来被删掉。要加列就**新开一个文件**。
+///
+/// 清单由部署脚本在部署成功后刷新，所以它记的就是线上真正跑过的那一版。
+#[cfg(test)]
+mod applied_migrations {
+    #[test]
+    fn the_applied_migrations_are_never_edited() {
+        let manifest = include_str!("../migrations/APPLIED.txt");
+        let mut bad = Vec::new();
+        let mut checked = 0usize;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            let (Some(_ver), Some(want), Some(file)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let path = format!("migrations/{file}");
+            let Ok(bytes) = std::fs::read(&path) else {
+                // 删掉一个已上线的迁移和改它一样糟：库里那条还在，文件没了，
+                // sqlx 同样拒绝启动。
+                bad.push(format!("{file}：文件没了，而它已经在线上跑过"));
+                continue;
+            };
+            checked += 1;
+            let got = {
+                use sha2::Digest;
+                use std::fmt::Write;
+                sha2::Sha384::digest(&bytes).iter().fold(String::new(), |mut a, b| {
+                    let _ = write!(a, "{b:02x}");
+                    a
+                })
+            };
+            if got != want {
+                bad.push(format!("{file}：内容被改了（线上那版算出来是 {want}）"));
+            }
+        }
+        assert!(
+            checked > 50,
+            "清单里只核到 {checked} 个迁移 —— 它多半是空的或者格式变了，这道闸等于没有",
+        );
+        assert!(
+            bad.is_empty(),
+            "有已上线的迁移被改动了，部署会让后端起不来。要加列请新开一个文件：\n  {}",
+            bad.join("\n  "),
         );
     }
 }
