@@ -27,6 +27,8 @@ export const zhCN: Partial<Dict> = {
   connectTitle: "自动到账",
   connectLede: "绑定一个 Stripe 账户，之后提现在提交的那一刻就直接转过去，不需要任何人审核。",
   connectResume: "Stripe 开户还没完成。在完成之前，提现仍然走人工处理。",
+  connectStatusUnknown:
+    "刚才没能连上 Stripe 查你的账户状态。这不代表账户有问题——在确认之前，提现先走人工队列。",
   connectCta: "绑定 Stripe",
   connectResumeCta: "继续完成开户",
   connectReady: "已开通自动到账 —— 提现会立刻转入你的 Stripe 账户。",

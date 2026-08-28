@@ -252,7 +252,10 @@ const HEADING: Record<CommissionView, { title: string; description: string }> = 
   "commission-withdrawals": {
     title: "分销 · 提现申请",
     description:
-      "谁要把佣金提出去、提多少、转到哪里。转账是人工的 —— 钱转出去之后再回来标记「已支付」。",
+      // 不说转账方式：它由 app_settings.referral_batch_enabled 决定，线上是**自动**
+      // （Stripe Connect 批量转账），而这句写死的话一直在说人工。与其从服务端下发一个
+      // 只为这句话服务的字段，不如别做这个断言 —— 这一屏本来就是「谁要提、提多少、转到哪」。
+      "谁要把佣金提出去、提多少、转到哪里。",
   },
 };
 
@@ -540,7 +543,22 @@ export function Commission({ view }: { view: CommissionView }) {
         </div>
       )}
 
-      {view === "commission" && (
+      {/*
+        设置到货之前**不画这个面板**。
+        它每一个控件的初值都是 useState 里的字面量，而那不是"还没读到"，看起来就是
+        "你当前的配置"。线上实测：比例 30%、期限 90 天、冻结 14 天、门槛 $50 这四个
+        恰好和字面量一样，而 auto_settle 和 batch_enabled 两个布尔**是反的**
+        （线上都是 true，字面量都是 false）。四个对、两个错，反而最难发现 ——
+        运营会以为打款还是人工审核，而服务器那边 Stripe 已经在自动转账了。
+        接口失败时同理：与其画一份编的配置，不如说"读不到"。
+      */}
+      {view === "commission" && !settings && !error && (
+        <Panel className="mx-auto w-full max-w-2xl" bodyClassName="p-5" title="分销设置">
+          <p className="text-sm text-muted-foreground">读取中…</p>
+        </Panel>
+      )}
+
+      {view === "commission" && settings && (
         // 设置只有两个输入框,不该摊在 1280px 宽的面板里 —— 那样内容全贴在左边,
         // 右边三分之二是空的。面板自己收窄并居中,而不是面板全宽、里面的内容收窄。
         <Panel
@@ -591,7 +609,9 @@ export function Commission({ view }: { view: CommissionView }) {
                   </span>
                 </div>
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  从绑定那天算起。90 天约等于三个月。
+                  {/* 别写死 90：旁边那个输入框就是这个值，改成 30 天之后这句话还说 90，
+                      紧挨着输入框的一个数字对不上，会让人以为自己没改成功。 */}
+                  从绑定那天算起，当前 {days || "—"} 天。
                 </p>
               </div>
             </div>

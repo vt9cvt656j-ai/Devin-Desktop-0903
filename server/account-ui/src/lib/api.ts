@@ -230,6 +230,8 @@ export type ConnectState = {
   configured: boolean;
   connected: boolean;
   ready: boolean;
+  /** 这次没查成账户状态。**不等于「没做完」** —— 见 ConnectCard 里的分支。 */
+  status_unknown?: boolean;
   missing: string[];
 };
 

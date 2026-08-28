@@ -54,7 +54,13 @@ export function ConnectCard({ lang }: { lang: Lang }) {
             {t.connectTitle}
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
-            {state.connected ? t.connectResume : t.connectLede}
+            {/* 三种情况三句话。把「查不到」并进「没做完」的话，一个已经做完
+                onboarding 的用户会被劝去重做一遍，而那什么也修不了。 */}
+            {state.status_unknown
+              ? t.connectStatusUnknown
+              : state.connected
+                ? t.connectResume
+                : t.connectLede}
           </p>
           {err && <p className="mt-1 text-sm text-destructive">{err}</p>}
         </div>

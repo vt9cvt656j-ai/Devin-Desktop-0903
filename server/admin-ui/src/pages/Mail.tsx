@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { api } from "@/lib/api";
+import { planKeys, useSettings } from "@/lib/settings";
 import { cn } from "@/lib/utils";
 
 /**
@@ -51,7 +52,13 @@ const SEGMENTS = [
   { key: "one", label: "单个邮箱", hint: "先发给自己看看效果。" },
 ] as const;
 
-const PLANS = ["trial", "basic", "pro", "power", "ultra"] as const;
+/**
+ * 套餐清单**从服务端来**（lib/settings.ts 的 planKeys）。
+ *
+ * 以前这里写死 ["trial","basic","pro","power","ultra"]，而运营能在后台新建套餐 ——
+ * 线上 plan_quotas 现在有 6 个，写死的那份漏掉了 `ceshi`。症状不是报错，
+ * 是这个下拉框里根本没有那一档，运营会以为那个套餐坏了。
+ */
 
 const SEGMENT_LABEL: Record<string, string> = {
   all: "全部用户",
@@ -80,6 +87,9 @@ function when(iso: string): string {
 export type MailView = "mail" | "mail-log";
 
 export function Mail({ view }: { view: MailView }) {
+  // 必须订阅：planKeys() 读的是快照，不订阅的话设置到货后这个组件不会重渲染，
+  // 套餐下拉框会一直空着。
+  useSettings();
   const [campaigns, setCampaigns] = useState<Campaign[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -256,7 +266,7 @@ export function Mail({ view }: { view: MailView }) {
                   value={plan}
                   onChange={(e) => setPlan(e.target.value)}
                 >
-                  {PLANS.map((p) => (
+                  {planKeys().map((p) => (
                     <option key={p} value={p}>
                       {p}
                     </option>
@@ -338,7 +348,15 @@ export function Mail({ view }: { view: MailView }) {
       )}
 
       {view === "mail-log" && (
-      <Panel title="发送记录" aside={campaigns && <span className="text-sm text-muted-foreground">{campaigns.length} 条</span>}>
+      <Panel title="发送记录" aside={
+          campaigns && (
+            // 服务端是 ORDER BY id DESC LIMIT 50，所以这个数满 50 就不是"总共几条"，
+            // 而是被截断后的条数。说清楚它是"最近多少条"，别当总数。
+            <span className="text-sm text-muted-foreground">
+              最近 {campaigns.length} 条{campaigns.length >= 50 && "（只保留最近 50 条）"}
+            </span>
+          )
+        }>
         {/* 三种「还没有内容」的状态同高，页面不会先矮一下再蹿高。 */}
         {error ? (
           <div className="grid min-h-[20rem] place-items-center px-5">

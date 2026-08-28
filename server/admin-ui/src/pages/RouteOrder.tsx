@@ -40,6 +40,8 @@ type Conn = {
   rate?: number;
   power_route?: boolean;
   enabled_models?: string[];
+  /** 派单实际认的模型集合（含出口自带的货）。服务端算的，别在前端重算。 */
+  effective_models?: string[];
   created_at?: string;
 };
 
@@ -120,7 +122,10 @@ export function RouteOrder() {
   const plain = live.filter((c) => !c.power_route);
   const owners = new Map<string, Conn[]>();
   for (const c of plain) {
-    for (const m of c.enabled_models ?? []) {
+    // 用**服务端算的派单集合**，不是线路自己声明的 enabled_models ——
+    // 出口可以带线路本身没有的货，少算就会得出「没有模型会换线」，
+    // 而这一屏存在的理由正是「排序会静默改变用户按谁的倍率付钱」。
+    for (const m of c.effective_models ?? c.enabled_models ?? []) {
       owners.set(m, [...(owners.get(m) ?? []), c]);
     }
   }
@@ -205,7 +210,7 @@ export function RouteOrder() {
                         </Badge>
                       )}
                       <span className="text-[11px] text-muted-foreground">
-                        按 Token ×{c.rate ?? 1} · {(c.enabled_models ?? []).length} 个模型
+                        按 Token ×{c.rate ?? 1} · {(c.effective_models ?? c.enabled_models ?? []).length} 个模型
                       </span>
                     </div>
                     <Truncate className="font-mono text-[11px] text-muted-foreground" title={c.base_url}>

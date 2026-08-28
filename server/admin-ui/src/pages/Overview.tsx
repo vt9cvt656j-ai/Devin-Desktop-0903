@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { num, when } from "@/lib/format";
 import { formatMoney, formatTotals, sumByCurrency } from "@/lib/money";
+import { planKeys, useSettings } from "@/lib/settings";
 
 /**
  * Leads with money. The old dashboard's three tiles were 总用户 / 今日新增 / 当前在线 — and
@@ -104,6 +105,8 @@ export function Overview() {
   const [events, setEvents] = useState<Event[] | null>(null);
   const [users, setUsers] = useState<User[] | null>(null);
   const [err, setErr] = useState("");
+  // 必须订阅：planKeys() 读的是快照，不订阅的话设置到货后套餐圆环不会重画。
+  useSettings();
 
   const load = useCallback(async (signal?: { alive: boolean }) => {
     try {
@@ -157,7 +160,12 @@ export function Overview() {
 
   // Plan mix. Ordered tiers, so the ring uses a SEQUENTIAL ramp — see Donut for why this design
   // system cannot use a categorical one.
-  const PLAN_ORDER = ["ultra", "power", "pro", "basic", "trial"];
+  // 档位次序跟服务端走（settings 里的 plans 已按 rank 排好）。
+  //
+  // 原来是前端一份白名单。它不只影响排序：下面 filter 之后用「总人数 − 各扇区之和」
+  // 当「无会员」，所以任何**不在白名单里**的套餐（比如线上已经存在的 ceshi，
+  // 或者运营以后新建的任何一档）的有效会员，都会被静默算进「无会员」。
+  const PLAN_ORDER: string[] = planKeys().slice().reverse();
   const planMix = (() => {
     const by = new Map<string, number>();
     for (const u of loadedUsers) {

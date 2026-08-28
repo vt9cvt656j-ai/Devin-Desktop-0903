@@ -33,6 +33,8 @@ export const zhTW: Partial<Dict> = {
   connectTitle: "自動到帳",
   connectLede: "綁定一個 Stripe 帳戶，之後提現在提交的當下就直接轉過去，不需要任何人審核。",
   connectResume: "Stripe 開戶尚未完成。在完成之前，提現仍然走人工處理。",
+  connectStatusUnknown:
+    "剛才沒能連上 Stripe 查你的帳戶狀態。這不代表帳戶有問題——在確認之前，提現先走人工佇列。",
   connectCta: "綁定 Stripe",
   connectResumeCta: "繼續完成開戶",
   connectReady: "已開通自動到帳 —— 提現會立刻轉入你的 Stripe 帳戶。",

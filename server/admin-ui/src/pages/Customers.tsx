@@ -50,7 +50,13 @@ import { cents, num, when } from "@/lib/format";
  */
 
 /** codes.rs:12 —— 合法套餐；"none" 由 admin_set_plan / cancel-plan 当作退订处理。 */
-const PLANS = ["trial", "basic", "pro", "power", "ultra"] as const;
+/**
+ * 套餐清单**从服务端来**（lib/settings.ts 的 planKeys）。
+ *
+ * 以前这里写死 ["trial","basic","pro","power","ultra"]，而运营能在后台新建套餐 ——
+ * 线上 plan_quotas 现在有 6 个，写死的那份漏掉了 `ceshi`。症状不是报错，
+ * 是这个下拉框里根本没有那一档，运营会以为那个套餐坏了。
+ */
 
 /**
  * 余额的面值换算：N 个真实计费分 = 客户看到的 $1.00 额度（默认 663）。
@@ -144,8 +150,9 @@ function toLocalInput(iso?: string | null) {
 }
 
 export function Customers() {
-  // 订阅面值分母：设置到货后金额要重算一次，否则表格会停在兜底面值上。
+  // 订阅设置：面值分母和**套餐清单**都从这儿来，设置到货后要重算/重列。
   useSettings();
+  const plans = planKeys();
   const [users, setUsers] = useState<User[]>([]);
   const [total, setTotal] = useState(0);
   const [stats, setStats] = useState<Stats>({ total: 0, members: 0, drained: 0, recent: 0 });
@@ -258,7 +265,7 @@ export function Customers() {
           <option value="member">有效会员</option>
           <option value="none">无会员</option>
           <option value="admin">管理员</option>
-          {PLANS.map((p) => (
+          {plans.map((p) => (
             <option key={p} value={p}>套餐：{p}</option>
           ))}
         </Select>
@@ -430,6 +437,8 @@ function CustomerDialog({
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
 
   const settings = useSettings();
+  // useSettings() 订阅了变化，所以设置一到货这个值就翻，按钮自己解禁。
+  const denomReady = settingsLoaded();
   const w = windowUse(user);
   const weeklyCap = user.quota_weekly_cap_cents || 0;
 
@@ -555,7 +564,7 @@ function CustomerDialog({
         <Fact
           label="本时段"
           value={w ? `${cents(creditCents(w.used))} / ${cents(creditCents(w.cap))}` : "—"}
-          hint={w ? (w.left <= 0 ? "已用完，等待刷新" : `剩 ${cents(creditCents(w.left))} · 每 5.5 小时刷新`) : "无会员额度"}
+          hint={w ? (w.left <= 0 ? "已用完，等待刷新" : `剩 ${cents(creditCents(w.left))} · 每 30 分钟刷新`) : "无会员额度"}
         />
         <Fact
           label="本周"
@@ -677,7 +686,9 @@ function CustomerDialog({
             {balanceMode === "add" ? (
               <Button
                 size="sm"
-                disabled={busy !== "" || topUpValue === 0 || topUpOverdraft}
+                // 分母没读到就不让发：运营输入的美元要乘分母才变成存库的真实分，
+                // 拿兜底的 663 去乘，发出去的额度直接是错的，而页面上看不出来。
+                disabled={busy !== "" || topUpValue === 0 || topUpOverdraft || !denomReady}
                 onClick={grantCredits}
               >
                 {busy === "grant" ? "充值中…" : "充值"}
@@ -685,7 +696,10 @@ function CustomerDialog({
             ) : (
               <Button
                 variant="outline" size="sm"
-                disabled={busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) || balanceValue < 0}
+                disabled={
+                  busy !== "" || !balanceDirty || !Number.isFinite(balanceValue) ||
+                  balanceValue < 0 || !denomReady
+                }
                 onClick={setAbsoluteBalance}
               >
                 {busy === "credits" ? "保存中…" : "改写余额"}
@@ -731,7 +745,7 @@ function CustomerDialog({
                 }}
               >
                 <option value="none">none（退订）</option>
-                {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
+                {planKeys().map((p) => <option key={p} value={p}>{p}</option>)}
               </Select>
             </div>
             <div>
@@ -788,7 +802,7 @@ function CustomerDialog({
             <div>
               <Label htmlFor="extend">再加</Label>
               <Select id="extend" value={extendPlan} onChange={(e) => setExtendPlan(e.target.value)}>
-                {PLANS.map((p) => <option key={p} value={p}>{p}</option>)}
+                {planKeys().map((p) => <option key={p} value={p}>{p}</option>)}
               </Select>
             </div>
             <div>

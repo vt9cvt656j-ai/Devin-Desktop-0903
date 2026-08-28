@@ -64,6 +64,10 @@ const EN = {
   connectTitle: "Get paid automatically",
   connectLede: "Connect a Stripe account and withdrawals are transferred the moment you ask — no one has to approve them.",
   connectResume: "Your Stripe account is not finished yet. Withdrawals stay in the manual queue until it is.",
+  // 状态查不到时用这句，**不能**复用 connectResume：那句断言「你还没做完」，
+  // 而这一刻我们恰恰不知道 —— 一个已经做完的人会被劝去重做一遍，而那什么也修不了。
+  connectStatusUnknown:
+    "We could not reach Stripe to check your account just now. This does not mean anything is wrong with it — withdrawals stay in the manual queue until we can confirm.",
   connectCta: "Connect Stripe",
   connectResumeCta: "Finish setup",
   connectReady: "Automatic payouts are on — withdrawals are transferred to your Stripe account straight away.",

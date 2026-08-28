@@ -444,7 +444,7 @@ export function Settings() {
                 <TableRow>
                   <TableHead className="w-32">套餐</TableHead>
                   <TableHead>总额度（真实计费 $）</TableHead>
-                  <TableHead>时段上限 5.5h（真实计费 $）</TableHead>
+                  <TableHead>时段上限（真实计费 $）</TableHead>
                   <TableHead>周上限（真实计费 $）</TableHead>
                   <TableHead className="w-24">天数</TableHead>
                   <TableHead className="w-52">客户看到（总 / 时段 / 周）</TableHead>
@@ -456,8 +456,11 @@ export function Settings() {
                   const set = (k: keyof typeof d, v: string) =>
                     setPlans((prev) => ({ ...prev, [p.plan]: { ...prev[p.plan], [k]: v } }));
                   // 客户看到的是面值，三列都要折算 —— 有争议的正是时段/周这两列。
+                  // 走 creditCentsFromRaw 而不是自己除：这里原来写的是 `savedDenom || 663`，
+                  // 又把分母抄了第四份。这个文件顶上的注释说的正是「663 曾经在四个文件里
+                  // 各有一份副本」—— 结果修完之后自己又添了一份。
                   const face = (dollars: string) =>
-                    cents(Math.round((toRawCents(dollars) / (savedDenom || 663)) * 100));
+                    cents(creditCentsFromRaw(toRawCents(dollars)));
                   return (
                     <TableRow key={p.plan}>
                       <TableCell className="font-medium">

@@ -68,6 +68,17 @@ const FALLBACK: AdminSettings = {
 };
 
 let snapshot: AdminSettings = FALLBACK;
+/**
+ * 设置**真的从服务端读到过**没有。
+ *
+ * 分母是写路径上的乘数：运营输入的美元 × 分母 = 存库的真实分。没读到就用 FALLBACK 的 663
+ * 去乘，而线上分母是运营可改的（服务端允许 1~100000）。改过之后一旦这次拉取失败，
+ * 「发放 $50」会按错误的分母折算 —— 发出去的额度直接是错的，而页面上没有任何痕迹。
+ *
+ * 所以要把「兜底」和「真值」分开：显示路径继续用兜底（否则每个金额都变成 Infinity），
+ * **写路径必须等真值到货**。
+ */
+let loaded = false;
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -105,6 +116,8 @@ export function currentSettings(): AdminSettings {
 
 export function applySettings(next: Partial<AdminSettings>) {
   snapshot = { ...snapshot, ...next };
+  // 设置页保存成功后会调它，那也算读到过真值了。
+  loaded = true;
   emit();
 }
 
@@ -117,6 +130,7 @@ export async function loadSettings(force = false): Promise<AdminSettings> {
     .get<AdminSettings>("/api/admin/settings")
     .then((s) => {
       snapshot = { ...FALLBACK, ...s };
+      loaded = true;
       emit();
       return snapshot;
     })

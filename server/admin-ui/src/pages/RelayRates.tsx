@@ -65,6 +65,8 @@ type Payload = {
   sites: number;
   with_rate: number;
   all_known: boolean;
+  /** 混合配比的统计窗口。页面上两处文案照它写，别再自己抄一个 30。 */
+  mix_window_days: number;
 };
 
 const num = (v: number, d = 4) => Number(v.toFixed(d));
@@ -256,17 +258,31 @@ export function RelayRates() {
 
       {error && <ErrorState message={error} onRetry={() => void load()} />}
 
+      {/*
+        没读到就写「—」，不写 0。这三张卡渲染在骨架屏之前且不受 data 约束，
+        原来加载中（和接口报错时）会显示「在用的中转站 0」「填了汇率 0 / 0」
+        「选路现在按什么排：倍率（不可比）」—— 三句都是确定的陈述，
+        而它们描述的是一个还没读到的世界。
+        另外「选路按什么排」的真实判据是**逐线路**的（一条线路下的候选出口都填了汇率，
+        那条就按人民币排），不是全局的 all_known，所以别再说「填全才会切过去」。
+      */}
       <div className="grid gap-3 sm:grid-cols-3">
-        <Stat label="在用的中转站" value={data?.sites ?? 0} hint="从线路和出口的地址里认出来的" />
+        <Stat label="在用的中转站" value={data ? data.sites : "—"} hint="从线路和出口的地址里认出来的" />
         <Stat
           label="填了汇率"
-          value={`${data?.with_rate ?? 0} / ${data?.sites ?? 0}`}
-          hint={data?.all_known ? "全部" : "没填的那些算不出真实成本"}
+          value={data ? `${data.with_rate} / ${data.sites}` : "—"}
+          hint={!data ? "读取中" : data.all_known ? "全部" : "没填的那些算不出真实成本"}
         />
         <Stat
           label="选路现在按什么排"
-          value={data?.all_known ? "真实人民币" : "倍率（不可比）"}
-          hint={data?.all_known ? "跨中转可比" : "填全才会切过去"}
+          value={!data ? "—" : data.all_known ? "真实人民币" : "看线路"}
+          hint={
+            !data
+              ? "读取中"
+              : data.all_known
+                ? "跨中转可比"
+                : "逐线路判：这条线下的候选出口都填了汇率，它就按人民币排"
+          }
         />
       </div>
 
@@ -549,7 +565,7 @@ export function RelayRates() {
                 名次按<b>混合价</b>排：<b className="font-mono">
                   输入价×输入占比 + 缓存价×缓存占比 + 输出价×输出占比
                 </b>
-                。占比不是我拍的，是这个模型<b>自己最近 30 天真实跑出来的</b>；
+                。占比不是我拍的，是这个模型<b>自己最近 {data?.mix_window_days ?? "…"} 天真实跑出来的</b>；
                 还没有真实用量的模型会明说「按输入价排」，而不是编一个默认配比让排名看起来有依据。
                 <br />
                 <b>「有价」和「比得了」是两件事</b>：{mp.models} 个模型有真实单价，但只有{" "}
@@ -593,7 +609,7 @@ export function RelayRates() {
                           : m.mix_source === "usage"
                             ? `混合价按真实配比：输入 ${Math.round(m.mix_in * 100)}% · 缓存 ${Math.round(
                                 m.mix_cached * 100,
-                              )}% · 输出 ${Math.round(m.mix_out * 100)}%（最近 30 天 ${m.mix_calls} 次调用）`
+                              )}% · 输出 ${Math.round(m.mix_out * 100)}%（最近 ${data?.mix_window_days ?? "?"} 天 ${m.mix_calls} 次调用）`
                             : "这个模型还没跑过真实流量，混合价 = 输入价"}
                       </p>
                     </div>

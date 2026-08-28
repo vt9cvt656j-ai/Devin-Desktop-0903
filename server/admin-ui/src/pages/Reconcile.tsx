@@ -89,6 +89,14 @@ type Row = {
   cost_usd: number | null;
   margin_usd: number | null;
   margin_pct: number | null;
+  /** 折成人民币的三个数。页面显示的就是它们——`*_usd` 那三个不是同一种货币，不能相减。 */
+  revenue_cny: number | null;
+  cost_cny: number | null;
+  margin_cny: number | null;
+  cost_by_balance_cny: number | null;
+  derived_cost_cny: number | null;
+  /** 折不出来时说明是哪一家没填汇率。 */
+  fx_note: string;
   unpriced_models: string[];
   legacy_only: boolean;
   cost_by_balance_usd: number | null;
@@ -124,11 +132,28 @@ type Payload = {
     unpriced_models: number;
     /** 合计成本里有多少是推算的。 */
     derived_cost_usd: number;
+    revenue_cny: number;
+    cost_cny: number;
+    margin_cny: number;
+    derived_cost_cny: number;
+    fx_rows: number;
+    fx_missing_rows: number;
   };
 };
 
 const usd = (v: number | null | undefined) =>
   v === null || v === undefined ? "—" : `$${v.toFixed(2)}`;
+
+/**
+ * 人民币。页面上的钱一律用它。
+ *
+ * 原来这一屏所有金额都打 `$`，而那两侧根本不是同一种「美元」：收入是按线路自带地址
+ * 那家的口径算的，成本是**这个出口那家中转的余额面值**。两家充值汇率差多少，减出来的
+ * 毛利就错多少倍。线上清衍那一行因此显示成「毛利 -144%」，而它实际是赚的。
+ * 折算在服务端做（`reconcile.rs`），这里只负责别再打错货币符号。
+ */
+const cny = (v: number | null | undefined) =>
+  v === null || v === undefined ? "—" : `¥${v.toFixed(2)}`;
 
 const RANGES = [1, 7, 30] as const;
 
@@ -188,7 +213,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
   const shown = allRows.slice((current - 1) * PAGE_SIZE, current * PAGE_SIZE);
   // 合计的分母要和分子取自同一批行，否则毛利率会拿全部收入去除一个只覆盖部分行的成本。
   const totalPct =
-    t && t.counted_revenue_usd > 0 ? (t.margin_usd / t.counted_revenue_usd) * 100 : null;
+    t && t.revenue_cny > 0 ? (t.margin_cny / t.revenue_cny) * 100 : null;
 
   const accounts = data?.accounts ?? [];
   const acctPages = Math.max(1, Math.ceil(accounts.length / PAGE_SIZE));
@@ -203,7 +228,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
         description={
           accountsView
             ? "按价目表算出来的消耗，和中转余额实际掉的钱，对不对得上。"
-            : "真实 token × 真实单价。抓不到价目的按「OpenRouter 官方价 × 倍率」推算并标出来，仍然算不出的显示未知，不按 0 算。"
+            : "金额一律折成人民币再比——收入按线路自带那家的口径、成本按这个出口那家的充值汇率，两家不折就没法相减。真实 token × 真实单价；抓不到价目的按「OpenRouter 官方价 × 倍率」推算并标出来，仍然算不出的显示未知，不按 0 算。"
         }
         actions={
           <div className="flex items-center gap-2">
@@ -239,32 +264,30 @@ export function Reconcile({ view }: { view: ReconcileView }) {
           */}
           <Stat
             label="用户付了"
-            value={usd(t.counted_revenue_usd)}
+            value={cny(t.revenue_cny)}
             hint={
-              t.counted_revenue_usd < t.revenue_usd
-                ? `能算成本的那部分 · 最近 ${data?.days} 天共 ${usd(t.revenue_usd)}`
-                : `最近 ${data?.days} 天`
+              t.fx_missing_rows > 0
+                ? `最近 ${data?.days} 天 · 有 ${t.fx_missing_rows} 个出口因为汇率没填折不出来，没算进去`
+                : `最近 ${data?.days} 天 · ${t.fx_rows} 个出口`
             }
           />
           <Stat
             label="中转收了"
-            value={usd(t.cost_usd)}
+            value={cny(t.cost_cny)}
             hint={
               t.derived_cost_usd > 0
-                ? `其中 ${usd(t.derived_cost_usd)} 是推算的 · 已录价 ${t.counted_rows}/${t.total_rows} 个出口`
+                ? `其中 ${cny(t.derived_cost_cny)} 是推算的 · 已录价 ${t.counted_rows}/${t.total_rows} 个出口`
                 : `同一批出口 · 已录价 ${t.counted_rows}/${t.total_rows} 个`
             }
           />
           <Stat
             label="毛利"
-            value={usd(t.margin_usd)}
+            value={cny(t.margin_cny)}
             hint={
               totalPct === null
                 ? "没有可比的收入"
-                : t.counted_revenue_usd < t.revenue_usd
-                  ? `${totalPct.toFixed(1)}% · 只覆盖 ${Math.round(
-                      (t.counted_revenue_usd / t.revenue_usd) * 100,
-                    )}% 的收入`
+                : t.fx_missing_rows > 0
+                  ? `${totalPct.toFixed(1)}% · ${t.fx_missing_rows} 个出口汇率没填，没算进去`
                   : `${totalPct.toFixed(1)}%`
             }
           />
@@ -343,15 +366,22 @@ export function Reconcile({ view }: { view: ReconcileView }) {
                         </TableCell>
                         <TableCell className="numeric">{usd(a.predicted_usd)}</TableCell>
                         <TableCell className="numeric font-medium">{usd(a.spent_usd)}</TableCell>
+                        {/*
+                          note 和百分比要**并排**，不是二选一。
+                          原来写成三元：有 gap 就只画数字。而服务端那句限定语
+                          （「只比了最近 N 天」「N 个模型里有 M 个没抓到价」）恰恰是
+                          解释这个百分比该怎么读的 —— 有百分比的行反而永远看不到它。
+                        */}
                         <TableCell>
-                          {a.gap_pct !== null ? (
+                          {a.gap_pct !== null && (
                             <span className={cn("text-[12px]", off && "font-medium text-amber-600")}>
                               {a.gap_pct > 0 ? "+" : ""}
                               {a.gap_pct.toFixed(0)}%
                               {off && " ← 中转扣的和它自己的价目表对不上"}
                             </span>
-                          ) : (
-                            <span className="text-[12px] text-muted-foreground">{a.note}</span>
+                          )}
+                          {a.note && (
+                            <div className="text-[12px] text-muted-foreground">{a.note}</div>
                           )}
                         </TableCell>
                         <TableCell className="numeric text-[12px]">{num(a.user_tokens)}</TableCell>
@@ -408,7 +438,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
                 </TableHeader>
                 <TableBody>
                   {shown.map((r) => {
-                    const losing = r.margin_usd !== null && r.margin_usd < 0;
+                    const losing = r.margin_cny !== null && r.margin_cny < 0;
                     const expanded = open === r.endpoint_id;
                     return [
                       <TableRow key={r.endpoint_id} className={cn(losing && "bg-destructive/5")}>
@@ -424,10 +454,10 @@ export function Reconcile({ view }: { view: ReconcileView }) {
                           </div>
                         </TableCell>
                         <TableCell className="numeric">{num(r.calls)}</TableCell>
-                        <TableCell className="numeric">{usd(r.revenue_usd)}</TableCell>
-                        <TableCell className="numeric">{usd(r.cost_usd)}</TableCell>
+                        <TableCell className="numeric">{cny(r.revenue_cny)}</TableCell>
+                        <TableCell className="numeric">{cny(r.cost_cny)}</TableCell>
                         <TableCell className="numeric">
-                          {r.margin_usd === null ? (
+                          {r.margin_cny === null ? (
                             "—"
                           ) : (
                             <span
@@ -441,7 +471,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
                               ) : (
                                 <TrendingUp className="h-3.5 w-3.5" />
                               )}
-                              {usd(r.margin_usd)}
+                              {cny(r.margin_cny)}
                               {r.margin_pct !== null && (
                                 <span className="text-[11px] font-normal opacity-70">
                                   {r.margin_pct.toFixed(0)}%
@@ -476,10 +506,17 @@ export function Reconcile({ view }: { view: ReconcileView }) {
                                 这段时间没跑过
                               </span>
                             )}
-                            {r.cost_by_balance_usd !== null && (
+                            {r.cost_by_balance_cny !== null && (
                               <span className="text-[12px] text-muted-foreground">
-                                余额口径 {usd(r.cost_by_balance_usd)}
+                                余额口径 {cny(r.cost_by_balance_cny)}
                               </span>
+                            )}
+                            {/*
+                              折不出来必须说是**哪一家**没填汇率，否则运维只看到一排「—」，
+                              不知道该去填谁。这一行没有汇率就没有毛利可言，比「待录价」更硬。
+                            */}
+                            {r.fx_note !== "" && (
+                              <span className="text-[12px] text-amber-600">{r.fx_note}</span>
                             )}
                           </div>
                         </TableCell>
@@ -522,9 +559,17 @@ export function Reconcile({ view }: { view: ReconcileView }) {
 function ModelDetail({ row, onSaved }: { row: Row; onSaved: () => void }) {
   if (row.models.length === 0) {
     return (
-      <p className="px-5 py-4 text-[13px] text-muted-foreground">
-        这个出口在所选时间段里没有调用记录。
-      </p>
+      <div className="px-5 py-4">
+        <p className="text-[13px] text-muted-foreground">
+          这个出口在所选时间段里没有调用记录。
+        </p>
+        {/*
+          没有调用记录 ≠ 不能录价。上一版这里就直接返回了，于是一个**还没跑过流量**
+          的出口一条价都填不进去 —— 而自研网关（没有任何可拉的价目接口）恰恰只能靠
+          手工录。「只能手工录」这句话必须在这里能落地，否则它是空的。
+        */}
+        <BulkPrices row={row} onSaved={onSaved} />
+      </div>
     );
   }
   return (
@@ -553,6 +598,178 @@ function ModelDetail({ row, onSaved }: { row: Row; onSaved: () => void }) {
           ))}
         </TableBody>
       </Table>
+      <BulkPrices row={row} onSaved={onSaved} />
+    </div>
+  );
+}
+
+/**
+ * 标定进价：发两发真实请求，按**余额差**反推真实单价。
+ *
+ * 这条路不依赖中转公布任何东西 —— 只要能发请求、能查余额就能量。而且量到的是
+ * **实际扣的钱**，天然含了分组倍率、活动折扣这些价目表上看不见的东西，比任何
+ * 公布的价目都准。线上那六家不给价的中转，这是唯一不用人抄的路。
+ *
+ * **它会花钱**，所以：只在点按钮时跑、先把要花什么说清楚、花掉多少（两次余额差）
+ * 原样回给界面。花了多少必须看得见。
+ */
+function Calibrate({ row, onSaved }: { row: Row; onSaved: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [res, setRes] = useState<CalResult[] | null>(null);
+  const [err, setErr] = useState("");
+
+  // 只标这个出口上**真的跑过**的模型：没跑过的标了也用不上，白花钱。
+  // 一次最多 12 个，和服务端那道闸一致。
+  const models = row.models.map((m) => m.model_id).slice(0, 12);
+
+  async function run() {
+    if (
+      !window.confirm(
+        `标定会给 ${models.length} 个模型各发两发真实请求（一发约 6000 个输入 token，` +
+          `一发约 600 个输出 token），这些请求要花钱，从这个出口的余额里扣。\n\n` +
+          `换来的是这些模型的真实进价（按余额差反推，比价目表准）。继续吗？`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setErr("");
+    setRes(null);
+    try {
+      const r = await api.post<{ calibrated: number; results: CalResult[] }>(
+        "/api/admin/endpoint-prices/calibrate",
+        { endpoint_id: row.endpoint_id, models },
+      );
+      setRes(r.results);
+      if (r.calibrated > 0) onSaved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (models.length === 0) {
+    return null;
+  }
+  return (
+    <>
+      <Button size="sm" variant="outline" onClick={() => void run()} disabled={busy}>
+        {busy ? "标定中…（要发真实请求，慢）" : `标定进价（${models.length} 个模型，会花钱）`}
+      </Button>
+      {err && <p className="w-full text-[12px] text-destructive">{err}</p>}
+      {res && (
+        <div className="w-full space-y-1 text-[12px]">
+          {res.map((x) => (
+            <p key={x.model} className={x.input_per_mtok == null ? "text-amber-600" : "text-emerald-600"}>
+              {x.model}：
+              {x.input_per_mtok == null
+                ? x.why
+                : `输入 ${x.input_per_mtok.toFixed(3)} / 输出 ${x.output_per_mtok?.toFixed(3)} 每百万 token` +
+                  `（这两发花了 ${x.samples.map((v) => v.delta.toFixed(4)).join(" + ")}）`}
+            </p>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+type CalResult = {
+  model: string;
+  input_per_mtok: number | null;
+  output_per_mtok: number | null;
+  samples: { input_tokens: number; output_tokens: number; delta: number }[];
+  why: string;
+};
+
+/**
+ * 从中转后台把整张价目表粘进来，一次录完。
+ *
+ * 一次一个模型的填法对**自研网关**是不可用的：它们没有任何可拉的价目接口
+ * （线上 api.teamorouter.com 挂了 9 个出口，价目只在它自己前端里动态渲染，
+ * 服务端拿不到），被人机校验挡住的面板同理。这些站手工录是唯一的路，
+ * 而一张表几十个模型一个个填不现实 —— 那等于「只能手工录」没有落地。
+ *
+ * 单位在标签里写死：$ / 百万 token。单位靠猜是这套账里最贵的一类错。
+ */
+function BulkPrices({ row, onSaved }: { row: Row; onSaved: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<
+    { saved: number; skipped: string[]; failed: string[] } | null
+  >(null);
+  const [err, setErr] = useState("");
+
+  async function submit() {
+    setBusy(true);
+    setErr("");
+    setResult(null);
+    try {
+      const r = await api.post<{ saved: number; skipped: string[]; failed: string[] }>(
+        "/api/admin/endpoint-prices/bulk",
+        { endpoint_id: row.endpoint_id, text },
+      );
+      setResult(r);
+      if (r.saved > 0) onSaved();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return (
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
+          粘贴整张价目表
+        </Button>
+        <Calibrate row={row} onSaved={onSaved} />
+      </div>
+    );
+  }
+  return (
+    <div className="mt-3 space-y-2 rounded-md border p-3">
+      <p className="text-[12px] text-muted-foreground">
+        一行一个模型：<code>模型名 输入价 输出价 [缓存读价] [缓存写价]</code>。
+        单位是 <strong>美元 / 百万 token</strong>，和上面那一列一致。
+        制表符、逗号、空格分隔都行，直接从中转后台框选复制过来即可。
+        认不出的行会逐条告诉你是第几行、为什么 —— 不会闷头跳过。
+      </p>
+      <textarea
+        className="h-40 w-full rounded-md border bg-background p-2 font-mono text-[12px]"
+        placeholder={"claude-opus-5\t5\t25\ngpt-5.6-sol, 1.25, 10, 0.125\ndeepseek-v4-flash 0.28 0.42"}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+      />
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={() => void submit()} disabled={busy || !text.trim()}>
+          {busy ? "存入中…" : "存入"}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>
+          收起
+        </Button>
+      </div>
+      {err && <p className="text-[12px] text-destructive whitespace-pre-wrap">{err}</p>}
+      {result && (
+        <div className="space-y-1 text-[12px]">
+          <p className="text-emerald-600">存好了 {result.saved} 个模型的价</p>
+          {/* 认不出的和写失败的都要逐条列出来。只报「存了 12 条」而不说另外
+              18 条去哪了，人会以为填完了，而对账会拿那些缺口按推算值顶上。 */}
+          {result.skipped.map((x) => (
+            <p key={x} className="text-amber-600">
+              {x}
+            </p>
+          ))}
+          {result.failed.map((x) => (
+            <p key={x} className="text-destructive">
+              写失败 {x}
+            </p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

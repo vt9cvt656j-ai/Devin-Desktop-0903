@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Panel } from "@/components/Panel";
+import { PlanHealthTab } from "@/components/PlanHealthTab";
 import { api } from "@/lib/api";
 import { cents, num, when } from "@/lib/format";
 
@@ -62,11 +63,15 @@ import { cents, num, when } from "@/lib/format";
  *    failed.
  */
 
-type Mode = "quota" | "token";
+// 「套餐体检」是默认页：它回答的是「额度给多少合适」，而那才是运营真正要问的。
+// 另外两页是拿来核对单条的，属于工具而不是结论。
+type Mode = "health" | "quota" | "token";
 
 type ChannelRate = {
   id: string;
   name: string;
+  /** 对应哪个中转域名。**空 = 假想渠道**，一条真实流量都没承载过。 */
+  host?: string;
   usd_per_cny: number;
   note?: string | null;
   created_at?: string;
@@ -176,10 +181,17 @@ const pct = (v: number | null | undefined) =>
 // this reason: Price (CNY per $1 of credit) and USDExchangeRate (display only).
 const buyRate = (v: number | null | undefined) => `¥1 买 ${dec(v, 4)} 美元额度`;
 
+/**
+ * 价格来源的中文名。键必须和服务端 `effective_token_prices` 回的三个值逐字一致。
+ *
+ * 这张表漂过：服务端 2026-08-20 收敛三条价格阶梯时把 `official_catalog` / `connection_fallback`
+ * 改成了 `catalog` / `backend`，这里没跟上，于是页面直接把英文原词显示出来 ——
+ * 不报错，只是那一格突然变成 "catalog"。有测试钉着两边一致。
+ */
 const PRICE_SOURCE: Record<string, string> = {
   model_override: "单模型自定义价",
-  official_catalog: "服务端官方价",
-  connection_fallback: "连接兜底价",
+  catalog: "服务端官方价",
+  backend: "连接兜底价",
 };
 
 const whole = (s: string) => {
@@ -224,7 +236,7 @@ function Field({
 }
 
 export function Pricing() {
-  const [mode, setMode] = useState<Mode>("quota");
+  const [mode, setMode] = useState<Mode>("health");
   const [channels, setChannels] = useState<ChannelRate[]>([]);
   const [conns, setConns] = useState<Connection[]>([]);
   const [channelId, setChannelId] = useState("");
@@ -238,8 +250,14 @@ export function Pricing() {
   // 套餐额度 inputs
   // Defaults mirror a REAL plan (power) so the page does not open on a fabricated loss.
   // The old $1000-sold-for-¥288 pairing matches nothing in plan_spec and rendered -187.76%.
-  const [quotaUsd, setQuotaUsd] = useState("271");
-  const [quotaSales, setQuotaSales] = useState("488");
+  // 这三个不写死。
+  //
+  // 原来是 "271" / "488" / "20"，注释说是「照抄主力档」，而主力档真值是面值 $210 / 售价 ¥295 ——
+  // 抄的时候就不对，之后价目改过更不会跟着动。一进页面就用它们算出一个「净利润 ¥308」，
+  // 那是一笔**不存在的生意**的利润，而它是这一屏最醒目的数。
+  // 现在等真实套餐到货再播种（下面那个 effect），播不到就留空，让人自己填。
+  const [quotaUsd, setQuotaUsd] = useState("");
+  const [quotaSales, setQuotaSales] = useState("");
   const [targetMargin, setTargetMargin] = useState("20");
   // Token 用量 inputs
   const [calls, setCalls] = useState("1");
@@ -279,6 +297,25 @@ export function Pricing() {
 
   // allSettled, not all: a broken /api/admin/models must not also throw away the channel rates
   // that loaded fine next to it.
+  // 用**真实套餐**给那两个输入框播种：面值额度和售价都来自 /api/admin/plan-health
+  // （它就是 plan_quotas × prices 现算的）。挑最贵那一档，那是走量的位置。
+  // 播不到就留空 —— 空着让人填，好过给一笔不存在的生意算利润。
+  useEffect(() => {
+    let alive = true;
+    api.get<{ plans?: { visible_usd?: number; price_cny?: number | null }[] }>("/api/admin/plan-health")
+      .then((r) => {
+        if (!alive) return;
+        const top = (r.plans || [])
+          .filter((p) => (p.price_cny || 0) > 0 && (p.visible_usd || 0) > 0)
+          .sort((a, b) => (b.price_cny || 0) - (a.price_cny || 0))[0];
+        if (!top) return;
+        setQuotaUsd((v) => v || String(Math.round(top.visible_usd!)));
+        setQuotaSales((v) => v || String(top.price_cny!));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -340,7 +377,18 @@ export function Pricing() {
 
   // Selection is derived, not synced in an effect: a deleted rate or a model that stopped being
   // exposed falls back to the first row on the same render, with no blank-select frame.
-  const activeChannelId = channels.some((c) => c.id === channelId) ? channelId : channels[0]?.id || "";
+  // 默认**不选假想渠道**。
+  //
+  // 原来是 `channels[0]`，按 created_at 排第一的恰好是「渠道A · ¥1 买 $10」——
+  // host 是空的（迁移原话：空 host 是假想渠道），生产 60 天一条流量都没走过它。
+  // 而它的购买价比真实渠道好十倍，于是这一屏一打开就按最好的价算，永远显示赚钱。
+  // 有 host 的才是真的在跑的，优先选它们里最贵的那条（保守）。
+  const realChannels = channels.filter((c) => (c.host || "").trim());
+  const defaultChannel =
+    realChannels.slice().sort((a, b) => a.usd_per_cny - b.usd_per_cny)[0] || channels[0];
+  const activeChannelId = channels.some((c) => c.id === channelId)
+    ? channelId
+    : defaultChannel?.id || "";
   const activeOptionKey = options.some((o) => o.key === optionKey) ? optionKey : options[0]?.key || "";
 
   const opt = options.find((o) => o.key === activeOptionKey);
@@ -699,9 +747,12 @@ export function Pricing() {
                   {!channels.length && (
                     <option value="">{ratesLoaded ? "还没有渠道购买价" : "渠道购买价没加载出来"}</option>
                   )}
+                  {/* host 为空的是假想渠道，一条真实流量都没承载过 —— 标出来，
+                      别让它看起来和真实中转一样。 */}
                   {channels.map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name} · {buyRate(c.usd_per_cny)}
+                      {(c.host || "").trim() ? "" : "（假想渠道，没有真实流量）"}
                     </option>
                   ))}
                 </Select>
@@ -1012,7 +1063,7 @@ export function Pricing() {
     <div className="space-y-6">
       <PageHeader
         title="定价试算"
-        description="改倍率、定套餐价之前先在这里算一遍。用的是服务端真正的计费规则，算完不会改动任何模型或用户的扣费。"
+        description="套餐给多少额度合适、卖这个价亏不亏。用的是真实用量和真实渠道构成，不是假设；算完不会改动任何模型或用户的扣费。"
       />
 
       <ErrorState message={loadErr} />
@@ -1021,10 +1072,14 @@ export function Pricing() {
       <SectionReveal as="section" delay={70}>
       <Tabs value={mode} onValueChange={(v) => setMode(v as Mode)} className="gap-6">
         <TabsList>
-          <TabsTrigger value="quota">套餐额度</TabsTrigger>
+          <TabsTrigger value="health">套餐体检</TabsTrigger>
+          <TabsTrigger value="quota">单条试算</TabsTrigger>
           <TabsTrigger value="token">Token 用量</TabsTrigger>
         </TabsList>
 
+        <TabsContent value="health" className="flex flex-col gap-6">
+          <PlanHealthTab />
+        </TabsContent>
         <TabsContent value="quota" className="flex flex-col gap-6">
           {lab}
         </TabsContent>
@@ -1058,7 +1113,6 @@ export function Pricing() {
               type="number"
               min="0"
               step="0.000001"
-              placeholder="0.139"
               value={crRate}
               onChange={(e) => setCrRate(e.target.value)}
             />

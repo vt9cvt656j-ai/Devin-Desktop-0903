@@ -28,7 +28,7 @@ import {
   Truncate,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import { when } from "@/lib/format";
+import { num, when } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /**
@@ -66,6 +66,11 @@ type Row = {
   balance_text: string;
   accounting_ready: boolean;
   blocked_reason: string;
+  /** 充值套餐为什么没拉到。空 = 拉到了。没有它就没有真实进价，人民币成本只能手填。 */
+  topup_reason: string;
+  /** 判据留在服务端：别拿中文字面量去比，措辞一改计数就静默错位。 */
+  family_known: boolean;
+  topup_needs_token: boolean;
   auto_guard: boolean;
   margin_floor_pct: number;
   synced_at: string | null;
@@ -107,6 +112,11 @@ type Topup = {
 type Payload = {
   rows: Row[];
   changes: Change[];
+  /** 价格异动的**真实总数**，不是上面那个数组的长度（那是 LIMIT 撞出来的天花板）。 */
+  changes_total: number;
+  change_limit: number;
+  /** 亏本看守重算多久的用量。表头那句说明照它写，别再自己抄一个 7。 */
+  margin_window_days: number;
   topup_plans: Plan[];
   topups: Topup[];
 };
@@ -251,11 +261,15 @@ export function Adapters({ view }: { view: AdapterView }) {
   const rows = data?.rows ?? [];
   // 顶部四个数**永远按全量算**，不跟着翻页变 —— 那是这一页的总账，
   // 翻到第二页就变一次的话，它就不是总账了。
-  const known = rows.filter((r) => r.family && r.family !== "未知").length;
+  const known = rows.filter((r) => r.family_known).length;
   // 「能真实记账」数的是**抓到真价**的那些。抓不到的现在也有成本（推算），
   // 但把两者合成一个数就分不出「实测」和「推的」—— 那正是这一列存在的意义。
   const ready = rows.filter((r) => r.accounting_ready).length;
   const blocked = rows.filter((r) => r.blocked_reason).length;
+  // 拿不到充值套餐 = 这个站的「花了多少人民币买到多少上游额度」是未知的，
+  // 于是成本里的人民币那一侧只能靠手填。这是今天让整盘账在盈亏之间摆动的那个输入。
+  const noTopup = rows.filter((r) => r.topup_reason).length;
+  const needToken = rows.filter((r) => r.topup_needs_token).length;
 
   const changes = data?.changes ?? [];
   const statusPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
@@ -294,10 +308,33 @@ export function Adapters({ view }: { view: AdapterView }) {
         <Stat
           label="能真实记账"
           value={`${ready} / ${rows.length}`}
-          hint={ready === rows.length ? "全部" : "其余成本只能手工录"}
+          hint={ready === rows.length ? "全部" : "其余按 OpenRouter 官方价 × 倍率推算"}
+        />
+        <Stat
+          label="拿不到充值套餐"
+          value={`${noTopup} / ${rows.length}`}
+          hint={
+            noTopup === 0
+              ? "全部都能算出真实进价"
+              : needToken
+                ? `其中 ${needToken} 家只差一个控制台令牌`
+                : "见下方每行的原因"
+          }
         />
         <Stat label="被自动停用" value={blocked} hint={blocked ? "见下方原因" : "没有"} />
-        <Stat label="价格异动" value={data?.changes.length ?? 0} hint="最近记录" />
+        {/*
+          这个数以前是 `changes.length` —— 那不是条数，是服务端 LIMIT 撞出来的天花板。
+          线上真实 11666 条，页面一直写着 60，看起来像「最近没什么异动」。
+        */}
+        <Stat
+          label="价格异动"
+          value={data ? num(data.changes_total) : "—"}
+          hint={
+            data && data.changes_total > data.change_limit
+              ? `下面只列最近 ${data.change_limit} 条`
+              : "全部在下面"
+          }
+        />
       </div>
 
       {!data && !error && <TableSkeleton rows={5} />}
@@ -310,7 +347,8 @@ export function Adapters({ view }: { view: AdapterView }) {
                 「靠什么认的」这一列不是装饰：<b>认错比认不出更糟</b>，因为认错会拉到一份
                 别家的价目还很自信。这一列让你能一眼判断结论可不可信。
                 <br />
-                亏本看守的判据是<b>按新进价把最近 7 天的真实用量重算一遍</b>，不是涨幅百分比——
+                亏本看守的判据是
+                <b>按新进价把最近 {data?.margin_window_days ?? "…"} 天的真实用量重算一遍</b>，不是涨幅百分比——
                 涨 200% 但仍有 10 倍毛利的不会被停，涨 20% 就翻负的会被停。
               </p>
             </CardHeader>
@@ -346,7 +384,7 @@ export function Adapters({ view }: { view: AdapterView }) {
                       </TableCell>
                       <TableCell>
                         {r.family ? (
-                          <Badge variant={r.family === "未知" ? "outline" : "secondary"}>
+                          <Badge variant={r.family_known ? "secondary" : "outline"}>
                             {r.family}
                           </Badge>
                         ) : (
@@ -402,6 +440,16 @@ export function Adapters({ view }: { view: AdapterView }) {
                           <p className="mt-1 flex items-start gap-1.5 text-[12px] text-destructive">
                             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                             {r.blocked_reason}
+                          </p>
+                        )}
+                        {/*
+                          拿不到充值套餐 = 这个站「花了多少人民币买到多少上游额度」是未知的。
+                          以前这里什么都不显示，因为那五条失败路径一律空手回、一行日志不留，
+                          于是空表看起来和「这家本来就没有充值套餐」一模一样。
+                        */}
+                        {r.topup_reason && (
+                          <p className="mt-1 text-[12px] text-muted-foreground">
+                            充值套餐没拉到：{r.topup_reason}
                           </p>
                         )}
                       </TableCell>

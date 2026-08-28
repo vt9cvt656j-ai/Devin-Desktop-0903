@@ -31,7 +31,7 @@ import { Pager, paginate } from "@/components/Pager";
 import { Textarea } from "@/components/ui/textarea";
 import { Panel } from "@/components/Panel";
 import { api } from "@/lib/api";
-import { creditCentsFromRaw, rawCentsFromCreditDollars, useSettings } from "@/lib/settings";
+import { creditCentsFromRaw, planKeys, rawCentsFromCreditDollars, useSettings } from "@/lib/settings";
 import { useRowFlash } from "@/lib/flash";
 import { cents, num, when } from "@/lib/format";
 import { formatMoney, formatTotals, realCharge, sumByCurrency } from "@/lib/money";
@@ -144,20 +144,36 @@ type Code = Grant & {
 type Ask = { title: string; desc: string; label: string; danger?: boolean; act: () => Promise<void> };
 
 /**
- * codes.rs PLANS —— 服务端只认这几个，别的会被拒。
+ * 套餐的**中文名**。只是显示名 —— **清单本身从服务端来**（planKeys）。
  *
- * 名字跟着 2026Q3 的价目走：等级 key 是不能改的（用户身上存的就是它），但下拉框里只写 key
- * 的话，运营得自己记住 ultra 是「尊享」。`pro` 已经停售 —— 它没有对应商品，配额行留着只是
- * 为了还挂在这一档的老用户能查到。默认值曾经就是它，点一下「生成」就会发出一批
- * 没人买得到、名字也对不上的套餐码。
+ * 以前这里连清单一起写死，于是运营在后台新建的套餐在下拉框里根本不存在：
+ * 线上 plan_quotas 有 6 个，这份只有 5 个，漏的是 `ceshi`。表现不是报错，
+ * 是那一档发不出兑换码、也建不了商品，看起来像那个套餐坏了。
+ *
+ * 认不出名字的 key 就**直接显示 key**，不从下拉框里消失 —— 少一个中文名只是难看，
+ * 少一档是功能缺失。
+ *
+ * 等级 key 不能改（用户身上存的就是它）。`pro` 已停售，配额行留着只是为了还挂在
+ * 这一档的老用户能查到；默认值曾经就是它，点一下「生成」会发出一批没人买得到的码。
  */
-const PLANS = [
-  { key: "trial", label: "日卡" },
-  { key: "basic", label: "入门" },
-  { key: "power", label: "主力" },
-  { key: "ultra", label: "尊享" },
-  { key: "pro", label: "pro（已停售，仅供老用户补发）" },
-] as const;
+/**
+ * 服务端一次最多回多少行（pay.rs / codes.rs 都是 `LIMIT 1000`）。
+ *
+ * 超过之后不会报错，只是**统计会少算**：已收款、未使用兑换码这些都是在前端拿回来的
+ * 数组上算的。今天订单 59、兑换码 93，离顶还远，但满了的时候必须看得见 ——
+ * 一个悄悄封顶的总数比没有总数糟。
+ */
+const SERVER_ROW_LIMIT = 1000;
+
+const PLAN_LABEL: Record<string, string> = {
+  trial: "日卡",
+  basic: "入门",
+  power: "主力",
+  ultra: "尊享",
+  pro: "pro（已停售，仅供老用户补发）",
+};
+
+const planOptions = () => planKeys().map((key) => ({ key, label: PLAN_LABEL[key] || key }));
 
 /**
  * User-facing credit balances are denominated at N real billing cents = $1.00 of visible
@@ -511,7 +527,7 @@ export function Billing() {
         {/* ---------------- 订单 ---------------- */}
         <TabsContent value="orders">
           <Panel
-            title={`订单 · ${orders.length}`}
+            title={`订单 · ${orders.length}${orders.length >= SERVER_ROW_LIMIT ? "（只列最近 1000 笔，统计也只到这里）" : ""}`}
             aside={
               <div className="w-36">
                 <Select
@@ -642,7 +658,7 @@ export function Billing() {
                 <>
                   <Field id="pr-plan" label="套餐">
                     <Select id="pr-plan" value={pPlan} onChange={(e) => setPPlan(e.target.value)}>
-                      {PLANS.map((p) => (
+                      {planOptions().map((p) => (
                         <option key={p.key} value={p.key}>
                           {p.label}
                         </option>
@@ -771,7 +787,7 @@ export function Billing() {
                   <>
                     <Field id="gen-plan" label="套餐">
                       <Select id="gen-plan" value={gPlan} onChange={(e) => setGPlan(e.target.value)}>
-                        {PLANS.map((p) => (
+                        {planOptions().map((p) => (
                           <option key={p.key} value={p.key}>
                             {p.label}
                           </option>
@@ -849,7 +865,7 @@ export function Billing() {
           </Panel>
 
           <Panel
-            title={`兑换码 · ${codes.length}，未使用 ${unused.length}`}
+            title={`兑换码 · ${codes.length}${codes.length >= SERVER_ROW_LIMIT ? "（只列最近 1000 个）" : ""}，未使用 ${unused.length}`}
             aside={
               <div className="w-36">
                 <Select
