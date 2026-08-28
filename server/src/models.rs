@@ -4913,25 +4913,42 @@ pub(crate) fn effective_cache_prices(
         return (0.0, 0.0);
     }
     let live = crate::model_catalog::lookup(model_id);
-    let live_in = live.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
-    let ratio = |cache: Option<f64>| match (cache, live_in) {
-        (Some(c), Some(ci)) => Some(c / ci),
-        _ => None,
+
+    // ① 目录（OpenRouter 实时）有这个模型的缓存价 → **直接用它的绝对值**。
+    //
+    // 2026-08-28 改：这一级原来是 `你的输入价 × (目录缓存价 ÷ 目录输入价)` —— 缓存价
+    // **跟着你的加价一起放大**。线上 claude-opus-5 目录 $5/$6.25，把输入价改成 $15
+    // 之后缓存写入自动变成 $18.75，而中转那边按它自己的价目收。于是「同样的价、同样的
+    // 输入输出、同样的缓存价」，算出来和实际扣的差好几倍 —— 用户就是这么发现的。
+    //
+    // 缓存价是**模型本身的属性**（哪家卖都是这个数量级），不是你的定价策略的函数。
+    // 输入/输出价照旧走 `effective_token_prices`（你填了就听你的），缓存价对齐目录。
+    //
+    // ② 目录没有这个模型 → 后台手填的连接级缓存价，但仅限**同一配置层**。
+    //    跨层混搭就是那个 $119 的老 bug：连接级只能填一个数，而一条连接上同时跑
+    //    Opus/Sonnet/Fable，填的是 Sonnet 的写入价，Opus 就按 Sonnet 收。
+    //    目录有值时这一级根本走不到，那个 bug 对已知模型已经不可能再发生。
+    //
+    // ③ 都没有 → 最后才按输入价 × 固定倍数推算。
+    let pick = |catalog: Option<f64>, conn: f64, factor: f64| -> f64 {
+        if let Some(c) = catalog {
+            return c;
+        }
+        if !price_is_per_model && conn > 0.0 {
+            return conn;
+        }
+        input_price * factor
     };
-    let read = if !price_is_per_model && conn_cache_read > 0.0 {
-        conn_cache_read
-    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_read_price)) {
-        input_price * r
-    } else {
-        input_price * CACHE_READ_FACTOR
-    };
-    let write = if !price_is_per_model && conn_cache_write > 0.0 {
-        conn_cache_write
-    } else if let Some(r) = ratio(live.as_ref().and_then(|e| e.cache_write_price)) {
-        input_price * r
-    } else {
-        input_price * CACHE_WRITE_FACTOR
-    };
+    let read = pick(
+        live.as_ref().and_then(|e| e.cache_read_price),
+        conn_cache_read,
+        CACHE_READ_FACTOR,
+    );
+    let write = pick(
+        live.as_ref().and_then(|e| e.cache_write_price),
+        conn_cache_write,
+        CACHE_WRITE_FACTOR,
+    );
     (read, write)
 }
 
@@ -5029,6 +5046,22 @@ fn compute_cost(
     let (off_in, off_out, price_is_per_model, _price_source) =
         effective_token_prices(model_id, admin_in, admin_out, model_over);
     if off_in <= 0.0 && off_out <= 0.0 {
+        // **显式填 0 和一个价都取不到，是两件事。**
+        //
+        // 前者是运维故意开的免费模型（`model_over` 为 `Some((0,0))`），静默返回 0 完全正确。
+        // 后者是「没填每模型价 + 目录里没有这个模型 + 连接级也没填」—— token 照烧、
+        // 中转照扣钱、我们记 0 分，而**整条链路一句话都不说**。2026-08-28 实测：仅这一天
+        // 就有约 7500 万输入 token 走了这条路，账面上看不出任何异常。
+        //
+        // 不改成报错（那会让用户的请求直接失败，比少收一笔更糟），改成让它在日志里
+        // 喊出来，并且喊的是**能照做的那一句**。
+        if model_over.is_none() {
+            tracing::error!(
+                model = %model_id,
+                "这个模型一个价都取不到（没有每模型覆盖、OpenRouter 目录里没有、连接级也没填），\
+                 本次调用按 0 计费而上游照常扣钱 —— 去「模型线路」里给它填上输入/输出价"
+            );
+        }
         return 0; // no known price for this model → can't compute a real cost
     }
     let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_f64()); // Anthropic
@@ -5069,19 +5102,6 @@ fn compute_cost(
     //      「没写就用 openrouter 实时获取的」，比按输入价拍脑袋推算准得多。
     //      目录明确给 0（缓存读免费的模型）也照用，None 才算"目录没有这个数"。
     //   ③ 目录也没有 → 最后才按输入价 × 倍数推算兜底。
-    let live_cache = crate::model_catalog::lookup(model_id);
-    // 用目录的**真实倍率 × 你实际计费的输入价**，不是照搬目录的绝对缓存价。
-    //
-    // 关键：off_in 是**你收用户的价**（每模型覆盖 / 连接价），常常在目录成本价上加了价——
-    // 线上 claude-opus-5 目录 $5、你收 $15（3×）。缓存价该跟着你的输入价走：照搬目录 $6.25
-    // （那是按目录 $5 算的）会把加价模型的缓存按**成本价**收，少收好几倍，而缓存写入恰恰
-    // 是单价最贵的一类 token。倍率取自目录（cache/input），比写死的 0.1/1.25 准——实测
-    // deepseek 缓存读真实 0.2×、不是默认 0.1×。目录明确给 0（免费缓存）→ 倍率 0 → 收 0。
-    let live_in = live_cache.as_ref().and_then(|e| e.input_price).filter(|p| *p > 0.0);
-    let cache_ratio = |cache: Option<f64>| match (cache, live_in) {
-        (Some(c), Some(ci)) => Some(c / ci),
-        _ => None,
-    };
     // 关闭缓存计费（每线路开关）：缓存读、缓存写都**不收钱**，普通输入照常。
     // 用户："我拉取的模型自带价格和缓存价……新增一个关闭缓存的开关，关闭的话价格一样、
     // 不收缓存钱。" 灰产/便宜渠道用——缓存那点钱干脆不算，输入输出价一分不动。
@@ -15664,11 +15684,55 @@ mod billing_tests {
         );
     }
 
-    /// 加价模型：你把输入价从目录的 $5 覆盖成 $15（3×），缓存价必须跟着放大到 3×，
-    /// 不能照搬目录按 $5 算出的绝对值——那会把最贵的缓存写入按成本价收，少收 3 倍。
-    /// 这是 2026-08-18 修的核心。
+    /// 一个价都取不到时按 0 计费 —— 这条路必须**出声**。
+    ///
+    /// 静默的后果实测过：2026-08-28 一天约 7500 万输入 token 走了这条路，中转照扣钱、
+    /// 我们记 0 分，账面上完全看不出异常。而「运维故意填 0 开免费模型」必须仍然安静，
+    /// 否则日志里全是噪音，真出事那句就被淹掉。
     #[test]
-    fn marked_up_input_scales_cache_price_by_the_catalog_ratio() {
+    fn a_model_with_no_price_at_all_is_not_billed_silently() {
+        let src = include_str!("models.rs");
+        // 先切掉测试模块：否则窗口会吃到文件末尾，匹配到这个测试自己写的字面量。
+        let prod = &src[..src.find("mod billing_tests").unwrap_or(src.len())];
+        let at = prod
+            .find("if off_in <= 0.0 && off_out <= 0.0 {")
+            .expect("取不到价的早退没了");
+        // **按结构取，不按固定字节数。** 中文注释一个字三个字节，`&prod[at..at+1400]`
+        // 第一版就把 `tracing::error!` 推到窗口外了 —— 而那种失败长得像「功能没做」。
+        let end = prod[at..]
+            .find("return 0; // no known price")
+            .map(|j| at + j)
+            .expect("早退那一句的结尾没了");
+        let block = &prod[at..end];
+        assert!(
+            block.contains("if model_over.is_none()") && block.contains("tracing::error!"),
+            "一个价都取不到时仍然静默按 0 计费 —— 白送掉的量在账面上看不出来",
+        );
+        // 显式填 0 必须走**不喊**的那一支：判据是 `model_over.is_none()` 这道闸还在。
+        let guard_at = block.find("if model_over.is_none()").unwrap();
+        let err_at = block.find("tracing::error!").unwrap();
+        assert!(
+            guard_at < err_at,
+            "喊话没有被 model_over.is_none() 挡住 —— 故意开的免费模型会把日志刷满",
+        );
+    }
+
+    /// **加价不放大缓存价**（2026-08-28 用户要求，推翻 2026-08-18 那版）。
+    ///
+    /// 旧规则是「缓存价 = 你的输入价 × 目录倍率」：把 opus-5 的输入价从目录的 $5 覆盖成
+    /// $15，缓存写入自动跟着变成 $18.75。它的出发点是「别把最贵的一类 token 按成本价卖」。
+    ///
+    /// 但它有个线上暴露出来的后果：**缓存价不再是模型的属性，而变成你定价策略的函数**。
+    /// 中转那边按它自己的价目扣钱，我们这边按「你的加价 × 倍率」算，于是「同样的价、
+    /// 同样的输入输出、同样的缓存价」，两边差好几倍 —— 对不上账，也没法判断一条线路
+    /// 到底赚不赚。用户是从余额掉得比账面快发现的。
+    ///
+    /// 新规则：输入/输出价你填了就听你的，**缓存价一律对齐 OpenRouter 的真实绝对价**。
+    ///
+    /// 代价明说：加价模型的缓存写入按目录成本价收，比旧规则少收。这是**刻意的**——
+    /// 要多收就把这部分加进输入/输出价里，那是显式的、对得上账的加价方式。
+    #[test]
+    fn marked_up_input_does_not_scale_the_cache_price() {
         seed_catalog();
         use crate::model_catalog::{seed_for_test, Entry};
         // 目录成本价：输入 $5、缓存写 $6.25（倍率 1.25×）、缓存读 $0.5（0.1×）。
@@ -15687,17 +15751,35 @@ mod billing_tests {
             "input_tokens": 1, "output_tokens": 0,
             "cache_read_input_tokens": 0, "cache_creation_input_tokens": 1_000_000,
         });
-        // 缓存写：倍率 1.25 × 你的 $15 = $18.75 = 1875 分。照搬目录只有 625 分（少收 3×）。
+        // 缓存写 = 目录绝对价 $6.25 × 100 万 = 625 分。**和有没有加价无关。**
+        let with_markup =
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, Some((15.0, 25.0)), false);
+        let without_markup =
+            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false);
+        assert_eq!(with_markup, 625, "缓存写没有对齐目录绝对价（$6.25/百万）");
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, Some((15.0, 25.0)), false),
-            1875,
-            "加价模型的缓存写没跟着放大——按成本价收了，少收 3 倍"
+            with_markup, without_markup,
+            "把输入价从 $5 加到 $15，缓存价跟着变了 —— 缓存价必须是模型的属性，\
+             不是你定价策略的函数，否则和中转对不上账",
         );
-        // 不加价（off_in 就用目录 $5）时，倍率 × 输入 = 目录绝对值，结果不变（625 分）。
+
+        // 但**输入价本身照旧听你的**：同一次覆盖，普通输入必须按 $15 收。
+        // 少了这一条，把缓存和输入一起写死成目录价也能让上面两条通过。
+        let plain_usage = serde_json::json!({
+            "input_tokens": 1_000_000, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        });
         assert_eq!(
-            compute_cost(Some(&write_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, None, false),
-            625,
-            "不加价时应当正好等于目录绝对值"
+            compute_cost(Some(&plain_usage), "markup-model", 1.0, 0.0, 0.0, 0.0, 0.0, Some((15.0, 25.0)), false),
+            1500,
+            "每模型覆盖的输入价没生效 —— 用户填的价必须照收",
+        );
+
+        // 倍率仍然乘在全部四项上（rate=2 → 翻倍）。用户填了倍率却不生效正是这次的起点。
+        assert_eq!(
+            compute_cost(Some(&write_usage), "markup-model", 2.0, 0.0, 0.0, 0.0, 0.0, Some((15.0, 25.0)), false),
+            1250,
+            "倍率没有作用在缓存写上",
         );
     }
 
