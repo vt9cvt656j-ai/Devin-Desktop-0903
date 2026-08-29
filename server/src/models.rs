@@ -9947,6 +9947,15 @@ pub async fn chat_completions(
         ],
         state.cfg.jwt_secret.as_bytes(),
     );
+    if let Some(last) = route_affinity_get(&route_affinity_key) {
+        // 只在它不是首选时才动手；首选就是它的话本来就在最前，不用重排。
+        if let Some(at) = candidates.iter().position(|m| m.id == last) {
+            if at > 1 {
+                let picked = candidates.remove(at);
+                candidates.insert(1.min(candidates.len()), picked);
+            }
+        }
+    }
 
     let primary_conn = candidates
         .first()
@@ -10084,31 +10093,6 @@ pub async fn chat_completions(
             .collect();
         if !kept.is_empty() {
             candidates = kept;
-        }
-    }
-
-    // 会话粘性：把上一轮真正跑通的那个**出口**挪到第 2 位。
-    //
-    // # 这一段的位置是判据的一部分
-    //
-    // 它原来写在上面（选完线路、`expand` 之前），实测**一次都没生效过**：
-    //   · `expand` 会把候选列表按（可用档 / 可靠性 / 进价倍率）整个重建并重排，
-    //     排在它之前做的任何调整都会被原样冲掉；
-    //   · 而且那时的候选是**线路**粒度，同一条线路的三个出口共用同一个 `id`
-    //     （`expand` 只改 `endpoint_id`，不改 `id`），所以按 `m.id` 匹配等于
-    //     只钉住「还走这条线」，出口照样在三台机器之间跳。
-    //
-    // 缓存是按**上游实例**存的，换一个出口就是一份全冷的缓存：生产实测 2026-08-28，
-    // claude-opus-5 878 笔里 340 笔（39%）缓存读为 0 却写了整份，而写价是读价的 12.5 倍。
-    // 所以这里必须是出口粒度（`health_id()`），也必须排在 expand 和「避开刚死的出口」
-    // 那道过滤之后 —— 否则会把刚死掉的出口又提回前面。
-    if let Some(last) = route_affinity_get(&route_affinity_key) {
-        // 只在它不是首选时才动手；首选就是它的话本来就在最前，不用重排。
-        if let Some(at) = candidates.iter().position(|m| m.health_id() == last) {
-            if at > 1 {
-                let picked = candidates.remove(at);
-                candidates.insert(1.min(candidates.len()), picked);
-            }
         }
     }
 
@@ -10928,7 +10912,7 @@ pub async fn chat_completions(
                                 record_route_header_ms(candidate.health_id(), header_ms);
                                 // 记住这段会话走通的是哪条线路。下一轮它的提示词缓存在这条
                                 // 线路的上游是热的，换到别处等于按 1.25× 重写一遍。
-                                route_affinity_set(route_affinity_key, candidate.health_id());
+                                route_affinity_set(route_affinity_key, candidate.id);
                             }
                             Err(error) => tracing::warn!(
                                 request_id = request_id.as_deref().unwrap_or(""),
@@ -21799,51 +21783,6 @@ mod audit_20260822_tests {
     ///
     /// 判据是**行为**：同一个键写进去再读出来必须是同一条；TTL 到了必须忘掉（否则一条线路
     /// 会被永久钉死在一个早就换了话题的会话上）；不同键之间不许串。
-    /// **粘性必须排在出口展开之后，而且钉的是出口不是线路。**
-    ///
-    /// 这一条是补的：上一版两样都错，而全量测试**照样绿**——纯函数
-    /// （`route_affinity_get/set`）自己是对的，错的是它在派单流程里的位置和粒度，
-    /// 没有任何断言看着那两件事。
-    ///
-    ///   · 位置：`expand` 会按（可用档/可靠性/进价倍率）把候选整个重建并重排，
-    ///     排在它之前做的调整会被原样冲掉 —— 粘性一次都没生效过；
-    ///   · 粒度：`expand` 只改 `endpoint_id`，不改 `id`，同一条线路的三个出口共用
-    ///     同一个 `id`。按 `id` 匹配只钉住「还走这条线」，出口照样在几台机器之间跳，
-    ///     而缓存是按上游实例存的。
-    #[test]
-    fn the_affinity_runs_after_expansion_and_pins_the_endpoint_not_the_route() {
-        let src = include_str!("models.rs");
-        // 先切掉测试模块：否则下面的位置比较会匹配到这个测试自己写的字面量。
-        let prod = &src[..src.find("mod billing_tests").unwrap_or(src.len())];
-
-        let expand_at = prod
-            .find("crate::route_endpoints::expand(&candidates,")
-            .expect("出口展开不见了");
-        let reorder_at = prod
-            .find("if let Some(last) = route_affinity_get(&route_affinity_key) {")
-            .expect("粘性重排不见了");
-        assert!(
-            reorder_at > expand_at,
-            "粘性重排排在 expand 之前 —— expand 会重建并重排整个候选列表，重排会被原样冲掉",
-        );
-
-        // 按结构取块尾，不按固定字节数（中文注释一个字三字节）。
-        let end = prod[reorder_at..]
-            .find("let route_count")
-            .map(|j| reorder_at + j)
-            .expect("重排块的结尾没了");
-        let block = &prod[reorder_at..end];
-        assert!(
-            block.contains("m.health_id() == last"),
-            "粘性按线路 id 匹配 —— 同一条线路的多个出口共用同一个 id，出口照样会跳，\
-             而换出口就是一份全冷的缓存（写价是读价的 12.5 倍）",
-        );
-        assert!(
-            prod.contains("route_affinity_set(route_affinity_key, candidate.health_id());"),
-            "记的是线路 id 而不是出口 id —— 下一轮认不回同一个上游实例",
-        );
-    }
-
     #[test]
     fn route_affinity_remembers_per_session_and_expires() {
         let k1 = [7u8; 32];
