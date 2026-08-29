@@ -233,6 +233,24 @@ pub fn usd_per_cny_bps() -> i64 {
         .clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS)
 }
 
+/// **美元分 → 用户钱包口径的分。**
+///
+/// `compute_cost` 全程按**美元**单价算（目录价、每模型覆盖、连接价，单位都是
+/// 「美元 / 百万 token」），返回的是美元分。而用户的钱包/额度是人民币口径。
+/// 直接拿美元分去减 `credits_cents`，等于按 1 美元 = 1 元扣 —— 实测差 7.1 倍：
+/// 一笔算出 $0.039 的调用，只从用户账上扣掉 ¥0.039，而中转按美元实收。
+///
+/// 汇率取后台设置的 `usd_per_cny_bps`（1 人民币分折合多少美元分，万分比），
+/// 不写死：汇率变了改一个数字就行，不用改代码重新发版。
+pub fn usd_cents_to_wallet_cents(usd_cents: i64) -> i64 {
+    let bps = usd_per_cny_bps();
+    if bps <= 0 {
+        return usd_cents; // 夹过区间了，理论到不了；到了也宁可少收不要乱收
+    }
+    // 用 i128 中转：usd_cents 最大到成本上限 5000，乘 10000 不会溢出，但写死安全边界。
+    ((usd_cents as i128 * 10_000) / bps as i128) as i64
+}
+
 /// 同一个数的浮点形式，供利润测算用（`models.rs` 原先的 6.63）。
 pub fn raw_usd_per_visible_usd() -> f64 {
     raw_cents_per_credit_usd() as f64 / 100.0

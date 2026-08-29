@@ -6923,7 +6923,19 @@ async fn bill_inner(
     // settled_requests 账本之外，重跑会双扣——见对抗审查 finding 1/3/5），以及失败时不重复入队。
     from_recovery: bool,
 ) -> BillOutcome {
+    // **扣的是用户的钱包，而钱包是人民币口径；`cost` 是美元分。**
+    //
+    // compute_cost 全程按美元单价算（目录价 / 每模型覆盖 / 连接价，单位都是
+    // 「美元 / 百万 token」）。这个数原来被直接拿去减 `credits_cents`，等于按
+    // 1 美元 = 1 元扣 —— 用户看到的 $0.039 就只从账上少了 ¥0.039，而中转那边
+    // 按美元实收，差 7.1 倍。
+    //
+    // 只折算**扣用户的这一份**。上层 `bill()` 传给 `note_endpoint_usage` 的仍然是
+    // 原始美元分 —— 对账页的收入/成本两侧都是美元口径，折在这里才不会污染它。
     // 入队一笔失败结算的快照：把当前输入原样交给 settlement::queue（无 request_id 的它会自行不入队）。
+    //
+    // **快照里存的必须是折算前的美元分。** 折算写在它前面的话，重放时会再折一次，
+    // 7.1 × 7.1 ≈ 50 倍 —— 而重放路径平时不走，这种错要等到一次结算失败才暴露。
     let queue_input = |stage: &'static str| crate::settlement::QueueInput {
         settlement_id,
         uid,
@@ -6944,6 +6956,16 @@ async fn bill_inner(
         emitted_tool: tokens.emitted_tool.clone(),
         stage,
     };
+
+    // **扣的是用户的钱包，而钱包是人民币口径；`cost` 是美元分。**
+    //
+    // compute_cost 全程按美元单价算（目录价 / 每模型覆盖 / 连接价，单位都是
+    // 「美元 / 百万 token」）。这个数原来被直接拿去减 `credits_cents`，等于按
+    // 1 美元 = 1 元扣 —— 用户看到 $0.039，账上就只少 ¥0.039，而中转按美元实收。
+    //
+    // 只折算**扣用户的这一份**：上层 `bill()` 传给 `note_endpoint_usage` 的仍是原始
+    // 美元分，对账页收入/成本两侧都保持美元口径。汇率取后台的 `usd_per_cny_bps`。
+    let cost = crate::settings::usd_cents_to_wallet_cents(cost);
 
     let requested_cost = cost.max(0);
     // Free models bill against the daily points pool, never quota or wallet. Done here rather
