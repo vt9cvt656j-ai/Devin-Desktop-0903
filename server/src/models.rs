@@ -1285,16 +1285,62 @@ fn route_goes_to_the_back(
     route_count > 1 && (cooled || mutes || stalled || broken)
 }
 
+/// 每条线路**自己**的正常首字节时间（指数滑动平均，毫秒）。
+static ROUTE_HEADER_EWMA_MS: LazyLock<Mutex<HashMap<uuid::Uuid, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 新样本的权重。0.25 ≈ 四次请求换掉一半的记忆：跟得上线路真的变快/变慢，
+/// 又不会被单次抖动带走。
+const ROUTE_HEADER_EWMA_ALPHA: f64 = 0.25;
+
+/// 再快的线路也至少给这么久 —— 低于它就会被一次正常的网络抖动切掉。
+const HEADER_WAIT_FLOOR: Duration = Duration::from_secs(20);
+
+pub(crate) fn record_route_header_ms(route_id: uuid::Uuid, ms: u128) {
+    if ms == 0 {
+        return;
+    }
+    if let Ok(mut m) = ROUTE_HEADER_EWMA_MS.lock() {
+        let e = m.entry(route_id).or_insert(ms as f64);
+        *e = *e * (1.0 - ROUTE_HEADER_EWMA_ALPHA) + (ms as f64) * ROUTE_HEADER_EWMA_ALPHA;
+    }
+}
+
+fn route_header_ewma(route_id: uuid::Uuid) -> Option<Duration> {
+    let m = ROUTE_HEADER_EWMA_MS.lock().ok()?;
+    m.get(&route_id).map(|ms| Duration::from_millis(*ms as u64))
+}
+
 /// 这一次给这条线路多少表头耐心。
 ///
-/// 正常情况就是按请求形态算出来的上限；只有当这条线路最近整整卡满过一次时，才压到
-/// 短探测预算。注意这是**减少**耐心，不是跳过 —— 请求照发，上游恢复了就照常拿到结果。
+/// # 用户要的规则
+///
+/// 「慢但能用的不需要切换，不能用的就切换。」这两件事**不能用同一个常数**分开：
+/// 首字节预算原来对所有线路都是 57 秒，于是 polly（正常 5 秒出首字节）挂掉时，
+/// 用户也要干等 57 秒才轮到下一条 —— 那正是「切换很慢」的来源。
+///
+/// 判据改成**这条线路自己的正常速度**：`它的均值 × 2.5`。
+///
+/// ```text
+///   polly     均值  5.0s → 12.5s → 抬到下限 20s   （挂了 20 秒就切，不再等 57）
+///   梦幻API   均值 24.4s → 61.0s → 仍取 base 57s  （它本来就慢，照常等，不切）
+///   清衍      均值 26.8s → 67.0s → 仍取 base 57s  （同上）
+/// ```
+///
+/// **只会收紧，绝不放宽**（`base.min(...)`）。这一条是上一版翻车的地方：那版写成
+/// 「卡顿窗口内给 3×均值」，慢线路算出来 59s 反而盖过了原本 25 秒的惩罚，
+/// 于是切换比改之前更慢 —— 用户当场感觉到了。没有样本时退回 `base`，
+/// 也就是改动前的行为，不凭一个还不存在的均值去砍任何线路。
 fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
+    let by_speed = route_header_ewma(route_id)
+        .map(|avg| (avg * 5 / 2).max(HEADER_WAIT_FLOOR))
+        .unwrap_or(base);
+    let mut wait = base.min(by_speed);
+    // 最近整整卡满过一次的线路，额外压到短探测预算。请求照发，恢复了就照常拿结果。
     if route_recently_stalled(route_id, now) {
-        base.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT)
-    } else {
-        base
+        wait = wait.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT);
     }
+    wait
 }
 
 fn thinking_clip_active(id: uuid::Uuid) -> bool {
@@ -10883,6 +10929,8 @@ pub async fn chat_completions(
                                 );
                                 // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
                                 clear_route_stall(candidate.health_id());
+                                // 喂给「这条线路的正常速度」——快切的判据全靠它。
+                                record_route_header_ms(candidate.health_id(), header_ms);
                                 // 记住这段会话走通的是哪条线路。下一轮它的提示词缓存在这条
                                 // 线路的上游是热的，换到别处等于按 1.25× 重写一遍。
                                 route_affinity_set(route_affinity_key, candidate.id);
@@ -20309,6 +20357,71 @@ mod stall_routing_tests {
     ///
     /// 以前记号只压缩表头耐心、不参与排序，于是主线路挂掉时冷却（20s）一过，请求又落回
     /// 死线路垫满 25 秒才 504，旁边的健康线路一次都没被优先过。
+    /// 用户的规则：**慢但能用的不切，不能用的快切。**
+    ///
+    /// 上一版在这里翻过一次车：写成「卡顿窗口内给 3×均值」，慢线路算出 59s 反而盖过了
+    /// 原本 25 秒的惩罚，切换比改之前**更慢**。所以这一条同时钉两个方向。
+    #[test]
+    fn a_fast_route_is_cut_quickly_and_a_slow_one_keeps_its_patience() {
+        let base = Duration::from_secs(57);
+        let now = Instant::now();
+        let fast = uuid::Uuid::from_bytes([31; 16]);
+        let slow = uuid::Uuid::from_bytes([32; 16]);
+        let fresh = uuid::Uuid::from_bytes([33; 16]);
+
+        // 生产实测（2026-08-29）：polly 5.0s、梦幻API 24.4s。
+        for _ in 0..12 {
+            super::record_route_header_ms(fast, 5_000);
+        }
+        for _ in 0..12 {
+            super::record_route_header_ms(slow, 24_400);
+        }
+
+        let fast_wait = super::header_wait_for_route(base, fast, now);
+        let slow_wait = super::header_wait_for_route(base, slow, now);
+
+        // 快线路：不回应时必须**远早于** base 就放弃，否则用户干等一分钟。
+        assert!(
+            fast_wait < base / 2,
+            "正常 5 秒出首字节的线路挂掉后还要等 {fast_wait:?}（base {base:?}）—— 切换太慢",
+        );
+        // 但也不能被一次抖动切掉。
+        assert!(
+            fast_wait >= HEADER_WAIT_FLOOR,
+            "快线路的预算低于下限 {HEADER_WAIT_FLOOR:?}，一次正常抖动就会被切",
+        );
+        // 慢线路：它本来就慢，不许因为「慢」被砍预算。
+        assert_eq!(
+            slow_wait, base,
+            "本来就要 24 秒出首字节的线路被砍到 {slow_wait:?} —— 「慢但能用」被当成了「不能用」",
+        );
+        // **永远不放宽。** 上一版正是在这里放宽到了 base 之上。
+        for id in [fast, slow, fresh] {
+            assert!(
+                super::header_wait_for_route(base, id, now) <= base,
+                "预算超过了请求本身的上限 —— 切换只会比不改更慢",
+            );
+        }
+        // 没有样本（刚重启）→ 退回 base，不凭一个还不存在的均值砍线路。
+        assert_eq!(super::header_wait_for_route(base, fresh, now), base);
+    }
+
+    /// 上一条自己往表里塞样本。生产代码里那句 record 如果不存在，它**照样绿** ——
+    /// 而没有样本，`header_wait_for_route` 永远退回 base，快切一次都不会发生。
+    #[test]
+    fn the_success_path_actually_feeds_the_first_byte_average() {
+        let src = include_str!("models.rs");
+        let prod = &src[..src.find("mod billing_tests").unwrap_or(src.len())];
+        let at = prod
+            .find("clear_route_stall(candidate.health_id());")
+            .expect("成功钩子不见了");
+        let end = prod[at..].find("\n                            }").map(|j| at + j).unwrap_or(prod.len());
+        assert!(
+            prod[at..end].contains("record_route_header_ms(candidate.health_id(), header_ms)"),
+            "成功路径没有回喂首字节样本 —— 速度表永远是空的，快切判据形同虚设",
+        );
+    }
+
     #[test]
     fn a_stalled_route_goes_to_the_back_when_there_is_another_route() {
         // 只因卡死就该排后面
