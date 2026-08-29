@@ -164,8 +164,12 @@
  * 999px 圆角在专业工具里几乎不出现（它属于社交/消费类产品的语言）。收到 6px，
  * 加发丝边和极轻阴影，立刻从"气泡"变成"可点的控件"。
  * ------------------------------------------------------------------------- */
+/* **`.next-steps__chip` 不在这条规则里。** 它当初确实是个胶囊，所以被一起收进来了；
+   后来 app.css 把它重做成了「接下来」那组**多行卡片**（padding 10px 13px、不限行数），
+   而这里的 `height: 30px` 还在，于是盒子只有一行高、正文有三四行 —— 文字整段溢出到
+   框外，后面的卡片被压在溢出的文字底下，看起来就是「内容都出来了 + 第三张卡片不见了」。
+   它在 app.css 里有完整的一套（边框/底色/圆角/内距/hover），这里不要再碰。 */
 .chip,
-.next-steps__chip,
 .chat-empty__chips button,
 .composer-suggest button {
   height: 30px;
@@ -180,7 +184,6 @@
   transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
 }
 .chip:hover,
-.next-steps__chip:hover,
 .chat-empty__chips button:hover,
 .composer-suggest button:hover {
   background: var(--hover);
