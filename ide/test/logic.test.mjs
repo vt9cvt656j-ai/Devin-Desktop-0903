@@ -36353,3 +36353,38 @@ test("文件系统布局那一处仍然按操作系统判（别合并）", () =>
   assert.match(SRC, /const candidates = _isWin[\s\S]{0,120}Scripts\/python\.exe/,
     "venv 的候选路径不该改成按 shell 判——那问的是文件系统布局");
 });
+
+// ---------------------------------------------------------------------------
+// 「接下来」卡片不许被任何"统一 chip 样式"的规则套上固定高度
+// ---------------------------------------------------------------------------
+test("接下来卡片是多行卡片，不能被 chip 胶囊规则钉死高度", () => {
+  const refine = readFileSync(join(HERE, "../src/styles/refine.css"), "utf8");
+  // 注释里会逐字引用被删掉的旧选择器，先剥注释再断言。
+  const code = refine.replace(/\/\*[\s\S]*?\*\//g, "");
+
+  // refine.css 在 app.css **之后**导入（boot.jsx），靠源码顺序取胜。所以它里面任何
+  // 命中 .next-steps__chip 的规则都会盖掉 app.css 那套多行卡片样式。
+  //
+  // 真实事故：那条「把所有 chip 收成 6px 圆角胶囊」的规则里带着 `height: 30px`，
+  // 而卡片正文有三四行 —— 盒子一行高、文字整段溢出到框外，后面的卡片被压在溢出的
+  // 文字底下，用户看到的是「内容都出来了 + 第三张卡片消失了」。
+  assert.ok(
+    !code.includes(".next-steps__chip"),
+    "refine.css 又开始给 .next-steps__chip 定样式了 —— 它在 app.css 里是多行卡片，" +
+      "这里任何 height/padding/border-radius 都会把它压回一行高的胶囊",
+  );
+
+  // 而 app.css 那一份必须还在，且**不带固定高度**。
+  const chip = APP_CSS.match(/\.next-steps__chip\s*\{[^}]*\}/);
+  assert.ok(chip, "app.css 里 .next-steps__chip 的样式不见了");
+  assert.ok(
+    // 不能用 `\bheight` —— 连字符也算词边界，`line-height: 1.5` 会被误判成写死了高度。
+    !/(?<![-\w])height\s*:/.test(chip[0]),
+    `.next-steps__chip 被写死了高度，多行正文会溢出框外：${chip[0]}`,
+  );
+  // 卡片靠内距撑开，胶囊靠固定高度。有内距才说明它还是卡片。
+  assert.ok(
+    /padding\s*:\s*\d+px\s+\d+px/.test(chip[0]),
+    "卡片没有上下内距了，那是胶囊不是卡片",
+  );
+});
