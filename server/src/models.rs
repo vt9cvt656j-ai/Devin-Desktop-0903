@@ -133,9 +133,18 @@ const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 /// latency includes model prefill. Production logs show healthy Claude headers beyond 8s
 /// (p95 ~8.2s, max ~8.5s on the current route). The old 8/10/11s ceilings sat inside the
 /// normal latency tail and generated self-inflicted 504s before the provider had failed.
-const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
-const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
-const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(57);
+// 首字节的绝对上限。2026-08-29 从 57 秒砍到 30 秒。
+//
+// 57 秒是按「最坏情况上游还能回来」定的，可这里是**交互式 IDE**：等一分钟才出第一个字，
+// 那条线路就算最后回来了也没意义。生产实测（2026-08-29）同批 claude 出口的正常首字节是
+// polly 5.0s、梦幻API 24.4s、清衍 26.8s —— 57 秒里有一半是在已经挂掉的线路上干等。
+//
+// **下不到 25 秒**：同一份实测里健康响应的 p90 是 21.7 秒，上限压到 25 会把一成正常请求
+// 也截断，每截断一次又记一次卡死，把慢线路自己按死。30 秒留了足够余量，
+// 而每条线路具体等多久还会按它自己的速度再收紧一次（见 `header_wait_for_route`）。
+const STANDARD_MAX_HEADER_WAIT: Duration = Duration::from_secs(30);
+const AGENT_MAX_HEADER_WAIT: Duration = Duration::from_secs(30);
+const DEEP_MAX_HEADER_WAIT: Duration = Duration::from_secs(30);
 const MAX_ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
 const ROUTE_BUDGET: Duration = Duration::from_secs(58);
 const CLIENT_DEADLINE_MARGIN: Duration = Duration::from_millis(750);
@@ -887,7 +896,7 @@ pub(crate) const CHAT_UPSTREAM_STALL_MEMORY: Duration = Duration::from_secs(120)
 /// 注意**不是**「让客户端的重试得以发生」——客户端那个 60 秒是每次尝试各自一份，不是
 /// 整轮共用一份，57 秒的回答本来就不会吃掉后续重试。这里买到的是等待时间腰斩，不是
 /// 重试次数。
-const CHAT_UPSTREAM_STALLED_PROBE_WAIT: Duration = Duration::from_secs(25);
+const CHAT_UPSTREAM_STALLED_PROBE_WAIT: Duration = Duration::from_secs(15);
 // 中转丢块自愈：jgy 等聚合中转在深思考超过 ~7.5K token 后会丢掉后面的 text/tool_use
 // 块并谎报 end_turn（对照实验：budget 6000 → thinking+text+tool_use 正常；budget 24000
 // → 只回 thinking 就 end_turn；官方 API 绝不会思考完直接收尾）。检出签名后该线路记
@@ -1294,7 +1303,11 @@ static ROUTE_HEADER_EWMA_MS: LazyLock<Mutex<HashMap<uuid::Uuid, f64>>> =
 const ROUTE_HEADER_EWMA_ALPHA: f64 = 0.25;
 
 /// 再快的线路也至少给这么久 —— 低于它就会被一次正常的网络抖动切掉。
-const HEADER_WAIT_FLOOR: Duration = Duration::from_secs(20);
+///
+/// 20 → 10 秒（2026-08-29）：上限砍到 30 秒之后，20 秒的下限会把快线路和慢线路压得
+/// 差不多（20–30 秒），按速度分档就白做了。polly 正常 5 秒出首字节，
+/// 10 秒还没动静基本可以断定它不在服务。
+const HEADER_WAIT_FLOOR: Duration = Duration::from_secs(10);
 
 pub(crate) fn record_route_header_ms(route_id: uuid::Uuid, ms: u128) {
     if ms == 0 {
@@ -1337,8 +1350,14 @@ fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> 
         .unwrap_or(base);
     let mut wait = base.min(by_speed);
     // 最近整整卡满过一次的线路，额外压到短探测预算。请求照发，恢复了就照常拿结果。
+    //
+    // **但这个短预算也不能低于它自己的正常速度。** 否则一条只是慢的线路会被反复截断，
+    // 每次截断又记一次卡死，自己把自己按死在短预算上 —— 原来那条 `>= 22 秒` 的下限断言
+    // 守的就是这件事，只是它用的是全局 p90（21.7s），对 polly 这种 5 秒的线路太松。
+    // 改成按线路取：慢线路拿自己的正常值，快线路才真的被压到 15 秒。
     if route_recently_stalled(route_id, now) {
-        wait = wait.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT);
+        let own = route_header_ewma(route_id).unwrap_or(CHAT_UPSTREAM_STALLED_PROBE_WAIT);
+        wait = wait.min(CHAT_UPSTREAM_STALLED_PROBE_WAIT.max(own));
     }
     wait
 }
@@ -18424,17 +18443,17 @@ mod upstream_timeout_tests {
     /// first-event latency without consuming the client's full 60s deadline.
     #[test]
     fn per_attempt_header_wait_is_request_aware_and_capped() {
-        assert_eq!(
-            max_header_wait_for_request(false, false),
-            Duration::from_secs(57)
-        );
-        assert_eq!(
-            max_header_wait_for_request(false, true),
-            Duration::from_secs(57)
-        );
-        assert_eq!(
-            max_header_wait_for_request(true, true),
-            Duration::from_secs(57)
+        // 57 → 30 秒（2026-08-29）：交互式 IDE 里等一分钟才出第一个字，
+        // 那条线路就算最后回来了也没意义。下不到 25 是因为健康响应的 p90 是 21.7 秒。
+        for (deep, agentic) in [(false, false), (false, true), (true, true)] {
+            assert_eq!(
+                max_header_wait_for_request(deep, agentic),
+                Duration::from_secs(30)
+            );
+        }
+        assert!(
+            STANDARD_MAX_HEADER_WAIT > Duration::from_secs(22),
+            "上限压到了健康响应 p90（21.7s）之下 —— 正常的慢请求会被当成挂了，反复切换"
         );
         assert!(DEEP_MAX_HEADER_WAIT < ROUTE_BUDGET);
     }
@@ -20316,11 +20335,38 @@ mod route_cooldown_tests {
             CHAT_UPSTREAM_STALLED_PROBE_WAIT * 2 <= STANDARD_MAX_HEADER_WAIT,
             "短探测预算不够短，省不下多少等待时间"
         );
-        // 下限：必须高于健康响应的 p90（实测 21.7s），否则一条只是慢的线路会被反复截断，
-        // 每次截断又记一次卡死，自己把自己按死在短预算上。
+        // 下限：**一条只是慢的线路不许被这个短预算反复截断** —— 每次截断又记一次卡死，
+        // 自己把自己按死在短预算上。
+        //
+        // 这一条原来用的是全局 p90（实测 21.7s）当下限，于是短预算被迫 ≥22 秒 ——
+        // 对 polly 这种正常 5 秒出首字节的线路太松，它挂了也要等 22 秒。
+        // 2026-08-29 改成按线路取：短预算和**这条线路自己的正常值**取大者。
+        // 判据没变（慢线路不许被误判成挂了），只是从一个全局数换成了每条线路自己的数。
+        let slow = uuid::Uuid::from_bytes([41; 16]);
+        for _ in 0..12 {
+            record_route_header_ms(slow, 24_400); // 梦幻API 的实测均值
+        }
+        mark_route_stall(slow);
         assert!(
-            CHAT_UPSTREAM_STALLED_PROBE_WAIT >= Duration::from_secs(22),
-            "短探测预算低于健康响应的 p90，会把「慢」误判成「挂了」"
+            header_wait_for_route(base, slow, Instant::now()) >= Duration::from_secs(24),
+            "一条正常就要 24 秒的线路被短预算截断了 —— 它会一直被记成卡死，永远翻不了身"
+        );
+        // 而快线路必须真的被压下去，否则这条规则什么也没做。
+        let quick = uuid::Uuid::from_bytes([42; 16]);
+        for _ in 0..12 {
+            record_route_header_ms(quick, 5_000); // polly 的实测均值
+        }
+        mark_route_stall(quick);
+        let quick_wait = header_wait_for_route(base, quick, Instant::now());
+        // 用 `<=` 不用 `==`：按速度那一档（5s × 2.5 = 12.5s）本来就比短预算 15s 更紧，
+        // 两道收紧取小者。写死等号会把「按速度切得更快」误判成回归。
+        assert!(
+            quick_wait <= CHAT_UPSTREAM_STALLED_PROBE_WAIT,
+            "卡顿过的快线路没有被压到短预算（拿到 {quick_wait:?}）—— 挂了还要陪它等满预算"
+        );
+        assert!(
+            quick_wait < base / 2,
+            "快线路的等待没有显著低于上限，这条规则等于没做"
         );
     }
 
