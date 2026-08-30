@@ -27,7 +27,15 @@ export function facetSummary(sections) {
   const list = Array.isArray(sections) ? sections : [];
   const parts = list
     .filter((s) => s && s.heading)
-    .map((s) => `${s.heading} ${s.failed ? "失败" : (Array.isArray(s.bullets) ? s.bullets.length : 0)}`);
+    .map((s) => {
+      if (s.failed) return `${s.heading} 失败`;
+      const n = Array.isArray(s.bullets) ? s.bullets.length : 0;
+      // 第三态：命中了 N 段，但一条要点都没压出来（行级过滤器把标题行/表格骨架/过短行
+      // 筛干净了，实测约 13.6% 的小节会这样）。写成裸的 0 就和「这个域确实没有这个主题」
+      // 长得一模一样——而后者是可以据此往下走的结论，前者不是。写成 0/4 段。
+      const hits = Number(s.hits) || 0;
+      return `${s.heading} ${n === 0 && hits > 0 ? `0/${hits} 段` : n}`;
+    });
   return parts.join(" · ");
 }
 
@@ -41,7 +49,12 @@ export function preflightSettleLabel(sections) {
   const failed = list.filter((s) => s?.failed).length;
   if (list.length && failed === list.length) return "";     // 交给 _knowledgeSettleLabel
   const total = list.reduce((n, s) => n + (Array.isArray(s?.bullets) ? s.bullets.length : 0), 0);
-  if (!total) return failed ? `无可用命中 · ${failed} 面失败` : "无可用命中";
+  if (!total) {
+    if (failed) return `无可用命中 · ${failed} 面失败`;
+    // 同上：检索命中了、只是没压出要点，不能和真零命中共用一句话。
+    const hits = list.reduce((n, s) => n + (Number(s?.hits) || 0), 0);
+    return hits > 0 ? `命中 ${hits} 段 · 未压出要点` : "无可用命中";
+  }
   return failed ? `${total} 条 · ${list.length} 面 · ${failed} 面失败` : `${total} 条 · ${list.length} 面`;
 }
 

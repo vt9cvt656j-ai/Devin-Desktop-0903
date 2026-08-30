@@ -146,11 +146,16 @@ test("the opener fold still reaches an opener that carries images", () => {
 // 2. 工具直觉表 + 能力名录
 // ---------------------------------------------------------------------------
 test("the tool hint is argument-free and byte-stable", () => {
-  const build = load("_buildToolHint", { toolCapabilityIndex });
+  // 名录按**真实注册表**过滤（网页版没有的 89 个 desktopOnly 工具不该被列成"全部可用"）。
+  // 那份名单是按进程 memo 的、只在用户改自定义能力声明时失效，**不随轮次变**——
+  // 所以下面那条「同一轮不同入参必须逐字节一致」的前缀缓存不变量照旧成立。
+  const _avail = new Set(["read_file", "write_file", "search", "web_search"]);
+  const build = load("_buildToolHint", { toolCapabilityIndex, _staticToolNames: () => _avail });
   const a = build();
   const b = build("跑起来了但看不到哪里错", { applies: true, bug: true });
   assert.equal(a, b, "anything the turn says must not change a byte of a prefix block");
-  assert.ok(a.includes(toolCapabilityIndex()), "the full capability index rides with it");
+  assert.ok(a.includes(toolCapabilityIndex(_avail)), "the capability index rides with it");
+  assert.ok(!a.includes(toolCapabilityIndex()), "名录没有按真实注册表过滤——网页版会被告知 89 个它没有的工具");
   assert.match(a, /场景→工具直觉/);
   // 签名里不许再有会按轮求值的默认参数——那会在 system 装配点上被无参调用时跑一次分类器。
   assert.match(grabCode("_buildToolHint"), /^function _buildToolHint\(\)/);

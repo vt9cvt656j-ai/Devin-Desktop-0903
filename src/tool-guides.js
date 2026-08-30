@@ -782,7 +782,11 @@ const CATEGORY_LABELS = Object.freeze({
   utility: '杂项',
 });
 
-let _capabilityIndexCache = "";
+// 按「可用工具集合」分桶的缓存。**不能退回单值缓存**：这段文本进 system 提示词，
+// 上游按前缀缓存计费，同一台机、同一模式下必须逐字节一致，否则每轮都击穿缓存。
+// 而桌面版/网页版/只读模式的可用集合不同，单值缓存会让先跑的那个模式把文本钉死。
+// 同一进程里集合数量是个位数（桌面全量 / 网页版 / 只读），Map 不会长。
+const _capabilityIndexCache = new Map();
 
 /**
  * 全量工具能力索引：按类别列出每一个已注册工具的名字。
@@ -826,10 +830,22 @@ function _capabilityNote(name, meta) {
   return note ? `(${note})` : '';
 }
 
-export function toolCapabilityIndex() {
-  if (_capabilityIndexCache) return _capabilityIndexCache;
+/**
+ * @param {Set<string>|null} available 本次真实可用的工具名集合；传 null = 不过滤（旧行为）。
+ *
+ * 必须能过滤：这份名录被拼进 system 提示词，抬头写着「全部可用，按名字直接调用即可自动
+ * 装载」。而它原来无条件遍历冻结的 TOOL_METADATA，网页版（inTauri=false）会把 89 个
+ * desktopOnly 工具一起列出来——模型照名录调 git_status / db_query / run_in_terminal，
+ * 要么在 search_tools 里等最长 8 秒 MCP 发现再吃一句「注册表没有这个工具」，
+ * 要么直接撞执行器的「[不可用] 需要桌面版」。一句承诺换一轮白烧。
+ */
+export function toolCapabilityIndex(available = null) {
+  const key = available ? [...available].sort().join(',') : '*';
+  const cached = _capabilityIndexCache.get(key);
+  if (cached) return cached;
   const byCategory = new Map();
   for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    if (available && !available.has(name)) continue;
     const cat = meta?.category || 'utility';
     if (!byCategory.has(cat)) byCategory.set(cat, []);
     byCategory.get(cat).push(name + _capabilityNote(name, meta));
@@ -845,8 +861,9 @@ export function toolCapabilityIndex() {
     if (CATEGORY_LABELS[cat] || !names.length) continue;
     lines.push(`${cat}: ${names.slice().sort().join(' ')}`);
   }
-  _capabilityIndexCache = lines.join('\n');
-  return _capabilityIndexCache;
+  const out = lines.join('\n');
+  _capabilityIndexCache.set(key, out);
+  return out;
 }
 
 export { TOOL_METADATA, CATEGORY_LABELS };

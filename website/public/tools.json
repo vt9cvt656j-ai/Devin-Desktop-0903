@@ -190,7 +190,7 @@
     {
       "name": "git_status",
       "group": "Git & GitHub",
-      "desktopOnly": false
+      "desktopOnly": true
     },
     {
       "name": "git_diff",

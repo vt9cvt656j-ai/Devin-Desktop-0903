@@ -7,8 +7,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, load, fnSource as topLevelFn } from "./helpers/source.mjs";
+import { domainKnowledgeBullets, domainKnowledgeBrief } from "../src/agent/domain-knowledge-brief.js";
 
-const bullets = load("_domainKnowledgeBullets");
+// 同上：直接 import 真模块。
+const bullets = domainKnowledgeBullets;
 const chunk = (sec, body) => `【1·经验｜d/x · ${sec}】\n## ${sec}\n${body}`;
 const L = (t) => `${t}——这一句写够了二十四个字符，能通过那道长度门被选中。`;
 
@@ -75,17 +77,20 @@ test("并发分支把原文留下来，供之后重算", () => {
 });
 
 // ── 四栏结构 ──────────────────────────────────────────────────────────
-const brief = load("_domainKnowledgeBrief", { _DOMAIN_KNOWLEDGE_BRIEF_BUDGET: 2500 });
+const brief = domainKnowledgeBrief;
 const secs = (counts) => ["适用条件", "硬性约束", "常见坑", "必须做的检查"]
   .map((h, i) => ({ heading: h, bullets: Array.from({ length: counts[i] }, (_, k) => `S → 第 ${i}-${k} 条`) }));
 
 test("brief 渲染的是**全部四栏**，不是有内容的那几栏", () => {
-  // 源码层面钉住：`sections.filter(s => s.bullets.length)` 这种写法会让空栏整个消失。
-  const src = topLevelFn("_domainKnowledgeBrief", { code: true });
-  assert.match(src, /const body = sections\s*\n?\s*\.map/,
-    "brief 又只渲染有内容的栏了——空栏消失会让模型以为那个维度没被问过");
-  assert.doesNotMatch(src.slice(src.indexOf("const body =")), /filter\(\(s\) => s\.bullets\.length\)/,
-    "渲染前又把空栏过滤掉了");
+  // 原来这条钉的是 main.js 的源码文本（`const body = sections.map`）。2026-08-30 函数搬进
+  // src/agent/domain-knowledge-brief.js 之后那个锚点就失效了——而它本来就该验行为：
+  // 源码断言换个写法（比如先 filter 再 map 到别的变量）照样能绕过去，行为断言绕不过去。
+  // 只要有一栏有内容，四栏就都必须出现在正文里。
+  const out = brief("healthcare", secs([1, 0, 0, 0]));
+  for (const h of ["适用条件", "硬性约束", "常见坑", "必须做的检查"]) {
+    assert.ok(out.includes(`【${h}】`),
+      `「${h}」这一栏整个消失了——空栏消失会让模型以为那个维度没被问过`);
+  }
 });
 
 test("空栏如实说明，不整栏消失", () => {
@@ -98,9 +103,19 @@ test("空栏如实说明，不整栏消失", () => {
   assert.match(out, /别当成"没有要求"/, "空栏没挡住「没列出来就是不用管」这种误读");
 });
 
-test("四栏全空时仍然走「整域不可用」那条兜底", () => {
-  const out = brief("healthcare", secs([0, 0, 0, 0]));
-  assert.match(out, /没有返回任何可用命中/, "全空时应当是整域不可用的说法，不是四个空栏");
+test("四栏全空时走整域级的一句话，而且要分清是哪一种「空」", () => {
+  // 意图没变：全空时给一句整域级的结论，而不是铺四个空栏。
+  // 变的是 2026-08-30 之后这句话分了三态——「没拿到」「确实没有」「命中了但没压出要点」
+  // 含义完全不同，压成同一句会让模型把检索失败当成「这个域没有资料」。
+  const zero = brief("healthcare", secs([0, 0, 0, 0]));
+  assert.match(zero, /确实没有匹配/, "真零命中应当给出「确实没有」这个可据以推进的结论");
+  for (const h of ["适用条件", "常见坑"]) {
+    assert.ok(!zero.includes(`【${h}】`), "全空时不该再铺四个空栏");
+  }
+  // 全失败：绝不能说成「库里没有」。
+  const failed = brief("healthcare", secs([0, 0, 0, 0]).map((x) => ({ ...x, failed: true })));
+  assert.match(failed, /没有拿到结果/, "全失败被说成了零命中");
+  assert.notEqual(failed, zero, "「没拿到」和「确实没有」压成了同一句");
 });
 
 test("有内容的栏一个字节没变", () => {

@@ -156,11 +156,18 @@ const GROUPS = [
 // Tools the app deliberately withholds from the browser build (see the desktopOnly
 // set in _buildAgentToolSchemas). The gallery marks them so nobody is told a demo
 // failed when the product is simply refusing to expose a desktop capability.
+// 先剥注释，再按「引号里的标识符」抽。原来是整段按 ASCII 逗号 split——而那段源码里夹着
+// 中文注释，注释里每一个半角逗号都会切一刀：`git_status` 正好被切在一句注释的尾巴上
+// （"…照常发给模型。\n  "git_status"），于是它从集合里消失，官网工具画廊就不给它打
+// 「桌面专属」标记，访客以为网页版能查 git 状态、进去发现没有。同一次还把两整段中文注释
+// 当成"工具名"塞进了集合（无害，但说明这条路一直是靠运气对的）。
+// 按标识符抽之后，逗号怎么放、注释怎么写都不影响。
 const DESKTOP_ONLY = new Set(
-  (src.match(/const desktopOnly = new Set\(\[([\s\S]*?)\]\)/)?.[1] ?? "")
-    .split(",")
-    .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-    .filter(Boolean),
+  ((src.match(/const desktopOnly = new Set\(\[([\s\S]*?)\]\)/)?.[1] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "")
+    .match(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g) ?? [])
+    .map((s) => s.replace(/^["']|["']$/g, "")),
 );
 
 const tools = names.map((name) => {

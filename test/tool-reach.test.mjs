@@ -91,7 +91,10 @@ test("能力名录字节稳定，不会击穿 prompt cache", () => {
 
 test("能力名录进了随 system 前缀发送的工具提示", () => {
   const hint = extractFn("_buildToolHint");
-  assert.match(hint, /toolCapabilityIndex\(\)/, "_buildToolHint 必须把完整名录带上");
+  // 钉「名录在场」，不钉它的调用形式。2026-08-30 起它按真实注册表过滤
+  //（toolCapabilityIndex(_staticToolNames())）——网页版没有的 89 个 desktopOnly 工具
+  // 不该被列成「全部可用」。过滤依据必须按轮恒定，那条判据在 logic.test.mjs 里单独钉着。
+  assert.match(hint, /toolCapabilityIndex\(/, "_buildToolHint 必须把名录带上");
   assert.match(hint, /自动装载|search_tools/,
     "名录必须同时告诉模型：没在开局窗口里也能直接按名调用");
 });
