@@ -29,10 +29,13 @@ window.addEventListener("unhandledrejection", (e) => {
 
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
+import { applyLayoutDensity } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
+import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
+import { summarizeTiming as _summarizeTiming } from "./agent/turn-timing.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
@@ -4052,8 +4055,12 @@ function initSashDrag(sash, signal) {
       } else {
         w = layoutRect.right - e.clientX;
       }
-      w = Math.max(140, Math.min(layoutRect.width * 0.5, w));
-      layout.style.setProperty(cssProp, w + "px");
+      // `--sidebar-w` / `--assistant-w` 存的是**物理像素**（app.css 里除以 --ui-zoom
+      // 还原成 CSS 宽度）。clientX 和 getBoundingClientRect 都是 CSS 像素，所以这里要
+      // 乘回缩放再存 —— 不乘的话放大时一松手，栏宽会当场跳到别的尺寸。
+      const z = Number(_uiZoom) || 1;
+      w = Math.max(140 / z, Math.min(layoutRect.width * 0.5, w));
+      layout.style.setProperty(cssProp, Math.round(w * z) + "px");
     });
     window.addEventListener("mouseup", () => {
       if (!dragging) return;
@@ -9312,7 +9319,15 @@ if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
 // 布局撑不住的地步，而 `_applyUiZoom` 平时只在按快捷键时跑，没人重新算这个上限。
 window.addEventListener("resize", () => {
   if (_uiZoom > _uiZoomCeiling()) _applyUiZoom(_uiZoom, { toast: false });
+  _applyLayoutDensity();
 });
+
+// 三栏自适应档位住在 src/agent/layout-density.js（main.js 撞行数闸时搬出去的）。
+// 量的是物理宽度，理由见那个模块的抬头。
+function _applyLayoutDensity() {
+  try { applyLayoutDensity(window.innerWidth, document.documentElement); } catch {}
+}
+_applyLayoutDensity();
 // 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），
 // 这里不再自己挂 keydown —— 自己挂的键在设置页里查不到也改不了。
 
@@ -46381,6 +46396,19 @@ function _isReadOnlyParallel(call) {
   // 我们没有任何依据认为它不动东西 —— 和这个文件里其它地方一样，
   // 「没有证据」不构成放行的理由。
   if (t === "mcp") return !!call.mcpReadOnly;
+  // shell 命令：只读的那些可以并行。判据**复用权限门那一份**（_looksLikeReadOnlyCommand），
+  // 不另抄一份——它是白名单式的，且被真实事故打磨过（拦 `find -delete`、拦切分支）。
+  //
+  // 实测：1218 条运行里相邻的「运行→运行」有 340 对，每一对都在一个接一个地等。
+  // 这一支此前整个不在表里，于是 `git log` 后面跟 `ls` 也要等前一条跑完。
+  //
+  // 只放 cmd，不放 termtask（长跑任务，本来就不该当只读批）也不放 browser
+  // （automation-server 是**单线程串行**的，IDE 这边并发只是把队列往前挪，没有收益）。
+  //
+  // 再减一层：权限判据回答的是「要不要弹审批框」，它把 `git branch feature-x` 也算只读。
+  // 那在并发这一侧是上面那段注释里记着的同一个事故——切/建分支动 refs 和工作树，
+  // 同批并发的读拿到别的分支的内容，还不报错。判据见 agent/parallel-command.js。
+  if (t === "cmd") return _looksLikeReadOnlyCommand(call.command) && !_parallelUnsafeCommand(call.command);
   // WITH/PRAGMA/EXPLAIN are not provably read-only: writable CTEs, assignment
   // pragmas, and EXPLAIN ANALYZE can all execute mutations.
   if (t === "db") return !_dbCallMayMutate(call);
@@ -51029,6 +51057,11 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
       // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
       walls: [...new Set(steps.filter((s) => s && s.ok === false && s.fail).map((s) => s.fail))].slice(0, 6),
+      // 时间线汇总。时间戳一直有、一直只喂给界面上那只跑秒表，然后随 run 一起消失——
+      // 于是「典型首字延迟是 3 秒还是 15 秒」「一条消息发几次模型请求」这两个问题，
+      // 客户端和服务端两侧都答不了（服务端的 request_id 是每会话一个，按它分组量不出来）。
+      // 判据见 agent/turn-timing.js，全是时间戳之差，不含任何推断。
+      ...(() => { const t = _summarizeTiming(run.timeline); return t ? { timing: t } : {}; })(),
       // 裁决这轮判的编排模式。没有它，"编排到底通没通"只能从 approach 的动词里反推——
       // 而那恰好分不清两种截然不同的情况：裁决压根没判成要编排，和判了却没派出去。
       // 前者要改判据，后者要改可达性；2026-08-22 实测两者同时存在（939 回合 0 次调用）。

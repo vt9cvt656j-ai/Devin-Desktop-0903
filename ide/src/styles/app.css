@@ -588,21 +588,51 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
    880 的最小窗口放大到 2 倍，有效宽度只剩 440，而三栏最少要 140+200+240 ≈ 590。
    允许收缩之后，空间不够时两侧缩到各自 min-width 为止，编辑器守住 200px，谁也不被裁。
    宽度够时 flex-shrink 根本不参与计算，正常布局一个像素不变。 */
+/* ---------------------------------------------------------------------------
+   三栏宽度：`--sidebar-w` / `--assistant-w` 存的是**物理像素**，不是 CSS 像素。
+
+   界面缩放走 `documentElement.style.zoom`（见 _applyUiZoom），1 CSS px 会变成 zoom 个
+   物理像素。侧栏原来写死 250px / 440px 这种 CSS 宽度，于是放到 140% 时两条侧栏各多占
+   40% 的屏幕，中间编辑区被挤到 min-width 以下，而 `.layout` 是 overflow:hidden ——
+   用户看到的就是「资源管理器和助手撑满、编辑区只剩一条、标题往下折行」。缩小则相反：
+   侧栏缩水，中间空出一大片。
+
+   除以 `--ui-zoom` 之后每一栏的**物理**宽度与缩放无关：缩放只把字和图标变大变小，
+   三栏各占屏幕多少始终不变。min-width 同理 —— 不除的话 140+240 这两个下限在放大时
+   照样按 CSS 像素算，等于又多吃一份。
+   --------------------------------------------------------------------------- */
 .layout .explorer {
-  width: var(--sidebar-w, 250px);
-  min-width: 140px;
+  width: calc(var(--sidebar-w, 250px) / var(--ui-zoom, 1));
+  min-width: calc(140px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
 }
 .layout .assistant {
-  width: var(--assistant-w, 440px);
-  min-width: 240px;
+  width: calc(var(--assistant-w, 440px) / var(--ui-zoom, 1));
+  min-width: calc(240px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
 }
+
+/* 自适应：窗口越窄，两条侧栏让得越多，中间编辑区才留得住。
+
+   用 `max-width` 封顶，不去改 `--sidebar-w` —— 拖分隔条存的就是那两个变量（内联在
+   .layout 上），改它等于把用户拖出来的宽度抹掉，窗口再拉宽也回不来。封顶只是暂时压住，
+   窗口一宽，用户自己的宽度原样回来。
+
+   档位由 _applyLayoutDensity 按 window.innerWidth（物理宽度，与缩放无关）打在 <html>
+   上，不用媒体查询：媒体查询量的是 CSS 像素 = 物理 / 缩放，而上面刚把各栏的物理宽度
+   做成恒定的，再按 CSS 像素分档就把缩放算了两次。 */
+:root[data-layout="narrow"] .layout .explorer { max-width: calc(220px / var(--ui-zoom, 1)); }
+:root[data-layout="narrow"] .layout .assistant { max-width: calc(380px / var(--ui-zoom, 1)); }
+:root[data-layout="tight"] .layout .explorer { max-width: calc(190px / var(--ui-zoom, 1)); }
+:root[data-layout="tight"] .layout .assistant { max-width: calc(330px / var(--ui-zoom, 1)); }
+:root[data-layout="min"] .layout .explorer { max-width: calc(165px / var(--ui-zoom, 1)); }
+:root[data-layout="min"] .layout .assistant { max-width: calc(290px / var(--ui-zoom, 1)); }
 .layout .editorwrap {
   flex: 1;
-  min-width: 200px;
+  /* 同上：下限也按物理像素算，否则放大时它跟着变大，反而更早撑爆。 */
+  min-width: calc(200px / var(--ui-zoom, 1));
 }
 .layout.hide-explorer .explorer,
 .layout.hide-explorer .panel-sash--left {

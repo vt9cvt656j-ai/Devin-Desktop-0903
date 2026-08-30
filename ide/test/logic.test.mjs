@@ -16,6 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
+import { summarizeTiming } from "../src/agent/turn-timing.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
@@ -35200,6 +35201,9 @@ function _epForLedger(entries, outcome = "success") {
     // 用真的 _epApproach，不打桩：approach 的取法是隔壁那条测试守着的东西，
     // 这里打桩会让两条测试对同一个函数各自成立、合起来却漂开。
     _epApproach: load("_epApproach"),
+    // 时间线汇总用真模块，不打桩：它的兜底行为（坏输入返回 null 而不是抛）本身就是
+    // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
+    _summarizeTiming: summarizeTiming,
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
@@ -36655,10 +36659,12 @@ test("两侧栏允许收缩，窄宽度下不被裁到屏幕外", () => {
       `${sel} 又变回 flex: none —— 空间不够时它不收缩，助手栏会被 .layout 的 overflow:hidden 裁掉。` +
         "实测：改回 none 之后 890px 以下就开始裁，允许收缩则 640px 都不裁",
     );
-    assert.match(r, /min-width:\s*\d+px/, `${sel} 没有最小宽度，会被压成 0`);
+    // 下限现在按**物理像素**写：calc(140px / var(--ui-zoom))。裸 140px 在放大时会跟着
+    // 变大，等于下限自己吃掉更多屏幕 —— 所以这里认 calc 形式，不再认裸像素。
+    assert.match(r, /min-width:\s*calc\(\d+px \/ var\(--ui-zoom/, `${sel} 没有最小宽度，会被压成 0`);
   }
   // 编辑器守住自己的下限，收缩的是两侧。
-  assert.match(rule(".layout .editorwrap"), /min-width:\s*200px/);
+  assert.match(rule(".layout .editorwrap"), /min-width:\s*calc\(200px \/ var\(--ui-zoom/);
 });
 
 // ---------------------------------------------------------------------------
@@ -36842,6 +36848,60 @@ test("方案文档保留全部小节，只摘掉开场白和结尾那句征询",
   assert.equal(planCoreFromReply(null), "");
   // 整份就是一段引子时原样给出，总好过空白。
   assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
+});
+
+test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩放不能算两次", async () => {
+  // 界面缩放走 documentElement.style.zoom：1 CSS px = zoom 个物理像素。app.css 里各栏
+  // 宽度已经除以 --ui-zoom，物理宽度因此与缩放无关。档位要是再按 CSS 像素（= 物理/缩放）
+  // 分，就等于把缩放算了两次：放大一次、档位又缩一次，窄窗口里一放大侧栏反而更小。
+  const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
+  const el = { dataset: {} };
+  const stepAt = (px) => { applyLayoutDensity(px, el); return el.dataset.layout; };
+  assert.equal(stepAt(1440), undefined, "宽窗口不该有档位 —— 用户拖出来的宽度要原样生效");
+  assert.equal(stepAt(1100), "narrow");
+  assert.equal(stepAt(900), "tight");
+  assert.equal(stepAt(700), "min");
+  // 窗口拉回来，封顶要松开 —— 否则用户拖宽过的侧栏再也回不来。
+  assert.equal(stepAt(1440), undefined, "窗口拉宽后档位没松开");
+  // 调用点必须喂**物理**宽度。量错对象的话（比如 documentElement.clientWidth），
+  // 1100 物理 ÷ 1.4 缩放 = 786，会掉到 "min" —— 放大一次、档位又缩一次。
+  const wire = stripJsComments(extractFn("_applyLayoutDensity"));
+  assert.match(wire, /applyLayoutDensity\(window\.innerWidth,/,
+    "喂进去的不是 window.innerWidth —— 缩放会被算两次");
+});
+
+test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素算", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const grab = (sel) => {
+    const i = css.indexOf(sel + " {");
+    assert.ok(i >= 0, `${sel} 这条规则不见了`);
+    return css.slice(i, css.indexOf("}", i));
+  };
+  // 三栏的宽度和下限都要除以 --ui-zoom。不除的话放大 140% 时两条侧栏各多占 40% 的屏幕，
+  // 中间编辑区被挤到 min-width 以下，而 .layout 是 overflow:hidden —— 用户原话
+  //「界面放大不应该这样啊，包括缩小，自适应也没了」。
+  for (const [sel, keys] of [[".layout .explorer", ["width", "min-width"]],
+                             [".layout .assistant", ["width", "min-width"]],
+                             [".layout .editorwrap", ["min-width"]]]) {
+    const body = grab(sel);
+    for (const k of keys) {
+      const m = body.match(new RegExp("(?:^|;|\\{)\\s*" + k + "\\s*:([^;]*)"));
+      assert.ok(m, `${sel} 少了 ${k}`);
+      assert.match(m[1], /var\(--ui-zoom/, `${sel} 的 ${k} 没有除以缩放 —— 放大时这一栏会多吃屏幕`);
+    }
+  }
+  // 拖分隔条存的也必须是物理像素，否则放大时一松手栏宽会跳。
+  const sash = stripJsComments(extractFn("makePanelSash"));
+  assert.match(sash, /setProperty\(cssProp, Math\.round\(w \* z\)/,
+    "分隔条存的还是 CSS 像素 —— 放大状态下拖完一松手，栏宽会跳到别的尺寸");
+  // 自适应档位用 max-width 封顶，**不能**去改 --sidebar-w/--assistant-w：那两个变量是
+  // 拖分隔条存下来的（内联在 .layout 上），改掉等于把用户拖出来的宽度抹了。
+  const dens = css.slice(css.indexOf(':root[data-layout="narrow"]'), css.indexOf(':root[data-layout="narrow"]') + 900);
+  assert.ok(!/--sidebar-w\s*:/.test(dens) && !/--assistant-w\s*:/.test(dens),
+    "自适应档位改写了拖动存下来的栏宽 —— 用户拖出来的宽度会被抹掉");
+  for (const step of ["narrow", "tight", "min"]) {
+    assert.ok(css.includes(`:root[data-layout="${step}"]`), `缺 ${step} 这一档`);
+  }
 });
 
 test("选了新模型，界面立刻跟着变——窗口级选择必须在刷界面之前钉住", async () => {
