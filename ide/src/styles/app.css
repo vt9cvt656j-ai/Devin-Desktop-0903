@@ -581,17 +581,24 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
   display: flex;
   overflow: hidden;
 }
+/* 两侧栏 `flex: none` → `flex: 0 1 auto`（2026-08-29）。
+   原来完全不许收缩：窗口或缩放把有效布局宽度压到三栏放不下时，编辑器被挤破自己的
+   min-width，助手栏被 `.layout` 的 overflow:hidden 整个裁到屏幕外 —— 用户看到的
+   「内容乱飞」。实测：innerWidth 不随 zoom 变，clientWidth = innerWidth / zoom，
+   880 的最小窗口放大到 2 倍，有效宽度只剩 440，而三栏最少要 140+200+240 ≈ 590。
+   允许收缩之后，空间不够时两侧缩到各自 min-width 为止，编辑器守住 200px，谁也不被裁。
+   宽度够时 flex-shrink 根本不参与计算，正常布局一个像素不变。 */
 .layout .explorer {
   width: var(--sidebar-w, 250px);
   min-width: 140px;
   max-width: 50vw;
-  flex: none;
+  flex: 0 1 auto;
 }
 .layout .assistant {
   width: var(--assistant-w, 440px);
   min-width: 240px;
   max-width: 50vw;
-  flex: none;
+  flex: 0 1 auto;
 }
 .layout .editorwrap {
   flex: 1;
