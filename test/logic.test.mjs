@@ -36407,7 +36407,9 @@ test("接下来卡片是多行卡片，不能被 chip 胶囊规则钉死高度",
 // 「接下来」卡片显示短标签，发送原文
 // ---------------------------------------------------------------------------
 test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
+  // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
+  const src = RAW_SRC;
   const fn = src.match(/function _chipShortLabel\(text\)[\s\S]*?\n\}/);
   assert.ok(fn, "_chipShortLabel 不见了");
   const _chipShortLabel = eval(`(${fn[0].replace(/^function /, "function ")})`);
@@ -36513,7 +36515,9 @@ test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜�
   assert.ok(merged.activeIdx >= 0 && merged.activeIdx < merged.sessions.length);
 
   // 纯函数对了还不算：恢复流程必须真的**每次都读镜像**并调用它。
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
+  // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
+  const src = RAW_SRC;
   const restore = stripJsComments(extractFn("restoreChatHistory"));
   assert.ok(
     /saved = _mergeChatArchives\(saved, _mirror\)/.test(restore),
@@ -36562,7 +36566,9 @@ test("缩放上限跟着窗口走，小窗口不许放大到布局撑不住", ()
   // 量不到尺寸时不额外限制（别凭一个 0 把用户锁死）。
   assert.equal(mk(0, 0), 2, "读不到窗口尺寸时不该限制");
 
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
+  // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
+  const src = RAW_SRC;
   // 上限必须真的接进 _applyUiZoom，不是算完不用。
   const apply = stripJsComments(extractFn("_applyUiZoom"));
   assert.match(apply, /_uiZoomCeiling\(\)/, "缩放没有用上按窗口算的上限");
@@ -36602,7 +36608,9 @@ test("两侧栏允许收缩，窄宽度下不被裁到屏幕外", () => {
 // 每个聊天标签有自己的模型；切标签不许把别的标签的模型带过去
 // ---------------------------------------------------------------------------
 test("切换聊天标签不改变各自的模型", () => {
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
+  // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
+  const src = RAW_SRC;
   const nw = stripJsComments(extractFn("_newChatSession"));
   const sw = stripJsComments(extractFn("_switchChatSession"));
   const sel = stripJsComments(extractFn("selectModel"));
@@ -36730,6 +36738,8 @@ test("切回聊天标签：钉底的停在最新，翻过历史的停原处，�
   assert.ok(!/_scrollChatBottom\(/.test(branch), "又走回了会多次纠正的那条路");
 
   // 这个函数整个不该再存在：它就是闪烁的来源。
-  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
+  // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
+  const src = RAW_SRC;
   assert.ok(!/_showChatAtBottomSilently/.test(src), "藏起来再露出来的那版还在");
 });

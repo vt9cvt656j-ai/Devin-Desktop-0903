@@ -31,6 +31,7 @@ import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
+import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import {
   stackTable as _STACK_TABLE, stackManifestNames as _stackManifestNames,
   stackManifestExts as _stackManifestExts, manifestExtra as _MANIFEST_EXTRA,
@@ -18052,7 +18053,16 @@ function _bindSessionMemoryCleanup(session) {
 }
 
 function _normalizeAiMode(mode) {
-  return ["agent", "chat", "plan", "explorer", "reviewer"].includes(mode) ? mode : "agent";
+  // Explorer / Reviewer 已从选择器下线（2026-08-29，用户："这俩没啥用了"）。
+  //
+  // **必须一起从这里删掉**，不能只删按钮：留着的话，一个已经停在这两个模式上的会话
+  // 会继续按那个模式跑，而选择器里没有对应条目 —— `_AI_MODES.find(...)` 落空、退回
+  // 显示第一个（Agent），于是「界面写着 Agent、实际按 Reviewer 的只读纪律跑」。
+  // Auto 模式当初下线走的也是这条路（见 "Auto mode is removed" 那条测试）。
+  //
+  // 下游那套机制（工具白名单、只读拦截、模式纪律）原样留着：它们各有测试钉着，
+  // 而且和「界面上给不给这个按钮」是两件事。
+  return ["agent", "chat", "plan"].includes(mode) ? mode : "agent";
 }
 
 function _createChatSession(name, mode, model, project) {
@@ -19356,54 +19366,6 @@ function _closedChatSessionsForLocalStorage(mediaBudget = CHAT_LOCAL_MEDIA_BUDGE
 // (webview reload / HMR / crash / the dev watcher killing the process). localStorage
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
 // fallback. It has no HTML snapshot and a strict aggregate media budget.
-// 两份存档按**会话**合并，而不是「谁先有内容用谁」。
-//
-// 存档三层，恢复时依次尝试：SQLite 快照 → session.json → localStorage 镜像。判据原本
-// 只有 `hasSavedChats`（有内容就用），**不比新旧**。而退出路径里只有 `onCloseRequested`
-// 会 await 快照写完；`beforeunload` / `pagehide`（Tauri 直接 destroy webview、强杀、
-// 更新重启走的正是这几条）跑不了异步，只来得及同步写 localStorage。
-//
-// 于是「几分钟前的快照 + 退出瞬间的镜像」两份都非空时，**旧的排在前面就赢了**。
-//
-// 合并而不是「整份取新的那个」：镜像按 media/text 预算截断过，整份采用会把所有老会话的
-// 图片和长文一起降级。逐个会话比消息条数取更全的那个，只在一边出现的原样保留。
-const _archiveMsgCount = (sess) => {
-  if (!sess) return 0;
-  const recent = sess.memory && sess.memory.recent;
-  if (Array.isArray(recent)) return recent.length;
-  return Array.isArray(sess.history) ? sess.history.length : 0;
-};
-const _mergeArchiveList = (primaryList, mirrorList) => {
-  const out = [];
-  const at = new Map();
-  for (const sess of (Array.isArray(primaryList) ? primaryList : [])) {
-    if (!sess) continue;
-    if (sess.id) at.set(sess.id, out.length);
-    out.push(sess);
-  }
-  for (const sess of (Array.isArray(mirrorList) ? mirrorList : [])) {
-    if (!sess) continue;
-    const i = sess.id ? at.get(sess.id) : undefined;
-    if (i === undefined) { out.push(sess); continue; }
-    // 两边都有同一个会话：谁的消息多要谁。相等留主存档 —— 它没被预算截断过。
-    if (_archiveMsgCount(sess) > _archiveMsgCount(out[i])) out[i] = sess;
-  }
-  return out;
-};
-const _archiveHasChats = (v) => !!(v && ((Array.isArray(v.sessions) && v.sessions.length) || (Array.isArray(v.closedSessions) && v.closedSessions.length)));
-function _mergeChatArchives(primary, mirror) {
-  if (!_archiveHasChats(primary)) return mirror;
-  if (!_archiveHasChats(mirror)) return primary;
-  const sessions = _mergeArchiveList(primary.sessions, mirror.sessions);
-  const closedSessions = _mergeArchiveList(primary.closedSessions, mirror.closedSessions);
-  // activeIdx 跟主存档：合并后主存档那些会话的下标原样不变，镜像的未必对得上。
-  const idx = Number.isFinite(primary.activeIdx) ? primary.activeIdx : 0;
-  return {
-    sessions,
-    closedSessions,
-    activeIdx: Math.max(0, Math.min(idx, Math.max(0, sessions.length - 1))),
-  };
-}
 
 // 注意：这条退出路径必须保持同步全量（数据安全 > 性能），不走下面的分片/缓存。
 function _flushChatHistorySync() {
@@ -24096,8 +24058,6 @@ const _AI_MODES = [
   { id: "agent", label: "Agent", desc: "自主读写文件、运行验证、用证据收敛", color: "#3b82f6", icon: `<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>` },
   { id: "chat", label: "Chat", desc: "纯问答/解释，不读写项目", color: "#8b5cf6", icon: `<rect x="2" y="3" width="12" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 13l2-2h5" fill="none" stroke="currentColor" stroke-width="1.3"/>` },
   { id: "plan", label: "Plan", desc: "只读取证后输出实施方案", color: "#f59e0b", icon: `<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h6M5 8h4M5 11h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` },
-  { id: "explorer", label: "Explorer", desc: "只读摸清代码/架构/调用链", color: "#10b981", icon: `<circle cx="7" cy="7" r="4" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10 10l4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>` },
-  { id: "reviewer", label: "Reviewer", desc: "只读审查，给证据化问题清单", color: "#ef4444", icon: `<path d="M8 2l6 10H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6v3M8 10.5v.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>` },
 ];
 
 function _modeRuntimeGuidanceBlock(mode, text, profile = _engineeringProfileWithAiIntent(text)) {
