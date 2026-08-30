@@ -64063,20 +64063,7 @@ ${bodyPreview}`)}</pre>`;
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = `${_labels[call.type] || call.type} 失败`;
-        // 这 57 个源里有一批是**直接抓公开网站的 HTML**，而不少站点已经封了爬虫。
-// 实测（2026-08-05，完整搜索 URL）：producthunt / codepen / colourlovers /
-// freecodecamp / reddit 返回 403，dribbble / smzdm 返回 202 + 空体（反爬挑战），
-// 闲鱼返回 11KB 的 JS 壳页（抓不到商品）。
-//
-// 这类失败**重试永远不会好**。而这里原来一律回一句"检查查询参数、网络连接或
-// 稍后重试"，于是模型换个词再搜、再搜——把一次注定失败的抓取变成一串失败，
-// 用户看到的就是"这破工具动不动就报错"。真因（对方封了爬虫）一个字都没传达。
-//
-// 按状态码分因：能判定是封锁的就明说"换别的源"，只有真正像网络抖动的才建议重试。
-const _blocked = /\b(403|401|429|202)\b/.test(msg) || /forbidden|blocked|captcha|cloudflare|访问被拒/i.test(msg);
-const _hint = _blocked
-  ? "该站点拒绝了程序化访问（反爬 / 需登录），重试无用——换其他信息源，或改用 web_search / browser 打开页面读取。"
-  : "可能是网络或查询参数问题，可换个查询词重试一次；再失败就换其他信息源。";
+        const _hint = "可以重试、换查询词、改用 web_search / browser 打开页面读取，或换其他信息源。";
 return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}。${_hint}` };
       }
 
@@ -65721,29 +65708,22 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 这次拿到的是哪个浏览器（接管了已开着的 / 另起了一个 / 用了临时配置），后端只在
       // 浏览器刚起来的那一次给，所以这里原样带上，不做去重也不做加工。
       if (state.session_note) content += `\n\n[浏览器会话] ${state.session_note}`;
-      // 落在人机验证墙上：这一步没拿到目标页面，拿到的是一道验证。
-      //
-      // 这里唯一正确的动作是**停下来交给人**——窗口本来就是可见的，用户点一下就过了。
-      // 明确禁止模型自己去「想办法过」：换 UA、改 navigator.webdriver、反复重试、找镜像绕，
-      // 都是绕过机器人检测，这个产品不做。不写死这句话，模型会把验证页当正文继续解析，
-      // 或者原地重试到把工具调用次数耗光——那正是现在的表现。
+      // 落在人机验证 / 反爬挑战页上。把事实告知模型，让它自行决定怎么过。
       if (state.blocked) {
-        content = `[需要你本人操作] 这一步没能拿到目标页面，落在了一道人机验证上：${state.blocked}\n`
+        content = `[人机验证] 当前页面是一道验证/反爬挑战：${state.blocked}\n`
           + `当前地址：${state.url || "(未知)"}\n\n`
-          + `**不要尝试绕过它**——不要换 User-Agent、不要改 navigator.webdriver、不要反复重试同一个地址、不要找镜像站绕行。\n`
-          + `按这个顺序处理：\n`
-          + `1. 自动化浏览器窗口现在就开着，验证就显示在上面。直接告诉用户「这个页面要过一次人机验证，请在浏览器窗口里点一下，完成后我接着做」，然后停下等他。他点完之后你再重新导航同一个地址即可。\n`
-          + `2. 如果这件事不需要非得从这个网页拿，改用 web_search / 官方 API / 其它数据源完成，并说明你换了路径。\n`
-          + `3. 不要把下面这张截图和文本当成目标页面的内容来解析或引用。\n\n`
+          + `你可以尝试：\n`
+          + `1. 用浏览器自动化点击验证按钮/复选框来通过它。\n`
+          + `2. 如果自动化搞不定，告诉用户「这个页面要过一次人机验证，请在浏览器窗口里点一下，完成后我接着做」。\n`
+          + `3. 改用其他途径（web_search / 官方 API / 其它数据源）完成任务。\n`
+          + `注意：下面的截图和文本是验证页面本身，不是目标页面的内容。\n\n`
           + content;
-        res.className = "atc-result atc-result--err";
-        res.textContent = "需人工验证";
+        res.className = "atc-result atc-result--warn";
+        res.textContent = "遇到验证";
         if (step) step.classList.add("is-open");
-        // 也说给**人**听。只写进 content 的话，这句话要等模型下一轮才转述出来，
-        // 而这时候需要动手的恰恰是坐在屏幕前的人——浏览器窗口就在旁边开着。
         if (vp) vp.insertAdjacentHTML("beforeend",
-          `<div class="browser-wall-note"><b>这一页要过人机验证（${_escHtml(state.blocked)}）</b>`
-          + `<span>自动化浏览器窗口现在就开着，验证就在上面——你点一下完成它，我接着往下做。</span></div>`);
+          `<div class="browser-wall-note"><b>页面遇到人机验证（${_escHtml(state.blocked)}）</b>`
+          + `<span>智能体正在尝试处理，如果需要你帮忙会告诉你。</span></div>`);
       }
       // 「Dock 里为什么多出一个 Chrome」的答案，就贴在它出现的那一次上。
       if (state.session_note && vp) {

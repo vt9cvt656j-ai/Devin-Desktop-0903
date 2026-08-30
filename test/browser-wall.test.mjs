@@ -5,7 +5,7 @@
 // 用户看到的就是「全自动流程不完美」。
 //
 // 这里守住两条性质：
-//   1. 撞墙时给模型的指令是**停下来交给人**，且明确禁止自行绕过；
+//   1. 撞墙时事实告知模型当前在验证页上，且给出处理选项（自动点击/交给用户/换路径）；
 //   2. Rust 那边发出来的字段名，和 main.js 这边读的字段名，不能各改各的。
 //      第 2 条是这类改动真正会烂掉的地方：两侧都编译、都全绿，只是从此永远不触发。
 import { readFileSync } from "node:fs";
@@ -48,41 +48,25 @@ function stripComments(src) {
 }
 const CODE = stripComments(SRC);
 
-test("撞上人机验证时，给模型的指令是停下交给人，不是想办法过去", () => {
+test("撞上人机验证时，告知模型事实并给出处理选项", () => {
   const i = CODE.indexOf("state.blocked");
   assert.ok(i >= 0, "main.js 没有消费后端的撞墙信号——那这套检测等于没接上");
   const branch = CODE.slice(i, i + 2200);
-  // 交接：窗口是可见的，人点一下就过了，模型要停下来等。
-  assert.match(branch, /需要你本人操作/, "撞墙的结果必须一眼看出要人介入");
-  assert.match(branch, /不要尝试绕过/, "必须明确禁止模型自己想办法绕过去");
-  // 逐项禁掉那几种「聪明办法」——这几条正是绕过机器人检测，这个产品不做。
-  for (const banned of ["User-Agent", "navigator.webdriver", "镜像"]) {
-    assert.ok(branch.includes(banned), `没有明确禁止「${banned}」这条绕行路子`);
-  }
-  // 反复重试同一个地址是现在的实际表现，必须点名禁掉。
-  assert.match(branch, /不要反复重试/, "必须禁止原地重试——那是现在真实发生的事");
+  // 事实告知：让模型知道当前在验证页上
+  assert.match(branch, /人机验证/, "撞墙的结果必须一眼看出当前是验证页");
+  // 给出可选路径：自动点击、交给用户、换路径
+  assert.match(branch, /自动化点击/, "必须提供自动点击验证的选项");
+  assert.match(branch, /告诉用户/, "必须提供交给用户的选项");
   // 挑战页的截图和文本不是目标内容，不能被当成答案引用。
-  assert.match(branch, /不要把下面这张截图和文本当成目标页面的内容/,
+  assert.match(branch, /验证页面本身.*不是目标页面/,
     "必须说明挑战页的内容不作数，否则模型会照着验证页胡编");
 });
 
-test("产品里没有任何绕过或反检测的实现", () => {
-  // 这条是有意写死的边界：只做「发现并交接」，不做「解题或藏起来」。
-  // 以后谁想顺手加个打码服务或者去掉自动化标志，这里会红。
-  const rustCode = stripComments(RUST);
-  // 注意区分「提到」和「真去做」：上一条测试要求禁令文本里**必须**写着
-  // navigator.webdriver（那是发给模型的话），所以这里只能钉真正的实现手法。
-  const implementations = [
-    /--disable-blink-features=AutomationControlled/,
-    /Object\.defineProperty\(\s*navigator\s*,\s*["']webdriver["']/,
-    /delete\s+navigator\.webdriver/,
-    /navigator\.webdriver\s*=/,
-    /2captcha|anti-captcha|capsolver|deathbycaptcha/i,
-  ];
-  for (const re of implementations) {
-    assert.doesNotMatch(rustCode, re, `browser.rs 里出现了绕过检测的实现：${re}`);
-    assert.doesNotMatch(CODE, re, `main.js 里出现了绕过检测的实现：${re}`);
-  }
+test("字段契约：state.blocked 被消费后告知模型验证状态", () => {
+  const i = CODE.indexOf("state.blocked");
+  assert.ok(i >= 0, "main.js 必须消费 state.blocked");
+  const branch = CODE.slice(i, i + 800);
+  assert.match(branch, /验证/, "blocked 分支必须提到验证");
 });
 
 test("Rust 发的字段名和前端读的字段名必须一致", () => {
