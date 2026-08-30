@@ -36645,3 +36645,45 @@ test("切换聊天标签不改变各自的模型", () => {
     "从存档恢复时没有把分组读回会话",
   );
 });
+
+// ---------------------------------------------------------------------------
+// 多窗口：每个窗口的模型是自己的（副窗口和主窗口共用 localStorage 和 store 文件）
+// ---------------------------------------------------------------------------
+test("模型选择按窗口隔离，另一个窗口改了不影响本窗口", () => {
+  // 每个窗口一份的假 sessionStorage —— 这正是隔离所依赖的那条性质。
+  const mkStore = () => { const m = new Map(); return {
+    getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)),
+    removeItem: (k) => m.delete(k),
+  }; };
+  const win = (ss) => ({
+    read: load("_windowModelOverride", { sessionStorage: ss, _WIN_MODEL_KEY: "k" }),
+    write: load("_setWindowModel", { sessionStorage: ss, _WIN_MODEL_KEY: "k" }),
+  });
+  const w1 = win(mkStore());
+  const w2 = win(mkStore());
+
+  assert.equal(w1.read(), null, "全新窗口不该凭空有覆盖 —— 那样它就用不到共享配置里的默认值了");
+  w2.write("claude-opus-4-6", "强力", "route-2");
+  assert.equal(w1.read(), null, "窗口 2 的选择漏进了窗口 1");
+  assert.deepEqual(w2.read(), { model: "claude-opus-4-6", modelGroup: "强力", gatewayRouteId: "route-2" });
+  w1.write("grok-4.6", "", "route-1");
+  assert.equal(w1.read().model, "grok-4.6");
+  assert.equal(w2.read().model, "claude-opus-4-6", "窗口 1 改完把窗口 2 也改了");
+  // 清空要能回落到共享配置。
+  w1.write("");
+  assert.equal(w1.read(), null);
+
+  // 覆盖必须真的盖在**所有读配置的地方**共用的那个漏斗上，否则等于没做。
+  const rt = stripJsComments(extractFn("_aiConfigForRuntime"));
+  assert.match(rt, /_windowModelOverride\(\)/, "运行时配置没有应用窗口级覆盖");
+  for (const f of ["gatewayModel", "modelGroup", "gatewayRouteId"]) {
+    assert.ok(new RegExp(`${f}: win \\?`).test(rt), `${f} 没有跟着窗口级覆盖走 —— 请求会跑回另一个窗口那条线路`);
+  }
+  // 选模型时要钉在窗口上；只写共享配置的话，另一个窗口一次 loadConfigAsync 就把它盖回去。
+  assert.match(stripJsComments(extractFn("selectModel")), /_setWindowModel\(/, "选模型没有钉到本窗口");
+  // **必须是 sessionStorage。** localStorage 在两个窗口之间是共享的，用它等于没隔离。
+  const setter = stripJsComments(extractFn("_setWindowModel"));
+  assert.ok(/sessionStorage/.test(setter) && !/localStorage/.test(setter),
+    "窗口级覆盖写进了 localStorage —— 副窗口和主窗口同源共享它，隔离是假的");
+});
