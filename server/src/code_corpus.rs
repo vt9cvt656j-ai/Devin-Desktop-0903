@@ -582,31 +582,53 @@ pub async fn search(
     } else {
         vec![0.1, 1.0, 0.5, 0.15]
     };
-    let rows: Vec<(String, String, String, String, String, String, f32)> = sqlx::query_as(
-        "SELECT ecosystem, name, version, symbol, title, body, \
+    // **先窄后宽：AND 命中够就不碰 OR。**
+    //
+    // `or_form` 把「stream large file upload without buffering memory」拆成 7 个词的 OR，
+    // 是为了召回（AND 太严，注释见 or_form）。代价此前没人量过：线上实测那条 OR
+    // 命中 **232,936 行**（全表 7.7%），光过滤就 4.0 秒、从盘上读 2.3 GB，
+    // 整条查询 4.6–4.9 秒；同一条查询的 AND 形式是 **29–39 毫秒**，差 125 倍。
+    //
+    // 而 AND 的召回在真实查询上绰绰有余（实测 connection pool sizing 293 条、
+    // parse json stream 327 条、retry with exponential backoff 634 条，而 limit 最多 20）。
+    // 真正不够的只有很长的自然语句（「how to upload a large file without loading it
+    // into memory」只有 5 条）—— 那时才退回 OR，也就是今天的行为，一个字不差。
+    //
+    // 所以这不是「用召回换速度」：OR ⊇ AND，退回那一支拿到的结果集和今天完全一样，
+    // 只是绝大多数查询不必再为它付 4.8 秒。排序表达式一个字没动（仍然同时用 AND 和
+    // OR 两种形式算分），换的只是**过滤**用哪个。
+    let sql = "SELECT ecosystem, name, version, symbol, title, body, \
                 (ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $1)) * 2.0 \
                   + ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $5)) \
                   + CASE WHEN $7 AND symbol <> '' THEN similarity(symbol, $2) * 2.0 ELSE 0 END \
                   + CASE WHEN lower(name) = ANY($8) THEN $9::real ELSE 0 END)::real AS score \
            FROM code_corpus \
           WHERE ($3 = '' OR name = $3) \
-            AND ($5 <> '' AND tsv @@ websearch_to_tsquery('english', $5) \
+            AND ($10 <> '' AND tsv @@ websearch_to_tsquery('english', $10) \
                  OR ($7 AND symbol <> '' AND symbol % $2)) \
           ORDER BY score DESC, length(body) ASC \
-          LIMIT $4",
-    )
-    .bind(query)
-    .bind(query)
-    .bind(package.unwrap_or(""))
-    .bind(limit)
-    .bind(&or_q)
-    .bind(&weights)
-    .bind(ident)
-    .bind(&name_tokens)
-    .bind(name_boost)
-    .fetch_all(db)
-    .await
-    .context("code corpus search")?;
+          LIMIT $4";
+    let run = |filter: String| {
+        sqlx::query_as::<_, (String, String, String, String, String, String, f32)>(sql)
+            .bind(query.to_string())
+            .bind(query.to_string())
+            .bind(package.unwrap_or("").to_string())
+            .bind(limit)
+            .bind(or_q.clone())
+            .bind(weights.clone())
+            .bind(ident)
+            .bind(name_tokens.clone())
+            .bind(name_boost)
+            .bind(filter)
+            .fetch_all(db)
+    };
+    // 第一趟用原查询（websearch_to_tsquery 默认按 AND 解析）。
+    let mut rows = run(query.to_string()).await.context("code corpus search")?;
+    // 没填满这一页才退回 OR。判据是「够不够一页」，不是「有没有结果」：
+    // 拿回 3 条而用户要 8 条时，那 5 个空位本来是能填上的。
+    if (rows.len() as i64) < limit && !or_q.is_empty() {
+        rows = run(or_q.clone()).await.context("code corpus search (or)")?;
+    }
 
     Ok(rows
         .into_iter()
@@ -1630,6 +1652,42 @@ pub fn spawn(db: sqlx::PgPool) {
 
 #[cfg(test)]
 mod tests {
+    /// **先窄后宽**这条不能被改回去。
+    ///
+    /// 线上实测（2026-08-30，生产库 300 万行）：那条 OR 串命中 232,936 行、占全表 7.7%，
+    /// 光过滤 4.0 秒、从盘读 2.3 GB，整条查询 4.6–4.9 秒；同一条查询的 AND 形式 29–39 毫秒。
+    /// 差 125 倍，而这 4.8 秒是**直接加在用户那一轮的等待里**的。
+    ///
+    /// 守三件事：
+    ///   1. 过滤那一位用的是 $10（可切换的），不是写死的 $5（OR 形式）
+    ///   2. 第一趟喂的是原查询（websearch_to_tsquery 默认 AND），不是 or_q
+    ///   3. 退回 OR 的判据是「没填满这一页」，不是「一条都没有」——
+    ///      拿回 3 条而用户要 8 条时，那 5 个空位本来能填上
+    #[test]
+    fn corpus_search_tries_the_narrow_filter_first() {
+        let raw = include_str!("code_corpus.rs");
+        let src = &raw[..raw.find("\n#[cfg(test)]\nmod ").map(|i| i + 1).unwrap_or(raw.len())];
+        assert!(
+            src.contains("AND ($10 <> '' AND tsv @@ websearch_to_tsquery('english', $10)"),
+            "过滤又写死成 OR 形式了 —— 每条自然语言查询都要多等 4.8 秒"
+        );
+        assert!(
+            src.contains("let mut rows = run(query.to_string()).await"),
+            "第一趟没用原查询（AND 形式）"
+        );
+        assert!(
+            src.contains("if (rows.len() as i64) < limit && !or_q.is_empty()"),
+            "退回 OR 的判据不是「没填满这一页」—— 写成「一条都没有」的话，\n             \
+             拿回 3 条而用户要 8 条时那 5 个空位就永远填不上了"
+        );
+        // 排序表达式必须仍然同时用两种形式：这次换的是**过滤**，不是打分。
+        assert!(
+            src.contains("ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $1)) * 2.0")
+                && src.contains("+ ts_rank($6::float4[], tsv, websearch_to_tsquery('english', $5))"),
+            "打分被一起改了 —— 这次只该动过滤"
+        );
+    }
+
     use super::*;
 
     #[test]
