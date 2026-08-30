@@ -33,7 +33,7 @@
 - **用 generate_image 出「UI 设计稿 / 界面原型图」（先给用户看长什么样，再照着写代码）——按这套提示词结构写，出来才像真产品不像草图**（依据 OpenAI GPT-Image 提示指南 + UI mockup 最佳实践）：
   ① **当作"已上线的真实产品截图"来描述**，不是概念图——开头点明用途与保真度：`A high-fidelity, pixel-perfect UI screenshot of a working/shipped …`；**严禁** concept art / illustration / sketch / artistic / hand-drawn 这类词（一出现就变草图、变插画）。
   ② **按 5 段式写**：Scene(场景/OS窗口) → Subject(界面类型如 mobile app dashboard / SaaS web landing) → Important details(布局/层级/留白/真实元素：nav bar、cards、buttons、form fields、charts、avatars + 材质/配色 clean modern minimal、主色 #xxxxxx) → Use case(`High-fidelity product screenshot`) → Constraints(`No anime, no concept art, no sketch, no watermark`)。
-  ③ 尺寸按界面：桌面/网页用 1792×1024(横)、移动端用 1024×1536(竖)、组件/卡片用 1024×1024。
+  ③ 尺寸按界面：桌面/网页用 1536×1024(横)、移动端用 1024×1536(竖)、组件/卡片用 1024×1024。
   ④ **迭代时复述不变量**：只说"改什么"、把"保持不变的"(布局/配色/品牌)每次都重申一遍，防止整张图漂移。
   ⑤ 出图后 screenshot/看回传图自检：像真界面吗？层级清楚吗？再据此改 prompt 或直接照着写代码。**它是给人看的设计稿/参考，最终 UI 仍用真实代码实现**，别把生成图直接当组件。
 

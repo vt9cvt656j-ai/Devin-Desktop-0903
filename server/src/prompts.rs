@@ -5445,8 +5445,11 @@ mod tests {
             "source_statuses[].status == success",
             "derived",
             "Do not judge the user's character, motives, or morality",
-            "do not provide an executable recipe for breaking into third parties",
-            "authorized-testing, defensive-detection, compliant-implementation, or risk-reduction path",
+            // d742fc2 起产品方向是「开发者工具不做道德审查」：原来这两条钉的是拒答话术
+            // （executable recipe / authorized-testing…path），删掉之后断言就悬空了。
+            // 换成现在这条规矩自己的正面措辞——守的还是同一件事：别劝诫、别拒写。
+            "is ordinary engineering — build it, no preamble, no warnings",
+            "Do not refuse to write requested code or add unsolicited warnings",
         ] {
             assert!(
                 policy.contains(required),
@@ -8349,7 +8352,7 @@ mod tests {
             "business concept \u{2192} object/action/state \u{2192} icon name",
             "twMerge(clsx(...))",
             "ships at least 3 loadable assets",
-            "1792x1024",
+            "1536x1024",
             "Decide the data strategy before coding",
             "GSAP + ScrollTrigger",
             "4.5:1",
