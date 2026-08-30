@@ -4,8 +4,13 @@
 
 use crate::error::{Error, Result};
 use crate::types::{BrowserAction, ExecutionResult};
+use crate::human_input;
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::layout::Point;
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -19,6 +24,9 @@ pub struct BrowserAutomation {
     pub current_page: Option<Arc<Page>>,
     /// 这个实例**实际**是怎么起来的。回执必须按它说话——见 BrowserIdentity。
     identity: BrowserIdentity,
+    /// 上一次鼠标落点（页面坐标）。人类化点击从这里起手画一条轨迹到目标，而不是瞬移。
+    /// None = 还没动过，第一次点击就从目标附近偏移一点起手。
+    last_mouse: Option<(f64, f64)>,
 }
 
 /// 找一个能用的 Chromium 内核浏览器。
@@ -295,6 +303,7 @@ impl BrowserAutomation {
             browser,
             current_page: None,
             identity,
+            last_mouse: None,
         })
     }
 
@@ -433,6 +442,49 @@ impl BrowserAutomation {
     }
 
     /// 点击元素（CSS 选择器，带重试）
+    /// 人类化地移动指针到 `target` 并点一下。
+    ///
+    /// 以前是 `element.click()`：chromiumoxide 会瞬间把指针挪到中心并 press/release——事件
+    /// 是 trusted 的，但**没有移动过程、没有按住时长**，一眼是机器。这里改成：从上次落点沿
+    /// 一条 ease-in-out + 弧线的轨迹走一串 `mouseMoved`，到位停一拍，再 press—按住 55–120ms—
+    /// release（全是 CDP Input，trusted）。曲线和时长都来自 `human_input`（纯函数、有单测）。
+    async fn human_click_point(&mut self, page: &Page, target: Point) -> Result<()> {
+        let to = (target.x, target.y);
+        // 第一次没有历史落点：从目标左上方偏移一点起手，走一小段而不是凭空出现在目标上。
+        let from = self.last_mouse.unwrap_or((target.x - 40.0, target.y - 60.0));
+        let seed = target.x.to_bits().wrapping_mul(0x0100_0000_01b3) ^ target.y.to_bits();
+        for (x, y) in human_input::ease_path(from, to, seed) {
+            let _ = page.move_mouse(Point::new(x, y)).await;
+            sleep(Duration::from_millis(human_input::move_step_delay_ms(
+                seed ^ x.to_bits(),
+            )))
+            .await;
+        }
+        // 到位后停一拍（settle），再按下。
+        sleep(Duration::from_millis(human_input::move_step_delay_ms(seed))).await;
+        let press = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(target.x)
+            .y(target.y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        page.execute(press).await?;
+        sleep(Duration::from_millis(human_input::press_hold_ms(seed))).await;
+        let release = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(target.x)
+            .y(target.y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+        page.execute(release).await?;
+        self.last_mouse = Some(to);
+        Ok(())
+    }
+
     pub async fn click_element(&mut self, selector: &str) -> Result<()> {
         debug!("点击元素: {}", selector);
         
@@ -459,11 +511,26 @@ impl BrowserAutomation {
             
             match page.find_element(selector).await {
                 Ok(element) => {
-                    match element.click().await {
+                    // 先滚进视野、取真实可点坐标，再人类化移动+按下。取不到坐标（元素在视野外/
+                    // 不可见）时退回 chromiumoxide 自己的 click（它会 scroll+click），保底不比原来差。
+                    let clicked = match element.scroll_into_view().await {
+                        Ok(el) => match el.clickable_point().await {
+                            Ok(pt) => self.human_click_point(&page, pt).await,
+                            Err(e) => {
+                                warn!("取可点坐标失败，退回原生 click: {:?}", e);
+                                element.click().await.map(|_| ()).map_err(Error::Chromium)
+                            }
+                        },
+                        Err(e) => {
+                            warn!("滚入视野失败，退回原生 click: {:?}", e);
+                            element.click().await.map(|_| ()).map_err(Error::Chromium)
+                        }
+                    };
+                    match clicked {
                         Ok(_) => return Ok(()),
                         Err(e) => {
                             warn!("点击失败 (尝试 {}): {:?}", attempt + 1, e);
-                            last_error = Some(Error::Chromium(e));
+                            last_error = Some(e);
                         }
                     }
                 }
@@ -473,7 +540,7 @@ impl BrowserAutomation {
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| Error::ElementNotFound(format!("元素 {} 未找到", selector))))
     }
 
@@ -504,18 +571,37 @@ impl BrowserAutomation {
             
             match page.find_element(selector).await {
                 Ok(element) => {
-                    if let Err(e) = element.click().await {
+                    // 先人类化点一下把焦点落到输入框（取不到坐标就退回原生 click）。
+                    let focused = match element.scroll_into_view().await {
+                        Ok(el) => match el.clickable_point().await {
+                            Ok(pt) => self.human_click_point(&page, pt).await,
+                            Err(_) => element.click().await.map(|_| ()).map_err(Error::Chromium),
+                        },
+                        Err(_) => element.click().await.map(|_| ()).map_err(Error::Chromium),
+                    };
+                    if let Err(e) = focused {
                         warn!("点击前置失败 (尝试 {}): {:?}", attempt + 1, e);
-                        last_error = Some(Error::Chromium(e));
+                        last_error = Some(e);
                         continue;
                     }
-                    
-                    match element.type_str(text).await {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            warn!("输入文本失败 (尝试 {}): {:?}", attempt + 1, e);
+
+                    // 逐字符敲，字符之间按 human_input 的 cadence 停顿——不是一次性灌入。
+                    // element.type_str(单字符) 会把该字符送进当前有焦点的元素，不重新聚焦。
+                    let seed = text.len() as u64;
+                    let delays = human_input::keystroke_delays(text, seed);
+                    let mut typed_ok = true;
+                    for (ch, delay) in text.chars().zip(delays) {
+                        let mut buf = [0u8; 4];
+                        if let Err(e) = element.type_str(ch.encode_utf8(&mut buf)).await {
+                            warn!("输入字符失败 (尝试 {}): {:?}", attempt + 1, e);
                             last_error = Some(Error::Chromium(e));
+                            typed_ok = false;
+                            break;
                         }
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                    if typed_ok {
+                        return Ok(());
                     }
                 }
                 Err(e) => {

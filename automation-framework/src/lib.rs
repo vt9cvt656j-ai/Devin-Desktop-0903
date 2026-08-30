@@ -44,6 +44,9 @@ pub mod http_server;
 #[cfg(feature = "browser")]
 pub mod browser;
 
+/// 人类化输入运动学（纯函数：轨迹 + 敲键节奏），browser 那套 CDP 输入用它。
+pub mod human_input;
+
 #[cfg(feature = "system")]
 pub mod system;
 

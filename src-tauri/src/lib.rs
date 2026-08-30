@@ -25,6 +25,7 @@ mod game;
 mod game_assets;
 mod git;
 mod handoff;
+mod human_input;
 mod image_location;
 mod knowledge;
 mod local_discovery;
