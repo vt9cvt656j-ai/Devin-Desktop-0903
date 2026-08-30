@@ -19954,19 +19954,27 @@ async function restoreChatHistory() {
         let _restored = 0;
         for (const _draft of await _streamDraftTake()) {
           const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
-          const _probe = String(_draft.text || "").trim().slice(0, 120);
+          const _draftText = String(_draft.text || "");
+          const _draftReasoning = String(_draft.reasoning || "");
+          const _steps = String(_draft.steps || "").trim();
+          // 探针查重：正文优先、正文空退到思考（否则「只思考过还没落正文」的草稿探针为空会被丢）。
+          const _probe = (_draftText.trim() || _draftReasoning.trim()).slice(0, 120);
           const _tail = _draftSession?.memory?.recent?.slice(-6) || [];
-          const _already = !_probe || _tail.some((m) => typeof m?.content === "string" && m.content.includes(_probe));
-          if (_draftSession && !_already) {
-            // 步骤清单排在叙述**前面**：被打断的那一轮里，「它到底做了什么」比「它说到哪」
-            // 更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
-            const _steps = String(_draft.steps || "").trim();
-            _draftSession.memory.push({
+          const _already = !!_probe && _tail.some((m) =>
+            (typeof m?.content === "string" && m.content.includes(_probe)) || (typeof m?.reasoning === "string" && m.reasoning.includes(_probe)));
+          // 可恢复内容 = 正文/思考/步骤任一非空。以前只认正文，于是被打断在工具执行途中（满是步骤、正文还没出）的那轮整条消失。
+          const _hasContent = !!(_draftText.trim() || _draftReasoning.trim() || _steps);
+          if (_draftSession && _hasContent && !_already) {
+            // 步骤清单排在叙述**前面**：被打断那轮「做了什么」比「说到哪」更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
+            const _msg = {
               role: "assistant",
               content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n`
                 + (_steps ? `${_steps}\n\n` : "")
-                + _draft.text,
-            });
+                + _draftText,
+            };
+            // 思考（reasoning）也存了、也被渲染过，以前只拼 steps+text 把它丢了、「✓ 思考」只剩个勾。带上它，走 assistant.reasoning 老路渲染成可折叠思考块。
+            if (_draftReasoning.trim()) _msg.reasoning = _draftReasoning;
+            _draftSession.memory.push(_msg);
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
             _restored++;
           }
