@@ -4,12 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mr. Day One</title>
-    <script type="module" crossorigin src="/app/assets/main-BHrUj6Mw.js"></script>
+    <script type="module" crossorigin src="/app/assets/main-D4UFPRNs.js"></script>
     <link rel="modulepreload" crossorigin href="/app/assets/rolldown-runtime-BVpWp9h4.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/vendor-DXElHJaw.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/tailwind-iGaSgD7L.js">
-    <link rel="stylesheet" crossorigin href="/app/assets/tailwind-C7Vn9kUI.css">
-    <link rel="stylesheet" crossorigin href="/app/assets/main-B8L1ILca.css">
+    <link rel="modulepreload" crossorigin href="/app/assets/vendor-ZlW_aUeQ.js">
+    <link rel="modulepreload" crossorigin href="/app/assets/tailwind-CgH9YQkY.js">
+    <link rel="stylesheet" crossorigin href="/app/assets/tailwind-Ctz2zdjD.css">
+    <link rel="stylesheet" crossorigin href="/app/assets/main-BUx9u4eQ.css">
   </head>
   <body>
     <!--
@@ -75,45 +75,19 @@
         <rect x="10" y="10" width="4" height="4" rx="1" fill="currentColor" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10 4v2m4-2v2m-4 12v2m4-2v2M4 10h2m-2 4h2m12-4h2m-2 4h2" />
       </symbol>
-      <symbol id="i-brand-openai" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7715-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zm-12.6438 4.135l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
-      </symbol>
       <!-- Real marks, not a generic branch glyph: a user scanning the @ menu recognises the
            Octocat and the fox long before they read the label beside it. -->
+      <!-- 模型厂商的品牌标不在这里了。
+           它们是 149 家的官方 logo（两百多 KB），放在 src/brand-sprite.js 里、
+           启动时注进 DOM —— 塞在这个骨架文件里会让它没法看。
+           **千万别在这里重新加 i-brand-<厂商>**：同名 id 在文档里先出现的赢，
+           而这段 HTML 比脚本先解析，于是那个旧的会静默盖掉真 logo，
+           症状是「图标换了但界面没变」。github / gitlab 留在下面，它们不是模型厂商。 -->
       <symbol id="i-brand-github" viewBox="0 0 24 24">
         <path fill="currentColor" d="M12 .5C5.73.5.5 5.73.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/>
       </symbol>
       <symbol id="i-brand-gitlab" viewBox="0 0 24 24">
         <path fill="currentColor" d="m23.55 9.8-.03-.08-3.26-8.51a.85.85 0 0 0-.34-.4.87.87 0 0 0-1 .05.87.87 0 0 0-.29.44l-2.2 6.73H7.58l-2.2-6.73a.86.86 0 0 0-.29-.44.87.87 0 0 0-1-.06.86.86 0 0 0-.34.4L.48 9.71l-.03.09a6.06 6.06 0 0 0 2.01 7l.01.01.03.02 4.97 3.72 2.46 1.86 1.5 1.13a1.01 1.01 0 0 0 1.22 0l1.5-1.13 2.46-1.86 5-3.74.02-.02a6.06 6.06 0 0 0 2-6.99Z"/>
-      </symbol>
-      <symbol id="i-brand-anthropic" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.541Zm-.3712 10.2426 2.2914-5.9456 2.2914 5.9456Z" />
-      </symbol>
-      <symbol id="i-brand-meta" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M6.915 4.03c-1.968 0-3.683 1.28-4.871 3.113C.704 9.208 0 11.883 0 14.449c0 .706.07 1.369.21 1.973a6.624 6.624 0 0 0 .265.86 5.297 5.297 0 0 0 .371.761c.696 1.159 1.818 1.927 3.593 1.927 1.497 0 2.633-.671 3.965-2.444.76-1.012 1.144-1.626 2.663-4.32l.756-1.339.186-.325c.061.1.121.196.183.3l2.152 3.595c.724 1.21 1.665 2.556 2.47 3.314 1.046.987 1.992 1.22 3.06 1.22 1.075 0 1.876-.355 2.455-.843a3.743 3.743 0 0 0 .81-.973c.542-.939.861-2.127.861-3.745 0-2.72-.681-5.357-2.084-7.45-1.282-1.912-2.957-2.93-4.716-2.93-1.047 0-2.088.467-3.053 1.308-.652.57-1.257 1.29-1.82 2.05-.69-.875-1.335-1.547-1.958-2.056-1.182-.966-2.315-1.303-3.454-1.303zm10.16 2.053c1.147 0 2.188.758 2.992 1.999 1.132 1.748 1.647 4.195 1.647 6.4 0 1.548-.368 2.9-1.839 2.9-.58 0-1.027-.23-1.664-1.004-.496-.601-1.343-1.878-2.832-4.358l-.617-1.028a44.908 44.908 0 0 0-1.255-1.98c.07-.109.141-.224.211-.327 1.12-1.667 2.118-2.602 3.157-2.602zm-10.201.553c1.265 0 2.058.791 2.675 1.446.307.327.737.871 1.234 1.579l-1.02 1.566c-.757 1.163-1.882 3.017-2.837 4.338-1.191 1.649-1.81 1.817-2.486 1.817-.524 0-1.038-.237-1.383-.794-.263-.426-.464-1.13-.464-2.046 0-2.221.63-4.535 1.66-6.088.454-.687.964-1.226 1.533-1.533a2.264 2.264 0 0 1 1.088-.282z" />
-      </symbol>
-      <symbol id="i-brand-deepseek" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 15.5v-3.07c-1.28-.07-2.2-.43-2.89-1.08-.78-.73-1.16-1.82-1.16-3.24 0-1.24.36-2.27 1.08-3.06.73-.8 1.72-1.3 2.97-1.5V4.5l4 3.5-4 3.5V9.57c-.84.15-1.47.48-1.89.98-.42.5-.63 1.14-.63 1.91 0 .86.22 1.5.66 1.92.44.42 1.07.66 1.86.71V15.5z"/>
-      </symbol>
-      <symbol id="i-brand-qwen" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M12.951 1.816 16.4 7.79h2.524c.69 0 1.328.368 1.673.966l3.197 5.538a1.93 1.93 0 0 1 0 1.931l-3.197 5.539a1.93 1.93 0 0 1-1.673.966h-2.523l-2.121 3.674a.483.483 0 0 1-.837 0l-3.45-5.974H7.6a1.93 1.93 0 0 1-1.673-.966l-3.197-5.539a1.93 1.93 0 0 1 0-1.931L5.927 6.93A1.93 1.93 0 0 1 7.6 5.964h2.523l2.011-3.484a.483.483 0 0 1 .817-.664zm-.408 2.946L10.96 7.5h2.166zm-.965 1.67H8.084l3.494 6.052zm2.844 0-3.205 5.55 1.298 2.249h6.41zm-7.49.836-1.082 1.874h2.165zm12.136 0-1.083 1.874h2.166zM4.39 9.42l-1.082 1.874h2.165zm15.22 0-1.082 1.875h2.165zm-9.516.51L6.798 15.48h6.41zm5.302.835-3.205 5.55h6.41zm-12.07.529L1.776 13.6 4.39 18.13l1.298-2.249zm15.89 0L18.61 15.88l1.298 2.249 2.614-4.528zm-9.515.51-3.206 5.55h2.616l1.298-2.249zm5.302.836-1.298 2.248h2.595zm-7.49.835-1.082 1.874h2.166zm9.135 1.67-1.082 1.874h2.165l1.082-1.874zm-7.49.835-1.082 1.875h2.166zm2.844 1.67-1.083 1.874h2.166z" />
-      </symbol>
-      <symbol id="i-brand-gemini" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M12 1.5c.6 5.2 4.8 9.4 10 10-5.2.6-9.4 4.8-10 10-.6-5.2-4.8-9.4-10-10 5.2-.6 9.4-4.8 10-10z" />
-      </symbol>
-      <symbol id="i-brand-minimax" viewBox="0 0 24 24">
-        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M4 19V6l8 9 8-9v13" />
-      </symbol>
-      <symbol id="i-brand-glm" viewBox="0 0 24 24">
-        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M5.5 5h13L5.5 19h13" />
-      </symbol>
-      <symbol id="i-brand-kimi" viewBox="0 0 24 24">
-        <path fill="currentColor" d="M13.9 2.2c-3.7.8-6.5 4.1-6.5 8 0 4.7 3.8 8.5 8.5 8.5 1.8 0 3.4-.5 4.8-1.5A9.8 9.8 0 0 1 11.9 22C6.4 22 2 17.6 2 12.1 2 6.9 6 2.6 11.1 2.1c1-.1 1.9 0 2.8.1Z" />
-        <path fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" d="M10 7.1v9.8m0-4.8 5.6-5m-4.3 5.1 5.1 4.7" />
-      </symbol>
-      <symbol id="i-brand-grok" viewBox="0 0 24 24">
-        <path fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round" d="M5 5.4 19 19M19 5.4 5 19" />
-        <path fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" d="M12 3v3.2M12 17.8V21M3 12h3.2M17.8 12H21" opacity=".72" />
       </symbol>
       <symbol id="i-caret" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" />
@@ -224,13 +198,31 @@
         <rect x="2.8" y="4.6" width="18.4" height="14.8" rx="3" fill="none" stroke="currentColor" stroke-width="2.05" />
         <path fill="none" stroke="currentColor" stroke-width="2.05" stroke-linecap="round" stroke-linejoin="round" d="m7.1 9.2 3.25 2.8-3.25 2.8M12.6 15h4.8" />
       </symbol>
+      <!-- 实时预览页签 / 视图菜单：浏览器窗口 + 播放三角 =「把它跑起来看」。
+           第一版在窗口正中画了同心圆点（想表达"直播中"），16px 下整体读成一台相机——
+           矩形加中央同心圆就是镜头。三角形没有这个歧义。 -->
+      <symbol id="i-live-preview" viewBox="0 0 24 24">
+        <rect x="2.6" y="4.3" width="18.8" height="15.4" rx="3" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M2.6 8.5h18.8" />
+        <circle cx="5.7" cy="6.4" r=".95" fill="currentColor" />
+        <circle cx="8.5" cy="6.4" r=".95" fill="currentColor" />
+        <path fill="currentColor" d="M10.05 11.15 15.6 14.4l-5.55 3.25z" />
+      </symbol>
       <symbol id="i-sidebar-left" viewBox="0 0 24 24">
         <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" d="M9 5v14" />
       </symbol>
+      <!-- 右侧面板开关的两个状态，同一副几何、只差右段填不填 —— VS Code 那套惯例：
+           实心 = 面板在，空框 = 面板收起。两个状态用同一个图标只换颜色的话，光看图标
+           根本判断不出当前是开是关。 -->
       <symbol id="i-sidebar-right" viewBox="0 0 24 24">
         <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
         <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+      </symbol>
+      <symbol id="i-sidebar-right-on" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+        <path fill="currentColor" stroke="none" d="M15.9 5.9h2.7a1.9 1.9 0 0 1 1.9 1.9v8.4a1.9 1.9 0 0 1-1.9 1.9h-2.7z" />
       </symbol>
       <symbol id="i-book" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
@@ -347,18 +339,6 @@
       <symbol id="i-appearance" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/>
         <path d="M12 5.4a6.6 6.6 0 0 1 0 13.2z" fill="currentColor"/>
-      </symbol>
-      <symbol id="i-theme-light" viewBox="0 0 24 24">
-        <rect x="3" y="4" width="18" height="16" rx="4" fill="#fffaf0" stroke="#f2c94c" stroke-width="1.2"/>
-        <path d="M6.8 8.2h5.8M6.8 11.6h9.8M6.8 15h6.4" stroke="#8a6d1d" stroke-width="1.35" stroke-linecap="round"/>
-        <circle cx="17" cy="8" r="2.35" fill="#ffd166"/>
-        <path d="M17 4.6v1M17 10.4v1M13.6 8h1M19.4 8h1M14.6 5.6l.7.7M18.7 9.7l.7.7M14.6 10.4l.7-.7M18.7 6.3l.7-.7" stroke="#f59e0b" stroke-width="1" stroke-linecap="round"/>
-      </symbol>
-      <symbol id="i-theme-dark" viewBox="0 0 24 24">
-        <rect x="3" y="4" width="18" height="16" rx="4" fill="#111113" stroke="#3a3a40" stroke-width="1.2"/>
-        <path d="M7 8.2h4.9M7 11.6h8.4M7 15h5.7" stroke="#d6d6d6" stroke-width="1.35" stroke-linecap="round"/>
-        <path d="M17.7 6.1a4.4 4.4 0 1 0 1.4 8.55 5.15 5.15 0 0 1-1.4-8.55z" fill="#4daafc"/>
-        <path d="M18.8 5.1l.35.8.85.08-.65.55.2.84-.72-.45-.72.45.2-.84-.65-.55.85-.08.34-.8z" fill="#bde1ff"/>
       </symbol>
       <symbol id="i-shield" viewBox="0 0 24 24">
         <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 2l8 4v5c0 5.5-3.8 10.7-8 12-4.2-1.3-8-6.5-8-12V6l8-4z"/>

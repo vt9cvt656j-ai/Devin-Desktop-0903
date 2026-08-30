@@ -1,1 +1,0 @@
-import{Qc as e,Zc as t}from"./vendor-DXElHJaw.js";t();export{e as relaunch};

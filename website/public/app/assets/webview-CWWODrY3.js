@@ -1,1 +1,0 @@
-import{gl as e,hl as t}from"./vendor-DXElHJaw.js";e();export{t as getCurrentWebview};

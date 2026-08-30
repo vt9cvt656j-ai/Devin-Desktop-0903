@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:web": "vite build --base=/app/ --outDir website/public/app --emptyOutDir",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "node scripts/run-tests.mjs",
