@@ -252,7 +252,9 @@ test("三栏布局的硬底仍然存在，只是从 890px 降到了 640px（这�
     return css.slice(i, css.indexOf("}", i) + 1);
   };
   for (const sel of [".layout .explorer", ".layout .assistant"]) {
-    assert.match(rule(sel), /min-width:\s*\d+px/, sel + " 没有最小宽度，会被一路压成 0");
+    // 下限现在按**物理像素**写：calc(140px / var(--ui-zoom))。裸 140px 在放大时会跟着
+    // 变大，等于下限自己多吃屏幕 —— 所以认 calc 形式，不再认裸像素。
+    assert.match(rule(sel), /min-width:\s*calc\(\d+px \/ var\(--ui-zoom/, sel + " 没有最小宽度，会被一路压成 0");
     assert.ok(!/flex:\s*none/.test(rule(sel)), sel + " 又变回不可收缩了 —— 890px 以下就会裁");
   }
   assert.match(rule(".layout .editorwrap"), /min-width:\s*200px/, "编辑器丢了自己的下限");
