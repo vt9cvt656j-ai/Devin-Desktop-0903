@@ -16,6 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
+import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery } from "../src/agent/outcome.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
 // 不再抠源码注入依赖（抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { stackTable as STACK_TABLE, extractStackHints as extractStack,
@@ -24835,9 +24836,25 @@ test("收尾评审员必须真的被调用——它曾经零调用点，而三�
   assert.match(call, /changeDigest:/,
     "不给它看真实 diff 的话，「这段改动有没有实现用户要求」这个问题结构上就问不出来");
   assert.match(call, /executionEvidence: run\._executionEvidence/);
-  // 只在改过代码的 agent 轮跑，有成本上界，且可关 —— 它多花一次模型调用。
-  const guard = SRC.slice(Math.max(0, at - 1800), at);
-  assert.match(guard, /_mutatedCode && run\.mode === "agent"/, "又变成不改代码也评审了");
+  // 闸门原来第一个合取项是 _mutatedCode，于是**零落盘的运行一次都进不去**——而实测
+  // （用户机器 1217 条真实运行）明确让它造/改东西的 273 条里，114 条一个文件都没碰，
+  // 其中 76 条被记成 success。最该被质疑的那一类，从来没人看过。
+  const guard = SRC.slice(Math.max(0, at - 2400), at);
+  assert.match(guard, /\(_mutatedCode \|\| _zeroDeliveryReview\) && run\.mode === "agent"/,
+    "评审又只在改过代码时跑了——零落盘那一类恰好最该被质疑，从此又没人看");
+  assert.match(guard, /_shouldReviewZeroDelivery\(\{/,
+    "零交付评审的判据不在 agent/outcome.js 里了——判据散回主循环就没人能单独验它");
+  // 判据本身做真往返，不验源码文本。
+  assert.equal(_shouldReviewZeroDelivery({ mode: "agent", didMutate: false, reviews: 0, steps: 2 }), true,
+    "零落盘、干过两步的 agent 轮必须被评审");
+  assert.equal(_shouldReviewZeroDelivery({ mode: "agent", didMutate: false, reviews: 1, steps: 9 }), false,
+    "零交付评审的成本上界没了——它必须只跑一次");
+  assert.equal(_shouldReviewZeroDelivery({ mode: "agent", didMutate: true, reviews: 0, steps: 9 }), false,
+    "改过代码的走 _mutatedCode 那条（可重审两次），不该同时命中零交付分支");
+  assert.equal(_shouldReviewZeroDelivery({ mode: "chat", didMutate: false, reviews: 0, steps: 9 }), false,
+    "非 agent 轮不该被评审");
+  assert.equal(_shouldReviewZeroDelivery({ mode: "agent", didMutate: false, reviews: 0, steps: 1 }), false,
+    "一步都没干的轮不算数，否则纯问答也要付一次评审");
   assert.match(guard, /agentWrapUpReview !== false/, "缺少关掉它的开关");
   assert.match(guard, /run\._wrapUpReviews \|\| 0\) < \d/, "评审的成本上界没了——它每次都多花一次模型调用");
   // 上界要在，但不能是「跑过就永不再跑」：评审下面还有三道闸门（诊断/构建/计划）会把
@@ -35897,30 +35914,46 @@ test("路径不唯一的读取要判失败，不能拿去打勾一条调研步�
 // 问题，改了没验证是取证问题。四种在存档里长得一样，就等于这 41% 永远只能靠猜。
 // （按步数分布已排除迭代上限：分布平滑，没有任何一个值异常聚集。）
 test("部分完成要记成因，且 outcome 必须由成因派生——不许两处各判一次", () => {
-  const src = SRC.slice(SRC.indexOf("const _partialCause = _stoppedEarly"),
-                        SRC.indexOf("const _partialCause = _stoppedEarly") + 900);
+  // 判定住在 agent/outcome.js，所以这里**真的跑一遍**，不再拿正则去匹配主循环的源码文本。
+  // 原来那版是 `SRC.slice(indexOf(...), +900)` 的固定窗口——判定一变长就守不住尾部，
+  // 而且照样是绿的。
+  const F = (o) => _partialCause(o);
 
-  // 分支顺序必须和原来那串 || 一致：先到者胜，记下来的才是真正促成 partial 的那一个。
-  const order = ["stopped_early", "_incompleteReason", "iteration_limit", "unverified_change", "unverified_ui"];
-  let at = -1;
-  for (const k of order) {
-    const i = src.indexOf(k);
-    assert.ok(i > at, `成因分支顺序错了：${k} 必须排在前一个之后，否则记下的不是真正触发的那个`);
-    at = i;
-  }
+  // 先到者胜：同时满足多个条件时，记下的必须是最靠前那个。
+  assert.equal(F({ stoppedEarly: true, incompleteReason: "x", hitCap: true }), "stopped_early");
+  assert.equal(F({ incompleteReason: "code_delivered_unverified", hitCap: true }), "code_delivered_unverified");
+  assert.equal(F({ hitCap: true, didMutate: true }), "iteration_limit");
+  assert.equal(F({ didMutate: true }), "unverified_change");
+  assert.equal(F({ didMutate: true, verificationPassed: true }), "unverified_ui");
+  assert.equal(F({ didMutate: true, verificationPassed: true, uiVerificationPassed: true }), "");
+  assert.equal(F({}), "", "什么都没发生的一轮不该被判成部分完成");
 
-  // outcome 必须**派生自**成因，不能两处各判一次——各判一次就会漂，
-  // 而漂掉的那天，存档里会出现「outcome=success 却带着成因」这种自相矛盾的记录。
-  assert.match(SRC, /: _partialCause \? "partial" : "success";/,
-    "outcome 必须由 _partialCause 派生");
-  assert.doesNotMatch(SRC, /\(_stoppedEarly \|\| run\._incompleteReason \|\| hitCap/,
-    "旧的那串 || 必须整个换掉，不能留一份平行判定");
+  // outcome 由成因派生，不许两处各判一次。
+  assert.equal(_runOutcome({}), "success");
+  assert.equal(_runOutcome({ hitCap: true }), "partial");
+  assert.equal(_runOutcome({ finalErr: "boom" }), "failed");
+  assert.equal(_runOutcome({ awaitingUserReply: true, finalErr: "boom" }), "awaiting_user",
+    "等用户回话要排在 failed 之前");
 
-  // 成因要真的落盘，否则等于没记。
-  assert.match(SRC, /run\._outcomeCause = _partialCause;/, "成因要挂到 run 上传给情景档案");
-  assert.match(SRC, /\.\.\.\(run\._outcomeCause \? \{ cause: String\(run\._outcomeCause\)/,
-    "情景档案里必须落一条 cause");
-  assert.match(SRC, /outcomeCause: _partialCause,/, "_lastRunState 也要带上，否则只有存档有、当轮读不到");
+  // ── 收尾评审的否决权 ──
+  // 这次付费评审读了真实 diff 和验收契约，此前它的结论**只进一张建议卡**，
+  // 对结局零影响：评审判「没实现用户要的东西」，outcome 照样 success。
+  const V = { wrapUpDone: false, implOps: 0, wrapUpReviewedAtImplOps: 0 };
+  assert.equal(F(V), "wrapup_not_delivered", "评审判了不合格，结局仍然记 success");
+  assert.equal(_runOutcome(V), "partial");
+  assert.equal(F({ ...V, implOps: 3 }), "",
+    "评审之后又落过盘，那份结论读的是旧世界，不该再否决这一轮");
+  assert.equal(F({ wrapUpDone: true, implOps: 0, wrapUpReviewedAtImplOps: 0 }), "");
+  assert.equal(F({ implOps: 0, wrapUpReviewedAtImplOps: 0 }), "",
+    "评审压根没跑成（done 缺席）不许被当成「没实现」——那是凭空冤枉自己");
+  assert.equal(F({ ...V, stoppedEarly: true }), "stopped_early",
+    "否决必须排在成因链最后，永远不许盖掉一个更具体的成因");
+
+  // 调用点：判定接上了，而且评审结论真的被喂进去了（否则否决权等于没接）。
+  assert.match(SRC, /const _partialCause = _partialCauseOf\(_outcomeFacts\)/,
+    "主循环没在用 outcome.js 的判定");
+  assert.match(SRC, /wrapUpDone: run\._wrapUpVerdict\?\.done/,
+    "评审结论没喂进结局判定——那次付费调用又变回一个没人收得到的结论");
 });
 
 // 能力名录不许对**已加载**的工具说"先去 search_tools 取 schema"。
