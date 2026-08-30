@@ -119,7 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, dropFeedback, planExplorerDrop } from "./agent/explorer-drop.js";
+import { dropDirFor, planExplorerDrop } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -12418,7 +12418,9 @@ function ioPrompt({ title, message = "", value = "", placeholder = "", okLabel =
   });
 }
 
-function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
+// altLabel 可选：给出时多一个次要按钮，resolve "ok" | "alt" | "cancel"；
+// 不给时行为和返回值（布尔）都和以前一模一样，现有调用方不受影响。
+function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", danger = false }) {
   return new Promise((resolve) => {
     _cancelActiveIoDialog();
     _cancelActiveIoConfirm();
@@ -12430,6 +12432,7 @@ function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
         <p class="io-confirm-message"></p>
         <div class="io-confirm-actions">
           <button class="btn io-confirm-cancel" type="button">取消</button>
+          ${altLabel ? '<button class="btn io-confirm-alt" type="button"></button>' : ""}
           <button class="btn io-confirm-ok${danger ? " btn--danger" : " btn--primary"}" type="button"></button>
         </div>
       </section>`;
@@ -12440,6 +12443,8 @@ function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
     const ok = overlay.querySelector(".io-confirm-ok");
     ok.textContent = okLabel || "OK";
     const cancel = overlay.querySelector(".io-confirm-cancel");
+    const alt = overlay.querySelector(".io-confirm-alt");
+    if (alt) alt.textContent = altLabel;
     document.body.appendChild(overlay);
     let done = false;
     const finish = (confirmed = false, returnValue = confirmed ? "ok" : "cancel", event = null) => {
@@ -12456,7 +12461,7 @@ function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
       ok.removeEventListener("pointerdown", onAccept);
       ok.removeEventListener("click", onAccept);
       try { overlay.remove(); } catch {}
-      resolve(confirmed);
+      resolve(altLabel ? returnValue : confirmed);
     };
     const cancelActive = () => finish(false, "cancel");
     const onCancel = (event) => finish(false, "cancel", event);
@@ -12480,6 +12485,7 @@ function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
     cancel.addEventListener("click", onCancel);
     ok.addEventListener("pointerdown", onAccept);
     ok.addEventListener("click", onAccept);
+    if (alt) { const onAlt = (e) => finish(false, "alt", e); alt.addEventListener("click", onAlt); }
     document.addEventListener("keydown", onKey, true);
     requestAnimationFrame(() => (danger ? cancel : ok).focus());
   });
@@ -80219,8 +80225,7 @@ const _explorerEl = document.getElementById("explorer");
 // Composer input is local-only. Paid intent work starts after Send owns the current
 // settlement requestId, so abandoned drafts cannot compete with the foreground model.
 const _composerEl = document.getElementById("composer");
-// Precise Lucide-geometry icons. folder-down = open into workspace; bot = reference in AI chat.
-const _ICON_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6"/><path d="m9 13 3 3 3-3"/></svg>';
+// bot 图标 = 引用到 AI 对话（唯一还在用的投放区图标）。
 const _ICON_AI = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>';
 function _mkDropZone(cls, labelCls, icon, label) {
   const z = document.createElement("div");
@@ -80229,11 +80234,9 @@ function _mkDropZone(cls, labelCls, icon, label) {
   return z;
 }
 if (_composerEl) _composerEl.appendChild(_mkDropZone("composer-dropzone", "dz-label--ai", _ICON_AI, "引用到对话"));
-// 「换掉整个项目」这一档的反馈落在**编辑器区**——光标在哪儿，反馈就在哪儿。
-// 文案由跟随光标的 drop-chip 说，这层只出一个虚线/实线的框，所以图标和标签都留空。
-const _layoutEl = document.querySelector(".layout");
-const _editorDropzoneEl = _mkDropZone("editor-dropzone", "dz-label--open", "", "");
-if (_layoutEl) _layoutEl.appendChild(_editorDropzoneEl);
+// 侧栏不再有整块罩色的投放区：VS Code 的投放反馈只有「目标那一行的底色」，罩整块反而
+// 说不清落点（而且旧标签写的是「打开到工作区」，和现在的复制语义正好相反）。
+// 编辑器区同理，不画自创的虚线框。
 
 let _dropHideTimer = 0;
 // Which target is the cursor over? Checks the composer rect against BOTH the raw position and the
@@ -80272,7 +80275,8 @@ function _dropDirAt(payload) {
 }
 // 拖进来的是什么：drag-enter 带 paths，drag-over 不带 → 在 enter 那一帧存下来给后续复用。
 let _dragItems = [];
-let _dropChipEl = null;
+let _dropSig = "";
+let _springTimer = 0;
 // 存**路径**而不是节点引用：fs-watcher 会在拖动途中重建整棵树，存引用的话高亮会挂在
 // 一个已被丢弃的节点上，既清不掉也贴不上。每帧按类名扫一遍再贴，重建后下一帧自愈。
 function _paintDropRow(path) {
@@ -80280,49 +80284,34 @@ function _paintDropRow(path) {
   if (!path) return;
   _treeEl?.querySelector(`.row[data-path="${cssEscape(path)}"]`)?.classList.add("is-drop-into");
 }
-let _dropSig = "";
 function _showDrop(target, payload) {
   clearTimeout(_dropHideTimer);
-  // P1-3 看门狗：drag-leave **不保证会来**（drop 后 macOS 不发 draggingExited、拖到别的
-  // 应用、ESC 取消、wry 漏发都可能）。没有它，行高亮会残留下来，长得很像"这个文件被选中了"。
+  // 看门狗：drag-leave **不保证会来**（drop 后 macOS 不发 draggingExited、拖到别的应用、
+  // ESC 取消、wry 漏发都可能）。没有它，行高亮会残留，长得很像"这个文件被选中了"。
   _dropHideTimer = setTimeout(_hideDrop, 450);
-  const fb = dropFeedback({
-    zone: target, destDir: target === "explorer" ? _dropDirAt(payload) : "",
-    rootPath, items: _dragItems,
-  });
-  // 反馈画在光标**真正所在**的那块区域。以前 target 是 "open"（光标在编辑器上、后果是
-  // 换掉整个项目）时却去点亮**侧栏**，而侧栏恰恰是唯一不会换项目的地方——用户"分不清
-  // 是放文件还是替换整个工作区"的直接来源就在这里。
+  const dest = target === "explorer" ? _dropDirAt(payload) : "";
   if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", target === "composer"); }
-  if (_explorerEl) _explorerEl.classList.remove("drag-into", "is-over");
-  _layoutEl?.classList.toggle("drag-open", target === "open");
-  _layoutEl?.classList.toggle("drag-open--replace", fb.kind === "replace");
-  _editorDropzoneEl?.classList.toggle("is-benign", fb.kind !== "replace");
-  // 按值去重：同一行内移动光标时不重写 DOM（elementFromPoint 已经强制同步布局了一次）。
-  const _sig = `${target}|${fb.kind}|${fb.rowPath}|${fb.title}|${fb.sub}`;
-  if (_sig !== _dropSig) { _dropSig = _sig; _paintDropRow(fb.rowPath); _paintDropChip(fb); }
-  // 夹取用 viewportW/H 而不是 innerWidth：innerWidth 不随页面缩放变，放大之后浮层会飞出屏幕。
-  const pt = _dropPointIn(payload?.position, document.documentElement);
-  if (pt) {
-    _dropChipEl.style.left = Math.max(4, Math.min(pt.x + 16, viewportW() - 330)) + "px";
-    _dropChipEl.style.top = Math.max(4, Math.min(pt.y + 18, viewportH() - 44)) + "px";
+  // 拖放进行中关掉 hover 高亮（VS Code 的选择器里带 :not(.drop-target)）：两块高亮同时
+  // 亮着，用户分不清哪个才是落点。
+  _treeEl?.classList.toggle("is-dropping", target === "explorer");
+  const _sig = `${target}|${dest}`;
+  if (_sig === _dropSig) return;
+  _dropSig = _sig;
+  _paintDropRow(dest);
+  // 悬停折叠目录 500ms 自动展开（VS Code 的 autoExpand，实测就是 500ms）。只在目标行
+  // **变化**时重新计时，且只展开不收起——拖动中把列表收回去会让落点在脚下跳。
+  clearTimeout(_springTimer);
+  if (dest && dest !== rootPath && !_treeIsExpanded(dest)) {
+    _springTimer = setTimeout(() => { try { _treeSetExpanded(dest, true); void expandDir(dest); } catch {} }, 500);
   }
-}
-// 跟随光标的标签：写清"复制到 renderer"这种具体去向，换项目时还要写出会失去什么。
-function _paintDropChip(fb) {
-  if (!_dropChipEl) { _dropChipEl = document.createElement("div"); document.body.appendChild(_dropChipEl); }
-  _dropChipEl.className = "drop-chip drop-chip--" + (fb.kind === "replace" ? "replace" : fb.kind === "deny" ? "deny" : "copy");
-  _dropChipEl.textContent = fb.title;
-  if (fb.sub) { const s = document.createElement("span"); s.className = "drop-chip__sub"; s.textContent = fb.sub; _dropChipEl.append(" ", s); }
 }
 function _hideDrop() {
   _dropSig = "";
-  clearTimeout(_dropHideTimer);
+  clearTimeout(_dropHideTimer); clearTimeout(_springTimer);
   for (const el of [_explorerEl, _composerEl]) { if (el) { el.classList.remove("drag-into"); el.classList.remove("is-over"); } }
-  _layoutEl?.classList.remove("drag-open", "drag-open--replace");
+  _treeEl?.classList.remove("is-dropping");
   _paintDropRow("");
   _dragItems = [];
-  if (_dropChipEl) { _dropChipEl.remove(); _dropChipEl = null; }
 }
 // drag-leave can fire spuriously mid-drag; debounce the hide so the zones don't flicker.
 const _hideDropSoon = () => { clearTimeout(_dropHideTimer); _dropHideTimer = setTimeout(_hideDrop, 130); };
@@ -80342,6 +80331,21 @@ async function _copyIntoWorkspace(paths, destDir) {
   for (const p of paths) {
     const abs = _toPosix(p);
     items.push({ path: abs, isDir: await backend.readDir(abs).then(() => true).catch(() => false) });
+  }
+  // 文件夹落在**项目根**上 → 先问，别默默复制。VS Code 在这一刻就是弹框问的：
+  // "Do you want to copy 'X' or add 'X' as a folder to the workspace?"
+  // 我们把次选项换成「打开为新项目」——用户原来就是靠拖到侧栏换项目的，改成复制之后
+  // 那条路就没了，这一问正好把它还回来（加进工作区仍在 文件菜单 → 添加文件夹到工作区）。
+  const _dirs = items.filter((x) => x.isDir);
+  if (_dirs.length && destDir === rootPath) {
+    const what = _dirs.length > 1 ? `${_dirs.length} 个文件夹` : `「${basename(_dirs[0].path)}」`;
+    const pick = await ioConfirm({
+      title: `${what}要怎么处理？`,
+      message: `复制进当前项目，还是打开为新项目？（打开会关掉当前的「${basename(rootPath) || "项目"}」）`,
+      okLabel: "复制进来", altLabel: "打开为新项目",
+    });
+    if (pick === "cancel") return;
+    if (pick === "alt") { await openFolder(_dirs[0].path); return; }
   }
   let existingNames = [];
   try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
