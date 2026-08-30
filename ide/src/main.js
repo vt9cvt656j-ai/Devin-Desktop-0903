@@ -31,7 +31,8 @@ import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
-import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery } from "./agent/outcome.js";
+import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
+import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
@@ -46044,59 +46045,6 @@ function _idleIterLimit() {
   return raw > 0 ? Math.max(2, Math.round(raw)) : 12;
 }
 
-function _freshBuildFailure(run, implOps) {
-  const ev = run && Array.isArray(run._executionEvidence) ? run._executionEvidence : [];
-  const settled = new Set();
-  let newestFailure = null;
-  for (let i = ev.length - 1; i >= 0; i--) {
-    const e = ev[i];
-    if (!e) continue;
-    // 判据必须和 `_evidenceCertifies`（发绿灯那一侧）**完全一致**，否则就有一条最省事的
-    // 过关路径。原来这里额外要求 `e.purpose === "verify"`，而绿灯那侧只看
-    // `verifierRecognized`、不看 purpose。于是模型跑 `npm test` 不声明 purpose：
-    //   过了 → 拿满验证学分；挂了 → 这里直接 continue 跳过，照常宣布完成。
-    // 「不填 purpose + 跑一条失败的测试」因此成了全系统最省事的收尾方式。
-    //
-    // 现在两侧都只认执行期盖上的 `verifierRecognized`。放宽的风险是：模型为了别的目的
-    // 跑了一条被识别为验证器的命令（比如 `npm run build` 只为产出资源）而它失败了，
-    // 于是这里会拦。但一个失败的 build 本来就不该收尾——拦对了。
-    if (e.verifierRecognized !== true) continue;
-    if (e.implementationVersion !== implOps) continue; // only the current artifact may drive another fix pass
-    if (e.timedOut === true) continue;
-    if (typeof e.exitCode !== "number") continue;
-    // 验证器**自己没起来**不是代码坏了的证据。
-    //
-    // agent_engineering.txt:32 逐字写着：「A verifier that cannot run is NOT evidence the code is
-    // broken, and is not a reason to wrap up. Exit 127/126 (command not found), a missing
-    // dependency, or a missing environment asserts nothing about the code」——而这道红构建门
-    // 照单把 127 当成「构建/测试没过，代码现在跑不起来」推给模型，逼它去修一个根本没被
-    // 检查过的代码。用户现场就撞过：`vhs demo.tape` 连着两次退出 127（工具没装），
-    // 而门给的指示是「先读真实错误、定位并修掉根因」——根因是没装 vhs，不在代码里。
-    //
-    // 判据用退出码 + 运行器级的「找不到」，不看代码里的报错文本：命令没找到是**执行事实**，
-    // 而正文里出现 "not found" 完全可能是被测代码自己打印的。
-    const _cannotRun = e.exitCode === 127 || e.exitCode === 126
-      || /^(?:[^\n]{0,80}?:\s*)?(?:command not found|not found|no such file or directory)\b/im
-        .test(String(e.output || e.tail || "").slice(0, 400));
-    if (_cannotRun) continue;
-    // last-write-wins 是**按命令**算的，不是全局的。
-    //
-    // 全局版的原意没错：「跑一次红 → 改好 → 再跑同一条命令绿」之后，那条更早的红不该
-    // 再把门打开。但它遇到任何一条绿就整体收工，于是**另一条无关的命令**也能替红的作证：
-    // 模型跑 `npm test` 挂了（退出 1），接着跑 `npx tsc --noEmit` 过了（退出 0），倒序扫描
-    // 先撞上 tsc、返回 null，整轮判成 success——失败的测试连提都不会被提起。
-    // 这正是"说自己解决了、实际没解决"里最难发现的一种：每一步都有真实执行证据。
-    //
-    // 一条绿只能替它自己作证。同一条命令的更晚记录压住更早的；不同命令各算各的，
-    // 只要还有任何一条命令最近一次是红的，这道门就得开。
-    const key = `${e.cwd || ""}\u0000${String(e.command || "").replace(/\s+/g, " ").trim()}`;
-    if (settled.has(key)) continue; // 这条命令更晚的那次已经裁决过了
-    settled.add(key);
-    // 倒序扫描，所以第一条没被压住的红就是"最近一次失败"。继续扫完，别的命令可能也红。
-    if (e.exitCode !== 0 && !newestFailure) newestFailure = e;
-  }
-  return newestFailure;
-}
 
 // 证据环满了要挤掉一条时，挑**对门禁无用**的那条，不是一律挤最老的。
 //
@@ -54239,22 +54187,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             } catch { run._wrapUpReviewFailed = (run._wrapUpReviewFailed || 0) + 1; /* 评审失败不该弄坏一轮交付 */ }
           }
         }
-        if (_codeDeliveredUnverified && !run._incompleteReason) {
-          // 改了代码、整轮零验证证据。这里**只记账，不代跑**——这是刻意的。
-          //
-          // 我一度在这里接上 `_runApprovedVerification` 让 IDE 自己跑一次 checkCmd，
-          // 被测试「验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代跑」拦下了，
-          // 而它是对的：关键词是 **secretly**。偷偷跑一个模型不知道的命令，会让"已完成"
-          // 变得不可预测（模型没请求过它、也没机会解释它的结果），和整套"不拿 harness 的
-          // 偏好覆盖模型判断"的哲学冲突。
-          //
-          // 真正的病不在这里，在别处：栈提示每轮都在向模型断言「agent 会每改几个文件
-          // 自动跑」「失败会自动注入报告」，而那套机器是死的（`_runApprovedVerification`
-          // 零调用点；那两个"待校验文件"账本从没有过读者，已删除）。模型据此把
-          // 验证外包给了一个不存在的东西。谎话已经在 `_formatStackHint` 里去掉，
-          // 改成祈使句"改完必须你自己跑，没有任何东西会替你跑"。
-          run._incompleteReason = "code_delivered_unverified";
-        }
+        // 「改了代码、整轮零验证证据」这条**不在这里记账**，只在收尾记。
+        //
+        // 中途记会产出假 partial：模型改代码 → 跑测试红 → 这里记账 → 红构建门放行续跑
+        // → 修好重跑绿 → `_verifiedAtImplOps = _implOps` → 静默轮收尾，而账还粘着。
+        // **每修好一次红构建就多一个假 partial。** 收尾处用终态重算同一个判据、
+        // 同一个成因字符串，条件还成立的话一个都不会漏。
+        //
+        // 这里**从来只记账、不代跑**，那条哲学没变。我一度在这里接上
+        // `_runApprovedVerification` 让 IDE 自己跑一次 checkCmd，被测试拦下了，而它是对的：
+        // 关键词是 **secretly**。偷偷跑一个模型不知道的命令，会让「已完成」变得不可预测
+        // （模型没请求过它、也没机会解释它的结果）。
+        //
+        // 真正的病曾经在别处：栈提示每轮向模型断言「agent 会自动跑验证」，而那套机器是死的
+        // （`_runApprovedVerification` 零调用点）。那句谎话已经在 `_formatStackHint` 里改成
+        // 祈使句「改完必须你自己跑，没有任何东西会替你跑」。
         // ── 「读完就停」曾经在这里由 harness 画像门强制补一回合——已移除 ──
         //
         // 那道门读的是 `_missingEffects.includes("workspace")`，也就是**分类器/画像猜**
@@ -54322,9 +54269,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
           }
-          // 预算用完、或者续跑闸门本来就是关着的：两种情况都不再推提醒，但账一样要记。
-          // 退出码是执行事实，和「还能不能再补一轮」无关。
-          run._incompleteReason = "build_failing";
+          // 账不在这里记：红了之后又修好、重跑绿了的话，中途记的会粘到收尾变成假 partial。
+          // 收尾处用 `_freshBuildFailure(run, _implOps)` 按终态重判，见 agent/outcome.js。
         }
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
         // A steer ("引导" / a 2nd message) arrived during THIS turn — it's sitting in the
@@ -57139,6 +57085,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 单独立一个标志，不去改 verificationPassed 的语义——它还要参与「评审说没验证
     // 但记账说验过了」那道假绿检测，在这里置真会平白制造分歧。
     run._nothingToVerify = !_codeNeedsVerification;
+    // 红构建改成收尾按终态重判（中途记会粘成假 partial）。判据与优先级见 outcome.js。
+    run._incompleteReason = _settleBuildFailure(run._incompleteReason, !!_freshBuildFailure(run, _implOps));
     if (_codeNeedsVerification && !_currentCodeVerified) {
       verificationPassed = false;
       run._incompleteReason ||= "code_delivered_unverified";
@@ -57151,7 +57099,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
     // （run._writeLedger 逐条记着每次写入尝试的成败），不读模型的任何措辞。
     {
-      const _failedWrites = (Array.isArray(run._writeLedger) ? run._writeLedger : []).filter((a) => a && a.ok === false);
+      // 按 path 取**最后一条**：账本是顺序追加、整 run 不剪枝的，写失败后重试成功的
+      // 那条仍留在账上，直接 filter 会把已经补救成功的也算进 N。
+      const _lastWrite = new Map();
+      for (const a of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) if (a?.path) _lastWrite.set(String(a.path), a.ok === true);
+      const _failedWrites = [..._lastWrite].filter(([, ok]) => !ok);
       if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
     }
     // 声明了要改工作区，一个文件都没落盘 —— 第七条谎报路径。
@@ -59398,56 +59350,6 @@ function _reindentReplacement(newStr, indent) {
     .join("\n");
 }
 
-/**
- * May this mutation of an EXISTING file proceed without current-version read evidence?
- *
- * Exactly two bypasses are legitimate, and neither is "the model sent a whole file":
- *
- *   - redacted write-back — the model DID read the current version, just a masked copy.
- *     Its placeholders are restored by _restoreRedactedPlaceholders, which returns null and
- *     refuses the write if restoration is not exact.
- *   - precise local edit — an exact, unique oldString anchor located in the current disk
- *     content is itself evidence the model is operating on the real bytes.
- *
- * A complete whole-file write is NOT a bypass. Undo-ability is not correctness: content
- * composed from the model's prior silently drops whatever the file already held. Callers
- * apply this only when the file exists; creating a new file needs no prior read.
- */
-/**
- * Does this execution-evidence record certify the code as it stands at `implOps` edits?
- *
- * Two independent ways to fail:
- *
- *   - STALE. Evidence taken before the current edit count certifies a file that has since
- *     changed. That is the credit this gate exists to revoke.
- *   - RED. A command that failed is not verification, it is the opposite. Every positive
- *     test below matches on command SHAPE, so without the exit-status check a
- *     `npm run build` that exited non-zero certified the code it had just proven broken —
- *     the most direct route to delivering code that does not run.
- *
- * `ok` and `exitCode` are stamped at settle time from the structured tool result. A
- * record missing either field is intentionally not certification evidence; legacy or
- * restored history must be re-run instead of being treated as a green build.
- */
-function _evidenceCertifies(e, implOps) {
-  if (!e || e.ok !== true) return false;
-  // Two independent sources of certification, both grounded in OBSERVED execution:
-  //   - `verification`: the IDE ran its own auto-verify pipeline.
-  //   - `verifierRecognized`: the MODEL ran a command the IDE recognises as a verifier
-  //     (`go test ./...`, `npm run build`, `cargo check`, …), stamped at settle time.
-  // Only the first was honoured, so a model-run `go build` + `go test ./...` that genuinely
-  // exited 0 earned NO credit: the outcome card said "build passed, tests passed" and
-  // "no valid verification evidence" in the same breath, then told the user to go run a build
-  // themselves. `verifierRecognized` was computed and stamped on every record and read by
-  // nothing — while the code that grants credit already documented crediting exactly this
-  // ("settlement stamped a recognized verifier and its structured evidence proves an explicit
-  // exit 0"). This is that intent, implemented. Both paths still require a real exit 0 at the
-  // current edit count, so a red or stale check certifies nothing.
-  if (e.verification !== true && e.verifierRecognized !== true) return false;
-  if (e.exitCode !== 0 || e.timedOut === true) return false;
-  if (e.implementationVersion !== implOps) return false;
-  return String(e.command || "").trim().length > 0;
-}
 
 // One shared cap: the read tool cuts slices at this many chars (whole lines only), so a
 // single line longer than this can never be delivered in full by any read.

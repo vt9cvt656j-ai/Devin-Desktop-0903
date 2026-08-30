@@ -16,7 +16,8 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
-import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery } from "../src/agent/outcome.js";
+import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
+import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
 // 不再抠源码注入依赖（抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { stackTable as STACK_TABLE, extractStackHints as extractStack,
@@ -10562,8 +10563,12 @@ test("code delivery without build/test evidence is reported without forcing anot
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _codeDeliveredUnverified = /,
     "the final accounting signal must exist");
-  assert.match(SRC, /run\._incompleteReason = "code_delivered_unverified"/,
+  // 记账只在**收尾**做，不在中途：中途记会产出假 partial（改代码→测试红→记账→
+  // 红构建门放行续跑→修好重跑绿→静默轮收尾，账还粘着）。收尾用终态重算同一个判据。
+  assert.match(SRC, /run\._incompleteReason \|\|= "code_delivered_unverified"/,
     "missing verification must remain visible in the outcome");
+  assert.doesNotMatch(SRC, /run\._incompleteReason = "code_delivered_unverified"/,
+    "中途那次记账又回来了——每修好一次红构建就会多一个假 partial");
   assert.doesNotMatch(loop, /_pushNudge\("codeVerify"/,
     "an inferred verification preference must not override the model's end-turn decision");
 });
@@ -23321,7 +23326,7 @@ test("verification credit expires when files change under it", () => {
   assert.match(loop, /_executionEvidence\.some\(\(e\) => _evidenceCertifies\(e, _implOps\)\)/,
     "the gate must delegate per-record certification to _evidenceCertifies");
   assert.match(loop, /implementationVersion: _implOps/, "…and still written when evidence is recorded");
-  assert.match(SRC, /function _evidenceCertifies\(e, implOps\)[\s\S]*?implementationVersion !== implOps/,
+  assert.match(SRC, /function evidenceCertifies\(e, implOps\)[\s\S]*?implementationVersion !== implOps/,
     "only evidence stamped for the exact current edit version may certify");
 
   // both mutation handlers expire it, matching their sibling resets
@@ -23607,16 +23612,14 @@ test("_writeGateBypass: tolerates malformed calls without throwing", () => {
 // shape test runs.
 // ---------------------------------------------------------------------------
 const _verifyEvidenceAccepts = (evidence, implOps = 1) => {
-  const certifies = load("_evidenceCertifies", {
-    _looksLikeVerificationCommand: (c) =>
-      /\b(npm|pnpm|yarn|cargo|go|make)\b.*\b(build|test|check)\b/.test(c),
-    _runtimeCommandKinds: (c) => (/\b(build|test|run|package)\b/.test(c) ? ["build"] : []),
-  });
+  // 不再注入 _looksLikeVerificationCommand / _runtimeCommandKinds：判据根本不读它们
+  // （下面那条 doesNotMatch 正是钉这件事），而且函数已经搬进模块、直接用产品实现。
+  const certifies = _evidenceCertifies;
   return evidence.some((e) => certifies(e, implOps));
 };
 
 test("verify gate: certification requires complete structured green evidence", () => {
-  const certifies = load("_evidenceCertifies");
+  const certifies = _evidenceCertifies;
   // The IDE stamp is only meaningful with an explicit exit code and current version.
   assert.equal(certifies({ command: "npm run build", implementationVersion: 2, ok: true, verification: true, exitCode: 0 }, 2), true);
   // A declaration alone cannot mint evidence, even for an otherwise plausible script.
@@ -23634,7 +23637,7 @@ test("verify gate: certification requires complete structured green evidence", (
   assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, verification: true, exitCode: 0 }, 2), false,
     "future evidence is not a pass");
   // No text classifier may be consulted here any more.
-  assert.doesNotMatch(extractFn("_evidenceCertifies"), /_looksLikeVerificationCommand|_runtimeCommandKinds/,
+  assert.doesNotMatch(extractFn("evidenceCertifies"), /_looksLikeVerificationCommand|_runtimeCommandKinds/,
     "certification must not read command text");
   // The IDE only sets that stamp for a DECLARED verification that exited 0.
   assert.match(SRC, /if \(\(call\.type === "cmd" \|\| call\.type === "termtask"\)\s*\n\s*&& call\.purpose === "verify"\s*\n\s*&& _isRecognizedVerifierCommand\(call\.command, run\?\.stack\)\s*\n\s*&& _toolExecutionSucceeded\(call, result\)\s*\n\s*&& _verificationExitRaw != null\s*\n\s*&& Number\(_verificationExitRaw\) === 0\) \{/,
@@ -23961,7 +23964,7 @@ test("review: strict-mutating tools are never admitted into a child by type", ()
 test("review: evidence with a non-zero exitCode never certifies, even when ok=true", () => {
   // read_terminal on an exited terminal SUCCEEDS as a read (ok=true) while carrying the
   // real command and exitCode:1 — looking at a failure must not mint green evidence.
-  const certifies = load("_evidenceCertifies");
+  const certifies = _evidenceCertifies;
   assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 1, purpose: "verify", verification: true }, 3), false);
   assert.equal(certifies({ command: "npm run build", implementationVersion: 3, ok: true, exitCode: 0, purpose: "verify", verification: true }, 3), true);
   // null/undefined exitCode (still running, no code reported) is not a pass.
@@ -24218,7 +24221,7 @@ test("run_cmd purpose is validated structurally and rides the call", () => {
 });
 
 test("declared verify does not bypass the structural verifier contract", () => {
-  const certifies = load("_evidenceCertifies");
+  const certifies = _evidenceCertifies;
   // A verification no regex could recognise still needs the IDE's structural stamp.
   assert.equal(certifies({ command: "python check_invariants.py", purpose: "verify", implementationVersion: 1, ok: true, exitCode: 0 }, 1), false);
   assert.equal(certifies({ command: "npm test", purpose: "verify", implementationVersion: 1, ok: true, verification: true, exitCode: 0 }, 1), true);
@@ -24275,7 +24278,7 @@ test("the checkpoint route runs with phase-scoped deadlines", () => {
 // iterates on). _freshBuildFailure surfaces it from the evidence the loop already holds.
 // ---------------------------------------------------------------------------
 test("_freshBuildFailure finds a declared verification that exited nonzero at this edit count", () => {
-  const fresh = load("_freshBuildFailure");
+  const fresh = _freshBuildFailure;
   const run = { _executionEvidence: [
     { purpose: "verify", verifierRecognized: true, command: "npm run build", exitCode: 0, implementationVersion: 2 }, // green, older
     { purpose: "run", command: "node app.js", exitCode: 1, implementationVersion: 3 },      // failed but not a verify
@@ -24925,7 +24928,7 @@ test("一条绿命令只能替它自己作证，盖不住另一条命令的红",
   // 真实执行证据。模型跑 `npm test` 挂了（退出 1），接着跑 `npx tsc --noEmit` 过了，
   // 而 last-write-wins 是**全局**的——倒序扫描先撞上 tsc、返回 null，整轮判成 success，
   // 那条失败的测试连提都不会被提起。跑一次格式化也能达到同样效果。
-  const fresh = load("_freshBuildFailure");
+  const fresh = _freshBuildFailure;
   const ev = (command, exitCode) => ({
     verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
   });
@@ -24979,7 +24982,7 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
   assert.match(loop, /if \(_canResume && buildFixAttempts < 2\) \{[\s\S]{0,900}_pushNudge\("buildFix"[\s\S]{0,400}continue;/,
     "a fresh red build must feed stderr back and continue, not finish");
   // Bounded: past the budget it records an honest incomplete instead of thrashing.
-  assert.match(loop, /run\._incompleteReason = "build_failing"/,
+  assert.match(loop, /run\._incompleteReason = _settleBuildFailure\(run\._incompleteReason, !!_freshBuildFailure\(run, _implOps\)\)/,
     "an unfixable build must converge to an honest incomplete");
   // …而这句记账不能被续跑闸门罩住。罩住的话，闸门关闭时红构建连账都不记，收尾判成功。
   assert.doesNotMatch(loop, /if \(_buildFail && _canResume\)/,
@@ -26079,7 +26082,7 @@ test("a model-run verifier that exits 0 earns verification credit", () => {
   // honoured `verification` (the IDE's own auto-verify). A model-run `go build` / `go test ./...`
   // is stamped `verifierRecognized: true` at settle time — computed on every record and read by
   // nothing — so a genuinely green check earned no credit and the run was labelled unverified.
-  const certifies = load("_evidenceCertifies");
+  const certifies = _evidenceCertifies;
   const green = { ok: true, exitCode: 0, implementationVersion: 3, command: "go test ./..." };
 
   // the model ran a recognised verifier, exit 0, at the current edit count → credited
@@ -27498,7 +27501,7 @@ test("绿证据要能盖住更早的红，否则改好了还被要求再修一�
   // 这条断言过源码文本（钉住那一行的写法），而那一行后来必须改：全局的
   // last-write-wins 会让**另一条无关命令**的绿也盖住红（见上面那条守卫）。
   // 意图不变、实现变了，所以判据改成行为——源码怎么写不重要，行为对就行。
-  const fresh = load("_freshBuildFailure");
+  const fresh = _freshBuildFailure;
   const ev = (command, exitCode) => ({
     verifierRecognized: true, implementationVersion: 1, timedOut: false, exitCode, command, cwd: "/ws",
   });
@@ -27723,7 +27726,7 @@ test("收尾门只记账、不偷偷代跑——这条是刻意的", () => {
   // 关键词是 secretly——偷偷跑一个模型不知道的命令，会让"已完成"变得不可预测。
   const loop = stripJsComments(extractFn("_runAgenticLoop"));
   assert.doesNotMatch(loop, /_runApprovedVerification\(/, "收尾门又在偷偷代跑了");
-  assert.match(SRC, /run\._incompleteReason = "code_delivered_unverified";/);
+  assert.match(SRC, /run\._incompleteReason \|\|= "code_delivered_unverified";/);
   // 这一条也**故意**断言注释：守的是"理由被写在源码里"，不是代码行为（行为由上面那条
   // doesNotMatch 守着）。用 RAW_SRC 显式表明它查的是原文，不是被注释喂绿的代码断言。
   assert.match(RAW_SRC, /关键词是 \*\*secretly\*\*/);
@@ -32652,9 +32655,15 @@ test("占位交付要有用户侧的出口，且不发红灯也不发绿灯", ()
   // 只记账、不补回合，和其它几道门同哲学。
   assert.match(loop, /run\._incompleteReason \|\| `stub_delivery:\$\{_stubs\.length\}`/);
   // 排在最后：更具体的原因（红构建、写入落空）先占位。
-  const at = loop.indexOf("stub_delivery");
-  const bf = loop.indexOf('run._incompleteReason = "build_failing"');
-  assert.ok(bf >= 0 && bf < at, "红构建这类更具体的原因要先占位");
+  //
+  // 这条以前靠**书写顺序**保证（中途那处 build_failing 是无条件 `=`，盖掉它之前的一切），
+  // 而书写顺序是三千行代码涌现出来的，没人能单独验它。现在是一条能跑的规则。
+  assert.equal(_settleBuildFailure(`stub_delivery:2`, true), "build_failing",
+    "红构建这类更具体的原因要先占位");
+  assert.equal(_settleBuildFailure("user_stopped", true), "user_stopped",
+    "用户按了停就该如实说是他停的——那回答的是「这一轮为什么结束」，不是「代码什么状态」");
+  assert.equal(_settleBuildFailure("stub_delivery:2", false), "stub_delivery:2",
+    "构建没红却把成因改写了");
   // 闭合枚举要认得它，否则界面回落到那句无意义的「继续没做完的部分」。
   const labels = loadConst("_INCOMPLETE_LABELS");
   assert.equal(labels.stub_delivery, "把留下的占位实现换成真的");
@@ -32877,8 +32886,12 @@ test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /run\._incompleteReason \|\|= `writes_failed:\$\{_failedWrites\.length\}`/,
     "写入落空在结局里没有任何出口——用户看到的收尾卡片一个字都不会提这件事");
-  assert.match(loop, /\(Array\.isArray\(run\._writeLedger\) \? run\._writeLedger : \[\]\)\.filter\(\(a\) => a && a\.ok === false\)/,
+  assert.match(loop, /for \(const a of \(Array\.isArray\(run\._writeLedger\) \? run\._writeLedger : \[\]\)\) if \(a\?\.path\) _lastWrite\.set\(String\(a\.path\), a\.ok === true\)/,
     "判据要读执行记录（每次写入尝试的成败），不是从措辞里猜");
+  // 账本顺序追加、整 run 不剪枝：写失败后重试成功的那条仍在账上，
+  // 直接 filter(ok === false) 会把已经补救成功的也算进 N。按 path 取最后一条。
+  assert.match(loop, /_failedWrites = \[\.\.\._lastWrite\]\.filter\(\(\[, ok\]\) => !ok\)/,
+    "写失败后重试成功的那条又被算进 writes_failed 了");
   // 闭合枚举必须认得它，否则界面回落到那句无意义的「继续没做完的部分」。
   const labels = loadConst("_INCOMPLETE_LABELS");
   assert.equal(labels.writes_failed, "重写那几个没写成的文件");
