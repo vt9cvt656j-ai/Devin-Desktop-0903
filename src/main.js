@@ -36470,6 +36470,11 @@ const GROWTH_PERSIST_DEBOUNCE_MS = 500;
 
 function observeToolCall(toolRecord) {
   try {
+    // `window._growthState` 全仓只有下面那一处写入，而那处在本函数**内部**、且被这一行的
+    // 早退挡在前面——先决条件是它自己先被写过。鸡生蛋：这个函数每次都在这里 return，
+    // 整条工具用量学习从来没收到过任何信号。留着不是"以后会用上"，是让人以为已经在用。
+    // 真正在记账的是 growth.signal()（message-sent / run-complete / review-diff /
+    // edit-applied 四处）；这条学习链要接就该接那边，并且单独一笔带实测。
     const g = typeof window !== 'undefined' ? window._growthState || null : null;
     if (!g) return;
     
@@ -51144,23 +51149,18 @@ function _criticToolCatalog(toolRegistry, maxTools = Infinity, maxDescriptionCha
 function _criticRequestedToolSchemas(toolNames, toolRegistry, maxTools = 8) {
   if (!Array.isArray(toolNames) || !toolRegistry || typeof toolRegistry.get !== "function") return [];
   
-  // P0 #2: Adaptive critic limit based on growth state
-  let dynamicMaxTools = Number(maxTools) || 8;
-  try {
-    const growthState = typeof window !== 'undefined' ? window._growthState || null : null;
-    if (growthState && typeof growthState.avgMastery === 'function') {
-      const avgP = growthState.avgMastery();
-      // Expert users get more tools in critic window
-      if (avgP > 0.7) {
-        dynamicMaxTools = 15;
-      } else if (avgP > 0.45) {
-        dynamicMaxTools = 12;
-      }
-      // else keep default 10 or provided maxTools
-    }
-  } catch (e) {
-    console.warn('Adaptive critic limit failed, fallback to default:', e.message);
-  }
+  // 上限就是传进来的那个。
+  //
+  // 这里原来还有一段「按用户熟练度自适应放宽到 12 / 15」，读的是 `window._growthState` ——
+  // 而那个形状**从来没有被赋过值**：全仓唯一的写入点在 observeToolCall 里，那个函数第一行
+  // 就是 `if (!g) return;`，先决条件是它自己先被写过。鸡生蛋，于是这段自适应一次都没生效，
+  // 上限恒等于默认值；读它的代码却让人以为「按熟练度放宽窗口」已经在做了。
+  //
+  // 删掉之后**没有接**真数据源（growth.js 的 getAvgMastery()，那边 BKT 是真的、signal() 已在
+  // 四处记账）。接上会静默改所有人的行为：getAvgMastery 失败返回 0.5，0.5 > 0.45 就抬到 12
+  // ——失败路径反而给更多工具。而工具窗口每轮都收注意力税（本文件多处记着「窗口从 11 涨到
+  // 20，每个都按轮收税」）。放宽窗口是产品决定，要开该单独一笔并带实测。
+  const dynamicMaxTools = Number(maxTools) || 8;
   
   const out = [], seen = new Set();
   for (const rawName of toolNames) {
@@ -51521,13 +51521,11 @@ function recommendToolsForIntent(intentText, context = {}) {
   // P0 #3: Personalize recommendations based on user's skill mastery levels
   let userSkills = {};
   try {
-    const growthState = typeof window !== 'undefined' ? window._growthState || null : null;
-    if (growthState && Array.isArray(growthState.skills)) {
-      userSkills = growthState.skills.reduce((acc, skill) => {
-        acc[skill.name] = skill.mastery ?? 0;
-        return acc;
-      }, {});
-    }
+    // 同 _criticRequestedToolSchemas 那处：`window._growthState` 从没被赋过值（唯一写入点
+    // 在 observeToolCall 内部、而它开头就 `if (!g) return;`），所以 userSkills 恒为空对象、
+    // 下面那套「按熟练度加权排序」恒等于不加权。留着读取只会让人以为个性化已经在生效。
+    // 真数据在 growth.js（BKT + signal() 四处记账）；接上属于产品决定，不在这一笔里做。
+    userSkills = {};
   } catch (e) {
     console.warn('Growth skill access failed, falling back to default ranking:', e.message);
   }
@@ -51813,6 +51811,12 @@ function _validateToolOrchestration(tools, toolRegistry, profile) {
     list = list.filter((name) => !!toolRegistry.get(name));
   }
   // 数量收敛：一次装太多工具，弱模型注意力直接被打散
+  // 注意：这道「>15 收敛到 12」在**当前的生产调用路径上到不了**——唯一调用点传的
+  // decision.tools 在上游 _semanticToolOrchestrator 里已经过了
+  // _criticRequestedToolSchemas(j.tools, toolRegistry, 10)，最多 10 个。
+  // 留着是因为这是个通用校验器（测试直接拿 20 个工具喂它），换个调用方就用得上；
+  // 但**别指望它来告诉用户"工具被裁过"**——真正在裁的是下游那个 10（弱模型 8），
+  // 那处此前完全静默，现在自己出声了（见 requestedSchemas 附近那条 note）。
   if (list.length > 15) {
     list = list.slice(0, 12);
     notes.push("工具过多易分心，已收敛到 12 个；其余可用 search_tools 按需请求");
@@ -53018,9 +53022,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 强制注入：当意图判定认为需要多角色协作时，确保子智能体工具在列表里——
     // 不依赖编排器自觉返回它们（弱模型常不返回不熟悉的工具名）。
     if (run.engineering?.orchestrationMode === "staged_roles" || run.engineering?.orchestrationMode === "parallel_roles") {
-      for (const t of ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"]) {
-        if (!routeToolNames.includes(t)) routeToolNames.push(t);
-      }
+      // **前置**不是追加。下面两道裁剪都从尾部切（弱模型 slice(0,8)、以及所有模型都过的
+      // _criticRequestedToolSchemas(..., 10)），而编排器返回 ≥7 个已注册工具是难任务的常态
+      // ——追加的话这四个派发工具会被静默切掉，正好把这段注释说的「不依赖编排器自觉返回」
+      // 变成一句空话：多角色协作模式下模型手上根本没有派子体的工具。
+      const _dispatch = ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"];
+      routeToolNames = [..._dispatch, ...routeToolNames.filter((t) => !_dispatch.includes(t))];
     }
     
     
@@ -53036,7 +53043,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       routeToolNames = routeToolNames.slice(0, 8);
       orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
     }
+    // 真正的裁剪在这里，而且原来是**静默**的：上面那条恒不可达的收敛分支从不出声，
+    // 于是「工具被裁过」这件事用户和排查者都看不到，出问题时会误以为编排器就没选中那个工具。
+    const _beforeCap = routeToolNames.length;
     const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
+    if (requestedSchemas.length < _beforeCap) {
+      orchCheck.notes.push(`编排选了 ${_beforeCap} 个工具，按注意力预算只装载了 ${requestedSchemas.length} 个；其余用 search_tools 按名请求`);
+    }
     const update = requestedSchemas.length
       ? _applyToolPayloadWindow(toolSchemas, requestedSchemas, run._toolCoreNames)
       : null;
