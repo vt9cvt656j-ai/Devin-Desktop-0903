@@ -118,6 +118,13 @@ import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
+import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
+
+// Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
+// Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
+// mac 正常。在任何编辑器（连带它的 minimap canvas）创建之前，把 Windows 的 2D canvas
+// 默认切到 CPU 后端（willReadFrequently）绕开这个 bug。只在 Windows 生效。
+installWindowsCanvasFix();
 
 // 品牌 sprite 得在任何 <use href="#i-brand-x"> 渲染之前进 DOM，否则那些引用会指向
 // 一个还不存在的 symbol —— 表现是图标位置空一块，而且**不会补画**（浏览器不会因为
