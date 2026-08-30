@@ -119,6 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
+import { dropDirFor, planExplorerDrop } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -80260,22 +80261,41 @@ let _dropHideTimer = 0;
 // Which target is the cursor over? Checks the composer rect against BOTH the raw position and the
 // devicePixelRatio-divided one, so it works whether Tauri reports physical or logical px (and for the
 // browser path where we pass client px). Anything not over the composer → "open" (sidebar/editor).
+const _treeEl = document.getElementById("tree");
+// 落点是否在某个元素里；命中就把**客户端坐标**还回去（后面 elementFromPoint 要用）。
+// 两套坐标都试：Tauri 报的可能是物理像素也可能是逻辑像素，浏览器路径给的是 client px。
+function _dropPointIn(p, el) {
+  if (!p || !el) return null;
+  const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const hit = (x, y) => (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? { x, y } : null);
+  return hit(p.x / dpr, p.y / dpr) || hit(p.x, p.y);
+}
+// 三个落区。文件树那档是 VS Code 的分工：落进树里 = 复制成子文件/子目录，**不换工作区**；
+// 换项目留给编辑器区那档（"open"）。没打开项目时树里是空状态，这时拖文件夹进来用户要的
+// 正是「打开它」，所以 rootPath 为空就不抢这个落点。
 function _dragTargetAt(payload) {
   const p = payload && payload.position;
-  if (p && _composerEl) {
-    const r = _composerEl.getBoundingClientRect();
-    if (r.width && r.height) {
-      const dpr = window.devicePixelRatio || 1;
-      const hit = (x, y) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-      if (hit(p.x / dpr, p.y / dpr) || hit(p.x, p.y)) return "composer";
-    }
-  }
+  if (_dropPointIn(p, _composerEl)) return "composer";
+  if (rootPath && _dropPointIn(p, _treeEl)) return "tree";
   return "open";
+}
+// 光标下面那一行 → 往哪个目录里放。目录行有 .chev（文件行是 .chev-spacer），拿它区分。
+function _dropDirAt(payload) {
+  const pt = _dropPointIn(payload && payload.position, _treeEl);
+  const row = pt ? document.elementFromPoint(pt.x, pt.y)?.closest?.(".row") : null;
+  return dropDirFor({ rowPath: row?.dataset?.path || "", rowIsDir: !!row?.querySelector(":scope > .chev"), rootPath });
 }
 function _showDrop(target) {
   clearTimeout(_dropHideTimer);
   const composer = target === "composer";
-  if (_explorerEl) { _explorerEl.classList.add("drag-into"); _explorerEl.classList.toggle("is-over", !composer); }
+  if (_explorerEl) {
+    _explorerEl.classList.add("drag-into"); _explorerEl.classList.toggle("is-over", !composer);
+    // 标签要说实话：落在树里是复制进去，落在编辑器区才是打开/换项目。
+    const _lb = _explorerEl.querySelector(".dz-label span:last-child");
+    if (_lb) _lb.textContent = target === "tree" ? "复制到工作区" : "打开到工作区";
+  }
   if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", composer); }
 }
 function _hideDrop() {
@@ -80292,8 +80312,38 @@ function _pathToRefArg(abs) {
     || (rootPath && abs.startsWith(rootPath.replace(/\/$/, "") + "/"));
   return inWs ? _pathToRel(abs) : abs;
 }
-async function _handleDrop(paths, target) {
+// 拖进文件树 = 复制进工作区（VS Code 那种），成为子文件/子目录。重名让路、拒绝把
+// 文件夹拖进它自己，都在 explorer-drop 模块里算好；这里只管读目录、逐条复制、刷新树。
+async function _copyIntoWorkspace(paths, destDir) {
+  if (!destDir) return;
+  const items = [];
+  for (const p of paths) {
+    const abs = _toPosix(p);
+    items.push({ path: abs, isDir: await backend.readDir(abs).then(() => true).catch(() => false) });
+  }
+  let existingNames = [];
+  try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
+  const { copies, skipped } = planExplorerDrop({ items, destDir, existingNames });
+  let done = 0; let failed = "";
+  for (const c of copies) {
+    try { await backend.copyPath(c.from, c.to); done++; } catch (e) { failed = String(e?.message || e); }
+  }
+  if (done) {
+    if (workspaceRoots.includes(destDir)) collapsedWorkspaceRoots.delete(destDir);
+    else _treeSetExpanded(destDir, true);
+    if (destDir !== rootPath) await expandDir(destDir);
+    await reloadDir(destDir);
+    _invalidateProjectFileCache();
+    try { refreshGitStatus(); } catch {}
+  }
+  const renamed = copies.filter((c) => c.renamed).length;
+  if (failed) showToast(`复制失败：${failed}`);
+  else if (skipped.some((s) => s.reason === "self")) showToast("不能把文件夹放进它自己里面");
+  else if (done) showToast(`已复制 ${done} 项到 ${basename(destDir) || destDir}${renamed ? `（${renamed} 项重名已改名）` : ""}`);
+}
+async function _handleDrop(paths, target, payload) {
   if (!paths || !paths.length) return;
+  if (target === "tree") { await _copyIntoWorkspace(paths, _dropDirAt(payload)); return; }
   if (target === "composer") {
     for (const p of paths) {
       const normalizedPath = _toPosix(p);
@@ -80331,10 +80381,11 @@ editorContainer.addEventListener("dragover", (e) => {
 editorContainer.addEventListener("dragleave", () => _hideDropSoon());
 editorContainer.addEventListener("drop", async (e) => {
   e.preventDefault();
-  const target = _dragTargetAt({ position: { x: e.clientX, y: e.clientY } });
+  const payload = { position: { x: e.clientX, y: e.clientY } };
+  const target = _dragTargetAt(payload);
   _hideDrop();
   const files = [...(e.dataTransfer?.files || [])].map((f) => f.path).filter(Boolean);
-  await _handleDrop(files, target);
+  await _handleDrop(files, target, payload);
 });
 // Tauri path: window-level drag events drive the zones AND route the drop by position.
 if (inTauri) {
@@ -80345,7 +80396,7 @@ if (inTauri) {
     listen("tauri://drag-drop", async (event) => {
       const target = _dragTargetAt(event.payload);
       _hideDrop();
-      await _handleDrop(event.payload?.paths || [], target);
+      await _handleDrop(event.payload?.paths || [], target, event.payload);
     });
   }).catch(() => {});
 }
