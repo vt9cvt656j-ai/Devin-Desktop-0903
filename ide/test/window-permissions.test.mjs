@@ -225,8 +225,9 @@ test("Windows 合并后的窗口配置不许把尺寸和标题丢掉", () => {
   assert.equal(w.width, base.app.windows[0].width, "初始宽度丢了，会回落到 800");
   assert.equal(w.height, base.app.windows[0].height, "初始高度丢了，会回落到 600");
   assert.equal(w.minWidth, base.app.windows[0].minWidth,
-    "最小宽度丢了——三栏布局的硬底是 890px，而 .layout 是 overflow:hidden，"
-    + "窗口再小就直接裁掉助手栏右缘（输入区和发送键）");
+    "最小宽度丢了——.layout 是 overflow:hidden，窄到三栏放不下就直接裁掉助手栏右缘"
+    + "（输入区和发送键）。2026-08-29 侧栏改成可收缩之后硬底从 890px 降到 640px"
+    + "（实测：560 会裁、640 不会），但窗口最小宽度仍然必须有");
   assert.equal(w.minHeight, base.app.windows[0].minHeight, "最小高度丢了");
 
   // 反向：mac 专属的两项不该被带进 Windows（那边根本不认，留着只会误导）。
@@ -234,12 +235,27 @@ test("Windows 合并后的窗口配置不许把尺寸和标题丢掉", () => {
   assert.ok(!("hiddenTitle" in w), "hiddenTitle 是 macOS 专属，同上");
 });
 
-test("三栏布局的硬底确实高于 Windows 的默认窗口宽度（这条是上面那条的前提）", () => {
-  // 哪天有人把侧栏改成可收缩（flex 不再是 none），上面那条的严重性就变了——
-  // 那时该重新评估，而不是让它继续用一个过时的理由挡着。
+test("三栏布局的硬底仍然存在，只是从 890px 降到了 640px（这条是上面那条的前提）", () => {
+  // 这条原来钉的是「侧栏必须 flex:none」，注释里写着：哪天有人把它改成可收缩，
+  // 上面那条的严重性就变了，那时该重新评估，而不是让它继续用一个过时的理由挡着。
+  //
+  // 2026-08-29 就是那一天：侧栏改成了 `flex: 0 1 auto`。原因是 flex:none 下窗口一窄，
+  // 编辑器被挤破自己的 min-width、助手栏被 overflow:hidden 整个裁到屏幕外 ——
+  // 实测 890px 以下就开始裁；允许收缩之后裁切阈值降到 640px 以下。
+  //
+  // 判据跟着换：不再要求「不许收缩」，改为要求收缩有下限（min-width 还在）
+  // 且裁切仍然可能发生（overflow:hidden 还在）—— 那两条才是上面那条断言的真前提。
   const css = readFileSync(join(ROOT, "src/styles/app.css"), "utf8");
-  assert.match(css, /\.explorer\s*\{[\s\S]{0,400}flex: none;/, "侧栏不再是 flex:none 了，硬底的算法要重算");
-  assert.match(css, /\.assistant\s*\{[\s\S]{0,400}flex: none;/, "助手栏不再是 flex:none 了，同上");
+  const rule = (sel) => {
+    const i = css.indexOf(sel + " {");
+    assert.ok(i >= 0, sel + " 的规则不见了");
+    return css.slice(i, css.indexOf("}", i) + 1);
+  };
+  for (const sel of [".layout .explorer", ".layout .assistant"]) {
+    assert.match(rule(sel), /min-width:\s*\d+px/, sel + " 没有最小宽度，会被一路压成 0");
+    assert.ok(!/flex:\s*none/.test(rule(sel)), sel + " 又变回不可收缩了 —— 890px 以下就会裁");
+  }
+  assert.match(rule(".layout .editorwrap"), /min-width:\s*200px/, "编辑器丢了自己的下限");
   assert.match(css, /\.layout\s*\{[\s\S]{0,200}overflow: hidden;/,
     "布局不再裁切了——那样窗口过窄只会出横向滚动条，不再是「控件够不着」");
 });
