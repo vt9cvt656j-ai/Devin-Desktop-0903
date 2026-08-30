@@ -36687,3 +36687,34 @@ test("模型选择按窗口隔离，另一个窗口改了不影响本窗口", ()
   assert.ok(/sessionStorage/.test(setter) && !/localStorage/.test(setter),
     "窗口级覆盖写进了 localStorage —— 副窗口和主窗口同源共享它，隔离是假的");
 });
+
+// ---------------------------------------------------------------------------
+// 切标签时：钉在底部的标签回到最新，只有主动往上翻过的才保留旧位置
+// ---------------------------------------------------------------------------
+test("切回聊天标签自动回到最新，除非用户在那个标签里翻过历史", () => {
+  const sw = stripJsComments(extractFn("_switchChatSession"));
+
+  // 刚恢复的标签跳到底（原有行为，别弄丢）。
+  assert.match(sw, /session\._restored[\s\S]{0,120}_scrollChatBottom\(\)/,
+    "刚恢复的标签不再跳到最新了");
+
+  // 钉在底部的标签也要跳到底 —— 这是这次修的。原来它走的是「按 scrollPos 恢复」，
+  // 而标签隐藏期间内容还在长，那个偏移量早就不是底部，用户得自己往下滑。
+  assert.match(sw, /else if \(session\._pinned !== false\) \{ _scrollChatBottom\(\); \}/,
+    "钉在底部的标签没有回到最新 —— 切回来会停在半截历史里");
+
+  // 只有**主动翻过历史**的标签才保留旧位置，而且那种情况下 _chatPinned 必须是 false。
+  assert.match(sw, /else \{ _chatPinned = false; chatEl\.scrollTop = session\.scrollPos/,
+    "保留旧位置的那一支没有把钉底状态置否 —— 下一条消息会把用户从历史里拽走");
+  // 旧写法不许回来：它把「钉底」和「按旧偏移恢复」同时做了，自相矛盾。
+  assert.ok(
+    !/_chatPinned = session\._pinned !== false; chatEl\.scrollTop/.test(sw),
+    "又回到「记住钉底却按旧偏移恢复」那种自相矛盾的写法",
+  );
+
+  // 用 _scrollChatBottom 而不是直接写 scrollTop：容器刚 append、布局没算完时
+  // 直接赋值会被钳到更小的值。那个函数自带多帧补位。
+  const bottom = stripJsComments(extractFn("_scrollChatBottom"));
+  assert.match(bottom, /requestAnimationFrame/, "回到底部没有跨帧补位，首帧会被钳住");
+  assert.match(bottom, /setTimeout/, "回到底部没有延时补位，内容还在铺开时会落空");
+});

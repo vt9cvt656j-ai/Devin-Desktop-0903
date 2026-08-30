@@ -18860,7 +18860,20 @@ async function _switchChatSession(idx) {
     // A freshly-restored tab (IDE just opened, or first time this restored tab is shown) jumps to the
     // NEWEST message instead of a stale saved scroll position — no manual scrolling to catch up.
     if (session._restored) { session._restored = false; _repinChat(); _scrollChatBottom(); }
-    else { _chatPinned = session._pinned !== false; chatEl.scrollTop = session.scrollPos || 0; _markProgramScroll(); }
+    // **钉在底部的标签要回到最新，不能按旧偏移量恢复。**
+    //
+    // 这里原来只有一句 `_chatPinned = session._pinned !== false; chatEl.scrollTop = session.scrollPos`
+    // —— 钉底状态记住了，却仍然把滚动条拽回离开时的那个数。而标签隐藏期间内容还在长
+    // （流式回复、工具卡、后台跑完的那一轮），那个偏移量早就不是底部了，于是切回来停在
+    // 半截历史里，右下角挂着「回到最新」等用户自己去点。
+    //
+    // `scrollPos` 只对**用户主动往上翻过**的标签有意义（`_pinned === false`）：
+    // 那种情况下他在看历史，回来当然该停在原处。
+    //
+    // 用 `_scrollChatBottom()` 而不是直接赋值：容器刚 append 上去、布局还没算完，
+    // 这一帧写 scrollTop 会被钳到更小的值。那个函数自带 rAF + 60/200/500/1000ms 的补位。
+    else if (session._pinned !== false) { _scrollChatBottom(); }
+    else { _chatPinned = false; chatEl.scrollTop = session.scrollPos || 0; _markProgramScroll(); }
     // 必须在恢复滚动位置之后再挂观察器：observe() 会立刻回调一次，早挂就会把一个
     // 停在半截历史里的标签直接拽到底。
     _installChatGrowthObserver(session);
