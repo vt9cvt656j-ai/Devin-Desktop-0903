@@ -17216,7 +17216,11 @@ async function selectModel(model, modelGroup) {
   refreshModelBadge();
   const session = _currentSession();
   if (session) {
+    // 三样一起存。只存 model 的话，切回来时分组和线路仍是**另一个标签**的 ——
+    // 同一个模型 id 可能挂在好几条线路下，价格和上游都不一样。
     session.model = model;
+    session.modelGroup = modelGroup || "";
+    session.gatewayRouteId = String(_picked?.connId || "");
     _renderChatTabs();
     saveChatHistory();
     // **不要**在这里批量改历史消息的头像。
@@ -18759,7 +18763,13 @@ async function _switchChatSession(idx) {
     // 钉底状态是每个标签自己的：滚动位置本来就按标签存，钉不钉却是个模块级全局，
     // 于是在 A 标签往上翻一下，切到 B 标签，B 的实时输出也跟着不动了。
     _chatSessions[_activeChatIdx]._pinned = _chatPinned;
-    _chatSessions[_activeChatIdx].model = loadConfig().model;
+    {
+      const _c = loadConfig();
+      const _leaving = _chatSessions[_activeChatIdx];
+      _leaving.model = _c.model || _c.gatewayModel || null;
+      _leaving.modelGroup = _c.modelGroup || "";
+      _leaving.gatewayRouteId = _c.gatewayRouteId || "";
+    }
     _teardownChatGrowthObserver(_chatSessions[_activeChatIdx]);
   }
   _activeChatIdx = idx;
@@ -18781,10 +18791,23 @@ async function _switchChatSession(idx) {
   _agentContextCache = { root: null, ts: 0, data: "" };
   if (session.model) {
     const c = loadConfig();
-    if (c.model !== session.model) {
-      saveConfig({ ...c, model: session.model });
+    const group = session.modelGroup || "";
+    const route = session.gatewayRouteId || "";
+    // 分组和线路也要跟着切：同一个模型 id 可能挂在好几条线路下，只还原 model
+    // 等于「显示的是这个标签的模型、请求走的是上一个标签的线路」。
+    if (c.model !== session.model || (c.modelGroup || "") !== group || (c.gatewayRouteId || "") !== route) {
+      saveConfig({ ...c, model: session.model, modelGroup: group, gatewayRouteId: route });
       refreshModelBadge();
     }
+  } else {
+    // 从旧存档恢复的标签可能没有模型身份（这个字段是后加的）。给它锚定当前的一次，
+    // 而不是让它继续跟着全局漂 —— 那正是「切个标签模型就被改掉」的老路。
+    try {
+      const c = loadConfig();
+      session.model = c.model || c.gatewayModel || null;
+      session.modelGroup = c.modelGroup || "";
+      session.gatewayRouteId = c.gatewayRouteId || "";
+    } catch {}
   }
   _renderChatTabs();
   if (chatEl) {
@@ -18823,6 +18846,20 @@ async function _switchChatSession(idx) {
 
 function _newChatSession(name, mode) {
   const session = _createChatSession(name, mode);
+  // **新标签建立时就把当前的模型身份钉进去。**
+  //
+  // 原来 `model` 是 null，于是切进这个标签时 `_switchChatSession` 里那句
+  // `if (session.model)` 整段跳过 —— 配置不动，新标签用的就是**上一个标签**的模型；
+  // 而下次切走时又把这个继承来的模型永久写进它自己。用户看到的是
+  // 「1 号窗口选了 opus，切到 2 号，2 号也变成 opus」。
+  //
+  // 「新标签沿用当前模型」本身是合理的默认；错的是它从此不再是自己的选择。
+  try {
+    const c = loadConfig();
+    session.model = c.model || c.gatewayModel || null;
+    session.modelGroup = c.modelGroup || "";
+    session.gatewayRouteId = c.gatewayRouteId || "";
+  } catch {}
   _chatSessions.push(session);
   void _switchChatSession(_chatSessions.length - 1);
   saveChatHistory();
@@ -18891,6 +18928,10 @@ function _restoreClosedChatSession(closedIndex) {
   if (closedIndex < 0 || closedIndex >= _closedChatSessions.length) return null;
   const sData = _closedChatSessions[closedIndex];
   const session = _createChatSession(sData.name, sData.mode, sData.model, sData.project ?? "");
+  // 模型身份是三件套，`_createChatSession` 只收 model 那一个。分组和线路不读回来的话，
+  // 重开之后标签显示的是对的模型、请求却走回全局那条线路。
+  session.modelGroup = sData.modelGroup || "";
+  session.gatewayRouteId = sData.gatewayRouteId || "";
   session.id = sData.id || session.id;
   session.created = sData.created || Date.now();
   // 存进去了却没人读回来 = 没存。这五个当初只写了存储腿，于是「重开一个刚关掉的标签页」
@@ -19147,6 +19188,9 @@ function _chatSessionDataForStorage(s, mediaBudget, includeHtml = false, options
   };
   const out = {
     id: s?.id, name: s?.name, mode: s?.mode, model: s?.model || null,
+    // 模型身份是三件套：同一个模型 id 可能挂在好几条线路下，价格和上游都不一样。
+    // 只存 model 的话，重开之后标签显示对了、请求却走回上一次的线路。
+    modelGroup: s?.modelGroup || "", gatewayRouteId: s?.gatewayRouteId || "",
     project: s?.project || "",
     anchorRoot: s?._anchorRoot || s?.anchorRoot || undefined,
     memory,
@@ -19711,6 +19755,10 @@ async function restoreChatHistory() {
         // collision (or empty name) gets a fresh monotonic "Chat N".
         const nm = sData.name && !usedNames.has(sData.name) ? sData.name : undefined;
         const session = _createChatSession(nm, sData.mode, sData.model, sData.project ?? "");
+        // 模型身份是三件套，`_createChatSession` 只收 model 那一个。分组和线路不读回来的话，
+        // 重开之后标签显示的是对的模型、请求却走回全局那条线路。
+        session.modelGroup = sData.modelGroup || "";
+        session.gatewayRouteId = sData.gatewayRouteId || "";
         usedNames.add(session.name);
         session.id = sData.id || session.id;
         session.created = sData.created || Date.now();

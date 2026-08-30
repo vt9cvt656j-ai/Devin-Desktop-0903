@@ -36597,3 +36597,51 @@ test("两侧栏允许收缩，窄宽度下不被裁到屏幕外", () => {
   // 编辑器守住自己的下限，收缩的是两侧。
   assert.match(rule(".layout .editorwrap"), /min-width:\s*200px/);
 });
+
+// ---------------------------------------------------------------------------
+// 每个聊天标签有自己的模型；切标签不许把别的标签的模型带过去
+// ---------------------------------------------------------------------------
+test("切换聊天标签不改变各自的模型", () => {
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const nw = stripJsComments(extractFn("_newChatSession"));
+  const sw = stripJsComments(extractFn("_switchChatSession"));
+  const sel = stripJsComments(extractFn("selectModel"));
+
+  // ① 新标签建立时就锚定当前模型。原来是 null，于是切进去时下面那个 if 整段跳过，
+  //    新标签直接用上一个标签的模型 —— 用户报的正是这个。
+  assert.match(nw, /session\.model\s*=\s*c\.model\s*\|\|\s*c\.gatewayModel/,
+    "新标签没有锚定自己的模型 —— 它会一直跟着全局漂");
+
+  // ② 切走时把当前身份存回**离开的那个**标签。
+  assert.match(sw, /_leaving\.model\s*=/, "切走时没有把模型存回原标签");
+  // ③ 切入时把**这个标签的**身份还原回配置。
+  // 断言要**连分组和线路一起要**。只写 `model: session.model` 的话，把还原退化成
+  // 「只还原模型」的变异照样能通过 —— 变异实测过，那一版是绿的。
+  assert.match(
+    sw,
+    /saveConfig\(\{ \.\.\.c, model: session\.model, modelGroup: \w+, gatewayRouteId: \w+ \}\)/,
+    "切入时没有把这个标签的模型**三件套**一起还原（只还原 model 等于请求仍走上一个标签的线路）",
+  );
+  // ④ 没有模型身份的老存档要被锚定一次，而不是继续跟着全局漂。
+  assert.match(sw, /\}\s*else\s*\{[\s\S]{0,400}session\.model\s*=\s*c\.model/,
+    "老存档标签没有被锚定 —— 它每次切换都会被全局模型改掉");
+
+  // ⑤ **模型身份是三件套。** 同一个模型 id 可能挂在好几条线路下，价格和上游都不一样；
+  //    只还原 model 等于「显示的是这个标签的模型、请求走的是上一个标签的线路」。
+  for (const [name, body] of [["selectModel", sel], ["_switchChatSession", sw], ["_newChatSession", nw]]) {
+    assert.ok(/modelGroup/.test(body), `${name} 没有处理 modelGroup`);
+    assert.ok(/gatewayRouteId/.test(body), `${name} 没有处理 gatewayRouteId`);
+  }
+  // ⑥ 三件套要能落盘，否则重开之后又回到全局那条线路。
+  const store = stripJsComments(extractFn("_chatSessionDataForStorage"));
+  assert.ok(
+    /modelGroup:/.test(store) && /gatewayRouteId:/.test(store),
+    "存档没有保存分组/线路 —— 重开之后标签显示对了、请求却走回上一次的线路",
+  );
+  // 读回来的路径同样要有。
+  assert.match(
+    stripJsComments(src),
+    /session\.modelGroup = sData\.modelGroup/,
+    "从存档恢复时没有把分组读回会话",
+  );
+});
