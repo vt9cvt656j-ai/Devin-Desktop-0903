@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop,
+  dropDirFor, planExplorerDrop, moveRejection, planMove,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
 
@@ -279,6 +279,69 @@ test("ioConfirm 的第三按钮是可选的，不影响老调用方", () => {
   assert.match(fn, /altLabel = ""/, "altLabel 必须有默认空值");
   assert.match(fn, /resolve\(altLabel \? returnValue : confirmed\)/,
     "不给 altLabel 时必须仍返回布尔——否则老调用方的判断会反转");
+});
+
+test("树内拖动移动：非法情形必须在计划期就拒", () => {
+  // VS Code 的 handleDragOver 对这三种一律 return false。前两条要是漏了，rename 会把目录
+  // 搬进它自己，整棵子树当场消失。
+  assert.equal(moveRejection({ src: "/w/src", destDir: "/w/src" }), "self", "拖到自己身上");
+  assert.equal(moveRejection({ src: "/w/src", destDir: "/w/src/deep" }), "self", "拖进自己的子目录");
+  assert.equal(moveRejection({ src: "/w/src/a.js", destDir: "/w/src" }), "same", "本来就在这个目录里");
+  assert.equal(moveRejection({ src: "/w/src/a.js", destDir: "/w/lib" }), "", "正常移动要放行");
+  // 前缀相同但不是子目录：/w/srcx 不在 /w/src 里
+  assert.equal(moveRejection({ src: "/w/src", destDir: "/w/srcx" }), "", "同前缀的兄弟目录是合法目标");
+});
+
+test("树内拖动移动：整批计划与同名冲突", () => {
+  const plan = planMove({ paths: ["/w/a.js", "/w/sub/a.js", "/w/b.js"], destDir: "/w/lib" });
+  assert.deepEqual(plan.moves.map((m) => m.to), ["/w/lib/a.js", "/w/lib/b.js"]);
+  // 同一批里两个 a.js：后端 rename 在目标已存在时直接报错，与其半路失败不如计划期就标出来。
+  assert.deepEqual(plan.skipped, [{ path: "/w/sub/a.js", reason: "dup" }]);
+  // 目标为空 → 一条都不产出（松手在树外面时就是这种情况）
+  assert.deepEqual(planMove({ paths: ["/w/a.js"], destDir: "" }).moves, []);
+});
+
+test("树内拖动真的接上了移动，而不是只会 @ 引用", () => {
+  // 这是用户报的核心问题：VS Code 里拖着文件就能挪进另一个目录，我们以前拖到别的文件夹上
+  // 什么都不发生（_wireTreeDragToComposer 只处理"落在输入框"这一种）。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const drag = src.slice(src.indexOf("function _wireTreeDragToComposer"));
+  assert.match(drag.slice(0, 3000), /_moveIntoDir\(candPaths\(\), _treeDropDirAt\(/,
+    "松手落在树里没有触发移动");
+  assert.match(drag.slice(0, 3000), /_paintDropRow\(onComposer \? "" : _treeDropDirAt\(/,
+    "拖动中没有高亮将要接收它的那个目录");
+  // 移动本身要走 renamePath，并且照 renameEntry 的规矩先关掉已打开的文件。
+  const mv = src.slice(src.indexOf("async function _moveIntoDir"), src.indexOf("(function _wireTreeDragToComposer"));
+  assert.match(mv, /_closeOpenFilesUnder\(m\.from\)/, "移动前没有关掉已打开的文件");
+  assert.match(mv, /backend\.renamePath\(m\.from, m\.to\)/, "没有真的调用后端移动");
+  assert.match(mv, /_treeMoveExpansionSubtree\(m\.from, m\.to\)/, "目录的展开状态没有跟着搬");
+  // 源目录和目标目录都要刷新——只刷一个的话，另一边的树还是旧的。
+  assert.match(mv, /dirs\.add\(parentDir\(m\.from\)\)/, "源目录没有被加进待刷新集合");
+  assert.match(mv, /for \(const d of dirs\)[\s\S]{0,60}reloadDir\(d\)/, "没有刷新所有受影响的目录");
+});
+
+test("拖住的行在多选里就带上整组", () => {
+  // VS Code 的 getStatsFromDragAndDropData 同理：拖住的那项若在选区内，整个选区一起走。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /_treeSel\.has\(_rowDragCandidate\.path\) \? \[\.\.\._treeSel\] : \[_rowDragCandidate\.path\]/,
+    "多选拖动没接上——拖一组文件只会移动其中一个");
+});
+
+test("正在被拖的行不能当自己的落点", () => {
+  // 拖住一个文件夹时，光标底下就是它自己，目标会恒等于自己 → 整个拖动看起来"没反应"。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("function _treeDropDirAt"), src.indexOf("async function _moveIntoDir"));
+  assert.match(fn, /dragging\.includes\(dir\) \? "" : dir/, "没有把正在拖的行排除掉");
+});
+
+test("三个以上动作的弹框要竖排，标签不许折断", () => {
+  // 用户截图：四个按钮挤在 420px 的卡片里，「添加到工作区」「打开为新项目」都被折成两行。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /\.io-confirm-actions \.btn \{[^}]*white-space: nowrap;/s, "按钮标签会被从中间折断");
+  assert.match(css, /\.io-confirm-actions--stack \{[^}]*flex-direction: column-reverse;/s,
+    "三个以上动作没有改成竖排");
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /classList\.add\("io-confirm-actions--stack"\)/, "竖排类没有被挂上去");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

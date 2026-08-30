@@ -119,7 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop, rootDropQuestion } from "./agent/explorer-drop.js";
+import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -12448,6 +12448,8 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
     if (alt) alt.textContent = altLabel;
     const alt2 = overlay.querySelector(".io-confirm-alt2");
     if (alt2) alt2.textContent = alt2Label;
+    // 三个以上动作横排放不下（中文标签会被折成两行），改成竖排。
+    if (alt2) overlay.querySelector(".io-confirm-actions").classList.add("io-confirm-actions--stack");
     document.body.appendChild(overlay);
     let done = false;
     const finish = (confirmed = false, returnValue = confirmed ? "ok" : "cancel", event = null) => {
@@ -75266,6 +75268,46 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   promptEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
+// 树内拖动：光标底下那一行 → 收它的那个目录。和外部拖入同一套规则（目录行进它自己、
+// 文件行进它所在目录、空白进活动根），但这里是 mousemove 的 client 坐标，直接可用。
+// 正在被拖的那些行要跳过：不然拖住一个文件夹时，光标下面就是它自己，目标恒等于自己。
+function _treeDropDirAt(x, y, dragging = []) {
+  const row = document.elementFromPoint(x, y)?.closest?.(".row");
+  if (!row || !_treeEl?.contains(row)) return "";
+  const path = row.dataset?.path || "";
+  const isDir = !row.querySelector(":scope > .chev-spacer");
+  const dir = dropDirFor({ rowPath: path, rowIsDir: isDir, rootPath });
+  return dragging.includes(dir) ? "" : dir;
+}
+// 把一批文件/目录移进 destDir。这是 VS Code 资源管理器里最常用的操作，之前我们完全没有
+// ——树内拖动只支持"拖到输入框变 @ 引用"，拖到别的文件夹上什么都不发生。
+async function _moveIntoDir(paths, destDir) {
+  if (!destDir || !paths?.length) return;
+  const { moves, skipped } = planMove({ paths, destDir });
+  if (!moves.length) {
+    if (skipped.some((x) => x.reason === "self")) showToast("不能把文件夹移进它自己里面");
+    return;
+  }
+  const dirs = new Set([destDir]);
+  let done = 0; let failed = "";
+  for (const m of moves) {
+    // 移动前先把该文件（或该目录下的文件）从编辑器里关掉，和 renameEntry 同一个规矩；
+    // 用户在关闭确认里点了取消就整批停下。
+    if (!(await _closeOpenFilesUnder(m.from))) break;
+    try {
+      await backend.renamePath(m.from, m.to);
+      _treeMoveExpansionSubtree(m.from, m.to);
+      dirs.add(parentDir(m.from));
+      done++;
+    } catch (e) { failed = String(e?.message || e); break; }
+  }
+  _clearTreeSel();
+  for (const d of dirs) { try { await reloadDir(d); } catch {} }
+  _invalidateProjectFileCache();
+  try { refreshGitStatus(); } catch {}
+  if (failed) showToast(`移动失败：${failed}`);
+  else if (done) showToast(`已移动 ${done} 项到 ${basename(destDir) || destDir}`);
+}
 (function _wireTreeDragToComposer() {
   const box = promptEl.closest(".composer__box") || promptEl.parentElement;
   if (!box) return;
@@ -75274,6 +75316,10 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   };
   const _blockSelect = (e) => { e.preventDefault(); };
+  // 拖住的那行如果本来就在多选里，就带上整组一起走；否则只拖它自己。
+  const candPaths = () => (_rowDragCandidate
+    ? (_treeSel.has(_rowDragCandidate.path) ? [..._treeSel] : [_rowDragCandidate.path])
+    : []);
   document.addEventListener("mousemove", (e) => {
     if (!_rowDragCandidate) return;
     if (!_rowDragging) {
@@ -75292,7 +75338,11 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
     }
     try { window.getSelection().removeAllRanges(); } catch {}
     if (_rowDragGhost) { _rowDragGhost.style.left = (e.clientX + 14) + "px"; _rowDragGhost.style.top = (e.clientY + 10) + "px"; }
-    box.classList.toggle("drop-target", _overComposer(e.clientX, e.clientY));
+    const onComposer = _overComposer(e.clientX, e.clientY);
+    box.classList.toggle("drop-target", onComposer);
+    // 落在树里 → 这是一次**移动**，高亮会接收它的那个目录（和外部拖入共用同一套反馈）。
+    _treeEl?.classList.toggle("is-dropping", !onComposer);
+    _paintDropRow(onComposer ? "" : _treeDropDirAt(e.clientX, e.clientY, candPaths()));
   });
   document.addEventListener("mouseup", (e) => {
     document.body.classList.remove("tree-selecting");
@@ -75303,9 +75353,11 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
     if (_rowDragGhost) { _rowDragGhost.remove(); _rowDragGhost = null; }
     document.body.classList.remove("tree-dragging");
     box.classList.remove("drop-target");
+    _treeEl?.classList.remove("is-dropping"); _paintDropRow("");
     if (wasDragging) {
       try { window.getSelection().removeAllRanges(); } catch {}
       if (_overComposer(e.clientX, e.clientY)) _insertRefAtCursor(_pathToRel(cand.path));
+      else void _moveIntoDir(candPaths(), _treeDropDirAt(e.clientX, e.clientY, candPaths()));
       _suppressTreeClick = true;
       setTimeout(() => { _suppressTreeClick = false; }, 80);
     }

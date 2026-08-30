@@ -10005,6 +10005,19 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .io-confirm-actions .btn {
   min-width: 86px;
   min-height: 34px;
+  white-space: nowrap;          /* 「添加到工作区」这种六个字的标签不许从中间折断 */
+}
+/* 三个以上动作时横排必然挤：卡片 420px 去掉内边距只剩 380，四个按钮光 min-width 就 344。
+   照 macOS 的做法竖排，主按钮在最上、取消在最下。DOM 顺序是 取消/次/次/主，所以用
+   column-reverse 正好把主按钮翻到顶上。 */
+.io-confirm-actions--stack {
+  flex-direction: column-reverse;
+  align-items: stretch;
+  gap: 8px;
+}
+.io-confirm-actions--stack .btn {
+  width: 100%;
+  min-height: 38px;
 }
 
 /* ---- About dialog ---- */
