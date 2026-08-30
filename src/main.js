@@ -80281,11 +80281,13 @@ function _dragTargetAt(payload) {
   if (rootPath && _dropPointIn(p, _treeEl)) return "tree";
   return "open";
 }
-// 光标下面那一行 → 往哪个目录里放。目录行有 .chev（文件行是 .chev-spacer），拿它区分。
+// 光标下面那一行 → 往哪个目录里放。判据是**文件行才有** :scope > .chev-spacer：
+// 不能反过来认 .chev，因为工作区根行把 .chev 包在 .workspace-root__toggle 按钮里，
+// 认 .chev 会把根行当成文件、把目标算成工作区**外面**的父目录（后端直接拒绝）。
 function _dropDirAt(payload) {
   const pt = _dropPointIn(payload && payload.position, _treeEl);
   const row = pt ? document.elementFromPoint(pt.x, pt.y)?.closest?.(".row") : null;
-  return dropDirFor({ rowPath: row?.dataset?.path || "", rowIsDir: !!row?.querySelector(":scope > .chev"), rootPath });
+  return dropDirFor({ rowPath: row?.dataset?.path || "", rowIsDir: !row?.querySelector(":scope > .chev-spacer"), rootPath });
 }
 function _showDrop(target) {
   clearTimeout(_dropHideTimer);

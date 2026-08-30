@@ -131,21 +131,33 @@ test("三个落区的分工，以及空工作区时不抢文件树", () => {
 
 test("落点落在哪一行 → 进哪个目录（真跑 elementFromPoint）", () => {
   const tree = elWithRect(rect(0, 0, 200, 400));
-  // 假树行：目录行有 .chev，文件行没有（和渲染处一致）。
-  const mkRow = (path, isDir) => ({
-    dataset: { path },
-    querySelector: (sel) => (sel === ":scope > .chev" && isDir ? {} : null),
-    closest: (sel) => (sel === ".row" ? mkRow(path, isDir) : null),
-  });
+  // 假树行**照抄真实 DOM 形状**（见 main.js 的行渲染 + 工作区根行渲染）：
+  //   普通目录行： <svg class="chev">…            → 直接子元素有 .chev
+  //   文件行：     <span class="chev-spacer">…    → 直接子元素有 .chev-spacer
+  //   工作区根行： <button class="workspace-root__toggle"><svg class="chev">…
+  //                → .chev 被包在按钮里，**不是**直接子元素；也没有 .chev-spacer
+  // 这三种形状是这条判据唯一会遇到的输入，缺一种就守不住。
+  const mkRow = (path, kind) => {
+    const has = (sel) =>
+      (sel === ":scope > .chev" && kind === "dir") ||
+      (sel === ":scope > .chev-spacer" && kind === "file");
+    const row = { dataset: { path }, querySelector: (sel) => (has(sel) ? {} : null) };
+    row.closest = (sel) => (sel === ".row" ? row : null);
+    return row;
+  };
   const at = (row) => load("_dropDirAt", {
     _dropPointIn, _treeEl: tree, rootPath: "/w", dropDirFor,
     window: { devicePixelRatio: 1 },
     document: { elementFromPoint: () => row },
   })({ position: { x: 50, y: 50 } });
 
-  assert.equal(at(mkRow("/w/src", true)), "/w/src", "落在文件夹行 → 进这个文件夹");
-  assert.equal(at(mkRow("/w/src/a.js", false)), "/w/src", "落在文件行 → 进它所在的目录");
+  assert.equal(at(mkRow("/w/src", "dir")), "/w/src", "落在文件夹行 → 进这个文件夹");
+  assert.equal(at(mkRow("/w/src/a.js", "file")), "/w/src", "落在文件行 → 进它所在的目录");
   assert.equal(at(null), "/w", "落在空白处 → 进工作区根");
+  // 回归闸：根行的 .chev 在按钮里。判据要是反过来认 .chev，这里会算出 "/"（工作区
+  // **外面**的父目录），后端一律拒绝，用户看到的是"复制失败"而不是文件进了根目录。
+  assert.equal(at(mkRow("/w", "root")), "/w",
+    "工作区根行必须当成目录——认 .chev 会把它当文件，目标算到工作区外面去");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
