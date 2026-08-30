@@ -36700,12 +36700,26 @@ test("切回聊天标签：钉底的停在最新，翻过历史的停原处，�
   // 而每次纠正都是一次重绘 —— 那就是用户看到的「乱跳」。
   assert.match(sw, /scrollFromBottom\s*=\s*chatEl[\s\S]{0,120}scrollHeight - chatEl\.scrollTop - chatEl\.clientHeight/,
     "切走时没有记录距底距离");
+  // **量高度必须排在 container.hidden = true 之前。**
+  //
+  // 读 scrollHeight 会强制重排；容器已经 display:none 的话总高塌成可视高，
+  // 算出来的距底距离恒等于 0 —— 每个标签切回来都停在最新那条，用户明明往上翻过也没用。
+  // 这是实际发生过的：第一版就把量高度写在了隐藏之后。
+  const iMeasure = sw.indexOf("scrollFromBottom");
+  const iHide = sw.indexOf("container.hidden = true");
+  assert.ok(iMeasure >= 0 && iHide >= 0, "切走时的隐藏或测量不见了");
+  assert.ok(
+    iMeasure < iHide,
+    "量距底距离排在了隐藏容器之后 —— 那时总高已经塌了，算出来恒为 0，翻过的位置全丢",
+  );
   assert.match(sw, /chatEl\.scrollTop = Math\.max\(0, chatEl\.scrollHeight - chatEl\.clientHeight - _fromBottom\)/,
     "切回来没有按距底距离一次算准位置");
 
-  // 钉在底部（或刚恢复）的标签，距底距离取 0 —— 也就是停在最新那条。
-  assert.match(sw, /session\._pinned === false\)\s*\?\s*Math\.max\(0, Number\(session\.scrollFromBottom\)/,
-    "只有主动翻过历史的标签才该保留距底距离");
+  // 位置只由距底距离决定，**不许再看 `_pinned`**：那是「要不要跟着新内容走」，
+  // 拿它当「要不要恢复位置」的开关，等于给恢复多加一个可能出错的前提 —— 它一旦不准，
+  // 用户翻到的位置就整个丢掉。人在底部时距底距离本来就是 0，不需要额外的判据。
+  assert.match(sw, /const _fromBottom = session\._restored\s*\?\s*0\s*:\s*Math\.max\(0, Number\(session\.scrollFromBottom\)/,
+    "恢复位置又挂上了 _pinned 这个额外前提");
 
   // **一次同步赋值，不许有多帧补位。** 之前两版一个是 rAF+setTimeout 追着补（看得见跳），
   // 一个是 visibility 藏起来再露出来（看得见闪）。两条路都是在跟布局赛跑。

@@ -18798,8 +18798,11 @@ async function _switchChatSession(idx) {
   try { _perfPhase("_switchChatSession"); } catch {}
   if (idx === _activeChatIdx || idx < 0 || idx >= _chatSessions.length) return;
   if (_activeChatIdx >= 0 && _chatSessions[_activeChatIdx]) {
-    _chatSessions[_activeChatIdx].container.hidden = true;
     // 记「离底部还有多远」，而不是绝对偏移量。
+    //
+    // **必须在 container.hidden = true 之前量。** 读 scrollHeight 会强制重排，
+    // 那时内容已经 display:none、总高塌成可视高，算出来的距底距离恒等于 0，
+    // 于是每个标签切回来都停在最新那条 —— 用户明明往上翻过也没用。
     //
     // 绝对偏移量一旦内容变了就失效（标签隐藏期间还在流式输出、工具卡展开、
     // content-visibility 的块进出视口都会改总高），只能靠切回来之后反复纠正去追 ——
@@ -18812,6 +18815,7 @@ async function _switchChatSession(idx) {
         ? Math.max(0, chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight)
         : 0;
     }
+    _chatSessions[_activeChatIdx].container.hidden = true;
     // 钉底状态是每个标签自己的：滚动位置本来就按标签存，钉不钉却是个模块级全局，
     // 于是在 A 标签往上翻一下，切到 B 标签，B 的实时输出也跟着不动了。
     _chatSessions[_activeChatIdx]._pinned = _chatPinned;
@@ -18882,9 +18886,17 @@ async function _switchChatSession(idx) {
     // 位置，在同一个 JS 任务里赋值，浏览器只画一帧 —— 既不跳也不闪。
     //
     // 钉在底部的标签距底距离是 0，于是这一句自然就是「停在最新那条」。
-    const _fromBottom = (!session._restored && session._pinned === false)
-      ? Math.max(0, Number(session.scrollFromBottom) || 0)
-      : 0;
+    // 位置只由距底距离决定，**不再看 `_pinned`**。
+    //
+    // `_pinned` 是「要不要跟着新内容往下走」，那是另一件事；拿它当「要不要恢复位置」的
+    // 开关，等于给恢复位置多加了一个可能出错的前提 —— 它一旦不准（比如那一轮没来得及
+    // 更新），用户翻到的位置就整个丢掉。而距底距离本身已经说明了一切：人在底部时它就是 0。
+    //
+    // 唯一的例外是刚从存档恢复、这个进程内第一次显示的标签：那时没有上一次的距底距离，
+    // 直接给最新那条。
+    const _fromBottom = session._restored
+      ? 0
+      : Math.max(0, Number(session.scrollFromBottom) || 0);
     if (session._restored) session._restored = false;
     _chatPinned = _fromBottom <= 2;
     try {
