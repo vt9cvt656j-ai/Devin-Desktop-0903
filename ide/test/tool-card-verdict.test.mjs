@@ -19,8 +19,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { CODE as SRC, load, fnSource } from "./helpers/source.mjs";
 import { workspaceMutatingTypes } from "../src/agent/tool-policy.js";
+import { setBadgeText } from "../src/agent/escape.js";
 
-const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
+const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {}, _setBadge: setBadgeText });
 
 /** 一张还在转圈的工具卡的最小替身；返回落定后的类名与 step 上加的类。 */
 function settleCard(result, label = "") {

@@ -17,8 +17,14 @@ use headless_chrome::protocol::cdp::{
     Page::{AddScriptToEvaluateOnNewDocument, CaptureScreenshotFormatOption},
     Performance::{Enable as EnablePerformanceMetrics, GetMetrics},
 };
+use crate::human_input;
+use headless_chrome::browser::tab::point::Point;
 use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
 use serde::{Deserialize, Serialize};
+
+/// 上一次鼠标落点（页面坐标）。人类化点击从这里起手画一条轨迹到目标，而不是瞬移。
+/// 进程内所有 tab 共用——够用，因为一次只有一个当前 tab 在被驱动。
+static LAST_MOUSE: LazyLock<Mutex<Option<(f64, f64)>>> = LazyLock::new(|| Mutex::new(None));
 
 struct Session {
     _browser: Browser, // kept alive so the child process & connection survive
@@ -1359,6 +1365,119 @@ pub async fn browser_navigate(url: String) -> Result<BrowserState, String> {
 
 /// Click an element via JS eval — works inside iframes (same-origin) where
 /// CDP's `DOM.querySelector` can't reach. Last-resort fallback.
+/// 元素**找到了但当前动不了**时的诊断。三种形状（disabled / not_visible / covered by）
+/// 各自指向完全不同的下一步，所以必须把原文带回给模型，而不是笼统说一句"没找到"——
+/// 否则模型会去换五种选择器重试，而真正该做的是先关掉遮罩 / 先满足启用条件。
+///
+/// 这段话原来在 browser_click / browser_type 里**抄了三份**（人类化路径、两条 eval 兜底），
+/// 改一处就会漂三份。收成一个函数：措辞只有一份，三个调用点共用。
+fn unactionable_reason(selector: &str, reason: &str) -> Option<String> {
+    let r = reason.trim();
+    if !(r.starts_with("disabled") || r.starts_with("not_visible") || r.starts_with("covered by")) {
+        return None;
+    }
+    Some(format!(
+        "[失败] 操作不到「{selector}」：{r}。这不是选择器写错——元素找到了。covered by 说明它被别的元素盖住（先关掉那个遮罩/弹层），not_visible 说明它在页面上不可见，disabled 说明它当前不可操作（先满足启用它的前置条件）。"
+    ))
+}
+
+/// 解析出一个**真实可点**的页面坐标，供 CDP 人类化点击用。复用 click_via_eval 的定位/
+/// 可见性/遮挡判定，但**不派发任何事件**——只回一个点或一句诊断。iframe-aware。
+/// 成功返回 (x, y)（视口坐标）；失败的 Err 文本沿用同一套词：
+/// "no"（没找到）/ "disabled …" / "not_visible …" / "covered by …"。
+fn resolve_click_point(tab: &Tab, selector: &str) -> Result<(f64, f64), String> {
+    let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(()=>{{var s={sel_js};
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function visible(el){{try{{var r=el.getBoundingClientRect(),cs=(el.ownerDocument.defaultView||window).getComputedStyle(el);return r.width>1&&r.height>1&&cs.visibility!=='hidden'&&cs.display!=='none'&&Number(cs.opacity||1)>0.01}}catch(e){{return false}}}}
+function disabled(el){{try{{return !!(el.disabled||el.getAttribute('aria-disabled')==='true'||el.closest('[disabled],[aria-disabled="true"]'))}}catch(e){{return false}}}}
+function brief(el){{try{{if(!el)return'';var t=String(el.innerText||el.textContent||el.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim().slice(0,60);return el.tagName.toLowerCase()+(el.id?'#'+el.id:'')+(t?' "'+t+'"':'')}}catch(e){{return'element'}}}}
+function clickable(el){{try{{var q='a[href],button,input:not([type=hidden]),select,textarea,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[onclick],label,summary';return el.matches(q)?el:(el.closest(q)||el)}}catch(e){{return el}}}}
+function point(el){{var doc=el.ownerDocument||document,win=doc.defaultView||window,r=el.getBoundingClientRect(),pts=[[.5,.5],[.25,.5],[.75,.5],[.5,.25],[.5,.75]];for(var i=0;i<pts.length;i++){{var x=Math.max(1,Math.min((win.innerWidth||1)-2,r.left+r.width*pts[i][0])),y=Math.max(1,Math.min((win.innerHeight||1)-2,r.top+r.height*pts[i][1])),top=null;try{{top=doc.elementFromPoint(x,y)}}catch(e){{}}if(top&&(top===el||el.contains(top)))return{{ok:true,x:x,y:y}};}}return{{ok:false,top:top}}}}
+var raw=find();if(!raw)return JSON.stringify({{ok:false,reason:'no'}});
+var el=clickable(raw);if(disabled(el))return JSON.stringify({{ok:false,reason:'disabled '+brief(el)}});
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{try{{el.scrollIntoView({{block:'center',inline:'center'}})}}catch(e2){{}}}}
+if(!visible(el))return JSON.stringify({{ok:false,reason:'not_visible '+brief(el)}});
+var p=point(el);if(!p.ok)return JSON.stringify({{ok:false,reason:'covered by '+brief(p.top)}});
+return JSON.stringify({{ok:true,x:p.x,y:p.y}})}})()"#
+    );
+    let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
+    let raw = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    if parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let x = parsed.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let y = parsed.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if x > 0.0 && y > 0.0 {
+            return Ok((x, y));
+        }
+        return Err("no".into());
+    }
+    Err(parsed
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("no")
+        .to_string())
+}
+
+/// 人类化地移动指针到 (x, y) 并点一下：从上次落点沿 ease_path 走一串 mouseMoved（trusted），
+/// 到位停一拍，再 click_point（press+release，trusted）。曲线/时长来自 human_input（有单测）。
+fn human_click(tab: &Tab, x: f64, y: f64) -> Result<(), String> {
+    let from = { *LAST_MOUSE.lock().unwrap() }.unwrap_or((x - 40.0, y - 60.0));
+    let seed = x.to_bits().wrapping_mul(0x0100_0000_01b3) ^ y.to_bits();
+    for (px, py) in human_input::ease_path(from, (x, y), seed) {
+        tab.move_mouse_to_point(Point { x: px, y: py })
+            .map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_millis(human_input::move_step_delay_ms(
+            seed ^ px.to_bits(),
+        )));
+    }
+    std::thread::sleep(Duration::from_millis(human_input::move_step_delay_ms(seed)));
+    tab.click_point(Point { x, y }).map_err(|e| e.to_string())?;
+    *LAST_MOUSE.lock().unwrap() = Some((x, y));
+    Ok(())
+}
+
+/// 聚焦并清空目标输入框（复用 eval 那套 iframe-aware 定位，保证 React 受控组件也被真正清掉），
+/// 好让随后的 CDP 逐字符敲从空开始、落在正确元素上。成功即 Ok（元素已聚焦）。
+fn focus_and_clear(tab: &Tab, selector: &str) -> Result<(), String> {
+    let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let js = format!(
+        r#"(()=>{{var s={sel_js};
+function docs(){{var out=[document],fs=document.querySelectorAll('iframe');for(var k=0;k<fs.length;k++){{try{{if(fs[k].contentDocument)out.push(fs[k].contentDocument)}}catch(e){{}}}}return out}}
+function find(){{var ds=docs();for(var d=0;d<ds.length;d++){{try{{var el=ds[d].querySelector(s);if(el)return el}}catch(e){{}}}}return null}}
+function target(el){{try{{if(el.tagName==='LABEL'&&el.control)return el.control;if(el.matches('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]'))return el;return el.querySelector('input:not([type=hidden]),textarea,select,[contenteditable=""],[contenteditable=true]')||el}}catch(e){{return el}}}}
+function fire(el,name){{try{{el.dispatchEvent(new Event(name,{{bubbles:true,cancelable:true}}))}}catch(e){{}}}}
+var raw=find();if(!raw)return'no';var el=target(raw);
+try{{el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}})}}catch(e){{}}
+try{{el.focus({{preventScroll:true}})}}catch(e){{try{{el.focus()}}catch(e2){{}}}}
+try{{if(el.isContentEditable){{el.textContent='';}}else if('value'in el){{var proto=Object.getPrototypeOf(el),base=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,desc=Object.getOwnPropertyDescriptor(proto,'value')||Object.getOwnPropertyDescriptor(base,'value');(desc&&desc.set?desc.set:function(v){{el.value=v}}).call(el,'');}}fire(el,'input');fire(el,'change')}}catch(e){{}}
+return document.activeElement===el||(el.ownerDocument&&el.ownerDocument.activeElement===el)?'ok':'ok_maybe'}})()"#
+    );
+    let ro = tab.evaluate(&js, false).map_err(|e| e.to_string())?;
+    let v = ro.value.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+    if v == "ok" || v == "ok_maybe" {
+        Ok(())
+    } else {
+        Err(format!("focus_failed:{v}"))
+    }
+}
+
+/// 逐字符按人类 cadence 敲入（CDP key events，trusted），字符之间停顿来自 human_input。
+/// 前置：目标已聚焦（见 focus_and_clear）。
+fn human_type(tab: &Tab, text: &str) -> Result<(), String> {
+    let seed = text.len() as u64;
+    let delays = human_input::keystroke_delays(text, seed);
+    for (ch, d) in text.chars().zip(delays) {
+        let mut buf = [0u8; 4];
+        tab.type_str(ch.encode_utf8(&mut buf))
+            .map_err(|e| e.to_string())?;
+        std::thread::sleep(Duration::from_millis(d));
+    }
+    Ok(())
+}
+
 fn click_via_eval(tab: &Tab, selector: &str) -> Result<(), String> {
     let sel_js = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
@@ -1424,6 +1543,24 @@ return actual===String(t)||actual.indexOf(String(t))>=0?'ok':'value_not_applied 
 #[tauri::command]
 pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        // ① 人类化 CDP 点击优先：trusted 事件 + 真实轨迹 + 按住时长，比合成 el.click() 像真人得多。
+        //    只在两种情形收口：成功；或元素找到但当前不可点（disabled/covered/not_visible，返回
+        //    和下方同一套富诊断）。其余情况（没找到、派发失败）静默落到原有兜底链路，行为不变。
+        match resolve_click_point(tab, &selector) {
+            Ok((x, y)) => {
+                if human_click(tab, x, y).is_ok() {
+                    std::thread::sleep(Duration::from_millis(140));
+                    let _ = tab.wait_until_navigated();
+                    return Ok(None);
+                }
+            }
+            Err(reason) => {
+                if let Some(msg) = unactionable_reason(&selector, &reason) {
+                    return Err(msg);
+                }
+            }
+        }
+        // ② 兜底：原有 eval 合成事件 + 原生 CDP click 链路（下面原封不动）。
         match click_via_eval(tab, &selector) {
             Ok(_) => {
                 std::thread::sleep(Duration::from_millis(260));
@@ -1450,11 +1587,8 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
                 // 遮罩盖住时，那一下作用在遮罩上，工具却报成功。模型于是换五种选择器重试，
                 // 而真正该做的是先关掉遮罩；disabled 时该做的是先满足启用它的前置条件。
                 // 把原文带回去，这三种情形模型自己就判得出下一步。
-                let r = reason.trim().to_string();
-                if r.starts_with("disabled") || r.starts_with("not_visible") || r.starts_with("covered by") {
-                    return Err(format!(
-                        "[失败] 操作不到「{selector}」：{r}。这不是选择器写错——元素找到了。covered by 说明它被别的元素盖住（先关掉那个遮罩/弹层），not_visible 说明它在页面上不可见，disabled 说明它当前不可操作（先满足启用它的前置条件）。"
-                    ));
+                if let Some(msg) = unactionable_reason(&selector, &reason) {
+                    return Err(msg);
                 }
             }
         }
@@ -1494,6 +1628,12 @@ pub async fn browser_click(selector: String) -> Result<BrowserState, String> {
 #[tauri::command]
 pub async fn browser_type(selector: String, text: String) -> Result<BrowserState, String> {
     with_tab(move |tab| {
+        // ① 人类化输入优先：先聚焦+清空（复用 eval 定位，React 受控组件也真被清掉），
+        //    再用 CDP 逐字符按 cadence 敲（trusted key events）。成功即返回；任何一步不成
+        //    静默落到原有 type_via_eval 兜底（它按整段 native-set，幂等，能兜住半成品状态）。
+        if focus_and_clear(tab, &selector).is_ok() && human_type(tab, &text).is_ok() {
+            return Ok(None);
+        }
         match type_via_eval(tab, &selector, &text) {
             Ok(_) => return Ok(None),
             Err(first_err)
@@ -1514,11 +1654,8 @@ pub async fn browser_type(selector: String, text: String) -> Result<BrowserState
                 // 遮罩盖住时，那一下作用在遮罩上，工具却报成功。模型于是换五种选择器重试，
                 // 而真正该做的是先关掉遮罩；disabled 时该做的是先满足启用它的前置条件。
                 // 把原文带回去，这三种情形模型自己就判得出下一步。
-                let r = reason.trim().to_string();
-                if r.starts_with("disabled") || r.starts_with("not_visible") || r.starts_with("covered by") {
-                    return Err(format!(
-                        "[失败] 操作不到「{selector}」：{r}。这不是选择器写错——元素找到了。covered by 说明它被别的元素盖住（先关掉那个遮罩/弹层），not_visible 说明它在页面上不可见，disabled 说明它当前不可操作（先满足启用它的前置条件）。"
-                    ));
+                if let Some(msg) = unactionable_reason(&selector, &reason) {
+                    return Err(msg);
                 }
             }
         }
@@ -2867,6 +3004,40 @@ mod tests {
             non_negative_delta(&before, &regressed, "TaskDuration"),
             None
         );
+    }
+
+    #[test]
+    fn 点击输入走人类化cdp路径_合成事件只做兜底() {
+        // 点击/输入的**主路径**必须是 CDP 人类化输入（trusted 事件 + 轨迹 + cadence），
+        // 合成 JS 事件（el.click / native value-set）只在解析不到坐标或派发失败时兜底。
+        // 钉源码：这些函数埋在 with_tab 闭包里、要真起浏览器才跑得动，抽不出来单测；
+        // 拼串找，避免匹配到本测试自己。
+        const SRC: &str = include_str!("browser.rs");
+        // 人类化点击/输入的 CDP 入口存在且真的被 browser_click / browser_type 调用。
+        for needle in [
+            format!("fn {}(", "human_click"),
+            format!("fn {}(", "human_type"),
+            format!("fn {}(", "resolve_click_point"),
+            format!("fn {}(", "focus_and_clear"),
+        ] {
+            assert!(SRC.contains(&needle), "缺少人类化输入函数: {needle}");
+        }
+        // 轨迹与节奏来自有单测的纯模块，不是就地瞎写的魔法数。
+        assert!(
+            SRC.contains(&format!("human_input::{}(", "ease_path")),
+            "human_click 没有用 ease_path 画轨迹",
+        );
+        assert!(
+            SRC.contains(&format!("human_input::{}(", "keystroke_delays")),
+            "human_type 没有用 keystroke_delays 定节奏",
+        );
+        // 主路径在前、兜底在后：browser_click 里 resolve_click_point 必须出现在
+        // 兜底的 click_via_eval 之前，否则「人类化优先」是空话。
+        let click_body = &SRC[SRC.find("pub async fn browser_click").expect("browser_click 不见了")..];
+        let click_body = &click_body[..click_body.find("pub async fn browser_type").unwrap_or(click_body.len())];
+        let p_human = click_body.find("resolve_click_point").expect("browser_click 没走人类化解析");
+        let p_fallback = click_body.find("click_via_eval").expect("browser_click 没有 eval 兜底");
+        assert!(p_human < p_fallback, "人类化点击不是主路径——它排在 eval 兜底后面了");
     }
 
     #[test]

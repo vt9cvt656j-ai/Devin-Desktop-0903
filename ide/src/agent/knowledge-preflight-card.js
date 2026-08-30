@@ -164,3 +164,27 @@ export function settlePreflightCard(step, sections, deps = {}) {
     return true;
   } catch { return false; }
 }
+
+/**
+ * 把 michael-design 预检的三条结果摊成 `settlePreflightCard` 要的 sections。
+ *
+ * 搬到模块里不是为了好看：main.js 有一条尺寸闸，而这段只依赖参数——没有 DOM、没有全局、
+ * 没有模块级可变状态，正是那条闸说的「能搬就搬」。
+ *
+ * `extractBullets` 必须注入而不是在这里另写一份：抽要点那套行级过滤器（丢标题行、丢表格
+ * 分隔、丢过短行）在 main.js 里，专业域那条路用的就是它。两条路共用同一个抽取器，卡面上
+ * 的条数才是同一个意思；各写一份迟早漂开。
+ *
+ * `failed` 的判据由调用方按**结构**算好传进来（`!result.knowledge`），这里只搬运不重判——
+ * 「零命中」和「检索失败」的唯一判据在 _knowledgeSettleLabel，这个仓库为抄第二份付过账。
+ */
+export function designPreflightSections(results, extractBullets) {
+  const list = Array.isArray(results) ? results : [];
+  const pick = typeof extractBullets === "function" ? extractBullets : () => [];
+  return list.map((item) => ({
+    heading: String(item?.plan?.purpose || item?.plan?.id || "检索"),
+    bullets: pick(String(item?.result?.content || "")),
+    failed: !!item?.failed,
+    failResult: item?.failResult || (item?.failed ? item?.result : null),
+  }));
+}

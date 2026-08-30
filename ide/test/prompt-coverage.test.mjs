@@ -142,7 +142,10 @@ const RETIRED_SHA = {
   agent_lite: ["2da999202b2c34c3", "无活版本，已被 agent_core 取代"],
   design_system: ["d50756e1f4ca2d37", "冻结的回滚样本，永不注入"],
   ui_design_flow: ["06a746e754d4eb58", "已被 design_core / design_tokens / design_components 取代"],
-  ui_design_guide: ["14b6840fd876bd58", "同上"],
+  // 2026-08-30 刻意同步：活版本（design_content.txt）的桌面生图尺寸从 1792x1024 改成
+  // 当前生图后端真正支持的 1536x1024（超了会被静默压过去），这份死副本里同一个数字
+  // 一起跟上，免得哪天它被复活时带回一个错的尺寸。真正上线的是 design_content.txt。
+  ui_design_guide: ["05710c92ee96f29c", "同上"],
   next_action: ["6825461eb0e92fdd", "ide/src/main.js 的 _ASK_PREDICT_SYSTEM"],
   compact: ["8f932b79ccd35757", 'ide/src/main.js 里 _P(\"compact\", …) 的第二参数'],
   research_prompt: ["dc96974e4c285f6a", 'ide/src/main.js 里 _P(\"research_prompt\", …) 的第二参数'],

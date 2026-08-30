@@ -6539,6 +6539,11 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
   display: flex; align-items: center; gap: 4px;
   padding: 3px 10px; border-radius: 999px;
+  /* text-overflow 在 display:flex 上是**死规则**——它只作用于块容器，而这里的裸文本是
+     匿名 flex 项，规则套不上去。实测：405px 的文案塞进 202px，硬切、没有省略号、没有
+     tooltip，用户看到一句读不通的残句还不知道后面有内容。真正生效的是下面的 __t，
+     所以 _settleToolStep 一律把文案包进 .atc-result__t 并同时设 title。
+     留着这两条是给 __t 之外的内联内容兜底，不是给裸文本用的。 */
   white-space: nowrap; text-overflow: ellipsis;
 }
 .atc-result svg { flex: none; }
@@ -6572,6 +6577,13 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 .atc-result--pending {
   color: var(--atc-accent); background: #e8f0fe;
+}
+/* 子体超时被强杀 / 浏览器撞上人机验证——这两个是最需要用户一眼看见的异常，此前
+   全表一条规则都没有：渲染成透明底 + 暗灰字，比表示「12 行」的中性 chip 还淡，
+   扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
+.atc-result--timeout,
+.atc-result--warn {
+  color: var(--atc-warning); background: #fef7e0;
 }
 /* Telegram-style link preview card below browser screenshots */
 .browser-url-card {
@@ -6917,9 +6929,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .bm-dot.cancelled { background: var(--text-dim); animation: none; }
 .bm-msg { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; line-height: 1.4; }
 .bm-meta { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1.6; }
-.bm-bar { height: 3px; border-radius: 2px; background: var(--line); margin-top: 10px; overflow: hidden; }
-.bm-fill { height: 100%; border-radius: 2px; background: var(--accent); transition: width .3s linear; }
-.bm-fill.timeout { background: #f0a030; }
 .bm-actions { display: flex; gap: 8px; margin-top: 10px; }
 .bm-btn {
   padding: 5px 14px; border-radius: 6px; border: 1px solid var(--line);
@@ -7676,6 +7685,11 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 [data-theme="dark"] .atc-diffstat .d, .dark .atc-diffstat .d { color: #f85149; }
 [data-theme="dark"] .atc-result--ok, .dark .atc-result--ok { background: #0d28181a; }
 [data-theme="dark"] .atc-result--err, .dark .atc-result--err { background: #2c10141a; }
+/* --pending 原来只有浅色那一份写死的 #e8f0fe：深色主题下每次落盘都会闪出一圈近白色药丸，
+   裹着一颗深色 diffstat，和整套深色卡片观感断裂。--timeout/--warn 同理，一并补齐。 */
+[data-theme="dark"] .atc-result--pending, .dark .atc-result--pending { background: #0d1b2e1a; }
+[data-theme="dark"] .atc-result--timeout, .dark .atc-result--timeout,
+[data-theme="dark"] .atc-result--warn, .dark .atc-result--warn { background: #2e21051a; }
 [data-theme="dark"] .atc-confirm, .dark .atc-confirm { background: #0d1117; }
 [data-theme="dark"] .atc-confirm-btn--accept, .dark .atc-confirm-btn--accept { background: #238636; border-color: #238636; }
 [data-theme="dark"] .atc-confirm-btn--reject:hover, .dark .atc-confirm-btn--reject:hover { background: #2c1014; }

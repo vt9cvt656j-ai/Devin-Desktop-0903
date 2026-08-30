@@ -136,9 +136,21 @@ test("两个检索落定点都走同一个判据（漏一个就还有半边是�
   // 那边的形参没有下划线前缀，所以两种拼法都数。守的性质一个字没变：
   // **两个落定点都必须经过 knowledgeSettleLabel**，它是全系统唯一区分
   // 「检索失败」与「零命中」的地方；谁绕过去，谁那半边就会把失败说成「库里没有」。
-  const hits = (SRC.match(/settleToolStep\(step, result,\s*\n?\s*(?:typeof )?_?knowledgeSettleLabel\b/g) || []).length;
-  assert.equal(hits, 2,
-    `只有 ${hits} 处走了新判据，应为 2（michael-design 预检 + 领域知识预检）`);
+  // 2026-08-30：michael-design 那条路也改走融合卡之后，两个落定点**共用**了
+  // knowledge-preflight-card.js 里的同一次结算。这比"两处各自记得调"更强：判据从
+  // 「两个地方都别忘」变成「只有一个地方能调」，漏一个在结构上就不可能了。
+  // 所以这里改成钉那个性质本身，而不是数出现次数。
+  const judged = (SRC.match(/settleToolStep\(step, result,\s*\n?\s*(?:typeof )?_?knowledgeSettleLabel\b/g) || []).length;
+  assert.equal(judged, 1,
+    `唯一判据点应当只有一处（在 knowledge-preflight-card.js 的 settlePreflightCard 里），实际 ${judged} 处`);
+  // 而两条预检路都必须落到那一处去——否则"只有一个地方能调"就成了"有一条路根本不调"。
+  for (const [fn, name] of [["_runDomainKnowledgePreflight", "领域知识预检"],
+                            ["_runMichaelDesignPreflight", "michael-design 预检"]]) {
+    const body = fnSource(fn, { code: true }) || "";
+    assert.ok(body.length > 300, `取不到 ${fn} 正文`);
+    assert.match(body, /_settlePreflightCard\(/,
+      `${name}没有走融合卡的结算——它那半边会绕过唯一的失败/零命中判据`);
+  }
   assert.doesNotMatch(SRC, /_settleToolStep\(step, result, evidence \? [^\n]*: "无可用命中"\)/,
     "michael-design 那处还在直接写死「无可用命中」");
 });
