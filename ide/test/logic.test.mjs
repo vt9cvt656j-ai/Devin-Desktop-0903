@@ -15,6 +15,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 这一对 2026-08-25 搬进了 src/agent/code-text.js —— 直接 import 真模块，
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
+import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
 // 不再抠源码注入依赖（抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { stackTable as STACK_TABLE, extractStackHints as extractStack,
@@ -23009,7 +23010,7 @@ test("offered choices and run-state suggestions merge into one 接下来 block",
       // 下面那几条「chip 上的字 = label」就等于没测这件事。
       // 这份清单是手工维护的：给 _renderSuggestionChips 新加辅助函数必须补进来，
       // 否则渲染在 try/catch 里静默抛掉，现象是「一张卡片都没有」，和真没渲染分不出来。
-      _chipShortLabel: load("_chipShortLabel", {}),
+      _chipShortLabel, // 它已经搬进 src/agent/chip-label.js，直接 import 真函数
     sendPrompt() {}, _currentSession: () => null, _chatFollow() {},
   };
   const render = load("_renderSuggestionChips", deps);
@@ -36410,9 +36411,7 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
   // 用 helpers/source.mjs 的 RAW_SRC：它把 main.js 和 src/agent/ 下每个模块拼在一起，
   // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
   const src = RAW_SRC;
-  const fn = src.match(/function _chipShortLabel\(text\)[\s\S]*?\n\}/);
-  assert.ok(fn, "_chipShortLabel 不见了");
-  const _chipShortLabel = eval(`(${fn[0].replace(/^function /, "function ")})`);
+  // 它住在 src/agent/chip-label.js，直接 import（顶部）—— 别再从源码文本 eval 出来。
 
   // 标题——解释：破折号前那一截就是完整的短标签。这是模型最常产出的形状。
   assert.equal(
@@ -36742,4 +36741,66 @@ test("切回聊天标签：钉底的停在最新，翻过历史的停原处，�
   // 自己读 main.js 的话，哪天把这段搬进模块，断言会假红（或者反向断言悄悄失效）。
   const src = RAW_SRC;
   assert.ok(!/_showChatAtBottomSilently/.test(src), "藏起来再露出来的那版还在");
+});
+
+// ---------------------------------------------------------------------------
+// Plan 模式：方案单独开一个页签，只放能照着做的部分
+// ---------------------------------------------------------------------------
+test("方案页签只留可执行内容，取证叙述不进去", async () => {
+  const { planCoreFromReply, planTitleFromReply } = await import("../src/agent/plan-doc.js");
+  const reply = [
+    "## 目标与非目标", "- 目标：加方案窗口", "",
+    "## 证据摘要", "我读了 main.js，发现预览页签是虚拟标签的先例，这一段是叙述。", "",
+    "## 关键文件", "- `src/main.js`", "",
+    "## 可执行计划", "1. 加图标", "2. 加页签", "",
+    "## 验证命令", "```bash", "npm test", "# 这个井号在代码块里，不是标题", "```", "",
+    "## 风险", "- 恢复时可能拿到空内容",
+  ].join("\n");
+  const core = planCoreFromReply(reply);
+
+  // 该留的都在。
+  for (const keep of ["目标与非目标", "关键文件", "可执行计划", "验证命令", "风险"]) {
+    assert.ok(core.includes(keep), `${keep} 这一节被丢了`);
+  }
+  // **叙述性的取证过程不进去** —— 这一屏是给人照着做的，不是再读一遍答案。
+  assert.ok(!core.includes("我读了 main.js"), "证据叙述被搬进了方案窗口");
+  assert.ok(!core.includes("## 证据摘要"), "证据小节的标题还在");
+  // 代码块里的 `#` 不能被当成标题，否则方案会被从中间切碎。
+  assert.ok(core.includes("# 这个井号在代码块里"), "代码块被当成标题切开了");
+
+  assert.equal(planTitleFromReply(reply), "目标与非目标");
+  assert.equal(planTitleFromReply("", "方案"), "方案");
+  // 抽不出东西时返回空串 —— 调用方据此**不开窗口**，而不是开一张空白页。
+  assert.equal(planCoreFromReply(""), "");
+  assert.equal(planCoreFromReply(null), "");
+  // 没有小节时退回「只留列表和代码块」，散文段落去掉。
+  const noHeads = planCoreFromReply("这是一段解释性的散文。\n\n- 第一步\n- 第二步");
+  assert.ok(noHeads.includes("第一步") && !noHeads.includes("解释性的散文"),
+    "没有小节时应当只留可执行的部分");
+});
+
+test("方案页签接进了编辑器的类型门和触发点", () => {
+  const src = RAW_SRC;
+  // 虚拟页签必须在 openFile 最前面被拦下 —— 否则会去读盘、读不到被当成「文件已删除」清掉。
+  assert.match(src, /if \(path === PLAN_TAB_PATH\) \{ return openPlanTab\(/,
+    "openFile 没有拦下方案页签");
+  // activate 要有自己的分支，不能落到 Monaco 那条路（它没有 model）。
+  assert.match(src, /f\.isPlan\) \{\s*_setEditorModelIfChanged\(monacoEditor, null\);\s*showPlanPane\(\);/,
+    "activate 没有给方案页签单独的分支");
+  // 页签图标要用 plan.svg，而不是退回通用文件图标。
+  assert.match(src, /f\.isPlan \? iconUrl\("plan"\)/, "方案页签没有自己的图标");
+  // Plan 模式跑完要真的去开这个页签 —— 纯函数写好了没人调用等于没做。
+  assert.match(src, /=== "plan" && inTauri[\s\S]{0,240}openPlanTab\(last\.content\)/,
+    "Plan 模式跑完没有打开方案页签");
+  // 底部两颗按钮：一颗照做、一颗不用。这是用户点名要的那个决定点。
+  const pane = readFileSync(join(HERE, "../src/agent/plan-tab.js"), "utf8");
+  assert.match(pane, /data-plan="go"/, "没有「按这个方案执行」");
+  assert.match(pane, /data-plan="dismiss"/, "没有「先不用」");
+  // **抽不出核心内容就不开窗口**。空白页比没有更糟：「这一轮没有可执行内容」
+  // 不该以一张空页的形式呈现。变异实测这条一开始漏了。
+  assert.match(pane, /const core = planCoreFromReply\(markdown\);\s*if \(!core\) return false;/,
+    "抽不出核心内容时仍然开了页签 —— 用户会看到一张空白页");
+  // 照做那一路必须先切回 Agent：Plan 是只读模式，留在里面它不会动手。
+  assert.match(pane, /act === "go"[\s\S]{0,220}onAccept\(\)[\s\S]{0,160}sendPrompt\(/,
+    "点了「按这个方案执行」却没有切回 Agent 就发出去 —— 只读模式下它不会动手");
 });

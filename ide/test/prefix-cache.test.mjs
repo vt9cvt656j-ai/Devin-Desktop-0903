@@ -343,7 +343,10 @@ test("a long filename does not take over the tab strip or the title bar", () => 
     "only the label may shrink — a close button that moves as you switch files is worse");
   // 形状变了，契约没变：预览页签的名字是固定的三个字，把当前地址放进 tooltip 才有
   // 信息量；文件页签仍然是完整文件名。断言钉的是「hover 一定能看到完整的那个东西」。
-  assert.match(SRC, /tab\.title = f\.isPreview \? \(_preview\.url \|\| f\.name\) : f\.name;/,
+  // 又多了一档：方案页签的名字也是固定的两个字，tooltip 放方案标题。断言仍然钉
+  // 「hover 一定能看到完整的那个东西」，只是分支从两档变成三档 —— 别再钉死整条表达式，
+  // 钉住「每一档都给了一个比标签更全的名字」。
+  assert.match(SRC, /tab\.title = f\.isPreview \? \(_preview\.url \|\| f\.name\)\s*:\s*f\.isPlan \? \(_plan\.title \|\| f\.name\)\s*:\s*f\.name;/,
     "a truncated label needs the full name on hover");
 
   // The title bar shortens from the middle: end-truncation drops the extension, which is the part
