@@ -232,10 +232,24 @@ test("悬停折叠目录 500ms 自动展开，且只展开不收起", () => {
   // VS Code 的 autoExpand：实测就是 500ms，只在**目标行变化**时重新计时，且从不自动收起
   //（拖动中把列表收回去，落点会在脚下跳）。没有它，折叠的子目录根本没法作为落点。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  assert.match(src, /_springTimer = setTimeout\(\(\) => \{[^}]*_treeSetExpanded\(dest, true\)/,
-    "没有悬停自动展开——折叠目录无法作为落点");
-  assert.match(src, /\}, 500\)/, "自动展开延时要和 VS Code 一致（500ms）");
+  assert.match(src, /_springTimer = setTimeout\(/, "没有悬停自动展开——折叠目录无法作为落点");
+  assert.match(src, /\}, 500\);/, "自动展开延时要和 VS Code 一致（500ms）");
   assert.doesNotMatch(src, /_treeSetExpanded\([^,]+, false\)/, "不许自动收起：拖动中列表跳动");
+  // 工作区**根**行是另一套展开状态：_treeSetExpanded / expandDir 对根都直接 return，
+  // 只走那条路的话，折叠的根永远展不开。
+  assert.match(src, /_rootCollapsed[\s\S]{0,400}collapsedWorkspaceRoots\.delete\(dest\)/,
+    "折叠的工作区根行没法被悬停展开——它走的是 collapsedWorkspaceRoots，不是 expandedTreeDirs");
+});
+
+test("落点反馈要覆盖整棵可见子树，不只是那一行", () => {
+  // VS Code 的 onDragOver 结尾是 `feedback: L6(u, u + getListRenderCount(loc))` ——
+  // 覆盖目标行**连同它已渲染的子孙**，而且是同一个颜色。只染一行说不清"东西进的是这个容器"。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("function _paintDropRow"), src.indexOf("function _showDrop"));
+  assert.match(fn, /nextElementSibling/, "没有取紧邻的 .children —— 子树不会被染");
+  assert.match(fn, /classList\?\.contains\("children"\)/, "子树容器判据不对");
+  assert.match(fn, /querySelectorAll\("\.row"\)[\s\S]{0,90}add\("is-drop-into"\)/,
+    "子树里的行没有被加上同一个投放态");
 });
 
 test("文件夹落在项目根上要先问，而不是默默复制", () => {
@@ -243,11 +257,17 @@ test("文件夹落在项目根上要先问，而不是默默复制", () => {
   // 我们把次选项换成「打开为新项目」——用户原来靠拖到侧栏换项目，改成复制后那条路没了。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
   const blk = src.slice(src.indexOf("async function _copyIntoWorkspace"), src.indexOf("async function _handleDrop"));
-  assert.match(blk, /destDir === rootPath/, "没有区分「落在项目根」这种情形");
-  assert.match(blk, /altLabel: "打开为新项目"/, "用户丢掉的「替换整个项目」没有还回来");
-  assert.match(blk, /pick === "alt".*openFolder/s, "选了「打开为新项目」没有真的去打开");
+  // 判据要和 VS Code 一样是「任意工作区根」（它的条件就是 e.isRoot）：多根工作区里
+  // 往**非活动根**上放文件夹，只认 rootPath 的话会静默复制，问都不问。
+  assert.match(blk, /workspaceRoots\.includes\(destDir\)/,
+    "根落框只认活动根——多根工作区里往另一个根上放文件夹会被静默复制");
+  assert.match(blk, /alt2Label: "打开为新项目"/, "用户丢掉的「替换整个项目」没有还回来");
+  assert.match(blk, /pick === "alt2"[\s\S]{0,220}openFolder/, "选了「打开为新项目」没有真的去打开");
+  assert.match(blk, /pick === "alt"[\s\S]{0,160}_addWorkspaceRoot/, "「添加到工作区」没有接上多根");
   assert.match(blk, /pick === "cancel"/, "取消必须什么都不做");
-  // 只对**文件夹**、且只在根上问；往子目录里放文件不该被打断。
+  // 多个文件夹时不能只处理第一个、把其余静默丢掉。
+  assert.match(blk, /_dirs\.slice\(1\)[\s\S]{0,90}_addWorkspaceRoot/,
+    "选了「打开为新项目」时，多余的文件夹被静默丢弃了");
   assert.match(blk, /_dirs = items\.filter\(\(x\) => x\.isDir\)/, "问的条件必须是「拖的是文件夹」");
 });
 

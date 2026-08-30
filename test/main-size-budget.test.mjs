@@ -33,6 +33,22 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_500（2026-08-30 第四次）：实测 81,431 行。用户两句：「不能替换整体目录了」「完全和
+ *   vscode 不一样，好好学些 vscode」。于是去读了 VS Code 的真实实现（Cursor 是它的分支，
+ *   读的是打包产物），按读到的代码对齐，顺带修掉四个照着它才发现的真 bug：
+ *     · 落点反馈只染一行 —— VS Code 是 `feedback: L6(u, u+getListRenderCount)`，覆盖目标行
+ *       **连同整棵已渲染子树**，同色。只染一行说不清「东西进的是这个容器」。
+ *     · 悬停自动展开对**折叠的工作区根**是死的：根走 collapsedWorkspaceRoots，而
+ *       _treeSetExpanded / expandDir 对根都直接 return。
+ *     · 根落框只认活动根；多根工作区里往另一个根上放文件夹会被静默复制（VS Code 的判据
+ *       是 e.isRoot，任意根都问）。
+ *     · 拖多个文件夹时 `for (p of paths) await openFolder(p)` 后一个把前一个换掉，只剩最后
+ *       一个；「打开为新项目」那条同样把多余的丢了。VS Code 是 1 个→打开、多个→建多根。
+ *   能进模块的都进了（rootDropQuestion 的文案计算）；剩下的四段全要 DOM 或 workspaceRoots
+ *   这类模块级可变状态，搬出去只会变成把变量再传回来的假模块。
+ *   **同期还删了不少**：上一版自创的 drop-chip / editor-dropzone / 侧栏压暗 / dropFeedback
+ *   已随「照 VS Code 重做」那一笔净减 92 行，这次是在那之上再加。
+ *
  * · 81_400（2026-08-30 第三次，**往上抬**）：实测 81,350 行。买到的是「拖文件/文件夹到
  *   文件树 = 复制进工作区」（VS Code 的分工）。在此之前拖到侧栏一律走「打开」：文件夹
  *   直接 openFolder() 换掉整个工作区——用户拖一个子文件夹进来，项目被重新打开了。
@@ -111,7 +127,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_400;
+const MAIN_JS_MAX_LINES = 81_500;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

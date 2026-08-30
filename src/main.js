@@ -119,7 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop } from "./agent/explorer-drop.js";
+import { dropDirFor, planExplorerDrop, rootDropQuestion } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -12420,7 +12420,7 @@ function ioPrompt({ title, message = "", value = "", placeholder = "", okLabel =
 
 // altLabel 可选：给出时多一个次要按钮，resolve "ok" | "alt" | "cancel"；
 // 不给时行为和返回值（布尔）都和以前一模一样，现有调用方不受影响。
-function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", danger = false }) {
+function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Label = "", danger = false }) {
   return new Promise((resolve) => {
     _cancelActiveIoDialog();
     _cancelActiveIoConfirm();
@@ -12433,6 +12433,7 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", danger 
         <div class="io-confirm-actions">
           <button class="btn io-confirm-cancel" type="button">取消</button>
           ${altLabel ? '<button class="btn io-confirm-alt" type="button"></button>' : ""}
+          ${alt2Label ? '<button class="btn io-confirm-alt2" type="button"></button>' : ""}
           <button class="btn io-confirm-ok${danger ? " btn--danger" : " btn--primary"}" type="button"></button>
         </div>
       </section>`;
@@ -12445,6 +12446,8 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", danger 
     const cancel = overlay.querySelector(".io-confirm-cancel");
     const alt = overlay.querySelector(".io-confirm-alt");
     if (alt) alt.textContent = altLabel;
+    const alt2 = overlay.querySelector(".io-confirm-alt2");
+    if (alt2) alt2.textContent = alt2Label;
     document.body.appendChild(overlay);
     let done = false;
     const finish = (confirmed = false, returnValue = confirmed ? "ok" : "cancel", event = null) => {
@@ -12485,7 +12488,8 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", danger 
     cancel.addEventListener("click", onCancel);
     ok.addEventListener("pointerdown", onAccept);
     ok.addEventListener("click", onAccept);
-    if (alt) { const onAlt = (e) => finish(false, "alt", e); alt.addEventListener("click", onAlt); }
+    if (alt) alt.addEventListener("click", (e) => finish(false, "alt", e));
+    if (alt2) alt2.addEventListener("click", (e) => finish(false, "alt2", e));
     document.addEventListener("keydown", onKey, true);
     requestAnimationFrame(() => (danger ? cancel : ok).focus());
   });
@@ -80282,7 +80286,16 @@ let _springTimer = 0;
 function _paintDropRow(path) {
   for (const r of _treeEl?.querySelectorAll(".row.is-drop-into") || []) r.classList.remove("is-drop-into");
   if (!path) return;
-  _treeEl?.querySelector(`.row[data-path="${cssEscape(path)}"]`)?.classList.add("is-drop-into");
+  const row = _treeEl?.querySelector(`.row[data-path="${cssEscape(path)}"]`);
+  if (!row) return;
+  row.classList.add("is-drop-into");
+  // VS Code 的落点反馈覆盖的是「目标行 + 它整棵已渲染的子树」，同一个颜色
+  //（onDragOver 结尾 `feedback: L6(u, u+h)`，h = getListRenderCount = 含可见子孙的行数）。
+  // 只染一行说不清"东西进的是这个容器"；.children 是 .row 的兄弟节点，取紧邻那个即可。
+  const kids = row.nextElementSibling;
+  if (kids?.classList?.contains("children")) {
+    for (const r of kids.querySelectorAll(".row")) r.classList.add("is-drop-into");
+  }
 }
 function _showDrop(target, payload) {
   clearTimeout(_dropHideTimer);
@@ -80301,8 +80314,16 @@ function _showDrop(target, payload) {
   // 悬停折叠目录 500ms 自动展开（VS Code 的 autoExpand，实测就是 500ms）。只在目标行
   // **变化**时重新计时，且只展开不收起——拖动中把列表收回去会让落点在脚下跳。
   clearTimeout(_springTimer);
-  if (dest && dest !== rootPath && !_treeIsExpanded(dest)) {
-    _springTimer = setTimeout(() => { try { _treeSetExpanded(dest, true); void expandDir(dest); } catch {} }, 500);
+  // 根行是另一套展开状态（collapsedWorkspaceRoots + renderWorkspaceRoots），
+  // _treeSetExpanded/expandDir 对根都直接 return —— 不分开处理的话，折叠的根永远展不开。
+  const _rootCollapsed = workspaceRoots.includes(dest) && collapsedWorkspaceRoots.has(dest);
+  if (dest && (_rootCollapsed || (!workspaceRoots.includes(dest) && !_treeIsExpanded(dest)))) {
+    _springTimer = setTimeout(() => {
+      try {
+        if (_rootCollapsed) { collapsedWorkspaceRoots.delete(dest); void renderWorkspaceRoots(); }
+        else { _treeSetExpanded(dest, true); void expandDir(dest); }
+      } catch {}
+    }, 500);
   }
 }
 function _hideDrop() {
@@ -80337,15 +80358,23 @@ async function _copyIntoWorkspace(paths, destDir) {
   // 我们把次选项换成「打开为新项目」——用户原来就是靠拖到侧栏换项目的，改成复制之后
   // 那条路就没了，这一问正好把它还回来（加进工作区仍在 文件菜单 → 添加文件夹到工作区）。
   const _dirs = items.filter((x) => x.isDir);
-  if (_dirs.length && destDir === rootPath) {
-    const what = _dirs.length > 1 ? `${_dirs.length} 个文件夹` : `「${basename(_dirs[0].path)}」`;
+  // 判据是「落在**任意**工作区根上」，不只是活动根：多根工作区里往另一个根上放文件夹，
+  // VS Code 同样会问（它的条件就是 e.isRoot）。
+  if (_dirs.length && workspaceRoots.includes(destDir)) {
+    const q = rootDropQuestion({ dirs: _dirs.map((x) => x.path), destDir, rootPath });
     const pick = await ioConfirm({
-      title: `${what}要怎么处理？`,
-      message: `复制进当前项目，还是打开为新项目？（打开会关掉当前的「${basename(rootPath) || "项目"}」）`,
-      okLabel: "复制进来", altLabel: "打开为新项目",
+      title: q.title, message: q.message,
+      okLabel: "复制到这里", altLabel: "添加到工作区", alt2Label: "打开为新项目",
     });
     if (pick === "cancel") return;
-    if (pick === "alt") { await openFolder(_dirs[0].path); return; }
+    if (pick === "alt") { for (const d of _dirs) await _addWorkspaceRoot(d.path); return; }
+    // 打开为新项目：第一个当新根打开，其余的加进工作区（等价于 VS Code 拖多个文件夹
+    // 到编辑器区时的 createAndEnterWorkspace，而不是像以前那样把多余的静默丢掉）。
+    if (pick === "alt2") {
+      await openFolder(_dirs[0].path);
+      for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
+      return;
+    }
   }
   let existingNames = [];
   try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
@@ -80389,12 +80418,17 @@ async function _handleDrop(paths, target, payload) {
     }
     try { promptEl.focus(); } catch {}
   } else {
-    for (const p of paths) {
-      const name = p.split("/").pop() || p;
-      const isDir = await backend.readDir(p).then(() => true).catch(() => false);
-      if (isDir) await openFolder(p);
-      else await openFile(p, name);
+    const kinds = [];
+    for (const p of paths) kinds.push({ p, isDir: await backend.readDir(p).then(() => true).catch(() => false) });
+    const dirs = kinds.filter((x) => x.isDir).map((x) => x.p);
+    // 多个文件夹时原来是逐个 openFolder —— 后一个把前一个换掉，最后只剩一个，前面的静默丢失。
+    // VS Code 在这里是：1 个 → 打开它；多个 → 建成多根工作区（createAndEnterWorkspace）。
+    if (dirs.length) {
+      await openFolder(dirs[0]);
+      for (const d of dirs.slice(1)) await _addWorkspaceRoot(d);
+      return;
     }
+    for (const { p } of kinds) await openFile(p, p.split("/").pop() || p);
   }
 }
 
