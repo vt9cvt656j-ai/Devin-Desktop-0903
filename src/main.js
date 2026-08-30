@@ -31,6 +31,7 @@ import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
+import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery } from "./agent/outcome.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
@@ -54183,7 +54184,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 所以判据换成「这一版实现比上次评审时更新」（_implOps 是成功落盘的实现次数，
         // 由真实执行事实累加）。成本那条约束没松：上界仍在，一个 run 最多两次。
         const _reviewedAtImplOps = Number.isFinite(run._wrapUpReviewedAtImplOps) ? run._wrapUpReviewedAtImplOps : -1;
-        if (_mutatedCode && run.mode === "agent"
+        // 零交付的运行原来一次都进不来（第一个合取项是 _mutatedCode）。判据和实测见
+        // agent/outcome.js 的 shouldReviewZeroDelivery。
+        const _zeroDeliveryReview = _shouldReviewZeroDelivery({
+          mode: run.mode, didMutate, reviews: run._wrapUpReviews || 0,
+          steps: Array.isArray(run.recording) ? run.recording.length : 0,
+        });
+        if ((_mutatedCode || _zeroDeliveryReview) && run.mode === "agent"
             && (run._wrapUpReviews || 0) < 2 && _implOps > _reviewedAtImplOps) {
           let _reviewOn = true;
           try { _reviewOn = loadConfig()?.agentWrapUpReview !== false; } catch {}
@@ -57247,25 +57254,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     _streamDraftClear(session); // 本次运行已持久化收尾，流式草稿不再需要（只清本会话的槽）
     // run 已收尾：解引用，否则 session 会一直吊着整轮的 recording / checkpoint。
     if (session._activeRun === run) session._activeRun = null;
-    // 「部分完成」有四个并列成因，而它们要的修法互不相同：提前停止是编排问题，
-    // 迭代上限是步数经济问题，改了没验证是取证问题。此前这四种在存档里长得一模一样，
-    // 于是「这些部分完成到底卡在哪一环」在数据上**无从回答**——只能猜。
-    // 实测（用户机器 1093 个真实任务）：≥15 步的任务里 41% 停在 partial，
-    // 而按步数分布排查已经排除了迭代上限（分布平滑，没有任何一个值异常聚集），
-    // 剩下三个分支只能靠这一条把它们分开。
-    //
-    // 这里**不新增判据**，只是把原来那串 || 拆成具名分支再合回去：判定逻辑一个字没改，
-    // 分支顺序也和原式一致（先到者胜），所以记下来的就是真正促成 partial 的那一个。
-    // outcome 直接由它派生，两者结构上不可能漂移。
-    const _partialCause = _stoppedEarly ? "stopped_early"
-      : run._incompleteReason ? String(run._incompleteReason).slice(0, 60)
-      : hitCap ? "iteration_limit"
-      : (didMutate && !verificationPassed && !run._nothingToVerify) ? "unverified_change"
-      : (didMutate && !uiVerificationPassed) ? "unverified_ui"
-      : "";
+    // 结局判定住在 agent/outcome.js（纯函数，可在 Node 里真往返断言）。
+    // 「部分完成」的四个并列成因、分支顺序为什么是先到者胜、以及收尾评审的否决权，
+    // 都在那个文件里说明。
+    const _outcomeFacts = {
+      stoppedEarly: _stoppedEarly, incompleteReason: run._incompleteReason, hitCap,
+      didMutate, verificationPassed, nothingToVerify: run._nothingToVerify, uiVerificationPassed,
+      awaitingUserReply, finalErr, implOps: _implOps,
+      wrapUpDone: run._wrapUpVerdict?.done, wrapUpReviewedAtImplOps: run._wrapUpReviewedAtImplOps,
+    };
+    const _partialCause = _partialCauseOf(_outcomeFacts);
     run._outcomeCause = _partialCause;
-    const _runOutcome = awaitingUserReply ? "awaiting_user" : finalErr ? "failed"
-      : _partialCause ? "partial" : "success";
+    const _runOutcome = _runOutcomeOf(_outcomeFacts, _partialCause);
     session._lastRunState = {
       outcome: _runOutcome,
       outcomeCause: _partialCause,

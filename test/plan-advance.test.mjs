@@ -20,6 +20,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
 import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn } from "./helpers/source.mjs";
 import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/agent/plan-target.js";
+import { partialCause as _partialCause, runOutcome as _runOutcome } from "../src/agent/outcome.js";
 
 // 模型现在可以在 update_plan 里逐步声明 kind，动词表退化成兜底，所以这两个函数多了
 // 一个依赖。本文件测的是**兜底那条路**（没有声明时的行为），声明那条路见
@@ -208,13 +209,25 @@ test("用户按停必须产出可续跑的结局，否则整套交接是死的",
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /const _stoppedEarly = !_live\(\);/,
     "没有捕捉「这一轮是被停掉的」这个事实");
-  // 那串 || 后来拆成了具名成因链（为了让「部分完成」在存档里能分辨成因，见 logic 那条测试）。
-  // 被守的性质一个字没变：「被停掉」必须进入结局判定，而且必须排在**第一位**——
-  // 排在后面就会被别的分支抢先命中，存档里记下的成因就不是真正促成它的那一个。
-  assert.match(loop, /const _partialCause = _stoppedEarly \? "stopped_early"/,
-    "结局判定没有把「被停掉」算进去（且它必须是成因链的第一分支），按停后仍会被判成 success");
-  assert.match(loop, /: _partialCause \? "partial" : "success";/,
+  // 那串 || 先拆成具名成因链，后来整个搬进 src/agent/outcome.js（为了能真跑而不是
+  // 匹配源码文本）。被守的性质一个字没变：「被停掉」必须进入结局判定，而且必须排在
+  // **第一位**——排在后面就会被别的分支抢先命中，存档里记下的成因就不是真正促成它的那一个。
+  //
+  // 分两处守：判定本身做真往返，调用点守「这个事实真的被传进去了」。
+  // 少了后者，判定再对也可能压根没人喂它。
+  assert.equal(_partialCause({ stoppedEarly: true }), "stopped_early");
+  assert.equal(_partialCause({ stoppedEarly: true, incompleteReason: "x", hitCap: true, didMutate: true }),
+    "stopped_early", "「被停掉」被别的成因抢先了，存档里记下的就不是真正促成它的那一个");
+  assert.equal(_runOutcome({ stoppedEarly: true }), "partial",
+    "按停后结局仍是 success —— 交接块和计划继承都只在 failed/partial 时成立，一个都不会触发");
+  assert.match(loop, /stoppedEarly: _stoppedEarly/,
+    "「这一轮是被停掉的」没被传进结局判定，判定再对也没人喂它");
+  // 「结局由成因派生」现在由 outcome.js 保证（runOutcome 拿 partialCause 的结果当参数），
+  // 这里守调用点：主循环必须把算出来的那个成因传回去，不许另起一份平行判定。
+  assert.match(loop, /_runOutcomeOf\(_outcomeFacts, _partialCause\)/,
     "结局必须由成因派生——另起一份平行判定迟早和成因漂开");
+  assert.equal(_runOutcome({ hitCap: true }, ""), "success",
+    "runOutcome 必须以传进来的成因为准，不许自己再判一次");
   assert.match(loop, /run\._incompleteReason = run\._incompleteReason \|\| "user_stopped"/,
     "没有记下中断原因，交接块就说不出「中断在哪」");
 
