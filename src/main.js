@@ -32,6 +32,9 @@ import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
+import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
+import { createPlanTab } from "./agent/plan-tab.js";
+import { chipShortLabel as _chipShortLabel } from "./agent/chip-label.js";
 import {
   stackTable as _STACK_TABLE, stackManifestNames as _stackManifestNames,
   stackManifestExts as _stackManifestExts, manifestExtra as _MANIFEST_EXTRA,
@@ -3920,7 +3923,7 @@ function openSplitEditor(filePath) {
   editorContainer.appendChild(wrap);
 
   const f = openFiles.get(filePath);
-  if (!f || f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview) return;
+  if (!f || f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview || f.isPlan) return;
 
   const ed = monaco.editor.create(wrap, {
     model: f.model,
@@ -3962,7 +3965,7 @@ function openSplitEditor(filePath) {
 function switchSplitFile(filePath) {
   if (!splitState.active || !splitState.editor) return;
   const f = openFiles.get(filePath);
-  if (!f || f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview) return;
+  if (!f || f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview || f.isPlan) return;
   _setEditorModelIfChanged(splitState.editor, f.model);
   splitState.path = filePath;
 }
@@ -4879,6 +4882,8 @@ async function openFile(path, name, activateFile = true, options = {}) {
   // 预览页签在会话里和别的页签一样被保存，恢复时原路走进这里。它背后没有文件，
   // 放它继续往下走的话会读盘失败、被当成"文件已删除"丢掉——重开 IDE 预览就没了。
   if (path === PREVIEW_TAB_PATH) { openLivePreview("", { focus: activateFile }); return true; }
+  // 方案页签同理：背后没有文件，往下走会被当成「文件已删除」清掉。
+  if (path === PLAN_TAB_PATH) { return openPlanTab(_plan.md, { focus: activateFile }); }
   path = _coherentFilePath(path);
   if (openFiles.has(path)) {
     if (activateFile) activate(path);
@@ -4992,6 +4997,10 @@ function activate(path) {
     _setEditorModelIfChanged(monacoEditor, null);
     showLivePreviewPane();
     editorEl.style.display = "none";
+  } else if (f.isPlan) {
+    _setEditorModelIfChanged(monacoEditor, null);
+    showPlanPane();
+    editorEl.style.display = "none";
   } else if (f.isImage) {
     _setEditorModelIfChanged(monacoEditor, null);
     showImagePreview(path);
@@ -5027,14 +5036,14 @@ function activate(path) {
   renderTabs();
   renderTreeActive();
   saveBtn.disabled = !f.dirty;
-  if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview);
+  if (runBtn) runBtn.disabled = !!(f.isImage || f.isVideo || f.isPdf || f.isInspection || f.isPreview || f.isPlan);
   const projectLabel = rootPath ? basename(rootPath) : "";
   // The title bar sits between the traffic lights and the toolbar buttons; a full filename there
   // crowds both. CSS can ellipsize it, but only from the end, which drops the extension.
   $("windowTitle") && _setWindowTitle(
     _ellipsizeMiddle(f.name) + (projectLabel ? " — " + _ellipsizeMiddle(projectLabel, 24) : "") + " — Mr. Day One",
   );
-  if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection && !f.isPreview) {
+  if (!f.isImage && !f.isVideo && !f.isPdf && !f.isInspection && !f.isPreview && !f.isPlan) {
     // Cheap, in-memory decorations — render synchronously so they paint with the file.
     renderBreakpointDecorations();
     applyDebugLineDecoration();
@@ -5317,6 +5326,39 @@ function _lpIcon(name, size = 16) {
 const PREVIEW_TAB_PATH = "mrdayone:live-preview";
 const PREVIEW_TAB_NAME = "实时预览";
 const PREVIEW_URL_STORE_KEY = "michael-ide.live-preview-url";
+
+// ---- Plan 模式的「方案」页签 ----
+// 虚拟页签（背后没有文件，openFile 最前面拦下来）。对话区那份保持完整——那是给人读的；
+// 这一屏只放能照着做的部分，见 planCoreFromReply。
+const PLAN_TAB_PATH = "mrdayone:plan";
+const PLAN_TAB_NAME = "方案";
+
+const _plan = { md: "", title: PLAN_TAB_NAME };
+let _planTab = null; // 界面层在 src/agent/plan-tab.js，这里只做接线
+function _planUI() {
+  if (!_planTab) {
+    _planTab = createPlanTab({
+      editorContainer, renderMarkdownInto, sendPrompt,
+      planCoreFromReply, planTitleFromReply,
+      tabPath: PLAN_TAB_PATH, tabName: PLAN_TAB_NAME,
+      openFiles, renderTabs, syncWelcome, activate,
+      getActivePath: () => activePath,
+      closeTab: () => closeFile(PLAN_TAB_PATH),
+      onAccept: () => {
+        _currentAiMode = "agent";
+        try { _updateModeUI(); } catch {}
+        const session = _currentSession();
+        if (session) { session.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
+      },
+      onDoc: (md, title) => { _plan.md = md; _plan.title = title; },
+    });
+  }
+  return _planTab;
+}
+const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts);
+const showPlanPane = () => _planUI().show();
+const hidePlanPane = () => _planTab?.hide();
+
 
 const _preview = {
   el: null,
@@ -9316,7 +9358,7 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
   // first; if that fails, stash a recoverable backup + warn (never silently drop).
   // `discardBuffer`：预览回滚等调用方显式声明“这个缓冲是 agent 残留、不是用户内容”——
   // 不抖救不备份，否则幽灵脏的半截预览会被“关闭前保存”写盘还魂（实测残洞）。
-  if (!discardBuffer && f.dirty && f.model && !f.isImage && !f.isVideo && !f.isInspection && !f.isPreview) {
+  if (!discardBuffer && f.dirty && f.model && !f.isImage && !f.isVideo && !f.isInspection && !f.isPreview && !f.isPlan) {
     let snapshot = "";
     try { snapshot = f.model.getValue(); } catch {}
     try {
@@ -9351,8 +9393,9 @@ async function closeFile(path, { force = false, discardBuffer = false } = {}) {
       return false;
     }
   }
-  if (!f.isInspection && !f.isPreview) lspManager?.didClose(path);
+  if (!f.isInspection && !f.isPreview && !f.isPlan) lspManager?.didClose(path);
   if (f.isPreview) _previewTeardown();
+  if (f.isPlan) hidePlanPane();
   // 销毁前先清标记——Monaco 不会替 file: 的 URI 清，标记会活过 dispose 并在重新打开时被重绘。
   if (!projectModels.has(path) && f.model) { _clearAllMarkersForModel(f.model); f.model.dispose(); }
   openFiles.delete(path);
@@ -9928,12 +9971,12 @@ function renderTabs() {
     tab.draggable = true;
     tab.dataset.path = path;
     tab.innerHTML =
-      `${iconImg(f.isPreview ? iconUrl("live-preview") : fileIconUrl(f.name))}<span class="label"></span>` +
+      `${iconImg(f.isPreview ? iconUrl("live-preview") : f.isPlan ? iconUrl("plan") : fileIconUrl(f.name))}<span class="label"></span>` +
       `<span class="x" title="Close"><span class="dot"></span><svg class="ic"><use href="#i-close" /></svg></span>`;
     _fillFileLabel(tab.querySelector(".label"), f.name);
     // The label is capped at 220px and ellipsised, so the full name has to be reachable somehow.
     // 预览页签的名字是固定的三个字，把当前地址放进 tooltip 才有信息量。
-    tab.title = f.isPreview ? (_preview.url || f.name) : f.name;
+    tab.title = f.isPreview ? (_preview.url || f.name) : f.isPlan ? (_plan.title || f.name) : f.name;
     // 用户亲手点开 = 认领这个 tab，之后不再自动回收（activate 本身不能挂钩子——
   // agent 展示正在写的文件时也会调它）。
   tab.addEventListener("click", () => { _claimAgentPreviewTab(path); activate(path); });
@@ -24152,9 +24195,13 @@ function _fillModeMenu(menu) {
       _closeModeMenu();
       const session = _currentSession();
       if (session) { session.mode = mode.id; _renderChatTabs(); saveChatHistory(); }
-      showToast(_isStreaming()
-        ? `已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`
-        : `已切换到 ${mode.label} 模式`);
+      // 普通切换不弹提示（用户："不需要有提示"）—— 按钮上就写着当前模式，再弹一条是重复。
+      //
+      // **但流式进行中那句留着**：它说的是「这一轮仍按原模式跑完，从下一条消息起生效」，
+      // 那是一个和界面显示不一致的事实。删掉它，用户会以为切换对正在跑的这轮生效了。
+      if (_isStreaming()) {
+        showToast(`已切换到 ${mode.label} 模式 · 当前这一轮仍按原模式跑完，从你下一条消息起生效`);
+      }
     });
     menu.appendChild(item);
   }
@@ -28194,51 +28241,6 @@ function _appendTextWithInlineCode(el, text) {
 
 // Total chips in one 「接下来」 block, across offered choices AND run-state suggestions.
 const _NEXT_STEPS_MAX = 4;
-/** 卡片上显示的短标签。**点下去发的仍然是原文，title 里也是原文。**
- *
- * 「接下来」的文案是模型从自己答案里摘的，常常是一整段。实测用户面板宽度（367px）下，
- * 一条 80 字的建议要占 9 行、198px —— 三张卡就是 456px，等于把答案又贴了一遍，
- * 用户原话「不然的话就容易丑陋了」。想要的是 Claude Code 那种一行一个短标签、扫一眼就能挑。
- *
- * 不做定宽截断（那是上一版被否掉的做法：切在半句上，选项名都看不全）。改成**按语义切**：
- * 这些句子几乎都是「标题——解释」的形状，破折号/冒号前那一截本身就是完整的短标签。
- *
- *   没有流式输出——现在整段返回后才打印，体验上就是…   →  没有流式输出
- *   长会话不自动压缩——context 顶到上限就得手动 /clear… →  长会话不自动压缩
- *
- * 切不出来才退回逗号，再不行才硬截。本来就短的一句话原样通过。
- */
-function _chipShortLabel(text) {
-  const full = String(text || "").trim();
-  if (!full) return full;
-  const width = (t) => [...t].reduce((n, ch) => n + (/[\u3000-\u9fff\uff00-\uffef]/.test(ch) ? 2 : 1), 0);
-  const MAX = 46; // ≈ 23 个汉字，367px 下正好一行出头
-  if (width(full) <= MAX) return full;
-
-  // 反引号必须成对：切在一对中间的话，行内代码会从断点一路吃到句尾。
-  const balanced = (t) => ((t.match(/`/g) || []).length % 2 === 0);
-  const pick = (t) => {
-    const v = t.trim().replace(/[，,、；;：:]+$/, "");
-    return v && balanced(v) && width(v) >= 6 ? v : null;
-  };
-
-  // 一级：标题/解释的分界。二级：分句。都按**第一个**出现的位置切。
-  for (const re of [/[\u2014\u2015\u2500]{1,2}|[:：]|[。！？!?]|\n/, /[，,；;]/]) {
-    const m = full.match(re);
-    if (!m) continue;
-    const head = pick(full.slice(0, m.index));
-    if (head && width(head) <= MAX) return head;
-  }
-  // 都切不出来：按显示宽度硬截，收省略号。全文仍在 title 和点击发送的内容里。
-  let out = "";
-  for (const ch of full) {
-    if (width(out + ch) > MAX - 1) break;
-    out += ch;
-  }
-  out = out.replace(/[，,、；;：:\s`]+$/, "");
-  if (!balanced(out)) out = out.replace(/`[^`]*$/, "").trim();
-  return out + "\u2026";
-}
 
 function _renderSuggestionChips(sess, items, label) {
   try {
@@ -30486,6 +30488,14 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       const postRunMessages = messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
+        // Plan 模式跑完 → 方案单独开成一个页签（抽不出核心内容时它自己返回 false，不开空白页）。
+        try {
+          if (_normalizeAiMode(sess?.mode || _currentAiMode) === "plan" && inTauri) {
+            const last = [...(postRunMessages || [])].reverse()
+              .find((m) => m && m.role === "assistant" && typeof m.content === "string" && m.content.trim());
+            if (last) openPlanTab(last.content);
+          }
+        } catch (e) { console.warn("[plan] 方案页签打开失败：", e); }
     } catch (e) {
       // Never leave a dead Stop button + silent no-response on an unexpected throw.
       console.error("[agent] run failed:", e);

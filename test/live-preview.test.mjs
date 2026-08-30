@@ -98,16 +98,23 @@ test("每一道按文件类型分岔的门都放预览页签过去", () => {
   // 预览页签没有 model、没有磁盘内容。漏掉任何一道都不会报错，只会表现成
   // 别的症状：跑到 Monaco 那条路会拿 null model 崩，跑到保存那条路会试着往
   // 一个伪路径写盘，跑到 LSP 那条路会给语言服务器发一个不存在的文件。
+  // 2026-08-29 起同一批门后面还跟着 `|| f.isPlan`（方案页签也是虚拟页签，同理）。
+  // 所以每条正则都写成「到 isPreview 为止」，不再钉死整行结尾 —— 否则每加一种虚拟
+  // 页签都要来改一次，而这条守的从来不是"有几种"，是"预览有没有被放过去"。
   const gates = [
     ["closeFile 关前保存", /!discardBuffer && f\.dirty && f\.model && [^\n]*!f\.isPreview/],
-    ["closeFile 的 didClose", /if \(!f\.isInspection && !f\.isPreview\) lspManager\?\.didClose/],
-    ["activate 的 runBtn", /runBtn\.disabled = !!\(f\.isImage[^)]*\|\| f\.isPreview\)/],
+    ["closeFile 的 didClose", /if \(!f\.isInspection && !f\.isPreview[^)]*\) lspManager\?\.didClose/],
+    ["activate 的 runBtn", /runBtn\.disabled = !!\(f\.isImage[^)]*\|\| f\.isPreview/],
     ["activate 的装饰绘制", /!f\.isImage && !f\.isVideo && !f\.isPdf && !f\.isInspection && !f\.isPreview/],
   ];
   for (const [what, re] of gates) assert.match(CODE, re, what + " 这道门没放预览页签过去");
   // 分屏那两处是同一行文本，数量对上即可
-  const splitGate = /if \(!f \|\| f\.isImage \|\| f\.isVideo \|\| f\.isPdf \|\| f\.isInspection \|\| f\.isPreview\) return;/g;
+  const splitGate = /if \(!f \|\| f\.isImage \|\| f\.isVideo \|\| f\.isPdf \|\| f\.isInspection \|\| f\.isPreview/g;
   assert.equal((CODE.match(splitGate) || []).length, 2, "分屏编辑器有两处类型门，预览页签没有全部被挡住");
+  // 方案页签也必须过同一批门 —— 它同样没有 model、没有磁盘内容。
+  for (const [what] of gates) void what;
+  assert.ok((CODE.match(/f\.isPlan/g) || []).length >= 5,
+    "方案页签没有被这批类型门放过去 —— 它会走进 Monaco / 保存 / LSP 那几条路");
 });
 
 test("activate 里预览分支排在最前，且切走时收起窗格", () => {
