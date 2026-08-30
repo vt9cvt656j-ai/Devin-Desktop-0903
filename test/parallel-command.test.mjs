@@ -117,3 +117,43 @@ test("情景档案真的写了 timing 字段", () => {
     "时间线汇总没有接进情景档案——数还是只在内存里，run 一结束就没了");
   assert.match(ep, /timing: t/, "算出来了却没落进记录");
 });
+
+/**
+ * 意图裁决前台等待的胜负记账。
+ *
+ * `_INTENT_FOREGROUND_WAIT_MS` 被反复调过（1500 → 8000 → 15000 → 6000），每一次都是拿
+ * 几条手工实测在赌。输赢的后果差得很远：赢＝网关按完整画像挂上工程/调研/设计各层
+ * （26951 字节），输＝只剩 agent.base 四块（18885 字节）——「突然变弱智、工具也不用了」
+ * 的物理成因。这几条守的是「这个数以后不用再靠赌」。
+ */
+test("裁决等待的胜负要记下来，且记账绝不能影响那道 race", async () => {
+  const { recordIntentRace, summarizeIntentRace } = await import("../src/agent/turn-timing.js");
+  const s = {};
+  recordIntentRace(s, true, 4200);
+  recordIntentRace(s, false, 6000);
+  recordIntentRace(s, true, 3100);
+  assert.deepEqual(summarizeIntentRace(s), { won: 2, lost: 1, wonMs: 4200, lostMs: 6000 });
+  // 没数据就不写这个字段——0/0 会被误读成「一次都没赢」。
+  assert.equal(summarizeIntentRace({}), null);
+  assert.equal(summarizeIntentRace(null), null);
+  // 记账在 Promise.race 的两条臂上，抛一下整轮就废了。
+  for (const bad of [null, undefined, 0, "", { _intentRace: null }]) {
+    assert.doesNotThrow(() => recordIntentRace(bad, true, 1), `记账抛了：${JSON.stringify(bad)}`);
+  }
+  assert.doesNotThrow(() => recordIntentRace(s, true, NaN));
+  assert.doesNotThrow(() => recordIntentRace(s, false, "x"));
+});
+
+test("两条臂都记账，且落进情景档案", () => {
+  const race = fnSource("_aiIntentProfile", { code: true });
+  const src = race || "";
+  // 赢的那条臂（裁决先到）和输的那条臂（超时先到）都要记——只记一边，比率就是假的。
+  assert.match(src, /_mark\(true\); return v;/, "裁决赢的那条臂没记账");
+  assert.match(src, /_mark\(false\); resolve\(null\);/,
+    "超时赢的那条臂没记账 —— 只记一边的话胜率恒为 100%");
+  assert.match(src, /typeof _intentRaceMarker === "function"/,
+    "记账没做 typeof 兜底 —— 沙箱里裸引用会抛，而它在 adopted.then 里，一抛整轮挂死");
+  const ep = fnSource("_recordEpisode", { code: true });
+  assert.match(ep, /_summarizeIntentRace\(session\)/,
+    "记了账却没落盘——数据还是随会话消失，这个数就还得继续赌");
+});

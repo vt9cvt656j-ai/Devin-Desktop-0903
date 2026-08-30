@@ -76,3 +76,53 @@ export function summarizeTiming(timeline) {
     return null;   // 算不出来就不写这个字段；绝不能让整条情景记录跟着消失
   }
 }
+
+/**
+ * 意图裁决前台等待的**胜负记账**。
+ *
+ * `_INTENT_FOREGROUND_WAIT_MS` 这个数被反复调过：1500 → 8000 → 15000 → 6000，
+ * 每一次的依据都是几条手工实测，而「它到底赢了几成」从来没有落过盘。
+ *
+ * 输赢的后果差得很远：赢＝网关按完整画像挂上工程 / 调研 / 设计各层（实测提示词 26951 字节），
+ * 输＝只剩 agent.base 四块（18885 字节），模型手里既没有工程纪律也没有设计纪律——
+ * 那正是「突然变弱智、工具也不用了」的物理成因。
+ *
+ * 记一笔，一周之后这个数就不用再靠赌。会话级累计，随情景档案落盘。
+ */
+export function recordIntentRace(session, verdictWon, ms) {
+  try {
+    if (!session) return;
+    const r = (session._intentRace ||= { won: 0, lost: 0, wonMs: [], lostMs: [] });
+    const n = Number.isFinite(Number(ms)) ? Math.max(0, Math.round(Number(ms))) : 0;
+    if (verdictWon) { r.won++; if (r.wonMs.length < 20) r.wonMs.push(n); }
+    else { r.lost++; if (r.lostMs.length < 20) r.lostMs.push(n); }
+  } catch { /* 记账绝不能影响那道 race 本身 */ }
+}
+
+/**
+ * 给一次 race 造一个记账笔。
+ *
+ * 做成工厂而不是让调用方每次拼参数，是因为它要塞进 `Promise.race` 的两条臂里——
+ * 那是**记账绝不能弄坏被记的那件事**的地方：`adopted.then(...)` 里抛一下，
+ * 派生的那条臂就拒绝、race 跟着拒绝、整轮挂死——写这一笔时真挂过一次，
+ * 而且因为测试跑的是 `--test-timeout=0`，它不报错，只是永远不结束。
+ * 所以这里吞掉一切异常；调用点那边还有一层 `typeof` 兜底
+ * （被单独装进测试沙箱跑时，模块级符号不存在，裸引用直接抛 ReferenceError）。
+ */
+export function intentRaceMarker(session, startedAt) {
+  return (won) => { try { recordIntentRace(session, won, Date.now() - startedAt); } catch {} };
+}
+
+/** 把会话级的胜负记账压成落盘用的一行；没有数据就返回 null。 */
+export function summarizeIntentRace(session) {
+  try {
+    const r = session?._intentRace;
+    if (!r || (!r.won && !r.lost)) return null;
+    const med = (a) => (a?.length ? [...a].sort((x, y) => x - y)[a.length >> 1] : null);
+    return {
+      won: r.won | 0, lost: r.lost | 0,
+      ...(med(r.wonMs) != null ? { wonMs: med(r.wonMs) } : {}),
+      ...(med(r.lostMs) != null ? { lostMs: med(r.lostMs) } : {}),
+    };
+  } catch { return null; }
+}

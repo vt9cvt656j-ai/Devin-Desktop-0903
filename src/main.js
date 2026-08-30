@@ -35,7 +35,7 @@ import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
-import { summarizeTiming as _summarizeTiming } from "./agent/turn-timing.js";
+import { summarizeTiming as _summarizeTiming, intentRaceMarker as _intentRaceMarker, summarizeIntentRace as _summarizeIntentRace } from "./agent/turn-timing.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
@@ -25016,9 +25016,11 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       return intents;
     });
     let timer = 0;
+    // 胜负记账（6000 这个数被反复调过，每次都在赌）；typeof 兜底的理由见 agent/turn-timing.js。
+    const _mark = typeof _intentRaceMarker === "function" ? _intentRaceMarker(session, Date.now()) : () => {};
     return Promise.race([
-      adopted,
-      new Promise((resolve) => { timer = setTimeout(() => resolve(null), _INTENT_FOREGROUND_WAIT_MS); }),
+      adopted.then((v) => { _mark(true); return v; }),
+      new Promise((resolve) => { timer = setTimeout(() => { _mark(false); resolve(null); }, _INTENT_FOREGROUND_WAIT_MS); }),
     ]).finally(() => { if (timer) clearTimeout(timer); });
   };
   const hit = _aiIntentCache.get(key);
@@ -51057,11 +51059,9 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
       // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
       walls: [...new Set(steps.filter((s) => s && s.ok === false && s.fail).map((s) => s.fail))].slice(0, 6),
-      // 时间线汇总。时间戳一直有、一直只喂给界面上那只跑秒表，然后随 run 一起消失——
-      // 于是「典型首字延迟是 3 秒还是 15 秒」「一条消息发几次模型请求」这两个问题，
-      // 客户端和服务端两侧都答不了（服务端的 request_id 是每会话一个，按它分组量不出来）。
-      // 判据见 agent/turn-timing.js，全是时间戳之差，不含任何推断。
-      ...(() => { const t = _summarizeTiming(run.timeline); return t ? { timing: t } : {}; })(),
+      // 时间线 + 裁决等待的胜负。这两个数在此之前两侧都取不到；判据见 agent/turn-timing.js。
+      ...(() => { const t = _summarizeTiming(run.timeline), r = _summarizeIntentRace(session);
+        return { ...(t ? { timing: t } : {}), ...(r ? { intentRace: r } : {}) }; })(),
       // 裁决这轮判的编排模式。没有它，"编排到底通没通"只能从 approach 的动词里反推——
       // 而那恰好分不清两种截然不同的情况：裁决压根没判成要编排，和判了却没派出去。
       // 前者要改判据，后者要改可达性；2026-08-22 实测两者同时存在（939 回合 0 次调用）。
