@@ -36695,13 +36695,27 @@ test("切回聊天标签自动回到最新，除非用户在那个标签里翻�
   const sw = stripJsComments(extractFn("_switchChatSession"));
 
   // 刚恢复的标签跳到底（原有行为，别弄丢）。
-  assert.match(sw, /session\._restored[\s\S]{0,120}_scrollChatBottom\(\)/,
+  assert.match(sw, /session\._restored[\s\S]{0,120}_showChatAtBottomSilently\(session\)/,
     "刚恢复的标签不再跳到最新了");
 
   // 钉在底部的标签也要跳到底 —— 这是这次修的。原来它走的是「按 scrollPos 恢复」，
   // 而标签隐藏期间内容还在长，那个偏移量早就不是底部，用户得自己往下滑。
-  assert.match(sw, /else if \(session\._pinned !== false\) \{ _scrollChatBottom\(\); \}/,
+  assert.match(sw, /else if \(session\._pinned !== false\) \{ _showChatAtBottomSilently\(session\); \}/,
     "钉在底部的标签没有回到最新 —— 切回来会停在半截历史里");
+
+  // **而且要「无感」**：不能让用户看着它一段一段往下跳。定位好之前先隐藏，
+  // 连着两帧按到底再露出来。
+  const silent = stripJsComments(extractFn("_showChatAtBottomSilently"));
+  assert.match(silent, /visibility = "hidden"/, "没有先隐藏 —— 用户会看见内容停在半截然后往下跳");
+  assert.ok(
+    !/display\s*=\s*"none"/.test(silent),
+    "用了 display:none —— 不参与布局就量不出 scrollHeight，按不到底",
+  );
+  assert.ok(
+    (silent.match(/requestAnimationFrame/g) || []).length >= 2,
+    "只等了一帧 —— 首帧布局还没算完，scrollTop 会被钳到更小的值",
+  );
+  assert.match(silent, /visibility = prev/, "隐藏之后没有再露出来");
 
   // 只有**主动翻过历史**的标签才保留旧位置，而且那种情况下 _chatPinned 必须是 false。
   assert.match(sw, /else \{ _chatPinned = false; chatEl\.scrollTop = session\.scrollPos/,

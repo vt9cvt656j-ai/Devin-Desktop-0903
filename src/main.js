@@ -2488,6 +2488,41 @@ let _programScrollTop = -1;
 // 这是唯一能把"人往上翻"和"下面又长出来一段"区分开的信号。
 let _lastUserIntentAt = 0;
 function _markProgramScroll() { if (chatEl) _programScrollTop = chatEl.scrollTop; }
+/** 切标签时把这个会话**无声地**摆到最新那条：定位好之前不让它显示。
+ *
+ * # 为什么不能直接用 _scrollChatBottom
+ *
+ * 那个函数是「跳到底 + rAF + 60/200/500/1000ms 各补一次」。补位本身是必要的 ——
+ * 容器刚 append 上去时布局还没算完，第一次写 scrollTop 会被钳到更小的值；
+ * `content-visibility` 的消息块也要等进视口才真正撑开高度。
+ *
+ * 但每一次补位都发生在**已经画过一帧之后**，于是用户看见的是内容先停在半截、然后
+ * 一段一段往下跳。用户原话「不要一下滑动下去，要让用户无感看到最新的内容」。
+ *
+ * 改成：先 `visibility: hidden`（**不是 display:none** —— 隐藏的元素得照常参与布局，
+ * 否则量不出 scrollHeight），连着两帧把它按到底，第二帧末尾再露出来。用户第一眼
+ * 看到的就已经是最新那条，中间那一两帧是空白而不是错位的内容。
+ *
+ * 两帧之后仍留几发慢补位：内容后到时兜住，而那时已经在底部，通常是空操作。
+ */
+function _showChatAtBottomSilently(session) {
+  if (!chatEl) return;
+  const el = session && session.container;
+  const prev = el ? el.style.visibility : "";
+  if (el) el.style.visibility = "hidden";
+  _repinChat();
+  const toBottom = () => { try { chatEl.scrollTop = chatEl.scrollHeight; _markProgramScroll(); } catch {} };
+  toBottom();
+  requestAnimationFrame(() => {
+    toBottom();
+    requestAnimationFrame(() => {
+      toBottom();
+      if (el) el.style.visibility = prev || "";
+      for (const t of [120, 400, 900]) setTimeout(toBottom, t);
+    });
+  });
+}
+
 function _repinChat() { _chatPinned = true; try { _syncChatJump(); } catch {} }
 // 滚轮往上翻是意图最明确的一种，直接当场解除钉底，不经过下面那个时间窗口——窗口要靠
 // wheel 和随后的 scroll 事件挨得足够近才成立，那是个不必要的时序依赖。其余输入方式
@@ -18859,7 +18894,7 @@ async function _switchChatSession(idx) {
     chatEl.appendChild(session.container);
     // A freshly-restored tab (IDE just opened, or first time this restored tab is shown) jumps to the
     // NEWEST message instead of a stale saved scroll position — no manual scrolling to catch up.
-    if (session._restored) { session._restored = false; _repinChat(); _scrollChatBottom(); }
+    if (session._restored) { session._restored = false; _showChatAtBottomSilently(session); }
     // **钉在底部的标签要回到最新，不能按旧偏移量恢复。**
     //
     // 这里原来只有一句 `_chatPinned = session._pinned !== false; chatEl.scrollTop = session.scrollPos`
@@ -18872,7 +18907,7 @@ async function _switchChatSession(idx) {
     //
     // 用 `_scrollChatBottom()` 而不是直接赋值：容器刚 append 上去、布局还没算完，
     // 这一帧写 scrollTop 会被钳到更小的值。那个函数自带 rAF + 60/200/500/1000ms 的补位。
-    else if (session._pinned !== false) { _scrollChatBottom(); }
+    else if (session._pinned !== false) { _showChatAtBottomSilently(session); }
     else { _chatPinned = false; chatEl.scrollTop = session.scrollPos || 0; _markProgramScroll(); }
     // 必须在恢复滚动位置之后再挂观察器：observe() 会立刻回调一次，早挂就会把一个
     // 停在半截历史里的标签直接拽到底。
