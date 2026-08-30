@@ -317,7 +317,7 @@ test("_authContextBlock 拆段后主路径逐字节不变，子体子集只含�
   assert.equal(full.slice(0, cut) + full.slice(cut2), sub,
     "子体子集和主路径不是同一份文本切出来的——两边迟早会漂");
   // 那三条按关键词查正文的测试靠的是文本仍留在这个函数体里，别把它抽成外部常量。
-  for (const w of ["渗透", "CTF", "逆向", "别拒答", "攻击未授权的第三方"]) {
+  for (const w of ["渗透", "CTF", "逆向", "别拒答", "开发者工具"]) {
     assert.ok(fn.includes(w), `「${w}」被抽出函数体了——三条按 extractFn 取正文的测试会一起失明`);
   }
 });

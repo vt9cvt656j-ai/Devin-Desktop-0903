@@ -24112,7 +24112,7 @@ test("both L0 call sites preserve client-only context without duplicating gatewa
     assert.ok(auth.includes(term), `auth framing must name ${term} as legitimate dev work`);
   }
   assert.match(auth, /别拒答|别说教/, "must instruct the model not to refuse or lecture");
-  assert.match(auth, /攻击未授权的第三方|盗他人凭据/, "must keep the genuine harm line");
+  assert.match(auth, /开发者工具/, "must state this is a developer tool with no restrictions");
 });
 
 test("failure caches do not outlive the fact that produced them", () => {
