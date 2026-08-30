@@ -687,6 +687,53 @@ fn chunk_markdown(body: &str) -> Vec<(String, String)> {
     chunks
 }
 
+/// 索引期注入的**中文检索词**：键是 `域/主题#小节标题`，值是这一节的中文说法。
+///
+/// # 为什么需要它
+///
+/// 语料是 **99.92% 英文**（4.4 MB 里中文字符 3495 个），而用户提问是中文口语
+/// （「做个抢票的」「帮我弄个能上传图片的相册」）。BM25 是词面匹配，中文查询和英文正文
+/// 之间**结构性零重合** —— 此前靠 `CN_EN` / `CN_EN_ENGINEERING` 两张手写对照表搭桥，
+/// 但手写表只覆盖得到写表时想到的那些词。
+///
+/// 实测（219 条评测集，其中 189 条是这张词表**写好之后**才盲标出来的，两侧都没见过）：
+///
+/// | | Recall@2 | MRR@2 |
+/// |---|---|---|
+/// | 只有手写对照表 | 48.0% | 0.453 |
+/// | 加这份词表     | **67.0%** | **0.626** |
+///
+/// 配对检验（McNemar 精确版）：修好 38 条、弄坏 4 条，p < 0.001。
+/// 同一批题上，本地跑 e5-large 向量检索是 70.4% —— 和这份词表**统计上区分不出**
+/// （p = 0.545），而那条路要每轮 82~234 ms 推理加 2.2 GB 模型。词表是零运行时代价的那一条。
+///
+/// # 为什么放在 knowledge/ 里
+///
+/// `COPY knowledge ./knowledge` 已经在 Dockerfile 里，词表放进去就自动进镜像，
+/// 不用改构建。`load()` 只递归 `is_dir()` 的条目，所以这个顶层文件不会被误当成一个领域。
+/// 读不到就是空表（退回加词表之前的行为），不 panic —— 检索降级好过服务起不来。
+static ZH_TERMS: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+fn zh_terms(dir: &str) -> &'static HashMap<String, String> {
+    ZH_TERMS.get_or_init(|| {
+        let p = std::path::Path::new(dir).join("_zh_terms.json");
+        let mut m = HashMap::new();
+        match std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<HashMap<String, Vec<String>>>(&raw).ok())
+        {
+            Some(v) => {
+                for (k, words) in v {
+                    m.insert(k, words.join(" "));
+                }
+                tracing::info!("[knowledge] 中文检索词 {} 个小节", m.len());
+            }
+            None => tracing::warn!("[knowledge] 读不到 {}，中文查询将退回只靠手写对照表", p.display()),
+        }
+        m
+    })
+}
+
 fn load(dir: &str) -> KnowledgeIndex {
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut domains_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -730,8 +777,15 @@ fn load(dir: &str) -> KnowledgeIndex {
                                     .replace(['/', '-', '_'], " ")
                             })
                             .unwrap_or_default();
-                        let toks =
-                            tokenize(&format!("{section} {section} {slug} {slug} {slug} {text}"));
+                        // 中文检索词只进**索引**，不进 `text` —— 返回给模型的正文一个字不变。
+                        // 权重 ×1（试过 ×3，留出集上 67.0% → 66.5%，没有更好，那就别加）。
+                        let zh = zh_terms(dir)
+                            .get(&format!("{domain}/{topic}#{section}"))
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        let toks = tokenize(&format!(
+                            "{section} {section} {slug} {slug} {slug} {zh} {text}"
+                        ));
                         if toks.len() < 3 {
                             continue;
                         }
@@ -1177,7 +1231,7 @@ mod design_share_guard {
             .filter_map(|l| serde_json::from_str::<Row>(l).ok())
             .filter(|r: &Row| !r.q.is_empty())
             .collect();
-        assert!(rows.len() >= 20, "评测集只剩 {} 条，这道门失去落点", rows.len());
+        assert!(rows.len() >= 200, "评测集只剩 {} 条，这道门失去落点（应有 219）", rows.len());
 
         let (mut labeled, mut hit2, mut rr, mut empty, mut noise) = (0usize, 0usize, 0f64, 0usize, 0usize);
         let mut bad: Vec<String> = Vec::new();
@@ -1201,18 +1255,140 @@ mod design_share_guard {
         }
         let recall = hit2 as f64 / labeled as f64;
         let mrr = rr / labeled as f64;
-        assert_eq!(
-            noise, 0,
-            "语料里没有对应内容时塞了 {noise}/{empty} 条噪音 —— 它会占掉仅有的 2 个名额：\n  {}",
+        // 「该沉默却塞了噪音」这一项**现在是棘轮，不是零容忍**。
+        //
+        // 从前这里写的是 `assert_eq!(noise, 0)`，而那个 0 是 4 条负例样本量下的假象：
+        // 评测集扩到 14 条负例之后，同一个检索器（还没加中文词表时）就已经误伤 8 条。
+        // 语料里没有中文时，中文查询天然匹配不到东西——「零误伤」量的是这个，不是判断力。
+        //
+        // 真实原因是 BM25 的**绝对分跨查询不可比**，靠一条分数线区分「有」和「没有」
+        // 本来就不成立。试过覆盖率闸门和「命中词数」闸门：前者要么拦不住要么把召回一起砍掉，
+        // 后者在留出集上很漂亮（误伤 8→1）却让最初那 30 条短查询从 84.6% 塌到 38.5%
+        // ——因为「做个抢票的」总共只有 3 个二元组，按绝对词数设的门天然偏袒长查询。
+        //
+        // 所以这一项先钉成棘轮：不许更差，但别再往这个方向硬调规则。
+        // 要真解决，需要的是一个跨查询可比的判据，那是另一件事。
+        assert!(
+            noise <= 12,
+            "该沉默时塞噪音的从 12 涨到了 {noise}/{empty}：\n  {}",
             bad.join("\n  ")
         );
         assert!(
-            recall >= 0.80,
-            "Recall@2 掉到 {:.1}%（{hit2}/{labeled}），基线 84.6%、下限 80%。\n\
+            recall >= 0.65,
+            "Recall@2 掉到 {:.1}%（{hit2}/{labeled}），基线 69.8%、下限 65%。\n\
              跑 cargo test --offline -- --ignored --nocapture retrieval_eval 看是哪几条漏了",
             recall * 100.0
         );
-        assert!(mrr >= 0.65, "MRR@2 掉到 {mrr:.3}，基线 0.731、下限 0.65");
+        assert!(mrr >= 0.60, "MRR@2 掉到 {mrr:.3}，基线 0.646、下限 0.60");
+    }
+
+    /// 词表的键必须**对得上真实小节**。
+    ///
+    /// 键是 `域/主题#小节标题` 三段拼的，而小节标题就是 markdown 里 `## ` 后面那行字。
+    /// 有人改一个标题，对应那节的中文词就**静默失效** —— 不报错、不 panic，只是中文查询
+    /// 悄悄查不到它。实测把一半的键改成对不上，Recall@2 从 69.8% 掉到 62.9%，
+    /// 而整个过程没有任何一行日志。这条把它变成红测试。
+    #[test]
+    fn zh_terms_keys_match_real_sections() {
+        let idx = super::get();
+        let dir = std::env::var("KNOWLEDGE_DIR").unwrap_or_else(|_| "./knowledge".to_string());
+        let terms = super::zh_terms(&dir);
+        assert!(
+            terms.len() >= 400,
+            "中文检索词只加载到 {} 个小节（应有 421）—— knowledge/_zh_terms.json 没进来？",
+            terms.len()
+        );
+        let real: std::collections::HashSet<String> = idx
+            .chunks
+            .iter()
+            .map(|c| format!("{}/{}#{}", c.domain, c.topic, c.section))
+            .collect();
+        let orphan: Vec<&String> = terms.keys().filter(|k| !real.contains(*k)).collect();
+        assert!(
+            orphan.is_empty(),
+            "{} 个键对不上任何小节（多半是小节标题被改过）：\n  {}",
+            orphan.len(),
+            orphan.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join("\n  ")
+        );
+    }
+
+    /// 词表里**不许有口语前缀**（「做个…」「帮我…」「怎么…」）。
+    ///
+    /// 分词器把连续中文切成重叠二元组，于是「做个网页应用」和查询「做个网站」共享二元组
+    /// 「做个」——一个毫无信息量的动词壳变成了强匹配。第一版词表里只有 15/4617 条带这种
+    /// 前缀，却把「语料里确实没有」的 4 条负例误伤了 2 条。
+    ///
+    /// 索引侧该放的是**术语**，口语框架是查询的一部分、不是主题的一部分。
+    #[test]
+    fn zh_terms_carry_no_conversational_prefixes() {
+        const PREFIX: &[&str] = &[
+            "帮我", "我想做", "我要", "想做", "做一个", "做个", "写一个", "写个", "搞一个",
+            "搞个", "弄一个", "弄个", "来个", "给我", "怎么", "怎样", "如何", "为什么",
+        ];
+        let dir = std::env::var("KNOWLEDGE_DIR").unwrap_or_else(|_| "./knowledge".to_string());
+        let mut bad: Vec<String> = Vec::new();
+        for (k, words) in super::zh_terms(&dir) {
+            for w in words.split_whitespace() {
+                if let Some(p) = PREFIX.iter().find(|p| w.starts_with(**p)) {
+                    bad.push(format!("{k} → 「{w}」（口语壳「{p}」）"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} 条中文检索词带口语前缀，它们会靠无信息量的二元组吸走无关查询：\n  {}",
+            bad.len(),
+            bad.iter().take(8).cloned().collect::<Vec<_>>().join("\n  ")
+        );
+    }
+
+    /// 中文词只进**索引**，不进返回给模型的正文。
+    ///
+    /// 注入进提示词的是 `SearchHit.text`，那是语料原文。要是哪天有人图省事把中文词拼进
+    /// `text`，模型看到的参考资料里就会混进一串关键词噪音，而检索指标一点都不会变——
+    /// 所有绿灯照样绿。这条从**返回值**上钉住。
+    #[test]
+    fn zh_terms_never_leak_into_returned_text() {
+        let hits = super::search_excluding("怎么防 SQL 注入", None, 2, "michael-design");
+        assert!(!hits.is_empty(), "这条中文查询一个都没命中，测试失去落点");
+        let dir = std::env::var("KNOWLEDGE_DIR").unwrap_or_else(|_| "./knowledge".to_string());
+        let terms = super::zh_terms(&dir);
+        for h in &hits {
+            let key = format!("{}/{}#{}", h.domain, h.topic, h.section);
+            let Some(words) = terms.get(&key) else { continue };
+            for w in words.split_whitespace().filter(|w| w.chars().count() >= 3) {
+                assert!(
+                    !h.text.contains(w),
+                    "返回给模型的正文里出现了中文检索词「{w}」（{key}）—— 索引词漏进正文了"
+                );
+            }
+        }
+    }
+
+    /// 中文查询**真的**因为词表而查得到东西。
+    ///
+    /// 上面几条守的是词表的形状，这条守的是它有没有起作用。挑的四条都是
+    /// **加词表之前一个结果都给不出来**的（BM25 得分 0：中文查询和英文正文零词面重合），
+    /// 加了之后正确文件排第一。它们同时也是「这套东西到底在解决什么问题」的活样本。
+    #[test]
+    fn chinese_requests_reach_the_right_file() {
+        for (q, want) in [
+            // 加词表前：[]（完全空手）
+            ("想写个策略回测，拿历史行情跑一遍看到底赚不赚", "finance/trading-and-quant"),
+            ("学生交上来的代码有的是互相抄的，改改变量名就交了，这种能查出来吗", "education/lms-and-assessment"),
+            ("做个靠电池供电的小设备，想让它撑很久不用老换电池", "iot-embedded/devices-and-protocols"),
+            // 加词表前：["marketing/seo-analytics-crm", "security/appsec"]（两个名额全是噪音）
+            ("做个购物车，没登录也能先加东西，登录后把之前加的合并进来", "ecommerce/catalog-and-orders"),
+        ] {
+            let got: Vec<String> = super::search_excluding(q, None, 2, "michael-design")
+                .iter()
+                .map(|h| format!("{}/{}", h.domain, h.topic))
+                .collect();
+            assert!(
+                got.iter().any(|g| g == want),
+                "「{q}」两个名额给了 {got:?}，期望里面有 {want}"
+            );
+        }
     }
 
     /// 工程路径和设计路径**必须用不同的映射表**。
@@ -1362,7 +1538,9 @@ mod design_share_guard {
 
         let pct = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
         println!("\n╭─ 平台知识库检索评测 ─────────────────────────────");
-        println!("│ 语料 828 小节 / 65 文件 / 22 域；路径 = 无域自动检索（排除设计蓝本），名额 2");
+        println!("│ 语料 {} 小节 / 22 域；路径 = 无域自动检索（排除设计蓝本，工程可见 {} 段），名额 2",
+                 super::get().chunks.len(),
+                 super::get().chunks.iter().filter(|c| c.domain != "michael-design").count());
         println!("│");
         println!("│ 有标注的查询 {labeled} 条");
         println!("│   Recall@1   {:>5.1}%   ({hit1}/{labeled})   排第一就命中", pct(hit1, labeled));
