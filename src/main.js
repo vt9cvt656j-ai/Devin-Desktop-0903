@@ -2488,41 +2488,6 @@ let _programScrollTop = -1;
 // 这是唯一能把"人往上翻"和"下面又长出来一段"区分开的信号。
 let _lastUserIntentAt = 0;
 function _markProgramScroll() { if (chatEl) _programScrollTop = chatEl.scrollTop; }
-/** 切标签时把这个会话**无声地**摆到最新那条：定位好之前不让它显示。
- *
- * # 为什么不能直接用 _scrollChatBottom
- *
- * 那个函数是「跳到底 + rAF + 60/200/500/1000ms 各补一次」。补位本身是必要的 ——
- * 容器刚 append 上去时布局还没算完，第一次写 scrollTop 会被钳到更小的值；
- * `content-visibility` 的消息块也要等进视口才真正撑开高度。
- *
- * 但每一次补位都发生在**已经画过一帧之后**，于是用户看见的是内容先停在半截、然后
- * 一段一段往下跳。用户原话「不要一下滑动下去，要让用户无感看到最新的内容」。
- *
- * 改成：先 `visibility: hidden`（**不是 display:none** —— 隐藏的元素得照常参与布局，
- * 否则量不出 scrollHeight），连着两帧把它按到底，第二帧末尾再露出来。用户第一眼
- * 看到的就已经是最新那条，中间那一两帧是空白而不是错位的内容。
- *
- * 两帧之后仍留几发慢补位：内容后到时兜住，而那时已经在底部，通常是空操作。
- */
-function _showChatAtBottomSilently(session) {
-  if (!chatEl) return;
-  const el = session && session.container;
-  const prev = el ? el.style.visibility : "";
-  if (el) el.style.visibility = "hidden";
-  _repinChat();
-  const toBottom = () => { try { chatEl.scrollTop = chatEl.scrollHeight; _markProgramScroll(); } catch {} };
-  toBottom();
-  requestAnimationFrame(() => {
-    toBottom();
-    requestAnimationFrame(() => {
-      toBottom();
-      if (el) el.style.visibility = prev || "";
-      for (const t of [120, 400, 900]) setTimeout(toBottom, t);
-    });
-  });
-}
-
 function _repinChat() { _chatPinned = true; try { _syncChatJump(); } catch {} }
 // 滚轮往上翻是意图最明确的一种，直接当场解除钉底，不经过下面那个时间窗口——窗口要靠
 // wheel 和随后的 scroll 事件挨得足够近才成立，那是个不必要的时序依赖。其余输入方式
@@ -18834,7 +18799,19 @@ async function _switchChatSession(idx) {
   if (idx === _activeChatIdx || idx < 0 || idx >= _chatSessions.length) return;
   if (_activeChatIdx >= 0 && _chatSessions[_activeChatIdx]) {
     _chatSessions[_activeChatIdx].container.hidden = true;
-    _chatSessions[_activeChatIdx].scrollPos = chatEl?.scrollTop || 0;
+    // 记「离底部还有多远」，而不是绝对偏移量。
+    //
+    // 绝对偏移量一旦内容变了就失效（标签隐藏期间还在流式输出、工具卡展开、
+    // content-visibility 的块进出视口都会改总高），只能靠切回来之后反复纠正去追 ——
+    // 每一次纠正都是一次重绘，用户看到的就是内容乱跳。距底距离没有这个问题：
+    // 钉在底部的标签它恒等于 0，一次同步赋值就位，不需要任何补位。
+    {
+      const _s = _chatSessions[_activeChatIdx];
+      _s.scrollPos = chatEl?.scrollTop || 0; // 老字段留着：存档里还在用
+      _s.scrollFromBottom = chatEl
+        ? Math.max(0, chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight)
+        : 0;
+    }
     // 钉底状态是每个标签自己的：滚动位置本来就按标签存，钉不钉却是个模块级全局，
     // 于是在 A 标签往上翻一下，切到 B 标签，B 的实时输出也跟着不动了。
     _chatSessions[_activeChatIdx]._pinned = _chatPinned;
@@ -18894,21 +18871,27 @@ async function _switchChatSession(idx) {
     chatEl.appendChild(session.container);
     // A freshly-restored tab (IDE just opened, or first time this restored tab is shown) jumps to the
     // NEWEST message instead of a stale saved scroll position — no manual scrolling to catch up.
-    if (session._restored) { session._restored = false; _showChatAtBottomSilently(session); }
-    // **钉在底部的标签要回到最新，不能按旧偏移量恢复。**
+    // **一次同步赋值就位，不做任何多帧补位。**
     //
-    // 这里原来只有一句 `_chatPinned = session._pinned !== false; chatEl.scrollTop = session.scrollPos`
-    // —— 钉底状态记住了，却仍然把滚动条拽回离开时的那个数。而标签隐藏期间内容还在长
-    // （流式回复、工具卡、后台跑完的那一轮），那个偏移量早就不是底部了，于是切回来停在
-    // 半截历史里，右下角挂着「回到最新」等用户自己去点。
+    // 前两版都错在「先画出来再纠正」：跳到底之后隔 60/200/500/1000ms 各补一次，
+    // 每一次都是一次重绘 —— 用户看到内容一段段往下跳。后来改成先 visibility:hidden
+    // 再露出来，跳没了、换成闪一下。两条路都是在跟布局赛跑。
     //
-    // `scrollPos` 只对**用户主动往上翻过**的标签有意义（`_pinned === false`）：
-    // 那种情况下他在看历史，回来当然该停在原处。
+    // 真正的问题是**存的量不对**：绝对偏移量在内容变化之后就没有意义了。改存「离底部
+    // 多远」之后，读一次 scrollHeight（这一步本身会强制算完布局）就能算出准确的目标
+    // 位置，在同一个 JS 任务里赋值，浏览器只画一帧 —— 既不跳也不闪。
     //
-    // 用 `_scrollChatBottom()` 而不是直接赋值：容器刚 append 上去、布局还没算完，
-    // 这一帧写 scrollTop 会被钳到更小的值。那个函数自带 rAF + 60/200/500/1000ms 的补位。
-    else if (session._pinned !== false) { _showChatAtBottomSilently(session); }
-    else { _chatPinned = false; chatEl.scrollTop = session.scrollPos || 0; _markProgramScroll(); }
+    // 钉在底部的标签距底距离是 0，于是这一句自然就是「停在最新那条」。
+    const _fromBottom = (!session._restored && session._pinned === false)
+      ? Math.max(0, Number(session.scrollFromBottom) || 0)
+      : 0;
+    if (session._restored) session._restored = false;
+    _chatPinned = _fromBottom <= 2;
+    try {
+      chatEl.scrollTop = Math.max(0, chatEl.scrollHeight - chatEl.clientHeight - _fromBottom);
+      _markProgramScroll();
+    } catch {}
+    try { _syncChatJump(); } catch {}
     // 必须在恢复滚动位置之后再挂观察器：observe() 会立刻回调一次，早挂就会把一个
     // 停在半截历史里的标签直接拽到底。
     _installChatGrowthObserver(session);

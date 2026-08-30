@@ -36691,44 +36691,31 @@ test("模型选择按窗口隔离，另一个窗口改了不影响本窗口", ()
 // ---------------------------------------------------------------------------
 // 切标签时：钉在底部的标签回到最新，只有主动往上翻过的才保留旧位置
 // ---------------------------------------------------------------------------
-test("切回聊天标签自动回到最新，除非用户在那个标签里翻过历史", () => {
+test("切回聊天标签：钉底的停在最新，翻过历史的停原处，且只画一帧", () => {
   const sw = stripJsComments(extractFn("_switchChatSession"));
 
-  // 刚恢复的标签跳到底（原有行为，别弄丢）。
-  assert.match(sw, /session\._restored[\s\S]{0,120}_showChatAtBottomSilently\(session\)/,
-    "刚恢复的标签不再跳到最新了");
+  // **存的是「离底部多远」，不是绝对偏移量。**
+  // 绝对偏移量在内容变化后就没意义了（标签隐藏期间还在流式输出、工具卡展开、
+  // content-visibility 的块进出视口都会改总高），只能靠切回来反复纠正去追，
+  // 而每次纠正都是一次重绘 —— 那就是用户看到的「乱跳」。
+  assert.match(sw, /scrollFromBottom\s*=\s*chatEl[\s\S]{0,120}scrollHeight - chatEl\.scrollTop - chatEl\.clientHeight/,
+    "切走时没有记录距底距离");
+  assert.match(sw, /chatEl\.scrollTop = Math\.max\(0, chatEl\.scrollHeight - chatEl\.clientHeight - _fromBottom\)/,
+    "切回来没有按距底距离一次算准位置");
 
-  // 钉在底部的标签也要跳到底 —— 这是这次修的。原来它走的是「按 scrollPos 恢复」，
-  // 而标签隐藏期间内容还在长，那个偏移量早就不是底部，用户得自己往下滑。
-  assert.match(sw, /else if \(session\._pinned !== false\) \{ _showChatAtBottomSilently\(session\); \}/,
-    "钉在底部的标签没有回到最新 —— 切回来会停在半截历史里");
+  // 钉在底部（或刚恢复）的标签，距底距离取 0 —— 也就是停在最新那条。
+  assert.match(sw, /session\._pinned === false\)\s*\?\s*Math\.max\(0, Number\(session\.scrollFromBottom\)/,
+    "只有主动翻过历史的标签才该保留距底距离");
 
-  // **而且要「无感」**：不能让用户看着它一段一段往下跳。定位好之前先隐藏，
-  // 连着两帧按到底再露出来。
-  const silent = stripJsComments(extractFn("_showChatAtBottomSilently"));
-  assert.match(silent, /visibility = "hidden"/, "没有先隐藏 —— 用户会看见内容停在半截然后往下跳");
-  assert.ok(
-    !/display\s*=\s*"none"/.test(silent),
-    "用了 display:none —— 不参与布局就量不出 scrollHeight，按不到底",
-  );
-  assert.ok(
-    (silent.match(/requestAnimationFrame/g) || []).length >= 2,
-    "只等了一帧 —— 首帧布局还没算完，scrollTop 会被钳到更小的值",
-  );
-  assert.match(silent, /visibility = prev/, "隐藏之后没有再露出来");
+  // **一次同步赋值，不许有多帧补位。** 之前两版一个是 rAF+setTimeout 追着补（看得见跳），
+  // 一个是 visibility 藏起来再露出来（看得见闪）。两条路都是在跟布局赛跑。
+  const branch = sw.slice(sw.indexOf("const _fromBottom"), sw.indexOf("_installChatGrowthObserver"));
+  assert.ok(!/requestAnimationFrame/.test(branch), "切标签又开始跨帧补位了 —— 用户会看见内容一段段往下跳");
+  assert.ok(!/setTimeout/.test(branch), "切标签又开始延时补位了 —— 同上");
+  assert.ok(!/visibility/.test(branch), "又用隐藏/显示去躲布局了 —— 用户会看见闪一下");
+  assert.ok(!/_scrollChatBottom\(/.test(branch), "又走回了会多次纠正的那条路");
 
-  // 只有**主动翻过历史**的标签才保留旧位置，而且那种情况下 _chatPinned 必须是 false。
-  assert.match(sw, /else \{ _chatPinned = false; chatEl\.scrollTop = session\.scrollPos/,
-    "保留旧位置的那一支没有把钉底状态置否 —— 下一条消息会把用户从历史里拽走");
-  // 旧写法不许回来：它把「钉底」和「按旧偏移恢复」同时做了，自相矛盾。
-  assert.ok(
-    !/_chatPinned = session\._pinned !== false; chatEl\.scrollTop/.test(sw),
-    "又回到「记住钉底却按旧偏移恢复」那种自相矛盾的写法",
-  );
-
-  // 用 _scrollChatBottom 而不是直接写 scrollTop：容器刚 append、布局没算完时
-  // 直接赋值会被钳到更小的值。那个函数自带多帧补位。
-  const bottom = stripJsComments(extractFn("_scrollChatBottom"));
-  assert.match(bottom, /requestAnimationFrame/, "回到底部没有跨帧补位，首帧会被钳住");
-  assert.match(bottom, /setTimeout/, "回到底部没有延时补位，内容还在铺开时会落空");
+  // 这个函数整个不该再存在：它就是闪烁的来源。
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  assert.ok(!/_showChatAtBottomSilently/.test(src), "藏起来再露出来的那版还在");
 });
