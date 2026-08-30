@@ -13305,12 +13305,15 @@ textarea.settings-input {
 }
 
 .planpane__foot {
-  flex: none; display: flex; align-items: center; gap: 10px;
+  /* 两颗按钮居中排一排。左边那句提示删掉了 —— 它把这一排推得偏右，也没人看。 */
+  flex: none; display: flex; align-items: center; justify-content: center; gap: 12px;
   padding: 12px 24px; border-top: 1px solid #e8eaed; background: #fff;
 }
-.planpane__hint { flex: 1 1 auto; font-size: 12px; color: #80868b; }
 .planpane__btn {
-  flex: none; padding: 7px 16px; font-size: 13px; font-weight: 500;
+  /* min-width 是为了**两颗一样宽**：文案长短不同（「按这个方案执行」vs「先不用」），
+     只靠 padding 会一大一小，排在一起很难看。 */
+  flex: none; min-width: 132px; padding: 8px 16px; text-align: center;
+  font-size: 13px; font-weight: 500; line-height: 20px;
   font-family: var(--font); border-radius: 8px;
   border: 1px solid #dadce0; background: #fff; color: #3c4043; cursor: pointer;
   transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
@@ -13354,8 +13357,6 @@ textarea.settings-input {
 [data-theme="dark"] .planpane__body blockquote, .dark .planpane__body blockquote { border-left-color: #3c4043; color: #9aa0a6; }
 :root[data-theme="dark"] .planpane__foot,
 [data-theme="dark"] .planpane__foot, .dark .planpane__foot { background: #202124; border-top-color: #3c4043; }
-:root[data-theme="dark"] .planpane__hint,
-[data-theme="dark"] .planpane__hint, .dark .planpane__hint { color: #9aa0a6; }
 :root[data-theme="dark"] .planpane__btn,
 [data-theme="dark"] .planpane__btn, .dark .planpane__btn { background: transparent; border-color: #5f6368; color: #e8eaed; }
 :root[data-theme="dark"] .planpane__btn:hover,

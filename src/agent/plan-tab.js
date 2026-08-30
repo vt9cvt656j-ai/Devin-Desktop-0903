@@ -22,9 +22,8 @@ export function createPlanTab(deps) {
       <div class="planpane__head"><span class="planpane__title"></span></div>
       <div class="planpane__body"></div>
       <div class="planpane__foot">
-        <span class="planpane__hint">也可以直接在对话框里说要改哪儿</span>
-        <button type="button" class="planpane__btn" data-plan="dismiss">先不用</button>
         <button type="button" class="planpane__btn planpane__btn--go" data-plan="go">按这个方案执行</button>
+        <button type="button" class="planpane__btn" data-plan="dismiss">先不用</button>
       </div>`;
     pane.addEventListener("click", (e) => {
       const act = e.target.closest("[data-plan]")?.dataset.plan;
@@ -54,6 +53,19 @@ export function createPlanTab(deps) {
   // 过程中**带着累积文本反复被调用**的唯一一处；另找收尾点只会两边各说各话。
   let liveAt = 0;
   let liveTurn = null;
+  // 一轮里模型分好几条消息说话（每跑一步一条），而 liveUpdate 每次只拿到**当前那条**的
+  // 累积文本。所以「换了一条消息」必须往后接，不能顶掉前面那条 —— 否则收尾那条
+  // 「方案交付完毕。给执行者的下一句话……」一到，整份方案就被两段话替换掉了，
+  // 用户看到的正是「写的时候明明很多，写完只剩一点」。
+  let liveDone = [];   // 本轮已经说完的那几条
+  let liveCur = "";    // 当前这条累积到哪儿
+  let liveShown = false; // 这一轮往面板里写过没有
+  function accumulate(turn, text) {
+    if (liveTurn !== turn) { liveTurn = turn; liveDone = []; liveCur = ""; liveShown = false; liveAt = 0; }
+    if (text.startsWith(liveCur)) liveCur = text;                        // 同一条在长
+    else { if (liveCur.trim()) liveDone.push(liveCur); liveCur = text; } // 换了一条
+    return [...liveDone, liveCur].filter((s) => s.trim()).join("\n\n");
+  }
 
   return {
     state,
@@ -61,20 +73,31 @@ export function createPlanTab(deps) {
     /** @param turn 这一轮的会话 id；@param md 到目前为止累积的回复文本 */
     liveUpdate(turn, md) {
       if (!isPlanMode()) return;
-      const text = String(md || "");
+      const doc = accumulate(turn, String(md || ""));
       // **等到出现第一个小节标题再开页签**，不是一有字就开：模型开头总有一两句引子，
       // 那时开等于刚吐两个字就把编辑区抢走，比不写还烦。
-      if (!openFiles.has(tabPath)) {
-        if (!/^#{1,6}\s+\S/m.test(text)) return;
-        liveTurn = turn; liveAt = Date.now();
-        this.openFromReply(text);           // 第一次开：跟过去，让用户看见它在长
+      // 判据是「这一轮写过没有」，不是「页签开着没有」：页签开着但换了新一轮时，按后者
+      // 会直接掉进下面的节流分支 —— 上一轮的方案要么被新一轮的第一个 token 顶掉，要么
+      // 被节流挡住一直挂着不动。两种都不对。
+      if (!liveShown) {
+        if (!/^#{1,6}\s+\S/m.test(doc)) return;
+        liveShown = true; liveAt = Date.now();
+        // 第一次开才跟过去；页签已经在了就别抢焦点，用户可能正在别的文件里。
+        this.openFromReply(doc, { focus: !openFiles.has(tabPath) });
         return;
       }
-      if (liveTurn !== turn) return;        // 上一轮留下的页签，这一轮还没轮到它
       const now = Date.now();
       if (now - liveAt < 300) return;
       liveAt = now;
-      this.openFromReply(text, { focus: false }); // 已经开着：只更新，不抢焦点
+      this.openFromReply(doc, { focus: false }); // 已经开着：只更新，不抢焦点
+    },
+
+    // 回合收尾。**照样过累积器**：收尾那条消息只是本轮的最后一段，不是全文，
+    // 直接拿它开窗就等于把前面几段扔了。流式没跑过时 liveDone 是空的，
+    // 这里退化成「就用这一条」—— 和以前的行为一样。
+    commit(turn, md) {
+      if (!isPlanMode()) return false;
+      return this.openFromReply(accumulate(turn, String(md || "")));
     },
     show() { ensure(); state.el.hidden = false; render(); },
     hide() { if (state.el) state.el.hidden = true; },
