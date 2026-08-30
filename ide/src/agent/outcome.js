@@ -73,3 +73,29 @@ export function runOutcome(f = {}, cause = partialCause(f)) {
 export function shouldReviewZeroDelivery(f = {}) {
   return f.mode === "agent" && !f.didMutate && (f.reviews | 0) === 0 && (f.steps | 0) >= 2;
 }
+
+/**
+ * 收尾时红构建的裁定。
+ *
+ * # 为什么它压得住 run 期间记下的成因
+ *
+ * 「当前这一版代码的验证命令退出码非 0」是整条链上**最硬、最可执行**的一条事实：
+ * 用户拿到它就知道下一步干什么。相比之下 plan_steps_pending / stub_delivery /
+ * removed_unchecked 这些都是软信号。原来的实现把这个优先级写在**书写顺序**里
+ * （中途那处 build_failing 用的是无条件 `=`，于是盖掉它之前的一切），而书写顺序是
+ * 三千行代码涌现出来的东西，没人能单独验它——搬到这里就变成一条能跑的规则。
+ *
+ * 唯一压不住的是 `user_stopped`：那回答的是「这一轮为什么结束」，
+ * 和「代码现在什么状态」不是同一个问题，用户按了停就该如实说是他停的。
+ *
+ * 中途不再记这笔账（见 main.js 那两处注释）：红了之后又修好、重跑绿的话，
+ * 中途记的会粘到收尾变成假 partial。`freshBuildFailure` 自带版本钉，
+ * 红完又改过代码的那条会被剔掉——对已经不存在的那版代码断言「构建是红的」没有意义。
+ * **剔掉不会变成假绿**：那些新编辑让 `_verifiedAtImplOps < _implOps`，紧随其后的
+ * code_delivered_unverified 立刻补位，结局仍是 partial，只是成因退化成更笼统的那个。
+ */
+export function settleBuildFailure(recorded, hasFreshFailure) {
+  if (!hasFreshFailure) return String(recorded || "");
+  if (recorded === "user_stopped") return recorded;
+  return "build_failing";
+}

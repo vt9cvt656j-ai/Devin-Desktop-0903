@@ -36843,7 +36843,8 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   // 页签图标要用 plan.svg，而不是退回通用文件图标。
   assert.match(src, /f\.isPlan \? iconUrl\("plan"\)/, "方案页签没有自己的图标");
   // Plan 模式跑完要真的去开这个页签 —— 纯函数写好了没人调用等于没做。
-  assert.match(src, /=== "plan" && inTauri[\s\S]{0,240}openPlanTab\(last\.content\)/,
+  // 收尾走 commitPlanTab 而不是 openPlanTab：前者过累积器，后者会拿最后一条消息顶掉全文。
+  assert.match(src, /=== "plan" && inTauri[\s\S]{0,300}commitPlanTab\([^)]*last\.content\)/,
     "Plan 模式跑完没有打开方案页签");
   // 底部两颗按钮：一颗照做、一颗不用。这是用户点名要的那个决定点。
   const pane = readFileSync(join(HERE, "../src/agent/plan-tab.js"), "utf8");

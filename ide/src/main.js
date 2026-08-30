@@ -5338,25 +5338,21 @@ const PLAN_TAB_PATH = "mrdayone:plan", PLAN_TAB_NAME = "方案";
 const _plan = { md: "", title: PLAN_TAB_NAME };
 let _planTab = null; // 界面层在 src/agent/plan-tab.js，这里只做接线
 function _planUI() {
-  if (!_planTab) {
-    _planTab = createPlanTab({
-      editorContainer, renderMarkdownInto, sendPrompt, planCoreFromReply, planTitleFromReply,
-      tabPath: PLAN_TAB_PATH, tabName: PLAN_TAB_NAME,
-      openFiles, renderTabs, syncWelcome, activate,
-      getActivePath: () => activePath, closeTab: () => closeFile(PLAN_TAB_PATH),
-      onAccept: () => { // Plan 是只读模式，照做之前先切回 Agent
-        _currentAiMode = "agent";
-        try { _updateModeUI(); } catch {}
-        const s = _currentSession();
-        if (s) { s.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
-      },
-      onDoc: (md, title) => { _plan.md = md; _plan.title = title; },
-      isPlanMode: () => inTauri && _normalizeAiMode(_currentSession()?.mode || _currentAiMode) === "plan",
-    });
-  }
+  if (!_planTab) _planTab = createPlanTab({
+    editorContainer, renderMarkdownInto, sendPrompt, planCoreFromReply, planTitleFromReply,
+    tabPath: PLAN_TAB_PATH, tabName: PLAN_TAB_NAME,
+    openFiles, renderTabs, syncWelcome, activate, getActivePath: () => activePath,
+    closeTab: () => closeFile(PLAN_TAB_PATH),
+    onAccept: () => { // Plan 是只读模式，照做之前先切回 Agent
+      _currentAiMode = "agent"; try { _updateModeUI(); } catch {}
+      const s = _currentSession(); if (s) { s.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
+    },
+    onDoc: (md, title) => { _plan.md = md; _plan.title = title; },
+    isPlanMode: () => inTauri && _normalizeAiMode(_currentSession()?.mode || _currentAiMode) === "plan",
+  });
   return _planTab;
 }
-const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts), showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
+const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts), commitPlanTab = (turn, md) => _planUI().commit(turn, md), showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
 
 
 const _preview = {
@@ -17817,7 +17813,7 @@ function _streamDraftSave(session, text, reasoning) {
   // pagehide/关窗/更新重启时由 _streamDraftFlushSync 一次性全量补写。
   session._streamDraftLatest = { text: String(text || ""), reasoning: String(reasoning || "") };
   // Plan 一边流一边写方案页签：这里是流式中带着累积文本反复被调用的唯一一处。
-  try { _planUI().liveUpdate(session?.id, text); } catch {}
+  try { _planUI().liveUpdate(`${session?.id}#${session?._runGen || 0}`, text); } catch {}
   const now = Date.now();
   // 节流戳挂在 session 上：多标签页并发流式时，模块级全局戳会让两个会话互相卡对方的节流。
   if (now - (Number(session._draftSaveAt) || 0) < 2000) return;
@@ -28350,6 +28346,11 @@ function _runStateNextActionSuggestions(sess, { maxAgeMs = 5 * 60_000 } = {}) {
   // plan_steps_pending 是同时打的标，所以不拦的话，场景 4 会在一个没人回答的问题上面
   // 喊"继续执行计划"。
   if (run.outcome === "awaiting_user") return [];
+  // Plan 模式同理，而且更硬：这一轮什么都没改，唯一的下一步是用户在方案面板上按那两颗
+  // 按钮。这里原来照旧端出「继续执行计划 (6步)」「继续没做完的步骤」—— 用户明说了要
+  // 方案，界面却在催他执行。判据取**跑那一轮时**的模式（记在 run.mode 上）：点了「按这个
+  // 方案执行」会把会话切成 agent，之后输入框那一档还会回来读这条旧记录。
+  if (String(run.mode || "") === "plan") return [];
   const picks = [];
   const task = String(run.task || "").slice(0, 60);
 
@@ -30496,7 +30497,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
         try {
           if (_normalizeAiMode(sess?.mode || _currentAiMode) === "plan" && inTauri) {
             const last = [...(postRunMessages || [])].reverse().find((m) => m && m.role === "assistant" && typeof m.content === "string" && m.content.trim());
-            if (last) openPlanTab(last.content);
+            if (last) commitPlanTab(`${sess?.id}#${sess?._runGen || 0}`, last.content);
           }
         } catch (e) { console.warn("[plan] 方案页签打开失败：", e); }
     } catch (e) {
@@ -54191,17 +54192,21 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         //
         // 中途记会产出假 partial：模型改代码 → 跑测试红 → 这里记账 → 红构建门放行续跑
         // → 修好重跑绿 → `_verifiedAtImplOps = _implOps` → 静默轮收尾，而账还粘着。
-        // **每修好一次红构建就多一个假 partial。** 收尾处用终态重算同一个判据、
-        // 同一个成因字符串，条件还成立的话一个都不会漏。
+        // **每修好一次红构建就多一个假 partial。** 收尾处（_codeNeedsVerification 那段）
+        // 用终态重算同一个判据、同一个成因字符串，条件还成立的话一个都不会漏。
         //
-        // 这里**从来只记账、不代跑**，那条哲学没变。我一度在这里接上
-        // `_runApprovedVerification` 让 IDE 自己跑一次 checkCmd，被测试拦下了，而它是对的：
+        // 这里**从来只记账、不代跑**，那条哲学没变。
+        //
+        // 我一度在这里接上 `_runApprovedVerification` 让 IDE 自己跑一次 checkCmd，被测试
+        // 「验证事实由真实命令/诊断提供，不由 IDE 收尾门强行代跑」拦下了，而它是对的：
         // 关键词是 **secretly**。偷偷跑一个模型不知道的命令，会让「已完成」变得不可预测
-        // （模型没请求过它、也没机会解释它的结果）。
+        // （模型没请求过它、也没机会解释它的结果），和整套「不拿 harness 的偏好覆盖模型
+        // 判断」的哲学冲突。
         //
-        // 真正的病曾经在别处：栈提示每轮向模型断言「agent 会自动跑验证」，而那套机器是死的
-        // （`_runApprovedVerification` 零调用点）。那句谎话已经在 `_formatStackHint` 里改成
-        // 祈使句「改完必须你自己跑，没有任何东西会替你跑」。
+        // 真正的病曾经在别处：栈提示每轮都在向模型断言「agent 会每改几个文件自动跑」
+        // 「失败会自动注入报告」，而那套机器是死的（`_runApprovedVerification` 零调用点）。
+        // 模型据此把验证外包给了一个不存在的东西。那句谎话已经在 `_formatStackHint` 里
+        // 改成祈使句「改完必须你自己跑，没有任何东西会替你跑」。
         // ── 「读完就停」曾经在这里由 harness 画像门强制补一回合——已移除 ──
         //
         // 那道门读的是 `_missingEffects.includes("workspace")`，也就是**分类器/画像猜**
@@ -54269,8 +54274,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             _pushNudge("buildFix", `[BUILD_FAILED] 上次声明为验证的命令 \`${_buildFail.command}\` 退出码 ${_buildFail.exitCode}——构建/测试没过，代码现在跑不起来。这是交付前必须清零的硬事实。先读下面的真实错误、定位并修掉根因，再重新运行同一条验证命令确认退出 0；在拿到绿色之前不要收尾、不要转去做别的：\n\n${_tail}`);
             continue;
           }
-          // 账不在这里记：红了之后又修好、重跑绿了的话，中途记的会粘到收尾变成假 partial。
-          // 收尾处用 `_freshBuildFailure(run, _implOps)` 按终态重判，见 agent/outcome.js。
+          // 账不在这里记：红了之后又修好、重跑绿了的话，中途记的账会粘到收尾变成假 partial。
+          // 收尾处用 `_freshBuildFailure(run, _implOps)` 按终态重判——它自带版本钉，
+          // 红完又改过代码的那条会被剔掉（对已经不存在的那版代码断言「构建是红的」没意义）。
         }
         // B — procedural memory: removed (2026-07-05). Model remembers on its own.
         // A steer ("引导" / a 2nd message) arrived during THIS turn — it's sitting in the
@@ -57085,7 +57091,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 单独立一个标志，不去改 verificationPassed 的语义——它还要参与「评审说没验证
     // 但记账说验过了」那道假绿检测，在这里置真会平白制造分歧。
     run._nothingToVerify = !_codeNeedsVerification;
-    // 红构建改成收尾按终态重判（中途记会粘成假 partial）。判据与优先级见 outcome.js。
+    // 构建/测试红：中途不再记账（红了又修好会粘成假 partial），改成收尾按终态重判。
+    // `_freshBuildFailure` 自带版本钉：红完又改过代码的那条会被剔掉——对已经不存在的
+    // 那版代码断言「构建是红的」没有意义。**剔掉不会变成假绿**：那些新编辑让
+    // `_verifiedAtImplOps < _implOps`，下面 code_delivered_unverified 立刻补位，
+    // 结局仍是 partial，只是成因退化成更笼统的那个。
     run._incompleteReason = _settleBuildFailure(run._incompleteReason, !!_freshBuildFailure(run, _implOps));
     if (_codeNeedsVerification && !_currentCodeVerified) {
       verificationPassed = false;
@@ -57219,7 +57229,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     run._outcomeCause = _partialCause;
     const _runOutcome = _runOutcomeOf(_outcomeFacts, _partialCause);
     session._lastRunState = {
-      outcome: _runOutcome,
+      outcome: _runOutcome, mode: _normalizeAiMode(session?.mode || _currentAiMode),
       outcomeCause: _partialCause,
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
       result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
