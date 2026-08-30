@@ -9325,7 +9325,7 @@ window.addEventListener("resize", () => {
 // 三栏自适应档位住在 src/agent/layout-density.js（main.js 撞行数闸时搬出去的）。
 // 量的是物理宽度，理由见那个模块的抬头。
 function _applyLayoutDensity() {
-  try { applyLayoutDensity(window.innerWidth, document.documentElement); } catch {}
+  try { applyLayoutDensity(window.innerWidth, window.innerHeight, document.documentElement); } catch {}
 }
 _applyLayoutDensity();
 // 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），

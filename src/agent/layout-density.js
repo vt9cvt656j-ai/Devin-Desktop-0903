@@ -31,6 +31,27 @@ export const LAYOUT_DENSITY_STEPS = [[1180, "narrow"], [980, "tight"], [780, "mi
  */
 export const LAYOUT_WIDE_STEPS = [[2200, "wide"], [3000, "xwide"]];
 
+/**
+ * 竖直方向：窗口**矮**到这些值以下时收紧竖直留白。从高到矮，取最后命中的一档。
+ *
+ * 竖直的空间大头不是三栏，而是：聊天区上下内边距、消息之间的 gap、输入框的最大高度、
+ * 空状态那一坨（图标 40 + 标题 + 说明 + 一排 chip ≈ 200px）、页签条。矮窗口里这些加起来
+ * 能把消息区挤到只剩两三行 —— 横向那套档位一点忙都帮不上，它只看宽度。
+ *
+ * 和宽度同一个口径：读 `window.innerHeight`（不随界面缩放变）。竖直留白本身是 CSS 像素，
+ * 缩放时跟着字一起变大是对的 —— 字大了行距也该大。
+ */
+export const LAYOUT_HEIGHT_STEPS = [[820, "short"], [680, "xshort"]];
+
+/** 纯函数：给定窗口高度，算出竖直档位名（够高时返回空串）。 */
+export function layoutHeightStep(height, steps = LAYOUT_HEIGHT_STEPS) {
+  const h = Number(height) || 0;
+  if (!(h > 0)) return "";
+  let step = "";
+  for (const [px, name] of steps) if (h < px) step = name;
+  return step;
+}
+
 /** 纯函数：给定窗口宽度，算出档位名（不命中任何一档时返回空串 = 用默认布局）。 */
 export function layoutDensityStep(width, steps = LAYOUT_DENSITY_STEPS, wide = LAYOUT_WIDE_STEPS) {
   const w = Number(width) || 0;
@@ -49,12 +70,20 @@ export function layoutDensityStep(width, steps = LAYOUT_DENSITY_STEPS, wide = LA
  * `.layout` 上），改掉等于把用户拖出来的宽度抹了，窗口再拉宽也回不来。封顶只是暂时压住，
  * 窗口一宽就自动松开。
  */
-export function applyLayoutDensity(width, rootEl) {
+export function applyLayoutDensity(width, height, rootEl) {
   if (!rootEl || !rootEl.dataset) return "";
   const step = layoutDensityStep(width);
-  if ((rootEl.dataset.layout || "") === step) return step;
-  if (step) rootEl.dataset.layout = step;
-  else delete rootEl.dataset.layout;
+  if ((rootEl.dataset.layout || "") !== step) {
+    if (step) rootEl.dataset.layout = step;
+    else delete rootEl.dataset.layout;
+  }
+  // 竖直独立成一个属性：宽和高互不相干，一个窄而高的窗口和一个宽而矮的窗口要的是
+  // 完全不同的两组收紧，合成一个档位名只会组合爆炸。
+  const vstep = layoutHeightStep(height);
+  if ((rootEl.dataset.vlayout || "") !== vstep) {
+    if (vstep) rootEl.dataset.vlayout = vstep;
+    else delete rootEl.dataset.vlayout;
+  }
   return step;
 }
 
