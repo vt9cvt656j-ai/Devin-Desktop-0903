@@ -19953,13 +19953,22 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
   assert.ok(SRC.includes("for (const _draft of await _streamDraftTake())"),
     "恢复路径必须遍历所有会话的草稿，只取一份会丢掉并发标签页的整轮输出");
-  // 原来两条分支都假定「横幅后面紧跟 _draft.text」。步骤清单现在插在中间（见
-  // 「被打断的 run 恢复出来要带上这一轮执行过的步骤」那条），旧锚点因此失效 ——
-  // 但它守的性质没变：进历史的必须是**全文**，不许在这里 slice。改成钉那个性质本身。
-  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draft\.text/.test(SRC),
-    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draft.text）");
-  assert.doesNotMatch(SRC, /_draft\.text\.slice\(/,
+  // 进历史的必须是**全文**，不许在这里 slice。正文捕成 _draftText = String(_draft.text||"")
+  // （全量），横幅+步骤之后接上它。步骤清单插在中间是刻意的（见恢复处注释）。
+  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draftText/.test(SRC),
+    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draftText 全文）");
+  assert.match(SRC, /const _draftText = String\(_draft\.text \|\| ""\);/,
+    "恢复处必须先把草稿正文原样捕成全量变量，不许 slice");
+  assert.doesNotMatch(SRC, /_draft(?:\.text|Text)\.slice\(/,
     "草稿正文在恢复处被截断了——那正是「显示一点点」的另一种写法");
+  // 思考（reasoning）也存了、也是被渲染过的内容，恢复时不能丢：以前只拼 steps+text，
+  // 「✓ 思考」只剩一个勾。现在带上，走 assistant.reasoning 那条渲染老路。
+  assert.match(SRC, /if \(_draftReasoning\.trim\(\)\) _msg\.reasoning = _draftReasoning;/,
+    "中断恢复丢了草稿里的思考内容——reasoning 存了却没补进恢复的消息");
+  // 被打断在工具执行途中（满是步骤、正文还没落）的那一轮不能整条消失：
+  // 可恢复内容 = 正文/思考/步骤三者任一非空，探针也退到思考而不是只认正文。
+  assert.match(SRC, /_hasContent = !!\(_draftText\.trim\(\) \|\| _draftReasoning\.trim\(\) \|\| _steps\)/,
+    "恢复判据只认正文——只思考过/只跑了工具还没出正文的那一轮会被当成空草稿丢掉");
 });
 
 // ---- 深度思考质量修复（方案 A+B+E） ----------------------------------------------
