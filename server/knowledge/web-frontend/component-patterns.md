@@ -46,7 +46,9 @@ const { data, isLoading } = useQuery({
 
 ## Design-to-Code Pipeline
 ```
-1. Get design spec (Figma MCP / screenshot / description)
+1. Get design spec — with a Figma URL, use the built-in `figma` tool (structured tokens,
+   Auto Layout, real colours; no external connector needed). Screenshots are the fallback
+   when there is no source file: never rebuild a design by eyeballing pixels from an image.
 2. Decompose into sections; generate each independently
 3. Map to existing components first (Code Connect pattern)
 4. Generate only unmapped elements

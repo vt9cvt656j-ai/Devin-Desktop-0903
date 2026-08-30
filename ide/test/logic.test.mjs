@@ -19629,6 +19629,36 @@ test("弱模型判定：激活参数标识优先，大模型不被关键字包�
   assert.equal(isWeak(""), false);
 });
 
+test("多角色协作时派发工具必须前置——追加会被两道尾部裁剪静默切掉", () => {
+  // 那段注入的注释自己写着「不依赖编排器自觉返回它们（弱模型常不返回不熟悉的工具名）」。
+  // 可它原来是 push 到**尾部**，而后面紧跟两道都从尾部切的裁剪：弱模型 slice(0, 8)、
+  // 以及所有模型都过的 _criticRequestedToolSchemas(..., 10)。编排器返回 ≥7 个已注册工具
+  // 是难任务的常态（系统提示词还专门鼓励「第一轮就把取证面铺开」）——于是 run_worker /
+  // await_subagent / spawn_multiple_agents 被静默丢掉，多角色协作模式下模型手上根本没有
+  // 派子体的工具，而那正是这个模式的全部意义。
+  const loop = extractFn("_runAgenticLoop");
+  const at = loop.indexOf('orchestrationMode === "staged_roles"');
+  assert.ok(at > 0, "找不到强制注入那段");
+  const seg = loop.slice(at, at + 600);
+  assert.doesNotMatch(seg, /routeToolNames\.push\(t\)/,
+    "又改回追加了——尾部裁剪会把这四个派发工具切掉，注入等于没做");
+  assert.match(seg, /routeToolNames = \[\.\.\._dispatch, \.\.\.routeToolNames\.filter/,
+    "派发工具没有前置");
+
+  // 真往返：模拟「编排器返回 8 个 + 注入 4 个 → 裁到 10」，前置时四个必须全活下来。
+  const dispatch = ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"];
+  const orchestrated = Array.from({ length: 8 }, (_, i) => `tool_${i}`);
+  const prepended = [...dispatch, ...orchestrated.filter((t) => !dispatch.includes(t))].slice(0, 10);
+  const appended = [...orchestrated, ...dispatch].slice(0, 10);
+  assert.deepEqual(dispatch.filter((t) => prepended.includes(t)), dispatch, "前置后四个派发工具应全部存活");
+  assert.ok(dispatch.filter((t) => appended.includes(t)).length < dispatch.length,
+    "这条反证：追加时确实会被切掉（夹具没构造出问题就说明断言是摆设）");
+
+  // 真正在裁的那处必须出声，否则用户和排查者看不到「工具被裁过」。
+  assert.match(loop, /编排选了 \$\{_beforeCap\} 个工具，按注意力预算只装载了/,
+    "10 个上限那处仍然是静默裁剪");
+});
+
 test("编排合理性检查：收敛不 reject，notes 把事实留给主模型权衡", () => {
   const classify = load("_classifyToolFailure");
   const validate = load("_validateToolOrchestration", { _classifyToolFailure: classify });
