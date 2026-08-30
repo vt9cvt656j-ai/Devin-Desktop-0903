@@ -18,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
 const TRUTH = readFileSync(join(HERE, "..", "..", "server", "prompts", "truthfulness.txt"), "utf8");
 const PLAN = readFileSync(join(HERE, "..", "..", "server", "prompts", "plan.txt"), "utf8");
 
@@ -167,8 +167,11 @@ test("红灯和绿灯必须用同一套判据，否则「不声明 + 跑个失�
   // 发绿灯的 _evidenceCertifies 只看执行期盖上的 verifierRecognized，不看 purpose；
   // 而判红灯的 _freshBuildFailure 原来额外要求 purpose === "verify"。于是模型跑
   // `npm test` 不声明 purpose：过了拿满学分，挂了被直接跳过、照常宣布完成。
-  const red = SRC.slice(RAW_SRC.indexOf("function _freshBuildFailure"), RAW_SRC.indexOf("function _freshBuildFailure") + 1800);
-  const green = SRC.slice(RAW_SRC.indexOf("function _evidenceCertifies"), RAW_SRC.indexOf("function _evidenceCertifies") + 1800);
+  // 按 AST 取整个函数，不用固定字符窗口：判据一变长，1800 字符的窗口就守不住尾部，
+  // 而且照样是绿的。两个函数现在住在 src/agent/verification-evidence.js，
+  // helpers 的 SRC 已经把 src/agent/ 下的模块拼进来了，所以 fnSource 照样找得到。
+  const red = fnSource("freshBuildFailure", { code: true });
+  const green = fnSource("evidenceCertifies", { code: true });
   assert.doesNotMatch(red, /e\.purpose !== "verify"/,
     "判红灯又要求声明 purpose 了——绿灯不要求，这个不对称就是一条过关捷径");
   for (const seg of [red, green]) {
@@ -192,7 +195,8 @@ test("「改了代码没验证」只记账不补回合——这是刻意的，�
   // 是「已完成」为假的直接证据；「没验证」观测到的是**缺席**，缺席不等于工作是坏的。
   // 拿缺席去覆盖模型的收尾判断，就是用 harness 的偏好压过它的判断。
   const loop = SRC.slice(RAW_SRC.indexOf("function _runAgenticLoop"));
-  assert.match(loop, /run\._incompleteReason = "code_delivered_unverified"/,
+  // 记账搬到了收尾（中途记会让「红了又修好」粘成假 partial），性质不变：缺席仍然要记。
+  assert.match(loop, /run\._incompleteReason \|\|= "code_delivered_unverified"/,
     "缺席必须记账，否则这一轮看起来就像验证过了");
   assert.ok(!/_pushNudge\("codeVerify"/.test(loop),
     "又把它改成强制补回合了——见 logic.test.mjs 里那两条守卫");

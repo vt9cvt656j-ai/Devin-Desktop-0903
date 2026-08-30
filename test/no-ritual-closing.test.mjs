@@ -103,7 +103,7 @@ test("退出 126/127 不再被当成「构建没过、代码跑不起来」", ()
   // agent_engineering.txt:32 逐字写着 A verifier that cannot run is NOT evidence the code is
   // broken；而红构建门照单把 127 推成「代码现在跑不起来，先修根因」。用户现场就撞过：
   // `vhs demo.tape` 连着两次退出 127（工具没装），门却指示去修代码。
-  const fn = fnSource("_freshBuildFailure", { code: true });
+  const fn = fnSource("freshBuildFailure", { code: true });
   assert.match(fn, /e\.exitCode === 127 \|\| e\.exitCode === 126/,
     "又把「命令没找到」当成代码坏了");
   assert.match(fn, /if \(_cannotRun\) continue;/, "认出来了却没跳过");

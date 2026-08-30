@@ -33,6 +33,18 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_400（2026-08-30，**往下收**）：实测 81,361 行。抽出 `src/agent/verification-evidence.js`
+ *   （`freshBuildFailure` 发红灯、`evidenceCertifies` 发绿灯，连注释 103 行）。判据照旧：
+ *   两个都只读传进来的 run/记录和一个数字，无 DOM、无模块级状态。
+ *
+ *   这两个是「已完成」判断的地基，而住在 main.js 里的时候**一条行为测试都没有**：
+ *   版本钉（防「一次 npm test 替后面十二次编辑作证」）、按命令键控（防「另一条无关命令的绿
+ *   替红作证」）、退出码 127/126 不算构建失败——三条都是踩过的坑，三条都只有源码断言。
+ *   搬出去之后 12 处 `load()/fnSource()` 抠源码改成直接 import 产品代码，
+ *   另有两处 `SRC.slice(indexOf(...), +1800)` 的固定窗口改成按 AST 取。
+ *
+ *   留 39 行余量：另一个会话的方案页签实时更新正在飞行中。余量给在飞的活，不给新功能。
+ *
  * · 83_600（2026-08-25 首次设闸）：实测 83,384 行。同日刚把主↔子实时通道
  *   （_smRunToken / _drainSubAgentCollaborationInbox / _broadcastMainAgentFinding，
  *   101 行）搬进 src/agent/mainlink.js，作为「边界干净就该搬」的样板：那三个函数
@@ -64,7 +76,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_450;
+const MAIN_JS_MAX_LINES = 81_400;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
