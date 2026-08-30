@@ -14770,7 +14770,6 @@ textarea.settings-input {
   box-shadow: 0 1px 4px rgba(0, 0, 0, .14);
 }
 .dz-label svg { width: 15px; height: 15px; }
-.dz-label--open { color: var(--accent, #1a73e8); }
 .dz-label--ai { color: var(--accent, #1a73e8); }
 
 /* ═══ 拖放目标反馈 —— 照 VS Code 的做法 ═══════════════════════════════════════
@@ -14795,6 +14794,9 @@ textarea.settings-input {
 #tree .row.is-drop-into::before { background: var(--drop-bg); }
 /* 拖放进行中关掉 hover 高亮：两块高亮同时亮着，用户分不清哪个才是落点。 */
 #tree.is-dropping .row:hover::before { background: transparent; }
+/* .row::before 平时有 0.1s 背景过渡；VS Code 的 drop-target 没有任何过渡，而子树整块
+   满染叠上过渡后，快速划过会拖出一条渐变尾巴。拖放期间关掉。 */
+#tree.is-dropping .row::before { transition: none; }
 #tree.is-dropping .row.is-drop-into::before { background: var(--drop-bg); }
 
 .ref-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 8px 3px; }

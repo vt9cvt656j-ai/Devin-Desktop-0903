@@ -68,6 +68,28 @@ export function dropDirFor({ rowPath = "", rowIsDir = false, rootPath = "" } = {
 }
 
 /**
+ * 文件夹落在**工作区根**上时那个问句的文案。
+ *
+ * VS Code 在这一刻会弹框（doImport 里 `if (dirs.length && target.isRoot)`），原文是
+ *   "Do you want to copy 'X' or add 'X' as a folder to the workspace?"
+ * 按钮 Add Folder to Workspace / Copy Folder / Cancel。我们多一个「打开为新项目」——
+ * 用户原来就是靠拖到侧栏换项目的，那条路必须留着。
+ *
+ * 纯文案计算，单独拎出来是为了能在 Node 里断言（弹框本身没法在测试里点）。
+ */
+export function rootDropQuestion({ dirs = [], destDir = "", rootPath = "" } = {}) {
+  const n = dirs.length;
+  const what = n > 1 ? `${n} 个文件夹` : `「${baseName(dirs[0] || "")}」`;
+  const here = baseName(destDir) || "项目根目录";
+  const cur = baseName(rootPath) || "当前项目";
+  return {
+    title: `${what}要怎么加进来？`,
+    message: `复制到这里 = 放进「${here}」；添加到工作区 = 当前项目继续开着，多一个根目录；`
+      + `打开为新项目 = 关掉当前的「${cur}」，改为打开它。`,
+  };
+}
+
+/**
  * 整批投放计划：给定拖进来的若干路径和目标目录，算出「从哪儿复制到哪儿」。
  *
  * items: [{ path, isDir }]，existingNames: 目标目录里已有的名字。
