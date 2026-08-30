@@ -19177,6 +19177,55 @@ function _closedChatSessionsForLocalStorage(mediaBudget = CHAT_LOCAL_MEDIA_BUDGE
 // (webview reload / HMR / crash / the dev watcher killing the process). localStorage
 // writes are synchronous, so this always lands; restoreChatHistory reads it as the
 // fallback. It has no HTML snapshot and a strict aggregate media budget.
+// 两份存档按**会话**合并，而不是「谁先有内容用谁」。
+//
+// 存档三层，恢复时依次尝试：SQLite 快照 → session.json → localStorage 镜像。判据原本
+// 只有 `hasSavedChats`（有内容就用），**不比新旧**。而退出路径里只有 `onCloseRequested`
+// 会 await 快照写完；`beforeunload` / `pagehide`（Tauri 直接 destroy webview、强杀、
+// 更新重启走的正是这几条）跑不了异步，只来得及同步写 localStorage。
+//
+// 于是「几分钟前的快照 + 退出瞬间的镜像」两份都非空时，**旧的排在前面就赢了**。
+//
+// 合并而不是「整份取新的那个」：镜像按 media/text 预算截断过，整份采用会把所有老会话的
+// 图片和长文一起降级。逐个会话比消息条数取更全的那个，只在一边出现的原样保留。
+const _archiveMsgCount = (sess) => {
+  if (!sess) return 0;
+  const recent = sess.memory && sess.memory.recent;
+  if (Array.isArray(recent)) return recent.length;
+  return Array.isArray(sess.history) ? sess.history.length : 0;
+};
+const _mergeArchiveList = (primaryList, mirrorList) => {
+  const out = [];
+  const at = new Map();
+  for (const sess of (Array.isArray(primaryList) ? primaryList : [])) {
+    if (!sess) continue;
+    if (sess.id) at.set(sess.id, out.length);
+    out.push(sess);
+  }
+  for (const sess of (Array.isArray(mirrorList) ? mirrorList : [])) {
+    if (!sess) continue;
+    const i = sess.id ? at.get(sess.id) : undefined;
+    if (i === undefined) { out.push(sess); continue; }
+    // 两边都有同一个会话：谁的消息多要谁。相等留主存档 —— 它没被预算截断过。
+    if (_archiveMsgCount(sess) > _archiveMsgCount(out[i])) out[i] = sess;
+  }
+  return out;
+};
+const _archiveHasChats = (v) => !!(v && ((Array.isArray(v.sessions) && v.sessions.length) || (Array.isArray(v.closedSessions) && v.closedSessions.length)));
+function _mergeChatArchives(primary, mirror) {
+  if (!_archiveHasChats(primary)) return mirror;
+  if (!_archiveHasChats(mirror)) return primary;
+  const sessions = _mergeArchiveList(primary.sessions, mirror.sessions);
+  const closedSessions = _mergeArchiveList(primary.closedSessions, mirror.closedSessions);
+  // activeIdx 跟主存档：合并后主存档那些会话的下标原样不变，镜像的未必对得上。
+  const idx = Number.isFinite(primary.activeIdx) ? primary.activeIdx : 0;
+  return {
+    sessions,
+    closedSessions,
+    activeIdx: Math.max(0, Math.min(idx, Math.max(0, sessions.length - 1))),
+  };
+}
+
 // 注意：这条退出路径必须保持同步全量（数据安全 > 性能），不走下面的分片/缓存。
 function _flushChatHistorySync() {
   // 新建窗口绝不写共享的聊天镜像：两窗口同源共用同一个 localStorage，之前新窗口每次
@@ -19190,7 +19239,9 @@ function _flushChatHistorySync() {
     const textBudget = { remaining: CHAT_LOCAL_TEXT_BUDGET, perValue: CHAT_LOCAL_TEXT_PER_VALUE };
     const data = _chatSessionsForLocalStorage(_chatSessions, _activeChatIdx, budget, textBudget);
     const closedSessions = _closedChatSessionsForLocalStorage(budget, textBudget);
-    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, closedSessions, activeIdx: _activeChatIdx }));
+    // `savedAt` 是恢复时比新旧的唯一判据（见 _mergeChatArchives）。少了它，这份
+    // 「退出瞬间同步写下的最新镜像」在下次启动时会输给一份更旧的 SQLite 快照。
+    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({ sessions: data, closedSessions, activeIdx: _activeChatIdx, savedAt: Date.now() }));
   } catch { /* quota / disabled — the debounced background path is still the primary */ }
 }
 
@@ -19347,7 +19398,9 @@ async function _persistChatHistoryOnce(freshSnapshots, lightweightOnly = false) 
     if (localJson.length !== _lastLocalMirrorLen || localJson !== _lastLocalMirror) {
       try { _perfPhase(`localStorage:setItem len=${localJson.length}`); } catch {}
       try {
-        localStorage.setItem(CHAT_STORE_KEY, localJson);
+        // 时间戳在**写的那一刻**才拼上，不进 localJson —— 下面 _lastLocalMirror 的比较
+        // 判的是「内容变没变」，把时间戳算进去等于每次都判「变了」，节流就白做了。
+        localStorage.setItem(CHAT_STORE_KEY, `${localJson.slice(0, -1)},"savedAt":${Date.now()}}`);
         _lastLocalMirror = localJson; _lastLocalMirrorLen = localJson.length;
       } catch {}
     }
@@ -19558,15 +19611,24 @@ async function restoreChatHistory() {
         catch (e) { console.warn("[chat] legacy store read failed, trying localStorage fallback:", e); }
       }
     }
-    // Fallback (or web mode, or a store permission/IO failure): the localStorage mirror.
-    if (!hasSavedChats(saved)) {
-      try {
-        const raw = localStorage.getItem(CHAT_STORE_KEY);
-        if (raw) {
-          const ls = JSON.parse(raw);
-          if (hasSavedChats(ls)) saved = ls;
-        }
-      } catch {}
+    // localStorage 镜像**永远要读**，不是只在主存档为空时才读。
+    //
+    // 它是退出路径上唯一能同步写完的一份（beforeunload / pagehide 跑不了异步），
+    // 所以常常比主存档新。这里原来是 `if (!hasSavedChats(saved))` —— 主存档一非空
+    // 就再也不看它，「明明没关的会话，重开就没了」正是这么来的。
+    let _mirror = null;
+    try {
+      const raw = localStorage.getItem(CHAT_STORE_KEY);
+      if (raw) {
+        const ls = JSON.parse(raw);
+        if (hasSavedChats(ls)) _mirror = ls;
+      }
+    } catch {}
+    if (_mirror) {
+      const before = Array.isArray(saved && saved.sessions) ? saved.sessions.length : 0;
+      saved = _mergeChatArchives(saved, _mirror);
+      const after = Array.isArray(saved && saved.sessions) ? saved.sessions.length : 0;
+      if (after > before) console.info(`[chat] 从 localStorage 镜像补回 ${after - before} 个会话（主存档比镜像旧）`);
     }
 
     if (saved && (Array.isArray(saved.sessions) || Array.isArray(saved.closedSessions))) {

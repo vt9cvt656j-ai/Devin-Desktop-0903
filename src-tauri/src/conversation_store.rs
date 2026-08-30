@@ -30,6 +30,15 @@ pub struct ConversationSnapshot {
     pub revision: i64,
     pub snapshot: Value,
     pub recovered_from_backup: bool,
+    /// 这份快照是什么时候写下的（unix 毫秒）。
+    ///
+    /// 表里一直有 `updated_at`，只是从没返回给前端。而前端恢复时是「SQLite → session.json
+    /// → localStorage 依次尝试，谁先有内容用谁」，**不比新旧**。退出路径里只有
+    /// `onCloseRequested` 会 await 快照写完；`beforeunload` / `pagehide`（Tauri 直接
+    /// destroy webview、强杀、更新重启走的就是这几条）跑不了异步，只来得及同步写
+    /// localStorage。于是「旧快照 + 新镜像」时旧的赢，用户看到的就是「没关的会话不见了」。
+    /// 把时间戳带出去，前端才有判据去比。
+    pub updated_at: i64,
 }
 
 #[derive(Serialize)]
@@ -1597,31 +1606,35 @@ pub async fn conversation_snapshot_load(
     app: AppHandle,
 ) -> Result<Option<ConversationSnapshot>, String> {
     let pool = pool(&app).await?;
-    let primary =
-        sqlx::query("SELECT revision, payload, checksum FROM conversation_state WHERE scope = ?")
-            .bind(SNAPSHOT_SCOPE)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|error| format!("conversation snapshot load failed: {error}"))?;
+    let primary = sqlx::query(
+        "SELECT revision, payload, checksum, updated_at FROM conversation_state WHERE scope = ?",
+    )
+    .bind(SNAPSHOT_SCOPE)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|error| format!("conversation snapshot load failed: {error}"))?;
     let mut selected = primary.and_then(|row| {
         let revision: i64 = row.get("revision");
+        let updated_at: i64 = row.get("updated_at");
         decode_snapshot(row.get("payload"), row.get("checksum"))
-            .map(|snapshot| (revision, snapshot, false))
+            .map(|snapshot| (revision, snapshot, false, updated_at))
     });
     if selected.is_none() {
-        let backups = sqlx::query("SELECT revision, payload, checksum FROM conversation_state_history WHERE scope = ? ORDER BY revision DESC")
+        let backups = sqlx::query("SELECT revision, payload, checksum, saved_at FROM conversation_state_history WHERE scope = ? ORDER BY revision DESC")
             .bind(SNAPSHOT_SCOPE).fetch_all(&pool).await
             .map_err(|error| format!("conversation backup load failed: {error}"))?;
         selected = backups.into_iter().find_map(|row| {
             let revision: i64 = row.get("revision");
+            let saved_at: i64 = row.get("saved_at");
             decode_snapshot(row.get("payload"), row.get("checksum"))
-                .map(|snapshot| (revision, snapshot, true))
+                .map(|snapshot| (revision, snapshot, true, saved_at))
         });
     }
-    let (revision, mut snapshot, recovered_from_backup) = selected.unwrap_or((
+    let (revision, mut snapshot, recovered_from_backup, updated_at) = selected.unwrap_or((
         0,
         json!({"version": 3, "sessions": [], "closedSessions": [], "activeIdx": 0}),
         false,
+        0,
     ));
     migrate_legacy_transcripts(&pool, &snapshot).await?;
     hydrate_snapshot(&pool, &mut snapshot).await?;
@@ -1640,6 +1653,7 @@ pub async fn conversation_snapshot_load(
         revision,
         snapshot,
         recovered_from_backup,
+        updated_at,
     }))
 }
 
