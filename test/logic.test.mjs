@@ -10472,6 +10472,18 @@ test("agent next-step chips use completed run memory and survive suggestion fail
     _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "build_failing",
       mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
   }).some((c) => c.label === "修复构建失败"));
+  // **Plan 模式跑完不给"下一步"**：这一轮什么都没改，唯一的下一步是用户在方案面板上按
+  // 那两颗按钮。原来照旧端出「继续执行计划 (6步)」—— 用户明说了要方案，界面却在催他执行。
+  // 判据取跑那一轮时的模式，因为点了「按这个方案执行」会把会话切成 agent。
+  assert.deepEqual(gen({
+    _lastRunState: { outcome: "success", mode: "plan", task: "给个方案", result: "", updatedAt: now,
+      planStepsStatus: { pending: 6, completed: 0, total: 6 } }
+  }), [], "Plan 模式跑完还在催用户执行计划");
+  // 同一份运行状态，模式是 agent 时照旧该给建议 —— 别把闸修成了永远关。
+  assert.ok(gen({
+    _lastRunState: { outcome: "success", mode: "agent", task: "给个方案", result: "", updatedAt: now,
+      planStepsStatus: { pending: 6, completed: 0, total: 6 } }
+  }).some((c) => c.label === "继续执行计划 (6步)"), "agent 模式下的建议被一起关掉了");
   assert.ok(gen({
     _lastRunState: { outcome: "partial", task: "x", result: "", incompleteReason: "plan_steps_pending:3",
       mutatedFileCount: 1, mutatedFileTypes: new Set(["src"]), updatedAt: now }
@@ -36850,6 +36862,28 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   const pane = readFileSync(join(HERE, "../src/agent/plan-tab.js"), "utf8");
   assert.match(pane, /data-plan="go"/, "没有「按这个方案执行」");
   assert.match(pane, /data-plan="dismiss"/, "没有「先不用」");
+  // 左边那句灰字提示删掉了：它把两颗按钮推得偏右，且没人看。
+  assert.ok(!/planpane__hint/.test(pane), "左边那句提示还在");
+  // 「按这个方案执行」排在前面 —— 用户点名要换的顺序。
+  assert.ok(pane.indexOf('data-plan="go"') < pane.indexOf('data-plan="dismiss"'),
+    "两颗按钮的顺序没换过来");
+  // **剥掉 CSS 注释再断言。** 否定式断言（「这条声明必须不在了」）会被注释正面喂到：
+  // 这里的注释写着「原来挂着 max-width: 78ch」，声明早删干净了，断言照样红。
+  const pcss = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.ok(!/planpane__hint/.test(pcss), "CSS 里还留着 hint 的规则");
+  const foot = pcss.slice(pcss.indexOf(".planpane__foot {"), pcss.indexOf(".planpane__btn:hover"));
+  assert.match(foot, /justify-content:\s*center/, "底栏没有水平居中");
+  // 两颗文案长短差一倍，只靠 padding 会一大一小。
+  assert.match(foot, /min-width:\s*\d+px/, "两颗按钮没有定等宽");
+  // **正文铺满整块编辑区**，和打开一个文件时一样。原来挂着 max-width: 78ch，而它限的是
+  // 滚动容器本身：正文缩在左边一条、右边空一大片、滚动条卡在中间，表格还被挤到换行。
+  const pbody = pcss.slice(pcss.indexOf(".planpane__body {"), pcss.indexOf(".planpane__body > :first-child"));
+  assert.ok(!/max-width/.test(pbody), "方案正文还限着宽 —— 只占左边一条");
+  // 「用 Agent 执行此方案」是这条回复末尾唯一的动作，要居中。inline-flex 吃不到 auto
+  // 外边距，所以光写 margin auto 没用，两样都得断言。
+  const eb = pcss.slice(pcss.indexOf(".plan-exec-btn {"), pcss.indexOf(".plan-exec-btn:hover"));
+  assert.ok(!/display:\s*inline-flex/.test(eb), "执行按钮还是 inline-flex —— auto 外边距对它无效");
+  assert.match(eb, /margin:[^;]*\bauto\b/, "执行按钮没有水平居中");
   // **抽不出核心内容就不开窗口**。空白页比没有更糟：「这一轮没有可执行内容」
   // 不该以一张空页的形式呈现。变异实测这条一开始漏了。
   assert.match(pane, /const core = planCoreFromReply\(markdown\);\s*if \(!core\) return false;/,
@@ -36889,24 +36923,46 @@ test("流式过程中方案页签边写边开：等到第一个小节标题，�
       onAccept: () => {}, onDoc: () => {}, isPlanMode: () => planMode,
     });
 
+    // 流式是**前缀增长**：acc += delta。测试文本照这个形状写，否则测的不是真路径。
+    const s1 = "好的，我先说结论：";
+    const s2 = s1 + "这个骨架是对的，不该推倒重来。";
+    const s3 = s2 + "\n\n## 第一梯队\n\n### 1. 流式输出\n现状是整段 await 后才打印。\n";
+    const s4 = s3 + "### 2. 会话压缩\ncontext 顶到上限只能 /clear。\n";
+
     // 1) 开头那一两句引子**不开窗**：刚吐两个字就把编辑区抢走，比不写还烦。
-    tab.liveUpdate("t1", "好的，我先说结论：");
-    tab.liveUpdate("t1", "好的，我先说结论：这个骨架是对的，不该推倒重来。");
+    tab.liveUpdate("t1", s1);
+    tab.liveUpdate("t1", s2);
     assert.equal(openFiles.has("mrdayone:plan"), false, "还没出现小节标题就把页签开了");
 
     // 2) 第一个小节标题一到，页签就该长出来 —— 这就是「并行」的那一下。
-    tab.liveUpdate("t1", "好的，我先说结论：这个骨架是对的。\n\n## 第一梯队\n\n### 1. 流式输出\n");
+    tab.liveUpdate("t1", s3);
     assert.equal(openFiles.has("mrdayone:plan"), true, "小节标题已经出来了，页签却没开");
     assert.match(tab.state.md, /第一梯队/, "页签开了，正文却没写进去");
 
     // 3) 紧接着的 token 被 300ms 节流挡住：每个 token 重排一次 markdown 会卡。
     const before = renders;
-    tab.liveUpdate("t1", "…\n\n## 第一梯队\n\n### 1. 流式输出\n### 2. 会话压缩\n");
+    tab.liveUpdate("t1", s4);
     assert.equal(renders, before, "300ms 内又重排了一次 —— 节流没生效");
 
-    // 4) 不在 Plan 模式就完全不该碰这一屏（Agent/Chat 模式下编辑区是用户的）。
+    // 4) **换了一条消息要往后接，不能顶掉前面那条。** 一轮里模型分几段说话，liveUpdate
+    //    每次只拿到当前那段的累积文本。上一版收尾那段「方案交付完毕」一到，就把整份方案
+    //    替换成了两句话 —— 用户原话「写的过程中明明有很多内容，写完后内容直接显示少了」。
+    //    收尾走 commit（不受节流管），它渲染出来的必须是全文。
+    const w1 = "方案交付完毕。执行路径已排成 6 步。";
+    tab.liveUpdate("t1", w1);
+    assert.equal(tab.commit("t1", w1 + "给执行者的下一句话：先跑 curl。"), true);
+    assert.match(tab.state.md, /第一梯队/, "收尾把前面的方案顶掉了 —— 内容凭空变少");
+    assert.match(tab.state.md, /会话压缩/, "节流窗口里那一段被永久丢了");
+    assert.match(tab.state.md, /先跑 curl/, "收尾那段自己没写进去");
+
+    // 5) 换一轮就重新攒，也重新过「等第一个标题」那道闸。判据要是「页签开着没有」，
+    //    新一轮的第一个 token 就会直接顶掉上一轮的方案，或者被节流挡住、面板一直挂着旧的。
+    tab.liveUpdate("t2", "## 新的一轮\n\n- 只有这一段\n");
+    assert.doesNotMatch(tab.state.md, /第一梯队/, "上一轮的内容漏进了新一轮");
+
+    // 6) 不在 Plan 模式就完全不该碰这一屏（Agent/Chat 模式下编辑区是用户的）。
     openFiles.clear(); planMode = false;
-    tab.liveUpdate("t2", "## 目标\n\n- 做点什么\n");
+    tab.liveUpdate("t3", "## 目标\n\n- 做点什么\n");
     assert.equal(openFiles.has("mrdayone:plan"), false, "非 Plan 模式也去开方案页签了");
   } finally {
     if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;

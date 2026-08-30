@@ -13273,9 +13273,10 @@ textarea.settings-input {
 
 .planpane__body {
   flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain;
-  padding: 20px 24px 28px; font-size: 13.5px; line-height: 1.8; color: #3c4043;
-  /* 正文限宽：一行 90 个字符以上眼睛要回扫，方案本来就是拿来逐条读的。 */
-  max-width: 78ch;
+  /* **铺满整块编辑区**，和打开一个文件时一样。原来这里挂着 max-width: 78ch，而它限的
+     是滚动容器本身 —— 于是正文缩在左边一条，右边空一大片，滚动条也跟着卡在中间，
+     方案里的表格还被挤到要换行。 */
+  padding: 20px 28px 32px; font-size: 13.5px; line-height: 1.8; color: #3c4043;
 }
 .planpane__body > :first-child { margin-top: 0; }
 .planpane__body h2 {
@@ -13625,8 +13626,10 @@ textarea.settings-input {
 
 /* Plan mode → "execute this plan in Agent mode" handoff button. */
 .plan-exec-btn {
-  display: inline-flex; align-items: center; gap: 7px;
-  margin-top: 10px; padding: 7px 13px;
+  /* 居中：它是这条回复末尾唯一的动作，跟着正文左贴着看着像半截。
+     width: fit-content + margin auto —— inline-flex 吃不到 auto 外边距。 */
+  display: flex; width: fit-content; align-items: center; gap: 7px;
+  margin: 10px auto 0; padding: 7px 13px;
   border-radius: 8px; border: none; cursor: pointer;
   font: inherit; font-size: 12.5px; font-weight: 600;
   color: #fff; background: var(--accent, #0a84ff);
