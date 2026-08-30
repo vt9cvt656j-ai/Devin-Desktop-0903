@@ -33,6 +33,18 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_400（2026-08-30 第三次，**往上抬**）：实测 81,350 行。买到的是「拖文件/文件夹到
+ *   文件树 = 复制进工作区」（VS Code 的分工）。在此之前拖到侧栏一律走「打开」：文件夹
+ *   直接 openFolder() 换掉整个工作区——用户拖一个子文件夹进来，项目被重新打开了。
+ *
+ *   能搬的都搬了：目标目录解析、重名让路（Finder 的 `notes 2.txt`）、**把文件夹拖进它
+ *   自己的防护**（后端 copy_dir_recursive 会一边读一边往里写，无限长出嵌套目录）、整批
+ *   投放计划，全部在 `src/agent/explorer-drop.js`（95 行，纯函数，8 条真往返测试）。
+ *   留在 main.js 的四段按这条闸的判据是搬不动的：`_dropPointIn` 要 getBoundingClientRect
+ *   和 devicePixelRatio、`_dropDirAt` 要 elementFromPoint 命中树行、`_dragTargetAt` 要读
+ *   实时的 rootPath、`_copyIntoWorkspace` 要调 backend 并刷新树/Git——DOM 与模块级可变
+ *   状态各占一头，搬出去只能变成「把 main.js 的变量再传回来」的假模块。
+ *
  * · 81_300（2026-08-30 第二次，**仍在往下**）：实测 81,264 行。抽出
  *   `src/agent/approval-label.js`（`_approvalLabel` 的 166 行 switch）。判据照 mainlink
  *   那次：唯一的外部依赖（MCP 快照表 `_mcpStates`）改成**从参数传**，main.js 侧留四行薄壳。
@@ -91,7 +103,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_300;
+const MAIN_JS_MAX_LINES = 81_400;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
