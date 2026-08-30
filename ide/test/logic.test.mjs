@@ -36779,37 +36779,44 @@ test("切回聊天标签：钉底的停在最新，翻过历史的停原处，�
 // ---------------------------------------------------------------------------
 // Plan 模式：方案单独开一个页签，只放能照着做的部分
 // ---------------------------------------------------------------------------
-test("方案页签只留可执行内容，取证叙述不进去", async () => {
+test("方案文档保留全部小节，只摘掉开场白和结尾那句征询", async () => {
   const { planCoreFromReply, planTitleFromReply } = await import("../src/agent/plan-doc.js");
+
+  // 这份用例照抄线上第一份真实方案的形状 —— 小节叫「第一梯队」「第二梯队」，
+  // 一个「目标/计划/验证」之类的词都不沾。第一版按关键词挑小节，把第一梯队整段丢了，
+  // 用户看到的是一份从中间断开的方案（原话「显示内容不对、好少、不详细」）。
   const reply = [
-    "## 目标与非目标", "- 目标：加方案窗口", "",
-    "## 证据摘要", "我读了 main.js，发现预览页签是虚拟标签的先例，这一段是叙述。", "",
-    "## 关键文件", "- `src/main.js`", "",
-    "## 可执行计划", "1. 加图标", "2. 加页签", "",
-    "## 验证命令", "```bash", "npm test", "# 这个井号在代码块里，不是标题", "```", "",
-    "## 风险", "- 恢复时可能拿到空内容",
+    "结论先给：这个 agent 的骨架是对的，不该推倒重来。", "",
+    "## 第一梯队：先把这个做成\"完整体验\"", "",
+    "### 1. 流式输出（SSE）", "现状是 callApiRaw 整段 await 后才打印。", "",
+    "### 2. 会话压缩", "context 顶到上限只能 /clear。", "",
+    "## 第二梯队：补齐\"验证闭环\"", "",
+    "4. git + 诊断工具。", "",
+    "```bash", "npm test", "# 这个井号在代码块里，不是标题", "```", "",
+    "要补哪个，说一声我就动手。",
   ].join("\n");
   const core = planCoreFromReply(reply);
 
-  // 该留的都在。
-  for (const keep of ["目标与非目标", "关键文件", "可执行计划", "验证命令", "风险"]) {
-    assert.ok(core.includes(keep), `${keep} 这一节被丢了`);
+  // **全部小节都要在。** 关键词表挑小节是在赌模型怎么命名，这条钉的就是不许再赌。
+  for (const keep of ["第一梯队", "第二梯队", "流式输出", "会话压缩", "git + 诊断工具"]) {
+    assert.ok(core.includes(keep), `${keep} 被丢了 —— 方案会从中间断开`);
   }
-  // **叙述性的取证过程不进去** —— 这一屏是给人照着做的，不是再读一遍答案。
-  assert.ok(!core.includes("我读了 main.js"), "证据叙述被搬进了方案窗口");
-  assert.ok(!core.includes("## 证据摘要"), "证据小节的标题还在");
-  // 代码块里的 `#` 不能被当成标题，否则方案会被从中间切碎。
+  // 开场白（第一个标题之前那段）和结尾那句征询摘掉：它们是说给人听的，不是文档。
+  assert.ok(!core.includes("结论先给"), "开场白进了文档");
+  assert.ok(!core.includes("说一声我就动手"), "结尾那句征询进了文档");
+  // 代码块里的 # 不能被当成标题，否则方案会被从中间切碎。
   assert.ok(core.includes("# 这个井号在代码块里"), "代码块被当成标题切开了");
 
-  assert.equal(planTitleFromReply(reply), "目标与非目标");
+  // 标题按显示长度截断（14 个字 + 省略号），标签栏放不下整句。
+  const title = planTitleFromReply(reply);
+  assert.ok(title.startsWith("第一梯队：先把这个做成") && title.endsWith("…"), `标题不对：${title}`);
+  assert.ok([...title].length <= 15, `标题太长，标签栏放不下：${title}`);
   assert.equal(planTitleFromReply("", "方案"), "方案");
-  // 抽不出东西时返回空串 —— 调用方据此**不开窗口**，而不是开一张空白页。
+  // 空回复返回空串 —— 调用方据此不开窗口，而不是开一张空白页。
   assert.equal(planCoreFromReply(""), "");
   assert.equal(planCoreFromReply(null), "");
-  // 没有小节时退回「只留列表和代码块」，散文段落去掉。
-  const noHeads = planCoreFromReply("这是一段解释性的散文。\n\n- 第一步\n- 第二步");
-  assert.ok(noHeads.includes("第一步") && !noHeads.includes("解释性的散文"),
-    "没有小节时应当只留可执行的部分");
+  // 整份就是一段引子时原样给出，总好过空白。
+  assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
 });
 
 test("方案页签接进了编辑器的类型门和触发点", () => {
@@ -36837,6 +36844,61 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   assert.match(pane, /act === "go"[\s\S]{0,220}onAccept\(\)[\s\S]{0,160}sendPrompt\(/,
     "点了「按这个方案执行」却没有切回 Agent 就发出去 —— 只读模式下它不会动手");
 });
+
+// ---------------------------------------------------------------------------
+// Plan 一边流一边写：方案页签要跟着输出长出来，而不是等回合跑完才蹦一下
+// ---------------------------------------------------------------------------
+test("流式过程中方案页签边写边开：等到第一个小节标题，之后 300ms 节流", async () => {
+  const { createPlanTab } = await import("../src/agent/plan-tab.js");
+  const { planCoreFromReply, planTitleFromReply } = await import("../src/agent/plan-doc.js");
+
+  // 这一层依赖全注入，所以能真跑。document 只被 ensure()/render() 用到，
+  // 给个够用的假的 —— 测的是「什么时候开、开几次」，不是 DOM 长什么样。
+  const node = () => ({
+    className: "", id: "", innerHTML: "", textContent: "", firstChild: null,
+    addEventListener() {}, appendChild() {}, removeChild() {},
+    querySelector() { return node(); },
+  });
+  const prevDoc = globalThis.document;
+  globalThis.document = { createElement: () => node() };
+
+  try {
+    const openFiles = new Map();
+    let renders = 0, planMode = true;
+    const tab = createPlanTab({
+      editorContainer: node(), renderMarkdownInto: () => { renders++; }, sendPrompt: () => {},
+      planCoreFromReply, planTitleFromReply,
+      tabPath: "mrdayone:plan", tabName: "方案",
+      openFiles, renderTabs: () => {}, syncWelcome: () => {}, activate: () => {},
+      getActivePath: () => "mrdayone:plan",
+      closeTab: () => openFiles.delete("mrdayone:plan"),
+      onAccept: () => {}, onDoc: () => {}, isPlanMode: () => planMode,
+    });
+
+    // 1) 开头那一两句引子**不开窗**：刚吐两个字就把编辑区抢走，比不写还烦。
+    tab.liveUpdate("t1", "好的，我先说结论：");
+    tab.liveUpdate("t1", "好的，我先说结论：这个骨架是对的，不该推倒重来。");
+    assert.equal(openFiles.has("mrdayone:plan"), false, "还没出现小节标题就把页签开了");
+
+    // 2) 第一个小节标题一到，页签就该长出来 —— 这就是「并行」的那一下。
+    tab.liveUpdate("t1", "好的，我先说结论：这个骨架是对的。\n\n## 第一梯队\n\n### 1. 流式输出\n");
+    assert.equal(openFiles.has("mrdayone:plan"), true, "小节标题已经出来了，页签却没开");
+    assert.match(tab.state.md, /第一梯队/, "页签开了，正文却没写进去");
+
+    // 3) 紧接着的 token 被 300ms 节流挡住：每个 token 重排一次 markdown 会卡。
+    const before = renders;
+    tab.liveUpdate("t1", "…\n\n## 第一梯队\n\n### 1. 流式输出\n### 2. 会话压缩\n");
+    assert.equal(renders, before, "300ms 内又重排了一次 —— 节流没生效");
+
+    // 4) 不在 Plan 模式就完全不该碰这一屏（Agent/Chat 模式下编辑区是用户的）。
+    openFiles.clear(); planMode = false;
+    tab.liveUpdate("t2", "## 目标\n\n- 做点什么\n");
+    assert.equal(openFiles.has("mrdayone:plan"), false, "非 Plan 模式也去开方案页签了");
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;
+  }
+});
+
 
 // ---------------------------------------------------------------------------
 // 打开的文件，它的页签一定要看得见

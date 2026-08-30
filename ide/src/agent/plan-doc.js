@@ -1,39 +1,31 @@
-// Plan 模式那一屏的「核心内容」。
+// Plan 模式那一屏的文档内容。
 //
-// # 为什么要抽，而不是把回复原样搬过去
+// # 判据换过一次，值得写清楚
 //
-// 对话里那份是给人读的：先讲取证过程、再讲权衡、最后才是要做什么。而方案窗口是给人
-// **照着做**的 —— 用户原话「AI 回复的是用户完整内容，但这个窗口要写的是核心逻辑那些」。
-// 所以这里做减法：留下能执行、能核对的部分（目标、关键文件/接口、步骤、验证命令、风险），
-// 把叙述性的取证过程去掉。
+// 第一版是**按关键词挑小节**：标题命中「目标/关键文件/计划/验证/风险」的留下，命中
+// 「证据/背景」的去掉。线上第一份真实方案就把它证伪了 —— 模型写的小节叫
+// 「第一梯队：先把这个做成完整体验」「第二梯队：补齐验证闭环」，前者一个关键词都不沾，
+// 整段被丢；后者只因为标题里有「验证」二字侥幸留下。用户看到的是一份缺了一半、
+// 从中间断开的方案（原话「显示内容不对、好少、不详细」）。
 //
-// 判据只用**结构**，不猜语义：Plan 模式的提示词规定了输出小节，标题里出现什么词就归到
-// 哪一类。抽不出小节时退回「留列表和代码块、去掉大段散文」——那两样天然是可执行的部分。
+// 教训是：**方案的小节名是模型自由发挥的，任何关键词表都是在赌它怎么命名。**
+// 现在反过来 —— 默认全留，只摘掉确定不属于文档的那两样：
+//
+//   · 第一个标题**之前**的开场白（「结论先给：……」这类，是说给人听的引子）；
+//   · 结尾那句征询（「要补哪个，说一声我就动手」）。
+//
+// 这两样都有明确形状（位置固定 + 短 + 没有列表/代码），不靠猜语义。
 
-/** 这些小节留下。命中的判据是标题里含任一关键词。 */
-const KEEP = [
-  ["目标", "非目标", "goal", "objective"],
-  ["关键文件", "接口", "数据契约", "契约", "file", "interface", "contract"],
-  ["计划", "步骤", "实施", "plan", "step"],
-  ["验证", "verify", "test", "检查"],
-  ["风险", "未知", "risk", "unknown"],
-];
-/** 这些小节去掉：它们是「为什么这么定」的过程，不是「要做什么」。 */
-const DROP = [["证据", "取证", "现状", "背景", "evidence", "context", "background"]];
+/** 结尾那句「要不要我动手」。只在**最后一段**匹配，中间出现同样的话不动。 */
+const CLOSING = /(说一声|告诉我|随时说|我就动手|要不要我|需要我)[^\n]{0,20}$/;
 
-const hit = (title, groups) => {
-  const t = String(title || "").toLowerCase();
-  return groups.some((g) => g.some((w) => t.includes(String(w).toLowerCase())));
-};
-
-/** 把 markdown 按 ATX 标题切成小节。第一段没有标题时归到一个空标题的小节里。 */
+/** 把 markdown 按 ATX 标题切成小节。代码块里的 # 不算标题。 */
 function splitSections(md) {
   const lines = String(md || "").split("\n");
   const out = [];
   let cur = { title: "", level: 0, body: [] };
   let inFence = false;
   for (const line of lines) {
-    // 代码块里的 # 不是标题 —— 不判这个的话，shell 注释会把方案切碎。
     if (/^\s*```/.test(line)) inFence = !inFence;
     const m = !inFence && /^(#{1,6})\s+(.*)$/.exec(line);
     if (m) {
@@ -47,41 +39,46 @@ function splitSections(md) {
   return out;
 }
 
-/** 没有小节可依据时的兜底：只留列表项、代码块、表格 —— 散文段落去掉。 */
-function actionableOnly(md) {
-  const lines = String(md || "").split("\n");
-  const out = [];
-  let inFence = false;
-  for (const line of lines) {
-    if (/^\s*```/.test(line)) { inFence = !inFence; out.push(line); continue; }
-    if (inFence) { out.push(line); continue; }
-    if (/^\s*([-*+]|\d+[.)])\s+/.test(line) || /^\s*\|/.test(line) || !line.trim()) out.push(line);
-  }
-  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+/** 这一段是不是「开场白」：没有标题、够短、不含列表和代码。 */
+function isPreamble(sec) {
+  if (sec.title) return false;
+  const text = sec.body.join("\n").trim();
+  if (!text) return true;
+  if (/^\s*([-*+]|\d+[.)])\s+/m.test(text) || text.includes("```")) return false;
+  return [...text].length <= 240;
 }
 
 /**
- * 从一份 Plan 回复里抽出方案窗口要展示的核心内容。
+ * 从一份 Plan 回复里取出方案文档。
  *
- * 抽不出任何东西时返回空串 —— 调用方据此**不开窗口**，而不是开一个空窗口。
- * 「没有可执行内容」和「有但抽错了」是两回事，前者不该以一个空白页的形式呈现。
+ * 空回复返回空串 —— 调用方据此**不开窗口**，而不是开一张空白页。
  */
 export function planCoreFromReply(md) {
   const text = String(md || "").trim();
   if (!text) return "";
   const sections = splitSections(text);
-  const titled = sections.filter((s) => s.title);
-  if (titled.length) {
-    const kept = titled.filter((s) => hit(s.title, KEEP) && !hit(s.title, DROP));
-    if (kept.length) {
-      return kept
-        .map((s) => `${"#".repeat(Math.min(3, Math.max(2, s.level)))} ${s.title}\n${s.body.join("\n").trim()}`)
-        .join("\n\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-    }
+  if (!sections.length) return text;
+
+  // 开场白只摘**最前面**那一段：中间的散文是小节正文，属于方案本身。
+  let start = 0;
+  if (isPreamble(sections[0])) start = 1;
+  const kept = sections.slice(start);
+  if (!kept.length) return text; // 整份就是一段引子 —— 那就原样给，总好过空白
+
+  const out = kept
+    .map((s) => (s.title ? `${"#".repeat(Math.min(4, Math.max(2, s.level)))} ${s.title}\n${s.body.join("\n")}` : s.body.join("\n")))
+    .join("\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  // 结尾那句征询：只看最后一个非空行。
+  const lines = out.split("\n");
+  for (let i = lines.length - 1; i >= 0 && i >= lines.length - 3; i--) {
+    if (!lines[i].trim()) continue;
+    if (CLOSING.test(lines[i].trim())) { lines.splice(i, 1); }
+    break;
   }
-  return actionableOnly(text);
+  return lines.join("\n").trim();
 }
 
 /** 窗口标题：取第一个标题，没有就用默认名。太长的截断（标签栏放不下）。 */

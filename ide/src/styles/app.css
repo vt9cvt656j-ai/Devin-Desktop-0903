@@ -13254,60 +13254,116 @@ textarea.settings-input {
   :root[data-theme="dark"] .mode-menu__item.is-active { color: #8ab4f8; background: rgba(138,180,248,.14); }
 
 /* ---- Plan 模式的「方案」页签 ----
-   和实时预览一样铺满编辑器区（绝对定位，hidden 时让位给编辑器）。
-   底部那条是固定的操作栏：方案再长，「按这个方案执行」也永远在手边，
-   不用滚到底去找。 */
+   谷歌风：白底、发丝边、8px 圆角、#1a73e8 主色、#5f6368 次级文字。
+   **颜色写死不走 var()** —— 这一屏要在浅色和深色下各自成立，而 var(--panel) 这类
+   在两套主题里的取值是别处定的，跟着它走等于把这一屏的观感交给别人。深色整套在下面。 */
 .planpane {
   position: absolute; inset: 0; z-index: 2;
   display: flex; flex-direction: column; min-height: 0;
-  background: var(--panel, #fff);
+  background: #fff; color: #202124;
+  font-family: var(--font);
 }
 .planpane[hidden] { display: none; }
+
 .planpane__head {
-  flex: none; display: flex; align-items: center; gap: 8px;
-  padding: 12px 18px 10px; border-bottom: 1px solid var(--line, #e8eaed);
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 14px 24px 12px; border-bottom: 1px solid #e8eaed;
 }
-.planpane__title { font-size: 14px; font-weight: 600; color: var(--text, #1c1c1e); }
+.planpane__title { font-size: 15px; font-weight: 500; letter-spacing: -.01em; color: #202124; }
+
 .planpane__body {
   flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain;
-  padding: 16px 20px 20px; font-size: 13px; line-height: 1.75;
-  color: var(--text, #1c1c1e);
+  padding: 20px 24px 28px; font-size: 13.5px; line-height: 1.8; color: #3c4043;
+  /* 正文限宽：一行 90 个字符以上眼睛要回扫，方案本来就是拿来逐条读的。 */
+  max-width: 78ch;
 }
-.planpane__body h2, .planpane__body h3 {
-  font-size: 13px; font-weight: 600; margin: 18px 0 6px;
-  color: var(--text, #1c1c1e);
+.planpane__body > :first-child { margin-top: 0; }
+.planpane__body h2 {
+  font-size: 15px; font-weight: 500; color: #202124;
+  margin: 26px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #f1f3f4;
 }
-.planpane__body h2:first-child, .planpane__body h3:first-child { margin-top: 0; }
-.planpane__body ul, .planpane__body ol { margin: 4px 0 10px; padding-left: 22px; }
-.planpane__body li { margin: 3px 0; }
+.planpane__body h3 { font-size: 13.5px; font-weight: 500; color: #202124; margin: 18px 0 6px; }
+.planpane__body h4 { font-size: 13px; font-weight: 500; color: #3c4043; margin: 14px 0 4px; }
+.planpane__body p { margin: 0 0 10px; }
+.planpane__body ul, .planpane__body ol { margin: 6px 0 14px; padding-left: 20px; }
+.planpane__body li { margin: 4px 0; }
+.planpane__body li::marker { color: #80868b; }
+.planpane__body strong { font-weight: 500; color: #202124; }
+.planpane__body a { color: #1a73e8; text-decoration: none; }
+.planpane__body a:hover { text-decoration: underline; }
+.planpane__body code {
+  font-family: var(--mono); font-size: 12px;
+  background: #f1f3f4; color: #1967d2; padding: 1px 5px; border-radius: 4px;
+}
 .planpane__body pre {
-  background: var(--panel-2, #f6f7f9); border: 1px solid var(--line, #e8eaed);
-  border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0 12px;
+  background: #f8f9fa; border: 1px solid #e8eaed; border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; margin: 10px 0 16px;
 }
-.planpane__body code { font-family: var(--mono); font-size: 12px; }
+.planpane__body pre code { background: none; color: #3c4043; padding: 0; }
+.planpane__body blockquote {
+  margin: 10px 0; padding: 2px 0 2px 14px; border-left: 3px solid #dadce0; color: #5f6368;
+}
+
 .planpane__foot {
-  flex: none; display: flex; align-items: center; gap: 8px;
-  padding: 10px 18px; border-top: 1px solid var(--line, #e8eaed);
-  background: var(--panel, #fff);
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 12px 24px; border-top: 1px solid #e8eaed; background: #fff;
 }
-.planpane__hint { flex: 1 1 auto; font-size: 12px; color: var(--text-dim, #80868b); }
+.planpane__hint { flex: 1 1 auto; font-size: 12px; color: #80868b; }
 .planpane__btn {
-  flex: none; padding: 6px 14px; font-size: 13px; font-family: var(--font);
-  border-radius: 8px; border: 1px solid var(--line-strong, #d7d7dc);
-  background: var(--panel-2, #fbfbfd); color: var(--text, #1c1c1e); cursor: pointer;
-  transition: background .12s ease, border-color .12s ease;
+  flex: none; padding: 7px 16px; font-size: 13px; font-weight: 500;
+  font-family: var(--font); border-radius: 8px;
+  border: 1px solid #dadce0; background: #fff; color: #3c4043; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
 }
-.planpane__btn:hover { background: var(--hover, rgba(0,0,0,.045)); }
+.planpane__btn:hover { background: #f8f9fa; border-color: #c6cace; }
 .planpane__btn--go {
-  border-color: transparent; background: var(--accent, #1a73e8); color: #fff; font-weight: 500;
+  border-color: transparent; background: #1a73e8; color: #fff;
+  box-shadow: 0 1px 2px rgba(60,64,67,.30), 0 1px 3px 1px rgba(60,64,67,.15);
 }
-.planpane__btn--go:hover { background: color-mix(in srgb, var(--accent, #1a73e8) 88%, #000); }
+.planpane__btn--go:hover { background: #1b66c9; box-shadow: 0 1px 3px rgba(60,64,67,.30), 0 4px 8px 3px rgba(60,64,67,.15); }
+.planpane__btn:active { box-shadow: none; }
+
+/* ---- 深色 ----
+   两套选择器都写：这套样式表里 `:root[data-theme="dark"]` 和 `[data-theme="dark"]`
+   两种写法都在用，只写一种会在另一半场景里失效。 */
 :root[data-theme="dark"] .planpane,
-[data-theme="dark"] .planpane { background: var(--panel, #1f1f22); }
+[data-theme="dark"] .planpane, .dark .planpane { background: #202124; color: #e8eaed; }
+:root[data-theme="dark"] .planpane__head,
+[data-theme="dark"] .planpane__head, .dark .planpane__head { border-bottom-color: #3c4043; }
+:root[data-theme="dark"] .planpane__title,
+[data-theme="dark"] .planpane__title, .dark .planpane__title { color: #e8eaed; }
+:root[data-theme="dark"] .planpane__body,
+[data-theme="dark"] .planpane__body, .dark .planpane__body { color: #bdc1c6; }
+:root[data-theme="dark"] .planpane__body h2,
+[data-theme="dark"] .planpane__body h2, .dark .planpane__body h2 { color: #e8eaed; border-bottom-color: #303134; }
+:root[data-theme="dark"] .planpane__body h3,
+[data-theme="dark"] .planpane__body h3, .dark .planpane__body h3,
+:root[data-theme="dark"] .planpane__body strong,
+[data-theme="dark"] .planpane__body strong, .dark .planpane__body strong { color: #e8eaed; }
+:root[data-theme="dark"] .planpane__body h4,
+[data-theme="dark"] .planpane__body h4, .dark .planpane__body h4 { color: #bdc1c6; }
+:root[data-theme="dark"] .planpane__body a,
+[data-theme="dark"] .planpane__body a, .dark .planpane__body a { color: #8ab4f8; }
+:root[data-theme="dark"] .planpane__body code,
+[data-theme="dark"] .planpane__body code, .dark .planpane__body code { background: #303134; color: #8ab4f8; }
+:root[data-theme="dark"] .planpane__body pre,
+[data-theme="dark"] .planpane__body pre, .dark .planpane__body pre { background: #282a2d; border-color: #3c4043; }
+:root[data-theme="dark"] .planpane__body pre code,
+[data-theme="dark"] .planpane__body pre code, .dark .planpane__body pre code { color: #bdc1c6; }
+:root[data-theme="dark"] .planpane__body blockquote,
+[data-theme="dark"] .planpane__body blockquote, .dark .planpane__body blockquote { border-left-color: #3c4043; color: #9aa0a6; }
+:root[data-theme="dark"] .planpane__foot,
+[data-theme="dark"] .planpane__foot, .dark .planpane__foot { background: #202124; border-top-color: #3c4043; }
+:root[data-theme="dark"] .planpane__hint,
+[data-theme="dark"] .planpane__hint, .dark .planpane__hint { color: #9aa0a6; }
 :root[data-theme="dark"] .planpane__btn,
-[data-theme="dark"] .planpane__btn { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.14); color: #e8eaed; }
+[data-theme="dark"] .planpane__btn, .dark .planpane__btn { background: transparent; border-color: #5f6368; color: #e8eaed; }
+:root[data-theme="dark"] .planpane__btn:hover,
+[data-theme="dark"] .planpane__btn:hover, .dark .planpane__btn:hover { background: rgba(232,234,237,.08); border-color: #80868b; }
 :root[data-theme="dark"] .planpane__btn--go,
-[data-theme="dark"] .planpane__btn--go { background: #1a73e8; border-color: transparent; color: #fff; }
+[data-theme="dark"] .planpane__btn--go, .dark .planpane__btn--go { background: #8ab4f8; border-color: transparent; color: #202124; box-shadow: none; }
+:root[data-theme="dark"] .planpane__btn--go:hover,
+[data-theme="dark"] .planpane__btn--go:hover, .dark .planpane__btn--go:hover { background: #aecbfa; }
 
 /* ---- Tool blocked state (Explorer/Reviewer readonly) ---- */
 .atc-result--blocked {
