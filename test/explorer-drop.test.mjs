@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, dropFeedback,
+  dropDirFor, planExplorerDrop,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
 
@@ -160,51 +160,6 @@ test("落点落在哪一行 → 进哪个目录（真跑 elementFromPoint）", (
     "工作区根行必须当成目录——认 .chev 会把它当文件，目标算到工作区外面去");
 });
 
-test("拖动反馈：三种后果必须给出互不相同的 kind、目标行和文案", () => {
-  // 用户报的就是"分不清会发生什么"。这条锁住语义：同一批文件落在不同区域，必须得到不同的
-  // kind（决定视觉）、不同的文案，而且"要高亮哪一行"必须算对。
-  const copy = dropFeedback({ zone: "explorer", destDir: "/w/renderer", rootPath: "/w", items: [{ path: "/x/a.txt" }] });
-  assert.equal(copy.kind, "copy");
-  assert.equal(copy.rowPath, "/w/renderer", "要高亮的正是接收文件的那个目录行");
-  assert.match(copy.title, /renderer/, "标签必须写出目标目录的名字，不能只说「复制到工作区」");
-
-  // 落到项目根要说清"这是根"，否则和某个恰好同名的子目录分不开。
-  const root = dropFeedback({ zone: "explorer", destDir: "/w/ide", rootPath: "/w/ide", items: [{ path: "/x/a.txt" }] });
-  assert.match(root.title, /项目根/, "落到根目录必须标明是根");
-  assert.equal(root.rowPath, "/w/ide");
-
-  // 换项目是有损操作：**必须写出会失去什么**，只说"打开"不够。
-  const rep = dropFeedback({ zone: "open", rootPath: "/w/ide", items: [{ path: "/x/design", isDir: true }] });
-  assert.equal(rep.kind, "replace");
-  assert.match(rep.sub, /当前「ide」会被关闭/, "换项目必须明说当前项目会被关掉");
-  assert.equal(rep.rowPath, "", "换项目跟任何一行都无关，不该去高亮某一行");
-
-  // 往编辑器区拖**文件**是无损的（只是开个标签），不能拿警告吓人。
-  const openFile = dropFeedback({ zone: "open", rootPath: "/w/ide", items: [{ path: "/x/a.txt" }] });
-  assert.equal(openFile.kind, "openFile");
-  assert.equal(openFile.sub, "", "开一个文件不该带警告副行");
-
-  // 没打开项目时拖文件夹进来 = 无损地打开它，不该走 replace 那套警告视觉。
-  assert.equal(dropFeedback({ zone: "open", rootPath: "", items: [{ path: "/x/design", isDir: true }] }).kind,
-    "openFile", "空工作区时打开项目是无损的，不该显示「会被关闭」");
-
-  // 三个 kind 两两不同 —— 这正是"分得清"的形式化表述。
-  assert.equal(new Set([copy.kind, rep.kind, openFile.kind]).size, 3);
-});
-
-test("拖动反馈：会被拒绝的投放要在松手前就说清楚", () => {
-  // 把文件夹拖进它自己，落地一定失败。以前要等松手才弹一句"复制失败"；
-  // drag-enter 带 paths，所以拖动途中就能判出来。
-  const deny = dropFeedback({
-    zone: "explorer", destDir: "/w/src/deep", rootPath: "/w",
-    items: [{ path: "/w/src", isDir: true }],
-  });
-  assert.equal(deny.kind, "deny");
-  assert.match(deny.title, /不能放进它自己/);
-  // 没打开项目时落在侧栏：目标为空，要拦住，而不是算出一个空路径去写。
-  assert.equal(dropFeedback({ zone: "explorer", destDir: "", rootPath: "", items: [{ path: "/x/a" }] }).kind, "deny");
-});
-
 test("拖动中的高亮必须能扛住树被重建", () => {
   // fs-watcher 会在拖动途中 reloadDir/renderWorkspaceRoots 重建整棵树。高亮如果存节点
   // 引用，就会挂在一个已被丢弃的节点上——既清不掉也贴不上。所以每帧按类名扫一遍再按
@@ -243,6 +198,67 @@ test("浏览器路径的坐标要乘回 dpr，否则 Retina 上命中错行", ()
     assert.match(line, /devicePixelRatio|_dpr/,
       `浏览器路径的坐标没有乘回 dpr：${line}`);
   }
+});
+
+test("投放高亮照 VS Code：一块底色，不改文字，不加边框", () => {
+  // 依据是 VS Code（Cursor 是它的分支）打包产物里的真实规则：
+  //   .monaco-list-row.drop-target { background-color: <list.dropBackground>; color: inherit !important; }
+  // 就这一条。list.dropBackground 实测色值：浅色 #D6EBFF、深色 #062F4A。
+  // 上一版我自创了上下边框 + 左粗条 + 子树染色 + 文字变强调色加粗 + 跟随光标的标签 +
+  // 编辑器区虚线框 + 侧栏压暗，用户的评价是「完全和 vscode 不一样」。这条守住不要再长回来。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /--drop-bg:\s*#D6EBFF/i, "浅色投放底色要和 VS Code 的 list.dropBackground 一致");
+  assert.match(css, /--drop-bg:\s*#062F4A/i, "深色投放底色要和 VS Code 的一致");
+  assert.match(css, /#tree \.row\.is-drop-into::before \{ background: var\(--drop-bg\); \}/,
+    "投放高亮必须就是一块底色");
+  // 自创的那几样都不许回来。
+  for (const gone of ["drop-chip", "editor-dropzone", "drag-open--replace", "is-drop-into + .children"]) {
+    assert.ok(!css.includes(gone), `自创视觉又回来了：${gone}——VS Code 没有这种东西`);
+  }
+  assert.ok(!/\.row\.is-drop-into::after/.test(css), "投放态不该再画边框/竖条");
+  assert.ok(!/is-drop-into \.name/.test(css), "VS Code 明确 color:inherit——投放态不改文字颜色");
+});
+
+test("拖放进行中要关掉 hover 高亮", () => {
+  // VS Code 的 hover 选择器带 :not(.drop-target)：两块高亮同时亮着，用户分不清哪个是落点。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /#tree\.is-dropping \.row:hover::before \{ background: transparent; \}/,
+    "拖放中没有关掉 hover 高亮");
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /_treeEl\?\.classList\.toggle\("is-dropping"/, "没有在拖放时给树挂 is-dropping");
+});
+
+test("悬停折叠目录 500ms 自动展开，且只展开不收起", () => {
+  // VS Code 的 autoExpand：实测就是 500ms，只在**目标行变化**时重新计时，且从不自动收起
+  //（拖动中把列表收回去，落点会在脚下跳）。没有它，折叠的子目录根本没法作为落点。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /_springTimer = setTimeout\(\(\) => \{[^}]*_treeSetExpanded\(dest, true\)/,
+    "没有悬停自动展开——折叠目录无法作为落点");
+  assert.match(src, /\}, 500\)/, "自动展开延时要和 VS Code 一致（500ms）");
+  assert.doesNotMatch(src, /_treeSetExpanded\([^,]+, false\)/, "不许自动收起：拖动中列表跳动");
+});
+
+test("文件夹落在项目根上要先问，而不是默默复制", () => {
+  // VS Code 在这一刻弹框："Do you want to copy 'X' or add 'X' as a folder to the workspace?"
+  // 我们把次选项换成「打开为新项目」——用户原来靠拖到侧栏换项目，改成复制后那条路没了。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const blk = src.slice(src.indexOf("async function _copyIntoWorkspace"), src.indexOf("async function _handleDrop"));
+  assert.match(blk, /destDir === rootPath/, "没有区分「落在项目根」这种情形");
+  assert.match(blk, /altLabel: "打开为新项目"/, "用户丢掉的「替换整个项目」没有还回来");
+  assert.match(blk, /pick === "alt".*openFolder/s, "选了「打开为新项目」没有真的去打开");
+  assert.match(blk, /pick === "cancel"/, "取消必须什么都不做");
+  // 只对**文件夹**、且只在根上问；往子目录里放文件不该被打断。
+  assert.match(blk, /_dirs = items\.filter\(\(x\) => x\.isDir\)/, "问的条件必须是「拖的是文件夹」");
+});
+
+test("ioConfirm 的第三按钮是可选的，不影响老调用方", () => {
+  // 加第三个按钮时改的是共享组件。不给 altLabel 时必须仍然 resolve 布尔，
+  // 否则每一处 `if (await ioConfirm(...))` 都会因为拿到字符串 "cancel"（真值）而反转。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("function ioConfirm({"), src.indexOf("// ---- Global search ----"));
+  assert.match(fn, /altLabel = ""/, "altLabel 必须有默认空值");
+  assert.match(fn, /resolve\(altLabel \? returnValue : confirmed\)/,
+    "不给 altLabel 时必须仍返回布尔——否则老调用方的判断会反转");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

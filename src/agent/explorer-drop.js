@@ -68,49 +68,6 @@ export function dropDirFor({ rowPath = "", rowIsDir = false, rootPath = "" } = {
 }
 
 /**
- * 拖动**过程中**该给用户看什么：这一下的后果是什么、要高亮哪一行、标签写什么。
- *
- * 纯函数——不碰 DOM，调用方拿着结果去贴 class / 摆标签。单独拎出来是因为这段判断最容易
- * 错，而错了用户就会像这次一样「分不清会发生什么」，所以它必须能在 Node 里逐条断言。
- *
- * 入参：
- *   zone      —— "composer" | "explorer" | "open"（光标落在哪块区域）
- *   destDir   —— explorer 档算出的目标目录（落在文件行时已换成它的父目录）
- *   rootPath  —— 当前活动工作区根；空串 = 没打开项目
- *   items     —— [{ path, isDir }]，拖进来的东西。drag-enter 带 paths、over 不带，
- *                所以调用方要把 enter 那一帧的 paths 存下来复用。
- *
- * 返回 { kind, rowPath, title, sub }：
- *   kind      —— "copy" | "replace" | "openFile" | "ref" | "deny"，决定用哪套视觉
- *   rowPath   —— 要高亮的那一行（空串 = 没有行可高亮）
- *   title/sub —— 标签正文与副行；副行专门用来写**损失**（会关掉哪个项目）
- */
-export function dropFeedback({ zone = "", destDir = "", rootPath = "", items = [] } = {}) {
-  const list = Array.isArray(items) ? items.filter((x) => x && x.path) : [];
-  const n = list.length;
-  const many = n > 1 ? `${n} 项` : (n === 1 ? baseName(list[0].path) : "");
-  if (zone === "composer") {
-    return { kind: "ref", rowPath: "", title: n ? `引用到对话：${many}` : "引用到对话", sub: "只发给 AI，不写入磁盘" };
-  }
-  if (zone === "explorer") {
-    const dest = trimSlash(destDir);
-    if (!dest) return { kind: "deny", rowPath: "", title: "没有打开的项目", sub: "先打开一个文件夹" };
-    // 把文件夹拖进它自己/它的子目录：递归复制会自噬，落地一定被拒——**拖动时**就说清楚，
-    // 别等松手了才弹一句"复制失败"。
-    const self = list.find((x) => x.isDir && isInsideOrSame(dest, x.path));
-    if (self) return { kind: "deny", rowPath: dest, title: "不能放进它自己里面", sub: baseName(self.path) };
-    const where = dest === trimSlash(rootPath) ? `${baseName(rootPath) || "项目"}（项目根）` : baseName(dest);
-    return { kind: "copy", rowPath: dest, title: `复制到 ${where}`, sub: many };
-  }
-  // zone === "open"：文件 = 开个标签（无损）；文件夹 = 换掉整个工作区（有损，必须写明损失）。
-  const anyDir = list.some((x) => x.isDir);
-  if (!anyDir && n) return { kind: "openFile", rowPath: "", title: `在编辑器中打开：${many}`, sub: "" };
-  const cur = baseName(rootPath);
-  if (!cur) return { kind: "openFile", rowPath: "", title: n ? `打开项目：${many}` : "打开项目", sub: "" };
-  return { kind: "replace", rowPath: "", title: n ? `打开为新项目：${many}` : "打开为新项目", sub: `当前「${cur}」会被关闭` };
-}
-
-/**
  * 整批投放计划：给定拖进来的若干路径和目标目录，算出「从哪儿复制到哪儿」。
  *
  * items: [{ path, isDir }]，existingNames: 目标目录里已有的名字。
