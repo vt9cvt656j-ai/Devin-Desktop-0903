@@ -53222,6 +53222,15 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     run._resumeFact = `上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃）${w.files && w.files.length ? "，当时这些文件已改好并落盘：" + w.files.join("、") : ""}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
     _pad.findings.push(`上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃），当时任务：「${w.task || ""}」${w.files && w.files.length ? "；当时已改好并落盘：" + w.files.join("、") : ""}。接着未完成的部分继续，已落盘的改动别重做。`);
   }
+  // 同会话里点了停止/线路中断之后又继续（不是崩溃重启，走不到上面那条 _wfInterrupted）：
+  // 上一轮结算出的「已落盘」事实存进了 _lastRunState.breakWriteFact。以前它是靠拼进可见
+  // 正文的那条页脚顺带被模型在历史里读到的；页脚拿掉后，这里补一条 run._resumeFact，让
+  // 「别重写已落盘文件」照样经每轮必注入的〔执行状态〕喂到模型。crash 路已置则不覆盖。
+  if (isAgent && !run._resumeFact && session?._lastRunState?.breakWriteFact) {
+    const _bwf = String(session._lastRunState.breakWriteFact).slice(0, 300);
+    run._resumeFact = `上一轮在停止/中断前，${_bwf}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
+    _pad.findings.push(`上一轮停止/中断前，${_bwf}。接着未完成的部分继续，别重写已落盘的文件。`);
+  }
   function _padText() {
     const includeRequirements = _shouldIncludeRequirementsInPad(run, _pad);
     // The plan is the one live artifact the reasoner cannot see: run._planSteps is maintained,
@@ -53687,9 +53696,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 路是同一个洞（那条今天早些时候已经补上），只是触发方式是用户自己点的停止。
         if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
-        // 同上：按了停止，但这一轮流式阶段可能已经写了文件。用户最需要知道的恰恰是
-        // "我点停止之前，它到底改了什么"。
-        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
+        // 停止前的流式阶段可能已经落盘。结算在途写入（等它们落定），把「改了什么」记成
+        // **状态**（run._breakWriteFact → _lastRunState → 续跑时的 run._resumeFact），
+        // 不再拼进可见正文——那条〔中断前的写入结果〕是 harness 写的字，冒充模型输出；
+        // 中断时用户要看的是完整、自然的聊天记录本身，「改了哪些文件」照样以状态喂给模型。
+        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) run._breakWriteFact = _eagerNote; }
         break;
       }
       // The classifier ran in parallel with this visible model turn. Adopt it before any
@@ -53755,7 +53766,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 落了盘的文件在消息历史、run 摘要、账本里一个记录都没有。
         {
           const _eagerNote = await _settleEagerWritesForBreak(run);
-          if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+          // 「改了什么」记成状态（见上面停止那条的说明），不拼进可见正文。
+          if (_eagerNote) run._breakWriteFact = _eagerNote;
           // 同上：这条 break 也绕过了批处理里的记账。落了盘就得认，否则收尾按
           // 「本轮什么都没改」结算，未验证的代码被静默放行。
           let _landed = 0;
@@ -53814,7 +53826,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 字都没有——下一轮模型看不到"本次运行已落盘"清单，会把同一个文件再从头写一遍，
         // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
         const _eagerNote = await _settleEagerWritesForBreak(run);
-        if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
+        // 记成状态而非可见正文；插话后 run 继续，模型本就从每轮的运行草稿纸（_padText 带
+        // 「改过的文件」）看到落盘清单，这里不需要把页脚塞进聊天记录。
+        if (_eagerNote) run._breakWriteFact = _eagerNote;
         let _landed = 0;
         for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
           if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
@@ -57146,6 +57160,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
       result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
+      // 中断/停止前结算出的「已落盘」事实。以前它作为〔中断前的写入结果〕页脚拼进可见
+      // 正文（等于 harness 替模型说话），现在改成状态：只在这一轮**确实没跑完**时留存，
+      // 下一轮由 run._resumeFact 走每轮必注入的执行状态喂给模型（"别重写已落盘文件"）。
+      // 正常收尾（哪怕途中插过话）不留——否则新任务会莫名其妙收到"上一轮中断前已落盘"。
+      breakWriteFact: (finalErr || _stoppedEarly || run._incompleteReason)
+        ? String(run._breakWriteFact || "").replace(/^〔中断前的写入结果〕/, "").slice(0, 300) : "",
       // 收尾评审（_wrapUpCritic 那次付费调用）判"这段改动没实现用户要的东西"时,结论
       // 原来只进交付事实行——而那行如今只喂模型,且评审按设计**不拦回合**,所以运行通常
       // 就在这里结束,没有"下一轮"来读它。等于每次改代码都花一次模型调用,算出一个
