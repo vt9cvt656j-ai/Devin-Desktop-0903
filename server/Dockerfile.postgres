@@ -1,0 +1,51 @@
+# Postgres 17 + pgvector，**基于 alpine 自己编**。
+#
+# # 为什么不用官方的 pgvector/pgvector:pg17
+#
+# 它是 Debian 的（glibc），而这台机器的库是 `postgres:17-alpine`（musl）建起来的，
+# 且 `datlocprovider = c` —— 排序规则直接来自 C 库。musl 和 glibc 对 `en_US.utf8`
+# 的排序不一样：musl 的 locale 支持极简，实际接近字节序；glibc 是真正的 en_US 规则。
+# 换过去之后，**352 个 btree 索引全部按错误的顺序排列**，症状是查询悄悄漏行、
+# 唯一约束可能失效 —— 不报错，只是答案错。要修就得 REINDEX 整个库（3.7 GB，锁表）。
+#
+# 自己在 alpine 上编 pgvector，换的只有「多了一个扩展」这一件事：
+# 同一个基础镜像、同一个 libc、同一套排序规则，数据卷原样挂上去继续用，零 REINDEX。
+#
+# # 版本钉死
+#
+# 基础镜像和上游 tag 都钉住：`postgres:17-alpine` 浮动到下一个小版本时，PGDATA
+# 是向前兼容的，但**不写死会让「同一份 compose 在两台机器上跑出两个版本」**，
+# 而那正是排查 DB 问题时最费时间的一类不一致。要升版就改这里，改完当次部署就能看见。
+FROM postgres:17-alpine AS build
+
+# pgvector 的版本。改这里升级；不要用 master，那是个会动的目标。
+ARG PGVECTOR_VERSION=v0.8.1
+
+# **不编 JIT 位码**（with_llvm=no）。
+#
+# PGXS 在基础镜像开了 --with-llvm 时会额外为每个 .c 生成一份 .bc，用的是
+# `clang-<版本>`。alpine 的 clang 包不提供那个带版本号的名字，于是 .so 明明已经用 gcc
+# 编好了，构建却卡在位码那一步报 `make: clang-21: No such file or directory`。
+#
+# 关掉它不是绕过问题：那些 .bc 只给 JIT **内联**用，是锦上添花，pgvector 的向量运算
+# 本来就在 .so 里跑。换来的好处是这一层不再需要 clang/llvm —— 少装约 1 GB 的工具链，
+# 也不用再猜 alpine 这一版把 LLVM 叫什么（包名跟着 LLVM 主版本走，半年一变，
+# 写死一个数字等于给这份 Dockerfile 设了个静默的过期日）。
+RUN set -eux; \
+    apk add --no-cache --virtual .build-deps build-base git; \
+    git clone --branch "$PGVECTOR_VERSION" --depth 1 \
+        https://github.com/pgvector/pgvector.git /tmp/pgvector; \
+    cd /tmp/pgvector; \
+    # OPTFLAGS="" 关掉 -march=native：构建机和运行机可能不是同一台，
+    # 带 native 指令的 .so 在别的 CPU 上会直接 SIGILL。
+    make OPTFLAGS="" with_llvm=no; \
+    make OPTFLAGS="" with_llvm=no install; \
+    rm -rf /tmp/pgvector; \
+    apk del .build-deps
+
+# 单阶段就够：上面已经把编译依赖 apk del 掉了，剩下的只有 vector.so 和它的 SQL 脚本。
+# 分两阶段反而要手工挑文件，挑漏一个（比如 vector--*.sql）扩展就装不上。
+
+# 自检：镜像里必须真的有这个扩展。构建期就发现，比部署到一半发现好。
+RUN test -f "$(pg_config --pkglibdir)/vector.so" \
+    && ls "$(pg_config --sharedir)/extension/" | grep -q '^vector\.control$'

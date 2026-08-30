@@ -8,7 +8,14 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:17-alpine
+    # postgres:17-alpine + pgvector，自己编（见 Dockerfile.postgres 顶部：
+    # 官方 pgvector 镜像是 Debian/glibc，换过去会让这个库 352 个 btree 索引
+    # 按错误的排序规则排列——不报错，只是查询悄悄漏行）。
+    # 打了 tag：compose 认 image 名，下次 up 不会因为没找到而去 Docker Hub 拉一个同名的。
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    image: michael-postgres:17-alpine-pgvector
     restart: unless-stopped
     # CIS Docker: block in-container privilege escalation (setuid binaries can't
     # gain new caps) — a defense-in-depth blast-radius limiter if a service is RCE'd.
