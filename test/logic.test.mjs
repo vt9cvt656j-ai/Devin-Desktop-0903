@@ -36535,3 +36535,65 @@ test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜�
     "localStorage 镜像的两个写入点没有都盖上 savedAt",
   );
 });
+
+// ---------------------------------------------------------------------------
+// 界面缩放的上限按窗口算；两侧栏允许收缩，不许被裁到屏幕外
+// ---------------------------------------------------------------------------
+test("缩放上限跟着窗口走，小窗口不许放大到布局撑不住", () => {
+  const mk = (w, h) => load("_uiZoomCeiling", {
+    window: { innerWidth: w, innerHeight: h },
+    UI_MIN_EFFECTIVE_W: 640, UI_MIN_EFFECTIVE_H: 420, UI_ZOOM_MAX_HARD: 2,
+  })();
+
+  // 实测（探针页）：innerWidth 不随 zoom 变，有效布局宽度 = innerWidth / zoom。
+  // 三栏最小 140+200+240 ≈ 590，取 640 作下限。窗口最小 880 时：880/640 = 1.375 → 1.35。
+  const small = mk(880, 560);
+  assert.ok(small < 2, `最小窗口下仍允许放到 ${small} 倍 —— 有效宽度会掉到 ${Math.round(880 / small)}px，三栏放不下`);
+  assert.ok(880 / small >= 640, `按上限 ${small} 放大后有效宽度 ${Math.round(880 / small)}px，低于 640 的下限`);
+
+  // 大窗口照旧能放到硬上限 2。
+  assert.equal(mk(1920, 1080), 2, "大窗口被无谓地限制了");
+
+  // 高度也是判据之一：宽够高不够时同样要压。
+  assert.ok(mk(1920, 500) < 2, "只看了宽度，没看高度");
+
+  // **再小的窗口也必须允许 1.0**，否则「缩放复位」都做不到。
+  assert.equal(mk(200, 200), 1, "极小窗口把复位到 100% 也禁掉了");
+  // 量不到尺寸时不额外限制（别凭一个 0 把用户锁死）。
+  assert.equal(mk(0, 0), 2, "读不到窗口尺寸时不该限制");
+
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  // 上限必须真的接进 _applyUiZoom，不是算完不用。
+  const apply = stripJsComments(extractFn("_applyUiZoom"));
+  assert.match(apply, /_uiZoomCeiling\(\)/, "缩放没有用上按窗口算的上限");
+  assert.ok(
+    !/Math\.min\(2,\s*Math\.max\(0\.5/.test(apply),
+    "还在用写死的 2 做上限 —— 小窗口放大到 2 倍时助手栏会被裁出屏幕",
+  );
+  // 窗口被拉小时要把缩放拽回来，否则「先放大再拖窄」照样破。
+  assert.match(
+    stripJsComments(src),
+    /addEventListener\("resize",[\s\S]{0,160}_uiZoomCeiling\(\)/,
+    "窗口变小后没有重新钳制缩放",
+  );
+});
+
+test("两侧栏允许收缩，窄宽度下不被裁到屏幕外", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
+  const rule = (sel) => {
+    const m = css.match(new RegExp(sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{[^}]*\\}"));
+    assert.ok(m, `${sel} 的规则不见了`);
+    return m[0];
+  };
+  for (const sel of [".layout .explorer", ".layout .assistant"]) {
+    const r = rule(sel);
+    assert.ok(
+      !/flex:\s*none/.test(r),
+      `${sel} 又变回 flex: none —— 空间不够时它不收缩，助手栏会被 .layout 的 overflow:hidden 裁掉。` +
+        "实测：改回 none 之后 890px 以下就开始裁，允许收缩则 640px 都不裁",
+    );
+    assert.match(r, /min-width:\s*\d+px/, `${sel} 没有最小宽度，会被压成 0`);
+  }
+  // 编辑器守住自己的下限，收缩的是两侧。
+  assert.match(rule(".layout .editorwrap"), /min-width:\s*200px/);
+});

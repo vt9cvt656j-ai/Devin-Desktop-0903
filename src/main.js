@@ -9199,8 +9199,43 @@ async function _toggleFullScreen() {
   }
 }
 
+// 界面缩放的上下限。**上限不是常数，按窗口实际有多大算。**
+//
+// 实测（2026-08-29，探针页）：`window.innerWidth` **不随 zoom 变**，
+// `document.documentElement.clientWidth` 才是有效布局宽度，等于 innerWidth / zoom：
+//
+//     zoom 0.5 → clientWidth 1640      zoom 1 → 820      zoom 2 → 410
+//
+// 而主布局是三栏 flex，最小宽度 140（资源管理器）+ 200（编辑器）+ 240（助手）+ 两条
+// 分隔条 ≈ 590px，`.layout` 又是 `overflow: hidden`。窗口最小 880 时放大到 2 倍，
+// 有效宽度只剩 440 —— 助手栏被整个裁到屏幕外。用户原话「内容会乱飞」。
+//
+// 所以上限取「有效宽高都不低于这两个下限」能允许的最大倍数：
+const UI_MIN_EFFECTIVE_W = 640; // 三栏 590 之上留一点余量
+const UI_MIN_EFFECTIVE_H = 420;
+const UI_ZOOM_MIN = 0.5;
+const UI_ZOOM_MAX_HARD = 2;
+function _uiZoomCeiling() {
+  // innerWidth/innerHeight 与缩放无关（实测），所以它们就是「物理可用尺寸」。
+  const w = Number(window.innerWidth) || 0;
+  const h = Number(window.innerHeight) || 0;
+  if (!(w > 0 && h > 0)) return UI_ZOOM_MAX_HARD; // 量不到就不额外限制
+  const byW = w / UI_MIN_EFFECTIVE_W;
+  const byH = h / UI_MIN_EFFECTIVE_H;
+  // 下取到 0.05 一档，避免出现 1.3714 这种数字
+  const cap = Math.floor(Math.min(byW, byH) * 20) / 20;
+  // 再小的窗口也得允许 1.0，否则「缩放复位」都做不到。
+  return Math.max(1, Math.min(UI_ZOOM_MAX_HARD, cap));
+}
+
 async function _applyUiZoom(factor, { toast = true } = {}) {
-  _uiZoom = Math.min(2, Math.max(0.5, Math.round(factor * 100) / 100));
+  const ceiling = _uiZoomCeiling();
+  const want = Math.round(factor * 100) / 100;
+  _uiZoom = Math.min(ceiling, Math.max(UI_ZOOM_MIN, want));
+  // 撞到边界要说出来。原来到顶之后再按还是弹「界面缩放 200%」，
+  // 看起来像生效了、其实没动 —— 用户会一直按。
+  const atCeiling = want > _uiZoom;
+  const atFloor = want < _uiZoom;
   try { localStorage.setItem(_UI_ZOOM_KEY, String(_uiZoom)); } catch {}
   /*
    * 用 CSS 缩放，不用 WebView 的原生 setZoom。
@@ -9224,9 +9259,22 @@ async function _applyUiZoom(factor, { toast = true } = {}) {
     try { splitState?.editor?.layout?.(); } catch {}
     try { window.dispatchEvent(new Event("resize")); } catch {}
   });
-  if (toast) showToast(`界面缩放 ${Math.round(_uiZoom * 100)}%`);
+  if (toast) {
+    if (atCeiling) {
+      showToast(`已是当前窗口能放到的最大 ${Math.round(_uiZoom * 100)}% —— 再大三栏就放不下了，把窗口拉宽可以继续放大`);
+    } else if (atFloor) {
+      showToast(`已是最小 ${Math.round(_uiZoom * 100)}%`);
+    } else {
+      showToast(`界面缩放 ${Math.round(_uiZoom * 100)}%`);
+    }
+  }
 }
 if (_uiZoom !== 1) _applyUiZoom(_uiZoom, { toast: false });
+// 窗口被拉小时要把缩放拽回来：先在大窗口放到 2 倍、再把窗口拖窄，有效宽度会一路掉到
+// 布局撑不住的地步，而 `_applyUiZoom` 平时只在按快捷键时跑，没人重新算这个上限。
+window.addEventListener("resize", () => {
+  if (_uiZoom > _uiZoomCeiling()) _applyUiZoom(_uiZoom, { toast: false });
+});
 // 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），
 // 这里不再自己挂 keydown —— 自己挂的键在设置页里查不到也改不了。
 
