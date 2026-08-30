@@ -16,7 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
-import { summarizeTiming } from "../src/agent/turn-timing.js";
+import { summarizeTiming, summarizeIntentRace } from "../src/agent/turn-timing.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
@@ -9184,7 +9184,9 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
   // 窗口必须是那个具名常量，不是裸字面量：发送路径的第一轮等待从同一个常量推导，
   // 各写一个数就是上一次留下 1500 的方式——等待短于窗口，race 从此恒定由 timer 赢。
-  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), _INTENT_FOREGROUND_WAIT_MS\)/,
+  // 超时臂多了一笔胜负记账（_mark(false)）——模块里包着 try、调用点 typeof 兜底，
+  // 结构上不可能影响 resolve。被守的性质没变：超时臂只**放行**，不阻断发送。
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => \{ _mark\(false\); resolve\(null\); \}, _INTENT_FOREGROUND_WAIT_MS\)/,
     "前台采用窗口只限制采用、绝不阻断发送，且必须与第一轮等待同源");
   assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
     "前台超时不能取消或废弃仍在运行的物理判定");
@@ -35204,6 +35206,7 @@ function _epForLedger(entries, outcome = "success") {
     // 时间线汇总用真模块，不打桩：它的兜底行为（坏输入返回 null 而不是抛）本身就是
     // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
     _summarizeTiming: summarizeTiming,
+    _summarizeIntentRace: summarizeIntentRace,
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
