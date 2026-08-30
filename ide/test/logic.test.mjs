@@ -20658,7 +20658,11 @@ test("#47-4 退出 flush 仍同步全量，周期保存才分片+缓存", () => 
   assert.match(flush, /_chatSessionsForLocalStorage\(_chatSessions, _activeChatIdx, budget, textBudget\)/,
     "退出 flush 仍走全量序列化，不走分片缓存");
   assert.match(flush, /_closedChatSessionsForLocalStorage\(budget, textBudget\)/);
-  assert.match(flush, /JSON\.stringify\(\{ sessions: data, closedSessions, activeIdx: _activeChatIdx \}\)/);
+  // 允许尾部多带字段（现在有 `savedAt`，恢复时靠它比新旧）。这条守的是
+  // 「退出路径仍是**同步全量** JSON.stringify，不走分片/缓存」，不是字段清单。
+  assert.match(flush, /JSON\.stringify\(\{ sessions: data, closedSessions, activeIdx: _activeChatIdx[,}]/);
+  assert.match(flush, /savedAt: Date\.now\(\)/,
+    "退出时写的镜像没盖时间戳 —— 下次启动没法判它比主存档新，会被旧存档盖掉");
   const persist = extractFn("_persistChatHistoryOnce");
   assert.match(SRC, /const _PERSIST_SLICE_BUDGET_MS = 50/);
   assert.match(persist, /_cachedSessionMirrorJson\(/,
@@ -36457,5 +36461,77 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
   assert.ok(
     /b\.title = text\.replace/.test(body) && /sendPrompt\(send\)/.test(body),
     "title 或点击发送被换成了短标签 —— 那是把内容真的丢了，不是只缩显示",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
+// ---------------------------------------------------------------------------
+test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
+  const merge = load("_mergeChatArchives", {
+    _archiveHasChats: load("_archiveHasChats", {}),
+    _mergeArchiveList: load("_mergeArchiveList", { _archiveMsgCount: load("_archiveMsgCount", {}) }),
+  });
+  const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
+
+  // 事故形状：退出时同步写的镜像里有一个会话，几分钟前的 SQLite 快照里没有。
+  // 原来的判据是「主存档非空就用它」—— 那个会话就此消失。
+  const primary = { sessions: [sess("a", 5)], closedSessions: [], activeIdx: 0 };
+  const mirror = { sessions: [sess("a", 5), sess("b", 3)], closedSessions: [], activeIdx: 1 };
+  const merged = merge(primary, mirror);
+  assert.deepEqual(merged.sessions.map((s) => s.id), ["a", "b"], "镜像里独有的会话被丢了");
+
+  // 同一个会话两边都有：谁的消息多要谁（退出瞬间的镜像通常更全）。
+  const newer = merge(
+    { sessions: [sess("a", 2)], closedSessions: [], activeIdx: 0 },
+    { sessions: [sess("a", 9)], closedSessions: [], activeIdx: 0 },
+  );
+  assert.equal(newer.sessions.length, 1, "同一个会话被复制成两条");
+  assert.equal(newer.sessions[0].memory.recent.length, 9, "没取消息更多的那份");
+
+  // 反向：主存档更全时不许被镜像降级 —— 镜像是按 media/text 预算截断过的。
+  const richer = merge(
+    { sessions: [sess("a", 9)], closedSessions: [], activeIdx: 0 },
+    { sessions: [sess("a", 2)], closedSessions: [], activeIdx: 0 },
+  );
+  assert.equal(richer.sessions[0].memory.recent.length, 9, "主存档被更瘦的镜像盖掉了");
+
+  // 一边为空时原样返回另一边。
+  const onlyMirror = merge({ sessions: [], closedSessions: [], activeIdx: 0 }, mirror);
+  assert.equal(onlyMirror.sessions.length, 2);
+  const onlyPrimary = merge(primary, { sessions: [], closedSessions: [], activeIdx: 0 });
+  assert.equal(onlyPrimary.sessions.length, 1);
+
+  // 关闭的会话同样合并 —— 「关过的对话」也是用户回得去的历史。
+  const closed = merge(
+    { sessions: [sess("a", 1)], closedSessions: [sess("x", 4)], activeIdx: 0 },
+    { sessions: [sess("a", 1)], closedSessions: [sess("x", 4), sess("y", 2)], activeIdx: 0 },
+  );
+  assert.deepEqual(closed.closedSessions.map((s) => s.id), ["x", "y"]);
+
+  // activeIdx 不许越界（合并后条数会变）。
+  assert.ok(merged.activeIdx >= 0 && merged.activeIdx < merged.sessions.length);
+
+  // 纯函数对了还不算：恢复流程必须真的**每次都读镜像**并调用它。
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const restore = stripJsComments(extractFn("restoreChatHistory"));
+  assert.ok(
+    /saved = _mergeChatArchives\(saved, _mirror\)/.test(restore),
+    "恢复流程没有合并两份存档",
+  );
+  // **正向钉「读镜像这一步前面没有任何条件」。**
+  //
+  // 上一版写的是负向正则（「不许出现 if (!hasSavedChats(saved)) { try {」），变异实测是
+  // 绿的：把守卫改成 `if (!hasSavedChats(saved)) try {`（少一对花括号）就绕过去了，
+  // 而那恰恰就是要修的那个 bug 本身。负向断言只能挡住它想到的那一种写法。
+  assert.match(
+    restore,
+    /let _mirror = null;\s*try \{\s*const raw = localStorage\.getItem\(CHAT_STORE_KEY\);/,
+    "读 localStorage 镜像被加了条件 —— 主存档一非空就再也看不到它，正是丢会话的老路",
+  );
+  // 镜像必须带时间戳，否则将来没法判新旧。
+  assert.ok(
+    /savedAt: Date\.now\(\)/.test(src) && /"savedAt":\$\{Date\.now\(\)\}/.test(src),
+    "localStorage 镜像的两个写入点没有都盖上 savedAt",
   );
 });
