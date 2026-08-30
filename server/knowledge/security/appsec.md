@@ -469,7 +469,10 @@ for (const { address } of addrs) if (isPrivate(address)) reject();
 - **Integrity**: use lockfile hashes / Subresource Integrity (SRI) for CDN `<script>`/`<link>`; verify checksums/signatures of downloaded binaries; prefer signed releases.
 - **Build/CI security**: least-privilege CI tokens, don't echo secrets in logs, protect the pipeline (it can push to prod). Beware compromised actions/plugins; pin third-party CI actions to a commit SHA, not a mutable tag.
 - Keep runtimes/base images patched; scan container images; prefer minimal/distroless bases. Remove dev tooling and secrets from production images.
-- Track your dependencies (SBOM) so you can respond fast when a new CVE drops.
+- Track your dependencies (SBOM) so you can respond fast when a new CVE drops. To look a CVE up on
+  demand — is dependency X vulnerable, what does CVE-YYYY-NNNN affect — use the built-in `cve_search`
+  tool (e.g. `cve_search(query='lodash prototype pollution')` or `cve_search(query='CVE-2021-44228')`);
+  it hits the NVD/CVE database directly, no external service or Kali install needed.
 
 ## OWASP Top 10 (2021) Quick Reference
 

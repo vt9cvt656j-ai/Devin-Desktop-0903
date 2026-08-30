@@ -179,8 +179,26 @@ CREATE TABLE usage_aggregates (
 );
 
 -- Aggregate on insert (or batch job)
--- Report to Stripe: stripe.subscriptionItems.createUsageRecord(si_id, { quantity, timestamp, action: 'set' })
+-- Report to Stripe with Billing Meters (the old subscriptionItems.createUsageRecord is gone
+-- from current Stripe SDKs — calling it throws, it is not just deprecated):
+--   await stripe.billing.meterEvents.create({
+--     event_name: 'api_calls',                       // must match the Meter's event_name
+--     payload: { stripe_customer_id: cus_id, value: String(quantity) },
+--     identifier: idempotency_key,                   // reuse usage_events.idempotency_key → retries dedupe
+--   })
 ```
+
+**Set the meter up before you can bill on it.** In Stripe, create the *Meter* first (it owns the
+`event_name` and the aggregation — sum/count/last), then create a *Price* that references that meter,
+then subscribe the tenant to that Price. A metered Price cannot be created against a meter that does
+not exist yet, so this order is not optional.
+
+**Meter events are keyed by customer, not by subscription item.** You no longer look up a
+`subscription_item` id to report usage — send `stripe_customer_id` and Stripe attributes the usage to
+whichever metered subscription that customer holds. Keep `identifier` = your local idempotency key:
+Stripe dedupes on it, which is what makes a retried aggregation job safe. Meter events are eventually
+consistent (seconds, not instant), so never read them back to compute a hard quota gate — gate on your
+own `usage_aggregates` table and treat Stripe as the billing sink.
 
 ### Credits / Prepaid Ledger
 ```sql

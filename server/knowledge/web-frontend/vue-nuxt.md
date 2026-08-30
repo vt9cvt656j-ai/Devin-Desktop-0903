@@ -1,6 +1,6 @@
 # Web Frontend (Vue 3 / Nuxt 3)
 
-> Opinionated, battle-tested defaults for building Vue 3 + Nuxt 3 frontends. When in doubt, follow the RIGHT DEFAULT given here. Assume Vue 3.4+, Nuxt 3.10+, Vite, TypeScript, and `<script setup>` everywhere.
+> Opinionated, battle-tested defaults for building Vue 3 + Nuxt 3 frontends. When in doubt, follow the RIGHT DEFAULT given here. Assume Vue 3.5+, Nuxt 4, Vite, TypeScript, and `<script setup>` everywhere unless told otherwise (Nuxt 3.1x only when you've confirmed the project is on it — Nuxt 4 moved app code under `app/`, so check the directory layout and `package.json` before writing paths).
 
 ## Composition API: ref vs reactive, computed, watch — the decision tree
 

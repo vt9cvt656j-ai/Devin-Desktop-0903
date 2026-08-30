@@ -12,7 +12,7 @@ Goal: small, reproducible, secure images that build fast and leak nothing.
 
 ```dockerfile
 # ---- builder ----
-FROM node:20.11.1-bookworm-slim AS builder
+FROM node:22.23.2-bookworm-slim AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci                      # full deps incl. devDependencies for build
@@ -20,7 +20,7 @@ COPY . .
 RUN npm run build               # produces /app/dist
 
 # ---- runtime ----
-FROM node:20.11.1-bookworm-slim AS runtime
+FROM node:22.23.2-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
@@ -52,7 +52,9 @@ Dockerfile
 .dockerignore
 ```
 
-**Pin base image versions — never `FROM node:latest`.** `latest` is a moving target: a rebuild months later silently pulls a new major version and breaks you. Pin to a specific tag (`node:20.11.1-bookworm-slim`); for true reproducibility pin the digest (`node:20.11.1-bookworm-slim@sha256:...`). Prefer `-slim` or `-alpine` (smaller attack surface) but know alpine uses musl libc — some native deps misbehave; `distroless` is even smaller but harder to debug (no shell).
+**Pin base image versions — never `FROM node:latest`.** `latest` is a moving target: a rebuild months later silently pulls a new major version and breaks you. Pin to a specific tag (`node:22.23.2-bookworm-slim`); for true reproducibility pin the digest (`node:22.23.2-bookworm-slim@sha256:...`). Prefer `-slim` or `-alpine` (smaller attack surface) but know alpine uses musl libc — some native deps misbehave; `distroless` is even smaller but harder to debug (no shell).
+
+**A pin must still be inside the runtime's official support window — re-check once per LTS cycle.** Pinning is the easy half; the trap is that a pin never expires on its own, so a repo quietly ends up frozen on a runtime that stopped getting security patches (Node 20 went EOL 2026-04-30, and plenty of Dockerfiles still say `node:20.x` today). Rule: pin to an even-numbered Node major that is still Active LTS or Maintenance LTS, never an odd/current release, and put a calendar check on the EOL date. Node 22 (`Jod`) is supported through 2027-04-30; Node 24 (`Krypton`) through 2028-04-30 — when 22 falls out, move the pin, don't renew it. Same rule for every base image (Python, Go, JDK, distro): the version number in this file is a snapshot, the support window is the actual rule. Check `nodejs.org/en/about/previous-releases` (or the equivalent upstream schedule) rather than trusting any number written in a doc, including this one.
 
 **Run as non-root.** Containers run as root by default; a container escape then has root on shared kernel resources. Create or use an unprivileged user.
 
@@ -243,7 +245,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20.11.1"
+          node-version: "22.23.2"
           cache: "npm"               # caches ~/.npm keyed on package-lock.json
       - run: npm ci
       - run: npm run lint

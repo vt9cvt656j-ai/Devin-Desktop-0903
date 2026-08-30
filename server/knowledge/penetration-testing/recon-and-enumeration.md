@@ -55,9 +55,18 @@ onesixtyone 10.10.10.10 public ; snmpwalk -v2c -c public 10.10.10.10
 ```
 
 ## Triage → vulnerability mapping
+For each service+version you fingerprinted, first check for known CVEs. **Prefer the built-in
+`cve_search` tool** — it queries the NVD/CVE database directly and needs no Kali install, so it works
+on any machine:
+```
+cve_search(query='apache 2.4.49')      # known CVEs straight from NVD — no local tooling required
+```
+When you are on a box with the Kali toolchain, these local tools supplement it (offline PoC copies,
+active probing) but are not the first stop:
 ```sh
-searchsploit "apache 2.4.49"          # known exploits for a version (Exploit-DB, offline)
+searchsploit "apache 2.4.49"          # local Exploit-DB PoCs for a version (needs exploitdb installed)
 searchsploit -m 50383                  # copy an exploit locally to read/use
+nuclei -u http://10.10.10.10 -tags cve # template-based active checks (needs nuclei installed)
 nmap --script vuln 10.10.10.10         # NSE vuln scripts (noisy — use targeted)
 ```
 For each service+version, ask: known CVE? default/weak creds? misconfig (anon access, dir listing,

@@ -1,6 +1,6 @@
 # Web Frontend (React / Next.js)
 
-> Opinionated, battle-tested defaults for building React + Next.js (App Router) frontends. When in doubt, follow the RIGHT DEFAULT given here. Assume React 18/19 and Next.js 14/15 App Router unless told otherwise.
+> Opinionated, battle-tested defaults for building React + Next.js (App Router) frontends. When in doubt, follow the RIGHT DEFAULT given here. Assume React 19 and Next.js 15/16 App Router unless told otherwise (React 18 / Next 14 only when you've confirmed the project is on them — check `package.json` before using version-gated APIs).
 
 ## React state: useState vs useReducer vs Context vs a store (the decision tree)
 
@@ -420,7 +420,10 @@ PITFALLS: using flexbox to fake a grid (wrapping + manual widths) when CSS Grid 
 <h1 className="text-2xl md:text-4xl">…</h1>
 ```
 
-- **Dark mode:** add `dark:` variants and toggle the `dark` class on `<html>`. In Tailwind set `darkMode: 'class'` (or `'selector'`) so YOU control it (theme switch + system default), not just `prefers-color-scheme`.
+- **Dark mode:** add `dark:` variants and toggle the `dark` class on `<html>` so YOU control it (theme switch + system default), not just `prefers-color-scheme`. How you enable that toggle depends on the Tailwind major, and the wrong one fails silently (no build error — `dark:` simply never matches):
+  - **Tailwind v4** — there is no `darkMode` option and `tailwind.config.js` is not read by default. Declare the variant in your CSS next to `@import "tailwindcss"`: `@custom-variant dark (&:where(.dark, .dark *));`. Theme tokens go in an `@theme { … }` block in the same file, not in a JS config.
+  - **Tailwind v3 (legacy projects)** — `darkMode: 'class'` (or `'selector'`) in `tailwind.config.js`, tokens under `theme.extend`.
+  - Tell which you're on before writing either: `@import "tailwindcss"` in the CSS ⇒ v4; `@tailwind base;` ⇒ v3. Check `package.json` if the CSS is ambiguous.
 - Theme via design tokens: prefer semantic colors (`bg-background text-foreground`, often CSS variables) over hardcoding `bg-white dark:bg-gray-900` in 50 places. shadcn/ui sets this up well.
 
 ```tsx

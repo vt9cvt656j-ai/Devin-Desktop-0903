@@ -57,8 +57,9 @@ const { data, isLoading } = useQuery({
 ## Styling Rules (Tailwind-First)
 - Default to Tailwind utility classes
 - shadcn/ui for common components (Button, Input, Card, Dialog, etc.)
-- Project theme via `tailwind.config` — include in context
-- Dark mode: `dark:` variant classes, system preference via `class` strategy
+- **Check the Tailwind major before writing any theme/config code** — v3 and v4 are configured in different files and the wrong one is silently ignored (no error, styles just never apply). `package.json` → `tailwindcss` version, or: a `@import "tailwindcss"` in the CSS means v4, a `@tailwind base/components/utilities` triple means v3.
+- Project theme — **v4**: tokens live in CSS, in an `@theme { --color-brand-500: oklch(...); --font-display: ...; }` block beside `@import "tailwindcss"`. There is no `tailwind.config.js` by default and none is read unless the project opts back in with `@config "./tailwind.config.js"`. **v3 (legacy projects)**: `tailwind.config.js` → `theme.extend`. Either way, put the project's actual theme source in context before generating.
+- Dark mode — **v4**: no `darkMode` key exists; declare the variant yourself in CSS, `@custom-variant dark (&:where(.dark, .dark *));`, then use `dark:` utilities and toggle `.dark` on `<html>`. **v3 (legacy projects)**: `darkMode: 'class'` (or `'selector'`) in `tailwind.config.js`. Both give YOU control (theme switch + system default) instead of raw `prefers-color-scheme`.
 - Custom CSS only for: complex animations, pseudo-elements, third-party overrides
 
 ## Testing
