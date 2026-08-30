@@ -1,1 +1,0 @@
-import{Xc as e,Yc as t}from"./vendor-DXElHJaw.js";e();export{t as check};

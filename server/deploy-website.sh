@@ -23,6 +23,14 @@
 #      exact filename index.html points at has to be readable by nginx first. This is not
 #      hypothetical — it took the site down once, and the run reported "deployed."
 #
+#   5. `public/app/` 是**手工同步**的 IDE 构建产物，不是这次构建生成的。它落后过两周半
+#      （561 个提交），根因是它得用 `--base=/app/` 构建、而那个参数只存在于某个人的记忆里：
+#      默认 base 产出的 index.html 引 `/assets/...`，放到 `/app/` 下全部 404，白屏。
+#      现在有 `npm run build:web` 了（ide/package.json），发站点前先在 ide/ 跑它。
+#      判据不是「记得跑」——下面第 6 条会当场拦住忘了跑的那次。
+#   6. 归档里 `app/index.html` 引的每个资源都必须真的在归档里。第 4 条守的是站点自己的
+#      index.html，这一条守内嵌 IDE 的：两者是两个独立的 bundle，各有各的白屏方式。
+#
 # The site is served straight out of this directory by sites-enabled/mrday-site; there is
 # no container to restart and no cache to bust beyond the browser's.
 set -euo pipefail
@@ -92,6 +100,15 @@ COPYFILE_DISABLE=1 tar --no-xattrs -czf /tmp/mrday-site.tgz -C dist -T /tmp/mrda
 # 上面那个故障能潜伏这么久，就是因为没人检查过归档内容。检查一次，成本是两行。
 tar -tzf /tmp/mrday-site.tgz | grep -qx 'app/index.html' \
   || { echo "✗ 归档里没有 app/index.html —— 嵌入的 IDE 又会停在旧 bundle 上"; exit 1; }
+# 内嵌 IDE 的 index.html 指名了它自己那套 content-hash 资源。少一个就是白屏，而且是
+# **只有网页版用户看得见**的白屏——桌面端走的是另一份产物，本地怎么点都是好的。
+_APP_HTML="$(tar -xzOf /tmp/mrday-site.tgz app/index.html)"
+for _ref in $(printf '%s' "$_APP_HTML" | grep -oE '(src|href)="/app/[^"]+"' | sed 's/.*"\/app\/\(.*\)"/\1/'); do
+  tar -tzf /tmp/mrday-site.tgz | grep -qx "app/$_ref" \
+    || { echo "✗ app/index.html 引的 app/$_ref 不在归档里 —— 网页版会白屏。"; \
+         echo "   多半是忘了在 ide/ 跑 npm run build:web（它带 --base=/app/）。"; exit 1; }
+done
+echo "==> 内嵌 IDE 的资源引用齐全（$(printf '%s' "$_APP_HTML" | grep -coE '(src|href)="/app/[^"]+"') 个）"
 tar -tzf /tmp/mrday-site.tgz | grep -qx 'index.html' \
   && { echo "✗ 归档里含站点根 index.html —— 它必须留到 bundle 验证通过后再单独上传"; exit 1; }
 "${SCP[@]}" -q /tmp/mrday-site.tgz "$REMOTE:$STAGE_DIR/site.tgz"
