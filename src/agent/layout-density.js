@@ -1,28 +1,44 @@
 // 三栏布局的自适应档位：窗口越窄，两条侧栏让得越多，中间编辑区才留得住。
 //
-// # 为什么量的是物理宽度
+// # 为什么量的是 window.innerWidth
 //
-// 界面缩放走 `documentElement.style.zoom`（见 main.js 的 _applyUiZoom），1 CSS px 会变成
-// zoom 个物理像素。app.css 里三栏的宽度已经除以 `--ui-zoom`，各栏的**物理**宽度因此与
-// 缩放无关 —— 缩放只把字和图标变大变小，谁占屏幕多少始终不变。
+// 界面缩放走 `documentElement.style.zoom`（见 main.js 的 _applyUiZoom）。app.css 里三栏的
+// 宽度已经除以 `--ui-zoom`，各栏占屏幕的比例因此与缩放无关 —— 缩放只把字和图标变大变小。
 //
-// 档位要是再按 CSS 像素分（媒体查询量的就是 CSS 像素 = 物理 / 缩放），等于把缩放算了
-// 两次：放大一次、档位又缩一次，窄窗口里一放大侧栏反而更小。所以这里读的是
-// `window.innerWidth` —— 实测它不随 zoom 变，就是物理可用宽度。
+// 档位要是再按布局视口（媒体查询量的就是它，= 屏宽 / 缩放）分，等于把缩放算了两次：
+// 放大一次、档位又缩一次，窄窗口里一放大侧栏反而更小。所以这里读 `window.innerWidth`，
+// 它不随 zoom 变。
+//
+// 注意它**不是设备像素**：HiDPI 屏和 Windows 的显示缩放都由 devicePixelRatio 吸收
+//（实测这台 mac：dpr=2、screen.width=1728、innerWidth 与之同一口径）。它是「未经界面
+// 缩放的 CSS 像素」，各平台口径一致 —— 正因如此才适合拿来分档。
 //
 // # 为什么住在这里而不是 main.js
 //
 // main.js 有行数闸（test/main-size-budget.test.mjs），仓库规矩是「撞线先腾地方」。
 // 这段只依赖参数、没有模块级可变状态，正好搬得动，也因此能被单独测。
 
-/** [触发宽度(物理 px), 档位名]，从宽到窄。窗口宽度小于哪一档就取哪一档，取最后命中的。 */
+/**
+ * 窄端：宽度**小于**这些值时依次让位。从宽到窄，取最后命中的一档。
+ */
 export const LAYOUT_DENSITY_STEPS = [[1180, "narrow"], [980, "tight"], [780, "min"]];
 
-/** 纯函数：给定物理宽度，算出档位名（宽窗口返回空串 = 不设档）。 */
-export function layoutDensityStep(width, steps = LAYOUT_DENSITY_STEPS) {
+/**
+ * 宽端：宽度**不小于**这些值时把侧栏的默认宽度调大。从窄到宽，同样取最后命中的一档。
+ *
+ * 大屏是窄屏的同一个问题掉了个头：2K/4K 上 250px 的侧栏细得像条缝，助手栏 440px 装不下
+ * 一段代码。这一档改的是默认宽度，用户拖过的宽度永远优先（见 app.css 里的两层 var）。
+ */
+export const LAYOUT_WIDE_STEPS = [[2200, "wide"], [3000, "xwide"]];
+
+/** 纯函数：给定窗口宽度，算出档位名（不命中任何一档时返回空串 = 用默认布局）。 */
+export function layoutDensityStep(width, steps = LAYOUT_DENSITY_STEPS, wide = LAYOUT_WIDE_STEPS) {
   const w = Number(width) || 0;
+  if (!(w > 0)) return "";
   let step = "";
-  if (w > 0) for (const [px, name] of steps) if (w < px) step = name;
+  for (const [px, name] of steps) if (w < px) step = name;
+  if (step) return step;                       // 窄端优先：两端不可能同时命中
+  for (const [px, name] of wide) if (w >= px) step = name;
   return step;
 }
 
@@ -43,20 +59,26 @@ export function applyLayoutDensity(width, rootEl) {
 }
 
 /*
- * 视口尺寸有**两种口径，绝不能混用**：
+ * 视口尺寸有**两种口径，绝不能混用**。而且两个引擎的行为**是反的** —— 这一点必须写在
+ * 代码里，否则在 mac 上验对的东西到 Windows 上会以另一种方式错。
  *
- *   · `window.innerWidth/Height` —— **物理**像素，不随界面缩放变（实测 2026-08-29）。
- *   · `documentElement.clientWidth/Height` —— **CSS** 像素 = 物理 / 缩放，也就是布局坐标系。
+ * 实测（2026-08-30，同一段探针：把 zoom 设成 1.4，量一个 width:100px 的元素）：
  *
- * `getBoundingClientRect()`、`clientX/Y`、`style.left/top` 全都是 CSS 像素。所以任何
- * 「把一个矩形夹进视口」的计算都必须用后者。
+ *   引擎                           rect.width   innerWidth   clientWidth
+ *   WebKit / WKWebView（mac）         100          不变       ÷1.4 变小
+ *   Chromium / WebView2（Windows）    140          不变         不变
  *
- * 混用的后果就是用户看到的那一幕：放到 140% 时 innerWidth 比实际布局宽度大 40%，
- * `Math.min(r.left, innerWidth - w - 8)` 这个上界永远大于 r.left，夹取一次都不触发，
- * 模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角 ——「放大缩小其他 UI 内容也都会乱飞」。
+ * 也就是说：WebKit 的 rect 是**未缩放**的 CSS 像素，视口在这套单位下是 clientWidth；
+ * Chromium 的 rect 是**已缩放**的，视口在这套单位下是 innerWidth（此时它正好等于
+ * clientWidth）。
  *
- * 反过来，只有两处该用物理口径：缩放上限（问的是「这块屏幕有多大」）和上面的自适应
- * 档位（问的是「这块屏幕能放下几栏」）。这两处都在注释里写明了。
+ * 所以 `clientWidth` 在**两个引擎上都对**：mac 上它是唯一正确的那个，Windows 上它恰好
+ * 等于 innerWidth，取谁都一样。反过来取 innerWidth 就只在 Windows 上对 —— 那正是用户在
+ * mac 上看到的：放到 140% 时 `Math.min(r.left, innerWidth - w - 8)` 的上界永远大于 r.left，
+ * 夹取一次都不触发，模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角。
+ *
+ * 反过来，只有两处该用 innerWidth：缩放上限和上面的自适应档位。它们问的都是「这块屏幕
+ * 有多大」，要的就是那个不随缩放变的数，跟布局坐标系无关。
  */
 export function viewportW() {
   const el = typeof document !== "undefined" ? document.documentElement : null;

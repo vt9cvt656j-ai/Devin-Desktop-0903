@@ -602,13 +602,15 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
    照样按 CSS 像素算，等于又多吃一份。
    --------------------------------------------------------------------------- */
 .layout .explorer {
-  width: calc(var(--sidebar-w, 250px) / var(--ui-zoom, 1));
+  /* `--sidebar-w` 是用户拖分隔条存下来的；没拖过时落到 `--sidebar-w-default`，
+     而那个默认值按屏幕大小分档（见下）—— 4K 上还端 250px 会细得像条缝。 */
+  width: calc(var(--sidebar-w, var(--sidebar-w-default, 250px)) / var(--ui-zoom, 1));
   min-width: calc(140px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
 }
 .layout .assistant {
-  width: calc(var(--assistant-w, 440px) / var(--ui-zoom, 1));
+  width: calc(var(--assistant-w, var(--assistant-w-default, 440px)) / var(--ui-zoom, 1));
   min-width: calc(240px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
@@ -629,6 +631,15 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
 :root[data-layout="tight"] .layout .assistant { max-width: calc(330px / var(--ui-zoom, 1)); }
 :root[data-layout="min"] .layout .explorer { max-width: calc(165px / var(--ui-zoom, 1)); }
 :root[data-layout="min"] .layout .assistant { max-width: calc(290px / var(--ui-zoom, 1)); }
+
+/* 大屏是**另一头**的同一个问题：2K/4K 上 250px 的侧栏细得像条缝，助手栏 440px 装不下
+   一段代码，而中间的编辑区宽到一行能排一百多个字符，眼睛要来回扫。
+
+   这里改的是**默认值**（`--sidebar-w-default`），不是 `--sidebar-w` 本身：后者是用户拖出来
+   的，一旦拖过就永远优先。所以「没拖过的人在大屏上得到合适的默认宽度，拖过的人保持
+   自己的选择」两件事同时成立。 */
+:root[data-layout="wide"] { --sidebar-w-default: 300px; --assistant-w-default: 520px; }
+:root[data-layout="xwide"] { --sidebar-w-default: 340px; --assistant-w-default: 620px; }
 .layout .editorwrap {
   flex: 1;
   /* 同上：下限也按物理像素算，否则放大时它跟着变大，反而更早撑爆。 */

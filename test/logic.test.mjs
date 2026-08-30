@@ -16,7 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
-import { summarizeTiming, summarizeIntentRace } from "../src/agent/turn-timing.js";
+import { summarizeTiming } from "../src/agent/turn-timing.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
@@ -9184,9 +9184,7 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
   // 窗口必须是那个具名常量，不是裸字面量：发送路径的第一轮等待从同一个常量推导，
   // 各写一个数就是上一次留下 1500 的方式——等待短于窗口，race 从此恒定由 timer 赢。
-  // 超时臂现在多了一笔胜负记账（_mark(false)）——它包在 try 里、且 typeof 兜底，
-  // 结构上不可能影响 resolve。被守的性质没变：超时臂只**放行**，不阻断发送。
-  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => \{ _mark\(false\); resolve\(null\); \}, _INTENT_FOREGROUND_WAIT_MS\)/,
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), _INTENT_FOREGROUND_WAIT_MS\)/,
     "前台采用窗口只限制采用、绝不阻断发送，且必须与第一轮等待同源");
   assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
     "前台超时不能取消或废弃仍在运行的物理判定");
@@ -35206,7 +35204,6 @@ function _epForLedger(entries, outcome = "success") {
     // 时间线汇总用真模块，不打桩：它的兜底行为（坏输入返回 null 而不是抛）本身就是
     // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
     _summarizeTiming: summarizeTiming,
-    _summarizeIntentRace: summarizeIntentRace,
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
@@ -36853,6 +36850,59 @@ test("方案文档保留全部小节，只摘掉开场白和结尾那句征询",
   assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
 });
 
+test("浮层定位一律按 CSS 视口夹取，不许混进物理像素", () => {
+  // 视口有两种口径：window.innerWidth/Height 是**物理**像素（不随界面缩放变，实测），
+  // documentElement.clientWidth/Height 是 **CSS** 像素 = 物理 / 缩放，也就是布局坐标系。
+  // getBoundingClientRect / clientX / style.left 全是 CSS 像素，所以任何「把矩形夹进视口」
+  // 的算式都必须用后者。混用的后果：放到 140% 时 innerWidth 比布局宽度大 40%，
+  // Math.min(r.left, innerWidth - w - 8) 这个上界永远大于 r.left，夹取一次都不触发，
+  // 模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角 ——「放大缩小其他 UI 内容也都会乱飞」。
+  //
+  // 这条是**全文件不变量**，不是逐个调用点的断言：新加一个浮层时照抄旧写法是最可能的
+  // 复发路径，逐点断言拦不住新写的那一个。
+  // 用 RAW_SRC（main.js + src/agent/ 下每个模块拼起来），不自己读 main.js：搬模块时
+  // 自读会假红，反向断言还会悄悄失效 —— wiring.test.mjs 那道闸拦的就是这个。拼起来也
+  // 更严：以后把某个浮层搬进模块，这条照样管得着。
+  let rest = RAW_SRC;
+  // 该用物理口径的，各自问的都是「这块屏幕有多大」，与布局坐标系无关；
+  // viewportW/H 自己的兜底也在里面（量不到 CSS 视口时退回 innerWidth，总比返回 0 强）。
+  for (const name of ["_uiZoomCeiling", "_applyLayoutDensity", "viewportW", "viewportH"]) {
+    const src = extractFn(name);
+    assert.ok(rest.includes(src), `${name} 不见了 —— 白名单失效，这条断言会变成恒真`);
+    rest = rest.replace(src, "");
+  }
+  // 这两行住在 src/agent/browser-page-scripts.js：那段是**注进目标网页**执行的，
+  // 那边没有我们的界面缩放，innerWidth 就是它自己的视口，是对的。
+  const ALLOW = new Set([
+    "var W = window.innerWidth || document.documentElement.clientWidth || 1;",
+    "var H = window.innerHeight || document.documentElement.clientHeight || 1;",
+  ]);
+  const hits = (stripJsComments(rest).match(/.*window\.inner(?:Width|Height).*/g) || [])
+    .map((l) => l.trim()).filter((l) => l && !ALLOW.has(l));
+  assert.deepEqual(hits, [],
+    "这些地方还在用物理像素夹 CSS 坐标 —— 放大后浮层会飞出屏幕，改用 viewportW()/viewportH()");
+});
+
+test("viewportW/H 取的是 CSS 视口，不是物理像素", async () => {
+  const m = await import("../src/agent/layout-density.js");
+  const prevDoc = globalThis.document, prevWin = globalThis.window;
+  try {
+    // 放大到 140% 时的真实形状：物理 1400×980，布局坐标系只有 1000×700。
+    globalThis.document = { documentElement: { clientWidth: 1000, clientHeight: 700 } };
+    globalThis.window = { innerWidth: 1400, innerHeight: 980 };
+    assert.equal(m.viewportW(), 1000, "取到了物理宽度 —— 夹取会失效，浮层飞出屏幕");
+    assert.equal(m.viewportH(), 700, "取到了物理高度");
+    // documentElement 量不到时（嵌入场景、测试台）才退回 innerWidth，总比返回 0 强：
+    // 0 会让 `min(x, 0 - w - 8)` 变成一个负上界，浮层被推到屏幕外。
+    globalThis.document = { documentElement: { clientWidth: 0, clientHeight: 0 } };
+    assert.equal(m.viewportW(), 1400, "量不到 CSS 视口时没有退回物理宽度");
+    assert.equal(m.viewportH(), 980);
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;
+    if (prevWin === undefined) delete globalThis.window; else globalThis.window = prevWin;
+  }
+});
+
 test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩放不能算两次", async () => {
   // 界面缩放走 documentElement.style.zoom：1 CSS px = zoom 个物理像素。app.css 里各栏
   // 宽度已经除以 --ui-zoom，物理宽度因此与缩放无关。档位要是再按 CSS 像素（= 物理/缩放）
@@ -36860,10 +36910,21 @@ test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩�
   const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
   const el = { dataset: {} };
   const stepAt = (px) => { applyLayoutDensity(px, el); return el.dataset.layout; };
-  assert.equal(stepAt(1440), undefined, "宽窗口不该有档位 —— 用户拖出来的宽度要原样生效");
+  assert.equal(stepAt(1440), undefined, "常规笔记本宽度不该有档位 —— 用户拖出来的宽度要原样生效");
   assert.equal(stepAt(1100), "narrow");
   assert.equal(stepAt(900), "tight");
   assert.equal(stepAt(700), "min");
+  // 大屏是同一个问题掉了个头：2K/4K 上 250px 的侧栏细得像条缝，助手栏装不下一段代码。
+  // 这两档调的是**默认**宽度，用户拖过的宽度永远优先（app.css 里是两层 var）。
+  assert.equal(stepAt(2560), "wide", "2K 上没把侧栏默认宽度调大");
+  assert.equal(stepAt(3840), "xwide", "4K 上没把侧栏默认宽度调大");
+  assert.equal(stepAt(1728), undefined, "常规 mac 屏被误判成大屏了");
+  // 两端不能同时命中，也不能互相漏掉：一路扫过去每个宽度都要落到唯一一档。
+  for (const [w, want] of [[100, "min"], [779, "min"], [780, "tight"], [979, "tight"],
+                           [980, "narrow"], [1179, "narrow"], [1180, undefined],
+                           [2199, undefined], [2200, "wide"], [2999, "wide"], [3000, "xwide"]]) {
+    assert.equal(stepAt(w), want, `${w}px 落错档了`);
+  }
   // 窗口拉回来，封顶要松开 —— 否则用户拖宽过的侧栏再也回不来。
   assert.equal(stepAt(1440), undefined, "窗口拉宽后档位没松开");
   // 调用点必须喂**物理**宽度。量错对象的话（比如 documentElement.clientWidth），
@@ -36897,12 +36958,17 @@ test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素�
   const sash = stripJsComments(extractFn("makePanelSash"));
   assert.match(sash, /setProperty\(cssProp, Math\.round\(w \* z\)/,
     "分隔条存的还是 CSS 像素 —— 放大状态下拖完一松手，栏宽会跳到别的尺寸");
-  // 自适应档位用 max-width 封顶，**不能**去改 --sidebar-w/--assistant-w：那两个变量是
-  // 拖分隔条存下来的（内联在 .layout 上），改掉等于把用户拖出来的宽度抹了。
-  const dens = css.slice(css.indexOf(':root[data-layout="narrow"]'), css.indexOf(':root[data-layout="narrow"]') + 900);
+  // 档位**不能**去改 --sidebar-w/--assistant-w 本身：那两个是拖分隔条存下来的（内联在
+  // .layout 上），改掉等于把用户拖出来的宽度抹了。窄端用 max-width 封顶，宽端只改
+  // --sidebar-w-default（两层 var 的兜底那一层），拖过的人两种情况下都保持自己的选择。
+  const dens = css.slice(css.indexOf(':root[data-layout="narrow"]'));
   assert.ok(!/--sidebar-w\s*:/.test(dens) && !/--assistant-w\s*:/.test(dens),
-    "自适应档位改写了拖动存下来的栏宽 —— 用户拖出来的宽度会被抹掉");
-  for (const step of ["narrow", "tight", "min"]) {
+    "档位改写了拖动存下来的栏宽 —— 用户拖出来的宽度会被抹掉");
+  assert.match(grab(".layout .explorer"), /var\(--sidebar-w,\s*var\(--sidebar-w-default/,
+    "侧栏宽度没走两层 var —— 大屏那一档的默认值不会生效，或者会盖掉用户拖出来的宽度");
+  assert.match(grab(".layout .assistant"), /var\(--assistant-w,\s*var\(--assistant-w-default/,
+    "助手栏宽度没走两层 var");
+  for (const step of ["narrow", "tight", "min", "wide", "xwide"]) {
     assert.ok(css.includes(`:root[data-layout="${step}"]`), `缺 ${step} 这一档`);
   }
 });
