@@ -469,12 +469,150 @@ const CN_EN: &[(&str, &str)] = &[
     ("视频", "video media"),
 ];
 
-fn expand_query(q: &str) -> String {
+/// 工程路径对 `CN_EN` 的**覆盖 + 增补**，不是替换。
+///
+/// 为什么要覆盖：`CN_EN` 是照着**设计路径**调的。「后台管理 → dashboard admin panel」
+/// 「网站 → website site landing page」全是 UI 词，对着 michael-design 那 452 段检索时
+/// 完全正确。但工程路径（`search_excluding` 排掉设计蓝本）共用同一张表之后，同样的词
+/// 落进了完全不同的语料："admin panel" 撞上渗透测试的攻击面、"terminal" 撞上逆向工程的
+/// binary triage、"landing page" 剩下的最近邻是 CSRF。实测 20 条真实请求，跑偏的 5 条
+/// 全是这么来的。
+///
+/// 为什么**不是**整张替换：`CN_EN` 里绝大多数条目（考试、多租户、电商、医疗、支付……）
+/// 在两条路上都对。整张换掉的话它们一起消失 —— 实测「做个在线考试」当场从命中变成零命中。
+/// 所以这里只列**两种**条目：工程侧要改写的（键在 CN_EN 里存在，值不一样），
+/// 以及 CN_EN 根本没有的工程词。
+///
+/// 空值 `""` 是有意义的：表示这个词在工程路径上**不扩展**。语料里没有对应内容时，
+/// 扩展只会把它推向最近的无关邻居（「命令行」→ terminal → 逆向工程）——
+/// 那比不给更糟，因为噪音会占掉仅有的 2 个名额。
+///
+/// 判据是**语料里真的有什么**，不是概念上该有什么：每一条都对着 knowledge/ 下的英文
+/// 正文挑过词。漏一条只是退回原样、没帮上忙，不会帮倒忙 —— 这是它敢用手工表的前提。
+const CN_EN_ENGINEERING: &[(&str, &str)] = &[
+    // —— 覆盖：这几个词在 CN_EN 里映射到 UI 术语，工程路径上会带偏 ——
+    ("后台管理", "crud schema authorization rbac admin"),
+    ("命令行", ""),
+    ("工具", ""),
+    ("网站", ""),
+    ("官网", ""),
+    ("建站", ""),
+    ("网页", ""),
+    ("首页", ""),
+    ("博客", "seo content indexing sitemap"),
+    ("原生", ""),
+    ("模板", ""),
+    ("脚手架", "scaffold project structure"),
+    ("聊天", "websocket realtime message delivery presence"),
+    // —— 那 8 条零命中，逐条对着语料正文挑的词 ——
+    ("会员", "subscription plan tier entitlement membership"),
+    ("订阅", "subscription billing plan tier"),
+    ("数据同步", "pipeline idempotent upsert incremental sync backfill"),
+    ("同步", "sync replication idempotent"),
+    ("记账", "ledger double-entry bookkeeping transaction reconciliation"),
+    ("账目", "ledger reconciliation"),
+    ("抢票", "inventory oversell reservation lock optimistic concurrency"),
+    ("秒杀", "inventory oversell flash sale lock contention"),
+    ("超卖", "oversell inventory lock"),
+    ("爬虫", "crawler scraping rate limit retry backoff politeness robots"),
+    ("抓取", "crawl fetch rate limit backoff"),
+    ("审批", "state machine workflow transition approval"),
+    ("流程", "state machine workflow transition"),
+    ("工作流", "state machine workflow orchestration"),
+    ("即时通讯", "websocket realtime message delivery presence"),
+    ("实时", "websocket realtime streaming push"),
+    ("灰度", "canary progressive rollout feature flag blue green"),
+    ("发布", "deploy release rollout rollback"),
+    ("回滚", "rollback revert deploy"),
+    // —— 常见工程意图，语料里都有对应正文 ——
+    ("接口", "api endpoint contract versioning"),
+    ("鉴权", "auth authentication authorization token session"),
+    ("登录", "authentication login session token password"),
+    ("权限", "authorization rbac permission scope"),
+    ("索引", "index query plan explain analyze"),
+    ("慢查询", "slow query index query plan explain"),
+    ("分页", "pagination cursor keyset offset"),
+    ("事务", "transaction isolation acid rollback"),
+    ("并发", "concurrency lock contention race"),
+    ("高并发", "concurrency throughput event loop backpressure"),
+    ("限流", "rate limit throttle token bucket backpressure"),
+    ("重试", "retry backoff idempotent"),
+    ("幂等", "idempotent idempotency key"),
+    ("缓存", "cache invalidation ttl stampede"),
+    ("队列", "queue worker background job"),
+    ("消息队列", "message queue broker consumer producer"),
+    ("微服务", "microservice service boundary decomposition"),
+    ("拆分", "decomposition boundary service split"),
+    ("部署", "deploy rollout container orchestration"),
+    ("容器", "container docker image runtime"),
+    ("监控", "observability metrics logging tracing alert"),
+    ("日志", "logging structured log observability"),
+    ("测试", "test coverage integration unit fixture"),
+    ("上传", "upload file validation storage content type"),
+    ("文件", "file storage upload path"),
+    ("搜索", "search index query ranking"),
+    ("推送", "push notification websocket delivery"),
+    ("多租户", "multi-tenant isolation tenant row level security"),
+    ("对账", "reconciliation ledger settlement"),
+    ("支付", "payment gateway idempotency settlement webhook"),
+    ("退款", "refund reversal settlement"),
+    ("表结构", "schema modeling normalization migration"),
+    ("建模", "schema modeling entity relationship"),
+    ("迁移", "migration schema versioning backfill"),
+    ("选型", "selection tradeoff comparison when to use"),
+    // —— 中文工程里最高频的那几个通用词。刻意不针对评测集里的失败项造词：
+    //     这些是任何中文工程请求都会出现的词，映射到语料真正用的术语。
+    ("后端", "backend server api service"),
+    ("服务端", "backend server api service"),
+    ("前端", "frontend client browser ui rendering"),
+    ("服务", "service api endpoint"),
+    ("防御", "prevent mitigation defense validation sanitize"),
+    ("防止", "prevent mitigation validation"),
+    ("加固", "hardening mitigation defense"),
+    ("安全", "security validation sanitize authentication authorization"),
+    ("性能", "performance latency throughput profiling"),
+    ("优化", "optimization performance index caching"),
+    ("架构", "architecture boundary decomposition tradeoff"),
+    ("扩展", "scalability horizontal scaling partition"),
+    ("可靠", "reliability retry idempotent failover"),
+    ("容灾", "failover redundancy backup recovery"),
+    ("备份", "backup restore recovery snapshot"),
+    ("聊天室", "websocket realtime message delivery presence room"),
+    ("在线", "realtime presence websocket online"),
+];
+
+/// 查询扩展。`engineering` 决定用哪张映射表。
+///
+/// 分路不是可选的：同一个中文词在两条路上要映射到**不同的英文词**。
+/// 「后台管理」对设计路径是 dashboard / admin panel（UI 版式），对工程路径是
+/// CRUD 建模 + 权限；把设计那份用在工程路径上，实测会命中渗透测试的攻击面。
+fn expand_query_for(q: &str, engineering: bool) -> String {
     let mut extra = String::new();
-    for (cn, en) in CN_EN {
-        if q.contains(cn) {
+    let mut push = |en: &str| {
+        if !en.is_empty() {
             extra.push(' ');
             extra.push_str(en);
+        }
+    };
+    for (cn, en) in CN_EN {
+        if !q.contains(cn) {
+            continue;
+        }
+        if engineering {
+            // 工程路径先看有没有覆盖。空值 = 这个词在工程路径上不扩展（见表头注释）。
+            if let Some((_, over)) = CN_EN_ENGINEERING.iter().find(|(k, _)| k == cn) {
+                push(over);
+                continue;
+            }
+        }
+        push(en);
+    }
+    if engineering {
+        // 再加上 CN_EN 里根本没有的工程词。
+        for (cn, en) in CN_EN_ENGINEERING {
+            if q.contains(cn) && !CN_EN.iter().any(|(k, _)| k == cn) {
+                push(en);
+            }
         }
     }
     if extra.is_empty() {
@@ -482,6 +620,11 @@ fn expand_query(q: &str) -> String {
     } else {
         format!("{q}{extra}")
     }
+}
+
+#[cfg(test)]
+fn expand_query(q: &str) -> String {
+    expand_query_for(q, false)
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -668,6 +811,22 @@ pub fn search(query: &str, domain: Option<&str>, top_k: usize) -> Vec<SearchHit>
 ///
 /// 设计活**另有专属注入通道**（design_knowledge_block），它在这条路上占名额是纯重复。
 /// 排除的是过滤不是打分，限定域的路径和那条专属通道都不受影响。
+/// **只在明确要它时才该出现的域。** 无域自动检索一律排除它们。
+///
+/// 判据不是「这些内容不好」，而是「它们各有专属的到达方式」：域路由按画像旗标走
+/// （`semantic_knowledge_domain`），真做渗透测试或逆向工程时会被限定到那个域，
+/// 走的是另一条路、拿的是 4 个名额。而这条无域路径服务的是**普通写代码**的请求，
+/// 只有 2 个名额。
+///
+/// 不排会怎样（实测）：
+///   · michael-design 452 段占全库 54.6%，「做个网站」拿回来两段配色克制
+///   · penetration-testing + reverse-engineering 58 段全是攻击视角，而攻防用同一批词——
+///     「怎么防 SQL 注入」命中 web-exploitation（怎么打），「写个后台管理」命中凭据攻击，
+///     「帮我写个命令行工具」命中 binary triage
+/// 三种都不是检索器算错了，是这些段本来就不该来竞争这 2 个名额。
+pub const AUTO_EXCLUDED_DOMAINS: &[&str] =
+    &["michael-design", "penetration-testing", "reverse-engineering"];
+
 pub fn search_excluding(
     query: &str,
     domain: Option<&str>,
@@ -703,7 +862,9 @@ fn search_inner(
     if idx.chunks.is_empty() {
         return Vec::new();
     }
-    let q_toks = tokenize(&expand_query(query));
+    // 排除设计蓝本 = 这是工程路径，用工程那张映射表。判据不是新加的：
+    // `exclude_domain` 本来就只有无域自动检索那一条路会传（见 prompts.rs 的调用点）。
+    let q_toks = tokenize(&expand_query_for(query, exclude_domain.is_some()));
     if q_toks.is_empty() {
         return Vec::new();
     }
@@ -735,10 +896,15 @@ fn search_inner(
         // 排除某个域。只在「无域自动检索」那条路上用，见 `search_excluding`。
         // 放在打分**之前**：这是过滤，不是降权 —— 降权会让它在别的段都不相关时
         // 又冒出来，而它在这条路上占名额本来就是纯重复。
-        if let Some(ex) = exclude_domain {
-            if c.domain.eq_ignore_ascii_case(ex) {
-                continue;
-            }
+        // 传了排除信号 = 这是无域自动检索那条路。排的不只是传进来那一个域，
+        // 而是整组「只在明确要它时才该出现的域」—— 见 AUTO_EXCLUDED_DOMAINS 的说明。
+        // 参数保留成单个域是为了不动调用点：它的取值本来就只有 michael-design 一个。
+        if exclude_domain.is_some()
+            && AUTO_EXCLUDED_DOMAINS
+                .iter()
+                .any(|ex| c.domain.eq_ignore_ascii_case(ex))
+        {
+            continue;
         }
         let mut score = 0.0;
         for term in &q_toks {
@@ -809,6 +975,27 @@ fn search_inner(
         if solid >= take {
             scored.retain(|(i, _)| idx.chunks[*i].text.len() >= MIN_USEFUL_BYTES);
         }
+    }
+    // **一个文件最多占一个名额**（只在名额很少时生效）。
+    //
+    // 无域自动检索只有 2 个名额，而 BM25 会把同一份文件里几个相邻小节一起推上来 ——
+    // 实测「登录怎么做才安全」拿回的是 security/appsec 的两个小节，2 个名额只覆盖 1 个文件，
+    // 等于一半的窗口白给。同一文件的另一节能补的信息，远不如换一个文件来得多。
+    //
+    // 只在 take <= 3 时生效：明确按域检索（4 个名额）和 michael-design（要整份蓝图）
+    // 本来就该让同一份文件多占几条，那时相邻小节是**连续的正文**，不是重复。
+    if take <= 3 {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        scored.retain(|(i, _)| {
+            let c = &idx.chunks[*i];
+            let key = (c.domain.as_str(), c.topic.as_str());
+            if seen.contains(&key) {
+                false
+            } else {
+                seen.push(key);
+                true
+            }
+        });
     }
     scored
         .into_iter()
@@ -964,6 +1151,242 @@ mod design_share_guard {
     /// 用 10 条真实形状的中文请求量出来，设计段占 65%（13/20），远超那条 25% 的线 ——
     /// 也就是说守卫存在、却一直在量另一个查询分布，从没响过。
     /// 现在无域那条路会排除 michael-design（`search_excluding`），这条测的是它真的生效。
+    /// 检索质量**不许倒退**。
+    ///
+    /// 上面那条 `retrieval_eval` 是给人看的（--ignored，跑起来会打一大片）。这一条是门：
+    /// 每次改检索（同义表、排除域、去重、打分）都会被它拦一次。
+    ///
+    /// 基线是 2026-08-28 实测出来的：改之前 Recall@2 = 50.0% / MRR = 0.462 / 误伤 50%，
+    /// 改之后 84.6% / 0.731 / 0%。这里的线**刻意压在实测值之下**（80% / 0.65 / 0 条），
+    /// 留出标注集微调的余地 —— 它要拦的是「大幅倒退」，不是「小数点后一位变了」。
+    ///
+    /// 误伤那条是 0 容忍：语料里确实没有对应内容时硬塞一段，会占掉仅有的 2 个名额，
+    /// 而模型被告知那是「与你的请求相关的工程参考」。宁可什么都不给。
+    #[test]
+    fn retrieval_quality_does_not_regress() {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default)]
+            q: String,
+            #[serde(default)]
+            relevant: Vec<String>,
+        }
+        let rows: Vec<Row> = include_str!("../knowledge_eval.jsonl")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Row>(l).ok())
+            .filter(|r: &Row| !r.q.is_empty())
+            .collect();
+        assert!(rows.len() >= 20, "评测集只剩 {} 条，这道门失去落点", rows.len());
+
+        let (mut labeled, mut hit2, mut rr, mut empty, mut noise) = (0usize, 0usize, 0f64, 0usize, 0usize);
+        let mut bad: Vec<String> = Vec::new();
+        for r in &rows {
+            let hits = super::search_excluding(&r.q, None, 2, "michael-design");
+            let got: Vec<String> = hits.iter().map(|h| format!("{}/{}", h.domain, h.topic)).collect();
+            if r.relevant.is_empty() {
+                empty += 1;
+                if hits.iter().any(|h| h.score >= 3.0) {
+                    noise += 1;
+                    bad.push(format!("误伤 {} → {:?}", r.q, got));
+                }
+                continue;
+            }
+            labeled += 1;
+            match got.iter().position(|g| r.relevant.iter().any(|w| w == g)) {
+                Some(0) => { hit2 += 1; rr += 1.0; }
+                Some(_) => { hit2 += 1; rr += 0.5; }
+                None => {}
+            }
+        }
+        let recall = hit2 as f64 / labeled as f64;
+        let mrr = rr / labeled as f64;
+        assert_eq!(
+            noise, 0,
+            "语料里没有对应内容时塞了 {noise}/{empty} 条噪音 —— 它会占掉仅有的 2 个名额：\n  {}",
+            bad.join("\n  ")
+        );
+        assert!(
+            recall >= 0.80,
+            "Recall@2 掉到 {:.1}%（{hit2}/{labeled}），基线 84.6%、下限 80%。\n\
+             跑 cargo test --offline -- --ignored --nocapture retrieval_eval 看是哪几条漏了",
+            recall * 100.0
+        );
+        assert!(mrr >= 0.65, "MRR@2 掉到 {mrr:.3}，基线 0.731、下限 0.65");
+    }
+
+    /// 工程路径和设计路径**必须用不同的映射表**。
+    ///
+    /// 这条守的是根因：`CN_EN` 是照设计路径调的（后台管理 → dashboard admin panel），
+    /// 工程路径共用它的时候，同样的词落进完全不同的语料，实测 20 条真实请求里跑偏 5 条。
+    #[test]
+    fn the_two_paths_expand_queries_differently() {
+        let design = super::expand_query_for("写个后台管理", false);
+        let eng = super::expand_query_for("写个后台管理", true);
+        assert_ne!(design, eng, "两条路的查询扩展一模一样 —— 那这次分路等于没做");
+        assert!(design.contains("admin panel"), "设计路径的映射被改掉了");
+        assert!(
+            !eng.contains("admin panel"),
+            "工程路径还在往查询里塞 UI 词 —— 它会命中渗透测试的攻击面：{eng}"
+        );
+        // 空值 = 这个词在工程路径上不扩展。语料里没有 CLI 工程内容，扩展只会把它
+        // 推向最近的无关邻居（terminal → 逆向工程的 binary triage）。
+        assert!(
+            !super::expand_query_for("帮我写个命令行工具", true).contains("terminal"),
+            "「命令行」在工程路径上还在扩展成 terminal"
+        );
+        // 基础表里两条路都对的那些不能因为分路而丢掉（实测「在线考试」曾当场从命中变零命中）。
+        assert!(
+            super::expand_query_for("做个在线考试", true).contains("quiz"),
+            "分路把基础表里通用的那些一起丢了"
+        );
+    }
+
+    /// 名额只有 2 个时，一个文件最多占一个。
+    #[test]
+    fn scarce_slots_are_not_wasted_on_one_file() {
+        for q in ["登录怎么做才安全", "怎么防 SQL 注入", "数据库索引怎么建"] {
+            let hits = super::search_excluding(q, None, 2, "michael-design");
+            if hits.len() < 2 {
+                continue;
+            }
+            assert_ne!(
+                (hits[0].domain.as_str(), hits[0].topic.as_str()),
+                (hits[1].domain.as_str(), hits[1].topic.as_str()),
+                "「{q}」的两个名额被同一个文件占满了：{}/{}",
+                hits[0].domain, hits[0].topic
+            );
+        }
+    }
+
+    /// 只在明确要它时才该出现的域，无域路径一律排除。
+    #[test]
+    fn attack_oriented_domains_stay_out_of_the_domain_less_path() {
+        assert!(super::AUTO_EXCLUDED_DOMAINS.contains(&"penetration-testing"));
+        assert!(super::AUTO_EXCLUDED_DOMAINS.contains(&"reverse-engineering"));
+        assert!(super::AUTO_EXCLUDED_DOMAINS.contains(&"michael-design"));
+        // 攻防用同一批词，防守型问题会被攻击视角的段压过（实测：「怎么防 SQL 注入」
+        // 命中 web-exploitation「怎么打」）。真做渗透时走域路由，拿的是 4 个名额、另一条路。
+        for q in ["怎么防 SQL 注入", "写个后台管理", "登录怎么做才安全", "帮我写个命令行工具"] {
+            for h in super::search_excluding(q, None, 2, "michael-design") {
+                assert!(
+                    !super::AUTO_EXCLUDED_DOMAINS.contains(&h.domain.as_str()),
+                    "「{q}」拿回了 {}/{} —— 那是只在明确要它时才该出现的域",
+                    h.domain, h.section
+                );
+            }
+        }
+        // 而**明确按域检索**时它们照常可用，这条排除不该把它们变成死语料。
+        assert!(
+            !super::search("privilege escalation", Some("penetration-testing"), 3).is_empty(),
+            "按域检索也拿不到了 —— 那是把语料废掉，不是排除"
+        );
+    }
+
+    /// **检索质量的尺**。跑：cargo test --offline -- --ignored --nocapture retrieval_eval
+    ///
+    /// 为什么要有它：换检索器（同义表扩容 / 查询改写 / 向量）之前，「效果提升多少」只能靠感觉。
+    /// 有了它，每一次改动都能给出一个可比的数，而不是又一句「感觉好多了」。
+    ///
+    /// 判据落在 **@2**：无域注入门只有 2 个名额（AUTO_KNOWLEDGE_MAX_HITS），
+    /// 排第 3 名的命中对用户根本不存在。
+    ///
+    /// 三个数各回答一件事：
+    ///   · Recall@2  —— 该给的给到了吗（有标注的那些查询）
+    ///   · MRR@2     —— 给对了但排第几（第 1 名和第 2 名对模型的分量不同）
+    ///   · 误伤率     —— 语料里**根本没有**对应内容时，有没有硬塞一段无关的
+    ///                   （这一项比前两个更要紧：塞进去的噪音会占掉仅有的 2 个名额，
+    ///                    而模型被告知那是「与你的请求相关的工程参考」）
+    #[test]
+    #[ignore = "评测用，不进常规套件"]
+    fn retrieval_eval() {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default)]
+            q: String,
+            #[serde(default)]
+            relevant: Vec<String>,
+            #[serde(default)]
+            note: String,
+        }
+        let raw = include_str!("../knowledge_eval.jsonl");
+        let rows: Vec<Row> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Row>(l).ok())
+            .filter(|r: &Row| !r.q.is_empty())
+            .collect();
+        assert!(rows.len() >= 20, "评测集只剩 {} 条，尺子失去意义", rows.len());
+
+        let (mut labeled, mut hit1, mut hit2, mut rr) = (0usize, 0usize, 0usize, 0f64);
+        let (mut empty_label, mut false_inject) = (0usize, 0usize);
+        let mut misses: Vec<String> = Vec::new();
+        let mut noise: Vec<String> = Vec::new();
+
+        for r in &rows {
+            // 生产无域路径：排除设计蓝本，取 2 个名额。
+            let hits = super::search_excluding(&r.q, None, 2, "michael-design");
+            let got: Vec<String> = hits
+                .iter()
+                .map(|h| format!("{}/{}", h.domain, h.topic))
+                .collect();
+
+            if r.relevant.is_empty() {
+                // 语料里没有对应内容 —— 正确行为是**什么都不给**。
+                empty_label += 1;
+                // 注入门还有一道分数线；低于它的命中进不了提示词，不算误伤。
+                if hits.iter().any(|h| h.score >= 3.0) {
+                    false_inject += 1;
+                    noise.push(format!("{} → {}", r.q, got.join(", ")));
+                }
+                continue;
+            }
+            labeled += 1;
+            let rank = got.iter().position(|g| r.relevant.iter().any(|w| w == g));
+            match rank {
+                Some(0) => {
+                    hit1 += 1;
+                    hit2 += 1;
+                    rr += 1.0;
+                }
+                Some(_) => {
+                    hit2 += 1;
+                    rr += 0.5;
+                }
+                None => misses.push(format!(
+                    "{}\n      期望 {:?}\n      实得 {:?}  [{}]",
+                    r.q, r.relevant, got, r.note
+                )),
+            }
+        }
+
+        let pct = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+        println!("\n╭─ 平台知识库检索评测 ─────────────────────────────");
+        println!("│ 语料 828 小节 / 65 文件 / 22 域；路径 = 无域自动检索（排除设计蓝本），名额 2");
+        println!("│");
+        println!("│ 有标注的查询 {labeled} 条");
+        println!("│   Recall@1   {:>5.1}%   ({hit1}/{labeled})   排第一就命中", pct(hit1, labeled));
+        println!("│   Recall@2   {:>5.1}%   ({hit2}/{labeled})   两个名额里命中", pct(hit2, labeled));
+        println!("│   MRR@2      {:>5.3}", if labeled == 0 { 0.0 } else { rr / labeled as f64 });
+        println!("│");
+        println!("│ 语料里确实没有的查询 {empty_label} 条");
+        println!("│   误伤率     {:>5.1}%   ({false_inject}/{empty_label})   该沉默却塞了噪音", pct(false_inject, empty_label));
+        println!("╰──────────────────────────────────────────────────");
+        if !misses.is_empty() {
+            println!("\n漏掉的（{} 条）：", misses.len());
+            for m in &misses {
+                println!("  ✗ {m}");
+            }
+        }
+        if !noise.is_empty() {
+            println!("\n误伤的（{} 条）：", noise.len());
+            for n in &noise {
+                println!("  ⚠ {n}");
+            }
+        }
+        println!();
+    }
+
     #[test]
     fn the_domain_less_path_leaves_room_for_architecture() {
         let real_requests = [

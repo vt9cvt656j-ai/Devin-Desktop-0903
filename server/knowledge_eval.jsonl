@@ -1,0 +1,41 @@
+{"_": "平台知识库检索的评测集。每行一条查询 + 人工标注的相关小节。"}
+{"_": "为什么需要它：换检索器（同义表 / 查询改写 / 向量）之前，得先有一把能重复跑的尺，"}
+{"_": "否则「效果提升多少」只能靠感觉。判据落在 @2，因为无域注入门只有 2 个名额"}
+{"_": "（AUTO_KNOWLEDGE_MAX_HITS = 2）——排第 3 名的命中对用户是不存在的。"}
+{"_": ""}
+{"_": "标注口径：relevant 里写「域/主题」，只要检索命中该文件的任一小节即算命中。"}
+{"_": "粒度取到文件而不是小节，是因为同一文件内的小节对模型都有参考价值，"}
+{"_": "而按小节标注需要逐段读 828 段——那份精度这把尺用不上，反而会让标注不可复现。"}
+{"_": "relevant 为空 = 语料里确实没有对应内容，这类查询用来量「该说不知道时有没有乱给」。"}
+{"_": "path 取值：less（无域自动检索，走 search_excluding 排除设计蓝本）。"}
+{"_": ""}
+{"q": "做个网站", "path": "less", "relevant": [], "note": "太泛，语料里没有「怎么做一个网站」这种总纲；正确行为是不给（给了必然是噪音）"}
+{"q": "帮我写个命令行工具", "path": "less", "relevant": [], "note": "语料没有 CLI 工程内容；现在命中 reverse-engineering 是纯误伤"}
+{"q": "做一个会员系统", "path": "less", "relevant": ["saas/multi-tenancy-and-billing", "backend-api/auth-patterns"], "note": "会员=订阅+鉴权"}
+{"q": "写个后台管理", "path": "less", "relevant": ["database/schema-and-queries", "backend-api/auth-patterns"], "note": "后台管理的工程面是 CRUD 建模 + 权限"}
+{"q": "做个博客", "path": "less", "relevant": ["marketing/seo-analytics-crm"], "note": "工程侧能给的只有 SEO；内容型站点的其余部分在设计蓝本里（本路径已排除）"}
+{"q": "帮我搭个 API 服务", "path": "less", "relevant": ["backend-api/api-design", "backend-api/error-handling"], "note": "最直接的一条"}
+{"q": "做个小程序后端", "path": "less", "relevant": ["backend-api/api-design", "backend-api/auth-patterns"], "note": "小程序后端就是普通 API 服务 + 鉴权"}
+{"q": "写个数据同步脚本", "path": "less", "relevant": ["data-ml/pipelines-and-features", "database/schema-and-queries"], "note": "同步=管道+幂等写入"}
+{"q": "做个多租户的排班系统", "path": "less", "relevant": ["saas/multi-tenancy-and-billing"], "note": "现在就命中，作为对照锚点"}
+{"q": "帮我做个电商下单流程", "path": "less", "relevant": ["ecommerce/catalog-and-orders", "database/schema-and-queries"], "note": "下单=订单建模+库存事务"}
+{"q": "做个能扛高并发的实时聊天", "path": "less", "relevant": ["backend-api/api-design", "backend-api/microservices", "web-frontend/performance"], "note": "现在命中 api-design，其余两个也该进"}
+{"q": "我要做个记账的", "path": "less", "relevant": ["finance/payments-and-banking", "saas/multi-tenancy-and-billing"], "note": "记账的工程面是复式账本；语料里在 finance"}
+{"q": "帮我弄个能上传图片的相册", "path": "less", "relevant": ["web-frontend/performance", "security/appsec"], "note": "图片性能 + 上传的安全面（类型校验/存储）"}
+{"q": "做个抢票的", "path": "less", "relevant": ["database/schema-and-queries", "ecommerce/catalog-and-orders"], "note": "抢票=超卖控制+库存锁，语料里有"}
+{"q": "写个爬虫", "path": "less", "relevant": ["backend-api/api-design"], "note": "限流/重试/礼貌抓取在 api-design"}
+{"q": "做个内部用的审批流", "path": "less", "relevant": ["gaming/game-architecture", "database/schema-and-queries"], "note": "状态机在 game-architecture（唯一讲状态机的地方），持久化在 database"}
+{"q": "帮我做个直播弹幕", "path": "less", "relevant": [], "note": "语料真的没有；正确行为是不给"}
+{"q": "搞个论坛", "path": "less", "relevant": [], "note": "语料真的没有"}
+{"q": "做个在线考试", "path": "less", "relevant": ["education/lms-and-assessment"], "note": "现在就命中，对照锚点"}
+{"q": "帮我做个 IM", "path": "less", "relevant": ["web-frontend/component-patterns", "backend-api/api-design"], "note": "WebSocket 在 web-frontend；后端面在 api-design"}
+{"q": "接口怎么设计版本", "path": "less", "relevant": ["backend-api/api-design", "saas/multi-tenancy-and-billing"], "note": "术语式中文对照组"}
+{"q": "数据库索引怎么建", "path": "less", "relevant": ["database/optimization", "database/schema-and-queries"], "note": "术语式中文对照组"}
+{"q": "登录怎么做才安全", "path": "less", "relevant": ["backend-api/auth-patterns", "security/secure-coding"], "note": "术语式中文对照组"}
+{"q": "怎么防 SQL 注入", "path": "less", "relevant": ["security/secure-coding", "security/appsec"], "note": "术语式中文对照组"}
+{"q": "怎么做灰度发布", "path": "less", "relevant": ["devops/deploy-and-ops", "devops/cicd-iac"], "note": "术语式中文对照组"}
+{"q": "database index optimization", "path": "less", "relevant": ["database/optimization"], "note": "英文术语对照组"}
+{"q": "connection pool sizing", "path": "less", "relevant": ["database/optimization", "database/selection-and-patterns"], "note": "英文术语对照组"}
+{"q": "JWT refresh token rotation", "path": "less", "relevant": ["backend-api/auth-patterns"], "note": "英文术语对照组"}
+{"q": "service decomposition boundaries", "path": "less", "relevant": ["backend-api/microservices"], "note": "英文术语对照组"}
+{"q": "rate limiting strategies", "path": "less", "relevant": ["backend-api/api-design"], "note": "英文术语对照组"}
