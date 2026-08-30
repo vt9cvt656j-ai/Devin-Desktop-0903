@@ -45,6 +45,14 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   实时的 rootPath、`_copyIntoWorkspace` 要调 backend 并刷新树/Git——DOM 与模块级可变
  *   状态各占一头，搬出去只能变成「把 main.js 的变量再传回来」的假模块。
  *
+ *   **同一条线的续账（同日）**：实测 81,393 行，余 7。用户报「看不出会落进哪个文件夹，
+ *   还是替换整个工作区」，于是补了行级高亮 + 跟随光标的目标标签 + 编辑器区那档自己的
+ *   投放框。这一笔顺带修了四个真 bug，都不是视觉问题：反馈画在了错的面板上（光标在
+ *   编辑器、亮的是侧栏）、Git 视图下 #tree 塌成 0 导致往侧栏拖文件夹会换掉项目、拖放
+ *   事件用全局 listen 让两个窗口各执行一遍、浏览器路径的 CSS 坐标没乘回 dpr。
+ *   文案与语义判断（dropFeedback）在 explorer-drop.js，视觉全在 CSS；留在 main.js 的
+ *   只有 DOM 命中与贴类。**余量只剩 7 行，下一个人先搬再加。**
+ *
  * · 81_300（2026-08-30 第二次，**仍在往下**）：实测 81,264 行。抽出
  *   `src/agent/approval-label.js`（`_approvalLabel` 的 166 行 switch）。判据照 mainlink
  *   那次：唯一的外部依赖（MCP 快照表 `_mcpStates`）改成**从参数传**，main.js 侧留四行薄壳。
