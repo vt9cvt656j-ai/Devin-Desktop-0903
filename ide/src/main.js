@@ -4977,6 +4977,7 @@ function activate(path) {
   closeDiffView();
   hideImagePreview();
   hideLivePreviewPane();
+  hidePlanPane(); // 漏掉这一句的话，从方案页签切到文件时方案面板会盖在编辑器上
   hideVideoPreview();
   hidePdfPreview();
   hideTablePreview();
@@ -10020,7 +10021,29 @@ function renderTabs() {
     });
     tabsEl.appendChild(tab);
   }
+  // 让**当前这个**页签一定看得见。
+  //
+  // 页签条是横向滚动容器，而 renderTabs 每次都重建 innerHTML —— scrollLeft 跟着归 0。
+  // 于是打开一个排在右边的文件时，内容出来了、页签却停在最左边看不到，用户得自己横滑
+  // 去找。用户原话「有时候也会懵逼掉，找不到那个 tab 窗口」。
+  //
+  // 只在它确实在视野外时才动，且**不用 scrollIntoView** —— 那个会顺带滚动祖先容器
+  // （编辑器区、整页），在这种嵌套布局里会把别处也带跑。
+  _revealActiveTab();
   _markClippedTabs();
+}
+
+function _revealActiveTab() {
+  if (!tabsEl || !activePath) return;
+  const el = tabsEl.querySelector(`[data-path="${CSS.escape(activePath)}"]`);
+  if (!el) return;
+  const pad = 12; // 贴边等于看不全，留一点余量
+  const left = el.offsetLeft;
+  const right = left + el.offsetWidth;
+  const viewLeft = tabsEl.scrollLeft;
+  const viewRight = viewLeft + tabsEl.clientWidth;
+  if (left < viewLeft + pad) tabsEl.scrollLeft = Math.max(0, left - pad);
+  else if (right > viewRight - pad) tabsEl.scrollLeft = right - tabsEl.clientWidth + pad;
 }
 
 // 文件页签条：纵向滚轮 → 横向滚动（VS Code 同款）。.tabs 是 overflow-x 容器且隐藏了

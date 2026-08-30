@@ -36804,3 +36804,30 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   assert.match(pane, /act === "go"[\s\S]{0,220}onAccept\(\)[\s\S]{0,160}sendPrompt\(/,
     "点了「按这个方案执行」却没有切回 Agent 就发出去 —— 只读模式下它不会动手");
 });
+
+// ---------------------------------------------------------------------------
+// 打开的文件，它的页签一定要看得见
+// ---------------------------------------------------------------------------
+test("激活的页签会被滚进可视区，且不牵动祖先容器", () => {
+  const src = RAW_SRC;
+  const fn = stripJsComments(extractFn("_revealActiveTab"));
+
+  // renderTabs 每次重建 innerHTML，scrollLeft 会归 0 —— 不主动滚过去的话，
+  // 打开一个排在右边的文件时页签停在最左边，用户得自己横滑去找。
+  assert.match(stripJsComments(extractFn("renderTabs")), /_revealActiveTab\(\);/,
+    "renderTabs 之后没有把当前页签滚进可视区");
+
+  // **不许用 scrollIntoView**：它会顺带滚动祖先容器（编辑器区、整页），
+  // 在这种嵌套布局里会把别处也带跑。
+  assert.ok(!/scrollIntoView/.test(fn),
+    "用了 scrollIntoView —— 它会连祖先容器一起滚，这里只该动页签条自己");
+  assert.match(fn, /tabsEl\.scrollLeft = /, "没有真的调整页签条的横向滚动");
+
+  // 只在确实看不见时才动 —— 否则用户每次点页签，条子都会自己跳一下。
+  assert.match(fn, /if \(left < viewLeft \+ pad\)/, "没有判断「左边看不见」");
+  assert.match(fn, /else if \(right > viewRight - pad\)/, "没有判断「右边看不见」");
+
+  // 方案面板也要在切走时收起来，否则它会盖在编辑器上。
+  assert.match(stripJsComments(extractFn("activate")), /hidePlanPane\(\);/,
+    "切到别的页签时没有收起方案面板 —— 它会盖在编辑器上");
+});
