@@ -23001,6 +23001,11 @@ test("offered choices and run-state suggestions merge into one 接下来 block",
     document: { createElement: mkEl, createTextNode: (v) => ({ nodeType: 3, textContent: String(v) }) },
     _NS_SPARK: "<svg/>", _NS_ARROW: "<svg/>", _NEXT_STEPS_MAX: 4,
     _appendTextWithInlineCode: (el, text) => { el.textContent = String(text); },
+      // **注入真家伙，不是替身。** 卡片显示短标签、发送原文；喂恒等替身的话，
+      // 下面那几条「chip 上的字 = label」就等于没测这件事。
+      // 这份清单是手工维护的：给 _renderSuggestionChips 新加辅助函数必须补进来，
+      // 否则渲染在 try/catch 里静默抛掉，现象是「一张卡片都没有」，和真没渲染分不出来。
+      _chipShortLabel: load("_chipShortLabel", {}),
     sendPrompt() {}, _currentSession: () => null, _chatFollow() {},
   };
   const render = load("_renderSuggestionChips", deps);
@@ -29872,8 +29877,13 @@ test("「接下来」建议：不砍半句、反引号渲染成代码、序号�
   // 函数写得再好，卡片不调用也是白搭 —— 这一环变异实测漏过。
   // 卡片正文必须走行内代码渲染，不能用 textContent 直铺（反引号会原样显示成字符）。
   const render = stripJsComments(extractFn("_renderSuggestionChips"));
-  assert.match(render, /_appendTextWithInlineCode\(b\.querySelector\("\.next-steps__chip-t"\), text\)/,
-    "卡片正文没走行内代码渲染");
+  // 第二个参数从 `text` 换成了 `_chipShortLabel(text)`（卡片显示短标签、发送仍是原文），
+  // 所以不再钉死那个实参 —— 钉的是「正文确实经过了行内代码渲染」这件事本身。
+  assert.match(
+    render,
+    /_appendTextWithInlineCode\(b\.querySelector\("\.next-steps__chip-t"\),\s*[^)]+\)/,
+    "卡片正文没走行内代码渲染",
+  );
   assert.ok(!/chip-t"\)\.textContent = text/.test(render), "正文还在用 textContent 直铺");
 
   // 序号不再进正文，也不再画成徽标 —— 卡片的上下顺序本来就说明了「第几条」。
@@ -36386,5 +36396,66 @@ test("接下来卡片是多行卡片，不能被 chip 胶囊规则钉死高度",
   assert.ok(
     /padding\s*:\s*\d+px\s+\d+px/.test(chip[0]),
     "卡片没有上下内距了，那是胶囊不是卡片",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 「接下来」卡片显示短标签，发送原文
+// ---------------------------------------------------------------------------
+test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
+  const src = readFileSync(join(HERE, "../src/main.js"), "utf8");
+  const fn = src.match(/function _chipShortLabel\(text\)[\s\S]*?\n\}/);
+  assert.ok(fn, "_chipShortLabel 不见了");
+  const _chipShortLabel = eval(`(${fn[0].replace(/^function /, "function ")})`);
+
+  // 标题——解释：破折号前那一截就是完整的短标签。这是模型最常产出的形状。
+  assert.equal(
+    _chipShortLabel("没有流式输出——现在整段返回后才打印，体验上就是敲完命令干等。爽感一大半来自逐字吐字。"),
+    "没有流式输出",
+  );
+  assert.equal(
+    _chipShortLabel("长会话不自动压缩——context 顶到上限就得手动 `/clear`，等于丢掉对话记忆，自动摘要是分水岭。"),
+    "长会话不自动压缩",
+  );
+  // 本来就短的原样通过，**不许**被截。
+  for (const short of ["修一下这个 bug", "把 App.tsx 换成真正对接后端的业务首页"]) {
+    assert.equal(_chipShortLabel(short), short, "短句被截了");
+  }
+  // 反引号必须成对：切在一对中间的话，行内代码会从断点一路吃到句尾。
+  const withCode = _chipShortLabel("先跑 `npm run build`，再看 dist 里有没有 assets 产物生成出来对不对得上");
+  assert.equal((withCode.match(/`/g) || []).length % 2, 0, `反引号被切散了：${withCode}`);
+  // **分隔符落在反引号内部**的那种：切在这里会留下半个代码段，行内代码从断点一路吃到句尾。
+  // 上面那条用例的分隔符在代码段外，走不到这道检查 —— 变异实测它是绿的。
+  const insideCode = _chipShortLabel(
+    "运行 `sed -n 1,20p：file` 这个命令，然后检查输出里有没有预期的那几行内容和报错信息",
+  );
+  assert.equal(
+    (insideCode.match(/`/g) || []).length % 2,
+    0,
+    `切在了代码段中间，留下半个反引号：${insideCode}`,
+  );
+  // 没有任何分隔符 → 硬截 + 省略号，但仍然显著短于原文。
+  const long = "这是一句没有任何分隔符也没有标点的很长很长很长很长很长很长很长很长很长很长的建议文本内容";
+  const cut = _chipShortLabel(long);
+  // 判据是「一行装得下」，不是「少于原文一半」—— 截断按**显示宽度**（全角算 2），
+  // 46 半角 ≈ 23 个汉字，正好一行出头。按字符数比会把这条写成一个更严但没道理的门槛。
+  const w = (t) => [...t].reduce((n, ch) => n + (/[\u3000-\u9fff\uff00-\uffef]/.test(ch) ? 2 : 1), 0);
+  assert.ok(cut.endsWith("…"), `没收省略号：${cut}`);
+  assert.ok(w(cut) <= 46, `截出来还是太宽（${w(cut)}）：${cut}`);
+  assert.ok(w(cut) < w(long), "根本没截");
+  // 空串不许炸。
+  assert.equal(_chipShortLabel(""), "");
+  assert.equal(_chipShortLabel(null), "");
+
+  // **短的只给眼睛看，发给模型的必须是原文。** 少了这一条，短标签就成了信息丢失。
+  const render = src.slice(src.indexOf("function _renderSuggestionChips"));
+  const body = render.slice(0, render.indexOf("\n  }"));
+  assert.ok(
+    body.includes("_chipShortLabel(text)"),
+    "卡片没用短标签 —— 整段答案又会被原样贴一遍",
+  );
+  assert.ok(
+    /b\.title = text\.replace/.test(body) && /sendPrompt\(send\)/.test(body),
+    "title 或点击发送被换成了短标签 —— 那是把内容真的丢了，不是只缩显示",
   );
 });
