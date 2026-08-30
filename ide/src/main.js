@@ -24055,9 +24055,9 @@ const _AI_MODE_PROMPTS = {
 };
 
 const _AI_MODES = [
-  { id: "agent", label: "Agent", desc: "自主读写文件、运行验证、用证据收敛", color: "#3b82f6", icon: `<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>` },
-  { id: "chat", label: "Chat", desc: "纯问答/解释，不读写项目", color: "#8b5cf6", icon: `<rect x="2" y="3" width="12" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 13l2-2h5" fill="none" stroke="currentColor" stroke-width="1.3"/>` },
-  { id: "plan", label: "Plan", desc: "只读取证后输出实施方案", color: "#f59e0b", icon: `<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h6M5 8h4M5 11h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` },
+  { id: "agent", label: "Agent", color: "#3b82f6", icon: `<circle cx="8" cy="5" r="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 14c0-3 2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M11 3l2-1m-2 1l2 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>` },
+  { id: "chat", label: "Chat", color: "#8b5cf6", icon: `<rect x="2" y="3" width="12" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 13l2-2h5" fill="none" stroke="currentColor" stroke-width="1.3"/>` },
+  { id: "plan", label: "Plan", color: "#f59e0b", icon: `<rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h6M5 8h4M5 11h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>` },
 ];
 
 function _modeRuntimeGuidanceBlock(mode, text, profile = _engineeringProfileWithAiIntent(text)) {
@@ -24143,7 +24143,9 @@ function _fillModeMenu(menu) {
   for (const mode of _AI_MODES) {
     const item = document.createElement("button");
     item.className = "mode-menu__item" + (mode.id === _currentAiMode ? " is-active" : "");
-    item.innerHTML = `<svg class="ic" viewBox="0 0 16 16">${mode.icon}</svg><div class="mode-menu__info"><div class="mode-menu__name">${mode.label}</div><div class="mode-menu__desc">${mode.desc}</div></div>`;
+    // 只画图标 + 名字。介绍那一行删掉了（2026-08-29，用户："不需要介绍给用户"）——
+    // 三个模式的名字本身已经说明问题，多一行灰字只是把菜单撑高。
+    item.innerHTML = `<svg class="ic" viewBox="0 0 16 16">${mode.icon}</svg><span class="mode-menu__name">${mode.label}</span>`;
     item.addEventListener("click", () => {
       _currentAiMode = mode.id;
       _updateModeUI();
