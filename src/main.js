@@ -14051,16 +14051,54 @@ async function _fetchGatewaySettlement(config, requestId, attempts = 5) {
   return null;
 }
 
+// 这个窗口自己选的模型。**存在 sessionStorage，而不是 localStorage。**
+//
+// 副窗口（`?w=sub`）和主窗口是两个浏览上下文，但它们**共用同一份 localStorage 和同一个
+// store 文件**（代码里多处注释写着这件事）。模型选择原来只存在那份共享配置里，于是：
+// 在窗口 2 选 opus → 写进共享 store → 窗口 1 任何一次 `loadConfigAsync()`（`selectModel`
+// 开头就有一次）都会把它读回来，覆盖掉自己的 `_cfgCache`。用户看到的就是
+// 「窗口 2 选了 opus，切回窗口 1，窗口 1 也变成 opus」。
+//
+// sessionStorage 恰好是**按浏览上下文隔离**的：每个 WebviewWindow 一份，关掉即消失。
+// 用它存「这个窗口现在用哪个模型」，共享配置仍然保留最后一次选择（新开的窗口据此得到
+// 一个合理的初值），两边各司其职。
+const _WIN_MODEL_KEY = "michael-ide.window-model";
+function _windowModelOverride() {
+  try {
+    const raw = sessionStorage.getItem(_WIN_MODEL_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    return v && typeof v.model === "string" && v.model ? v : null;
+  } catch { return null; }
+}
+function _setWindowModel(model, modelGroup, gatewayRouteId) {
+  try {
+    if (!model) { sessionStorage.removeItem(_WIN_MODEL_KEY); return; }
+    sessionStorage.setItem(_WIN_MODEL_KEY, JSON.stringify({
+      model: String(model),
+      modelGroup: String(modelGroup || ""),
+      gatewayRouteId: String(gatewayRouteId || ""),
+    }));
+  } catch {}
+}
+
 function _aiConfigForRuntime(raw) {
   raw = raw || {};
   const c = { ..._DEFAULT_AI_CONFIG, ...(raw || {}) };
   const token = c.gatewayApiKey || (typeof localStorage !== "undefined" && localStorage.getItem("michael_token")) || c.apiKey || "";
+  // 窗口级选择优先于共享配置。**所有读配置的地方都走这个漏斗**，所以在这里盖一次
+  // 就够了 —— 不用去追每一个 loadConfig 调用点。
+  const win = _windowModelOverride();
+  const model = win ? win.model : (c.gatewayModel || c.model || "");
   return {
     ...c,
     providerMode: AI_PROVIDER_GATEWAY,
     baseUrl: MICHAEL_API,
     apiKey: token,
-    model: c.gatewayModel || c.model || "",
+    model,
+    gatewayModel: win ? win.model : c.gatewayModel,
+    modelGroup: win ? win.modelGroup : c.modelGroup,
+    gatewayRouteId: win ? win.gatewayRouteId : c.gatewayRouteId,
   };
 }
 
@@ -17221,6 +17259,8 @@ async function selectModel(model, modelGroup) {
     session.model = model;
     session.modelGroup = modelGroup || "";
     session.gatewayRouteId = String(_picked?.connId || "");
+    // 同时钉在**这个窗口**上：共享配置会被另一个窗口改写，sessionStorage 不会。
+    _setWindowModel(model, modelGroup, _picked?.connId);
     _renderChatTabs();
     saveChatHistory();
     // **不要**在这里批量改历史消息的头像。
@@ -18795,10 +18835,13 @@ async function _switchChatSession(idx) {
     const route = session.gatewayRouteId || "";
     // 分组和线路也要跟着切：同一个模型 id 可能挂在好几条线路下，只还原 model
     // 等于「显示的是这个标签的模型、请求走的是上一个标签的线路」。
+    // 先钉窗口级，再写共享配置：`refreshModelBadge` 和后续任何 loadConfig 都走
+    // `_aiConfigForRuntime`，窗口级优先，这样即使另一个窗口同时在改共享配置也不受影响。
+    _setWindowModel(session.model, group, route);
     if (c.model !== session.model || (c.modelGroup || "") !== group || (c.gatewayRouteId || "") !== route) {
       saveConfig({ ...c, model: session.model, modelGroup: group, gatewayRouteId: route });
-      refreshModelBadge();
     }
+    refreshModelBadge();
   } else {
     // 从旧存档恢复的标签可能没有模型身份（这个字段是后加的）。给它锚定当前的一次，
     // 而不是让它继续跟着全局漂 —— 那正是「切个标签模型就被改掉」的老路。
@@ -18807,6 +18850,7 @@ async function _switchChatSession(idx) {
       session.model = c.model || c.gatewayModel || null;
       session.modelGroup = c.modelGroup || "";
       session.gatewayRouteId = c.gatewayRouteId || "";
+      _setWindowModel(session.model, session.modelGroup, session.gatewayRouteId);
     } catch {}
   }
   _renderChatTabs();
