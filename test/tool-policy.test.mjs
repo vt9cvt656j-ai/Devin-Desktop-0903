@@ -65,6 +65,10 @@ test("workspace-mutating set matches the pre-refactor literal exactly", () => {
     //（reference/<slug>-design-system.md 和 <slug>-tokens.css），却一直没登记，
     // 于是只读三模式下照写不误、审批也不弹。
     "learndesign",
+    // 新增（2026-08-30 审计）：worker —— run_worker 派的是 mode 被改写成 "agent" 的**可写**
+    // 子体，main.js 有四处已经把它当改工作区的动作在记账（_toolMutatesWorkspace 周边），
+    // 唯独这张判定表里从没登记过。和上面 learndesign / worktree 是同一种漏法。
+    "worker",
   ])));
   // The subtle one: a shell command may change the workspace but never REPORTS it, so it is
   // not in this set. Adding it would make `mutated === false` look like proof of a no-op.
@@ -134,7 +138,29 @@ test("approval set matches the pre-refactor literal exactly", () => {
     // 「会改工作区就必须能问」那条不变量只豁免 worktree 一个，所以 git 登记了
     // mutatesWorkspace 就必须同时登记 needsApproval。
     "git",
+    // 新增（2026-08-30 审计）：background_monitor —— 它的 check_type:"command" 支路把模型
+    // 给的 pattern **原样交给 shell**，还按轮询节奏重复跑几十上百次，而整条授权链一次都
+    // 没看见过它（_callIsDangerousCommand 只认 cmd/termtask，这张表里根本没注册）。于是
+    // deny 名单、只读模式、审批开关三道门同时失效——和上面 termtask 那条注释记的是同一个
+    // 坑的第三种形状：同一件事换个工具名就绕过去。**逐次**判定：其余 check_type
+    //（file/port/url/screen/capture/manual）是纯观察，只读模式里正该放行，不能一刀切；
+    // 出现在这个集合里只表示「至少有一种调用会被挡」。
+    // 新增（2026-08-30 审计）：worker —— run_worker 派的是一个 mode 被改写成 "agent" 的
+    // **可写**子体。main.js 有四处把它当改工作区的动作在记账，唯独这张判定表里从没登记过，
+    // 于是三道门全取默认值：只读不拦、审批不弹、mutatesWorkspace 恒 false。用户亲手选了
+    // Plan / Explorer / Reviewer，模型照样能派子体改文件。和 subagent 是同一族的漏。
+    "worker",
+    "background_monitor",
   ])));
+  // 逐次判定的细则：只有跑 shell 的那一种被挡，纯观察的六种照常放行。
+  // 光断言它在集合里不够——把 needsApproval 写成恒 true 也能让上面那条绿，
+  // 而那会把「等文件出现」「等端口监听」这类纯观察也拖进审批弹窗。
+  for (const ct of ["file", "port", "url", "screen", "capture", "manual"]) {
+    assert.equal(needsApprovalFor("background_monitor", { type: "background_monitor", checkType: ct }), false,
+      `check_type=${ct} 是纯观察，不该弹审批`);
+  }
+  assert.equal(needsApprovalFor("background_monitor", { type: "background_monitor", checkType: "command" }), true,
+    "check_type=command 会跑 shell，必须审批");
   // worktree 是**有意**不问的：它只在 <root>/.mrdayone/worktrees/ 下动，是 IDE 自己的
   // 目录，best-of-N 每建一个候选弹一次窗就没法用了。这条豁免要留着，也要看得见。
   assert.equal(approvalTypes().has("worktree"), false, "worktree 的豁免是有意的，见 tool-policy 里的说明");
@@ -203,7 +229,24 @@ test("read-only-mode block matches the pre-refactor chain, plus the closed termt
     //（reference/<slug>-design-system.md 和 <slug>-tokens.css），却一直没登记，
     // 于是只读三模式下照写不误、审批也不弹。
     "learndesign",
+    // 新增（2026-08-30 审计）：background_monitor 的 check_type:"command" 是把模型给的
+    // pattern 原样交给 shell，还按轮询节奏重复跑几十上百次。同样是**逐次**判定：
+    // file/port/url/screen/capture/manual 六种是纯观察，只读模式正靠它们干活，照常放行。
+    // 新增（2026-08-30 审计）：worker —— run_worker 派的是一个 mode 被改写成 "agent" 的
+    // **可写**子体。main.js 有四处把它当改工作区的动作在记账，唯独这张判定表里从没登记过，
+    // 于是三道门全取默认值：只读不拦、审批不弹、mutatesWorkspace 恒 false。用户亲手选了
+    // Plan / Explorer / Reviewer，模型照样能派子体改文件。和 subagent 是同一族的漏。
+    "worker",
+    "background_monitor",
   ])));
+  // 逐次细则：只挡跑 shell 的那一种。写成一刀切会把「等端口起来」这类观察也挡掉，
+  // 而那正是 Plan 模式最需要的能力。
+  for (const ct of ["file", "port", "url", "screen", "capture", "manual"]) {
+    assert.equal(blockedInReadOnlyMode("background_monitor", { type: "background_monitor", checkType: ct }), false,
+      `check_type=${ct} 是纯观察，只读模式不该挡`);
+  }
+  assert.equal(blockedInReadOnlyMode("background_monitor", { type: "background_monitor", checkType: "command" }), true,
+    "check_type=command 是任意 shell —— 只读模式必须挡，否则换个工具名就绕过 cmd/termtask 两道闸");
   // 上一版这里断言的是 `false`，并写着「补掉的时候这一行要在同一个提交里翻成 true」——
   // 这就是那个提交。termtask 就是 run_in_terminal，命令串由模型给出、原样执行，和 cmd
   // 是同一类能力；cmd 在只读模式被挡而它不被挡，等于换个工具名就绕过去了。

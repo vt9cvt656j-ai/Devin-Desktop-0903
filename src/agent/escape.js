@@ -50,3 +50,36 @@ export function escapeAttr(s) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+/**
+ * 往工具卡右侧那个状态徽章 `.atc-result` 里写文案。
+ *
+ * **不能直接 `res.textContent = label`**：`.atc-result` 是 flex 容器（spinner / svg / diffstat
+ * 都靠它对齐），而 `text-overflow: ellipsis` 只作用于**块容器**——裸文本在 flex 里是匿名
+ * flex 项，规则套不上去。于是那条 CSS 写着却恒不生效：实测一句 405px 的失败原因塞进 202px
+ * 的徽章（它最宽只有行宽的 40%），被硬切在半个汉字上，既没有省略号提示「后面还有」，
+ * 也没有 tooltip 能看全。用户看到的是一句读不通的残句，根本不知道自己漏了内容。
+ *
+ * 包进 `.atc-result__t`（它本身带正确的 `min-width:0 / overflow / text-overflow`）省略号就
+ * 生效了，再把全文放进 `title` 供悬停。两件事一起做才完整：省略号告诉他「被截了」，
+ * title 让他能读到被截掉的部分。
+ *
+ * 放在 escape.js 是因为它和这里的两个转义函数同族——都是渲染层的叶子工具，纯 DOM 操作、
+ * 不读全局、不依赖 main.js 的任何状态；而 main.js 有一条尺寸闸，这段本来就该住在模块里。
+ */
+export function setBadgeText(el, text) {
+  try {
+    if (!el) return false;
+    const s = String(text ?? "");
+    el.textContent = "";
+    const doc = el.ownerDocument || globalThis.document;
+    const span = doc?.createElement?.("span");
+    if (!span) { el.textContent = s; return false; }
+    span.className = "atc-result__t";
+    span.textContent = s;
+    el.appendChild(span);
+    // 短到根本不会被截的就别挂 title：每个徽章都带 tooltip 反而是噪音。
+    if (s.length > 12) el.title = s; else el.removeAttribute?.("title");
+    return true;
+  } catch { return false; }
+}

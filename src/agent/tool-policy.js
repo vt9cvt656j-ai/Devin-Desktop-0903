@@ -232,6 +232,35 @@ function seed() {
   // ── other side-effecting tools ────────────────────────────────────────────
   // 只读模式里按**单次调用**判：服务自己声明了 readOnlyHint 的放行，没声明的照挡。
   // 每一次调用仍然过 needsApproval 那道门，所以放行的也不是无人看管。
+  // run_worker（内部 type "worker"）：派一个 mode 被改写成 "agent" 的**可写**子体去改工作区。
+  // main.js 有四处（_toolMutatesWorkspace 周边、40237/40308/40337/40356）都把它当成改工作区
+  // 的动作在记账，唯独这张**判定用**的表里从没登记过它——于是三道门全取默认值：
+  // 只读模式不拦、审批不弹、mutatesWorkspace 恒 false。用户在模式选择器上亲手选了
+  // Plan / Explorer / Reviewer，模型照样能派子体改文件。
+  // 走默认网关线路时网关的拒绝清单会兜住 schema；但自定义端点 / 自带 key 那条路（_l0On=false）
+  // 由客户端自己拼 body，兜底就没了。「会改工作区就必须能问」那条不变量只豁免 worktree 一个。
+  // 它和 subagent 是同一族（那条也是逐次判、也补过同样的漏），这里对齐。
+  defineTool("worker", {
+    mutatesWorkspace: true,
+    needsApproval: true,
+    readOnlyModeBlocked: true,
+    readOnlyBlockedVerb: "派一个会写文件的 worker 子体",
+  });
+
+  // background_monitor 的 check_type:"command" 支路会拿模型给的 pattern **原样跑 shell**
+  // （main.js 那处 `backend.taskRunCapture(bmCwd, bmPat, …)`），而且按轮询节奏重复跑几十
+  // 上百次。它一直没在这张表里注册过，于是 deny 名单、只读模式、审批开关三道门同时失效：
+  // Plan / Explorer / Reviewer 这三个**声称只读**的模式里，一句
+  // background_monitor(check_type:"command", pattern:"…") 就能绕过 cmd/termtask 那两道闸。
+  // 这和上面 termtask 那条注释记的是同一个坑的第三种形状——同一件事换个工具名就绕过去。
+  // 按**单次调用**判：其余 check_type（file/port/url/screen/capture/manual）是纯观察，
+  // 只读模式里正是最该放行的，不能一刀切。
+  const _bmRunsShell = (call) => String(call?.checkType || "") === "command";
+  defineTool("background_monitor", {
+    needsApproval: _bmRunsShell,
+    readOnlyModeBlocked: _bmRunsShell,
+    readOnlyBlockedVerb: "用后台监控跑 shell 命令",
+  });
   defineTool("mcp", { needsApproval: true, readOnlyModeBlocked: (call) => !call?.mcpReadOnly, readOnlyBlockedVerb: "执行 MCP 工具" });
   // 用户自己声明接进来的 HTTP 能力。一律要审批，和 MCP 同级——声明可能来自 clone 来的
   // 仓库，而它能往任意 http(s) 地址发请求。只读判定同样**逐次**看这一次调用：声明里写的

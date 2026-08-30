@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fnSource, SRC } from "./helpers/source.mjs";
-import { facetSummary, preflightSettleLabel, preflightBody, movePreflightCardsAfter, attachFacetLine, createPreflightCard, settlePreflightCard }
+import { facetSummary, preflightSettleLabel, preflightBody, movePreflightCardsAfter, attachFacetLine, createPreflightCard, settlePreflightCard, designPreflightSections }
   from "../src/agent/knowledge-preflight-card.js";
 
 /**
@@ -98,6 +98,45 @@ test("预检卡挪到思考卡后面，且只挪在它前面的那些", () => {
   // 坏输入不抛。
   for (const [b, a] of [[null, think], [body, null], [body, {}], [undefined, undefined]]) {
     assert.doesNotThrow(() => movePreflightCardsAfter(b, a));
+  }
+});
+
+test("设计预检也走融合卡——不能只修专业域那条路", () => {
+  // 融合卡和「挪到思考卡后面」最初只做在专业域（domain_*）那条路上，michael-design
+  // 那条一个字都没改：三条 plan 各建一张卡、且从不打 data-knowledge-preflight，
+  // 于是 movePreflightCardsAfter 一张都选不到。结果是——设计任务（这个产品最主打的
+  // 场景）看到的仍然是「三张知识检索卡压在最前面」，也就是用户原话抱怨的那一幕。
+  // 从代码 review 上很容易误以为已经修完，所以这条测试单独钉设计那条路。
+  const pre = fnSource("_runMichaelDesignPreflight", { code: true }) || "";
+  assert.ok(pre.length > 400, "取不到 _runMichaelDesignPreflight 正文");
+  assert.match(pre, /_createPreflightCard\(body, "michael-design", _createToolStep\)/,
+    "设计预检没建融合卡——三条检索还是各出一张");
+  assert.match(pre, /_settlePreflightCard\(card,/, "设计预检的融合卡没结算");
+  // 每条 plan 各建一张卡的老写法必须消失，否则融合等于没做。
+  assert.doesNotMatch(pre, /step = _createToolStep\(call\)/,
+    "每条 plan 又各建一张卡了——这正是「一下出一堆」的成因");
+  // 失败 vs 零命中的结构判据不许在这次改动里丢掉。
+  assert.match(pre, /failed: !result\?\.knowledge/,
+    "设计预检丢了「失败 vs 零命中」的结构判据");
+  // 卡面那一行的条数要来自**专业域那条路同一个抽取器**，不是拿命中数凑一个等长空数组，
+  // 也不是在这条路上另写一份行级过滤——各写一份迟早漂开，卡面数字就和正文对不上了。
+  assert.match(pre, /_designPreflightSections\(results, _domainKnowledgeBullets\)/,
+    "设计预检没把真实抽取器注入进去");
+
+  // 摊 sections 这段是纯函数，做真往返，别只钉源码。
+  const secs = designPreflightSections([
+    { plan: { purpose: "信息架构" }, result: { content: "AAA" }, failed: false },
+    { plan: { id: "motion" },        result: { content: "BBB" }, failed: false },
+    { plan: { purpose: "媒体" },     result: { content: "" }, failed: true, failResult: { content: "[失败] 超时" } },
+  ], (txt) => (txt ? [txt] : []));
+  assert.deepEqual(secs.map((x) => x.heading), ["信息架构", "motion", "媒体"], "heading 没回落到 plan.id");
+  assert.deepEqual(secs.map((x) => x.bullets.length), [1, 1, 0]);
+  assert.deepEqual(secs.map((x) => x.failed), [false, false, true], "失败面没被标出来");
+  assert.equal(facetSummary(secs), "信息架构 1 · motion 1 · 媒体 失败",
+    "失败面在卡面上写成了 0——那会把「没拿到」伪装成「库里没有」");
+  // 坏输入不抛：它跑在渲染路径上。
+  for (const bad of [null, undefined, "x", [null]]) {
+    assert.doesNotThrow(() => designPreflightSections(bad, null));
   }
 });
 

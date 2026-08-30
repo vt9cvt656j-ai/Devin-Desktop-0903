@@ -32,6 +32,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as acorn from "acorn";
 import { dirname, join } from "node:path";
+import { setBadgeText } from "../src/agent/escape.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // 正向源码断言必须跑在**剥掉注释**的源码上。注释不是代码：把一条契约从代码里删掉、
@@ -508,7 +509,7 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
   // 这条原来钉的是 _settleToolStep 里那串判据正则的**字面量**。判据后来换成了结构化的
   // （failure.code / ok:false / cmd 退出码 / 正文首行的方括号标记，见 test/tool-card-verdict），
   // 字面量一改这条就假红，而它真正要守的从来是「[未执行] 不许显示成绿勾」。改钉行为。
-  const settleStep = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
+  const settleStep = load("_settleToolStep", { _collapseSettledToolSteps: () => {}, _setBadge: setBadgeText });
   let cardText = "";
   const cardClasses = new Set();
   const resultEl = {

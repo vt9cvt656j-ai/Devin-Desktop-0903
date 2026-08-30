@@ -184,3 +184,54 @@ export function _stripTimeoutWrapper(command) {
   i++;
   return toks.slice(i).join(" ").trim();
 }
+
+// background_monitor 的「生产者已停」判据。监视器在等一个条件成立（登录完成、端口起来、
+// 页面出现某段文字），而这个条件通常要靠某条终端命令去促成——cursor login 那条 CLI、
+// dev server 那条 npm run dev。那条命令自己退出了（尤其带着报错），条件就永远不会成立
+// 了：继续空等到超时只会回一句「已超时」，读起来像「用户没做那件事」，可实际上是**它在
+// 等一件已经失败了的事**（就是用户截图里那张卡——终端已打出 `auth error: login was not
+// completed` 并退回提示符，卡片还在「等待你在浏览器中完成 Cursor 授权… 17s / 300s」）。
+//
+// 只在**开始等的时候还在跑、现在退出了**这个跃迁上判定（wasExited=false → nowExited=true）；
+// 一开始就已经退出的终端是陈旧快照，不管——避免把某个早就跑完的无关终端误当成生产者。
+// 保守起见只在退出**且带失败信号**时才收尾：干净退出可能是服务自我 daemon 化，留给
+// 端口/URL 那条正常轮询去确认，不在这里抢判。返回 { stopped, failed, pattern, tail }。
+export function monitorProducerStopped({ wasExited, nowExited, recentOut } = {}) {
+  if (wasExited || !nowExited) return { stopped: false, failed: false, pattern: "", tail: "" };
+  const tail = String(recentOut || "").replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "").trim().slice(-1500);
+  const rd = _detectTerminalReady(tail);
+  // 登录/授权/凭据这类失败信号，_detectTerminalReady 的 error:/fatal 覆盖不全（"login was
+  // not completed" 里根本没有 error 字样），单独补一组。
+  const auth = /\b(?:auth(?:entication|orization)?\s+(?:error|failed|denied)|login\s+(?:failed|was\s+not\s+completed|not\s+completed|cancell?ed)|not\s+(?:authorized|authenticated)|permission\s+denied|access\s+denied|token\s+(?:expired|invalid|revoked)|credential[s]?\s+(?:invalid|rejected)|refused|declined)\b/i;
+  const failed = !!rd.failed || auth.test(tail);
+  return { stopped: true, failed, pattern: rd.pattern || (auth.test(tail) ? "auth-failure" : ""), tail };
+}
+
+/// background_monitor 的「一开始就已经满足」判据。
+//
+// 六条检查分支里，file / port / url / command / screen 五条都只问「现在成立吗」，不问
+// 「是不是**我开始等之前**就成立了」。于是这个形状会稳定骗人：模型要重启 dev server，
+// 先起新进程再 background_monitor(port 3000)——而 3000 还被**旧**进程占着，第一次轮询
+// （1 秒后）就命中，回执说「端口 3000 已被监听，继续执行」。模型据此认定新服务起来了，
+// 后面所有验证都建立在这个假前提上。file 同理：等一个登录产物文件出现，而上次登录的
+// 那份还在，于是「文件已出现」立刻返回。
+//
+// 这是本仓库反复出现的那类 bug 的又一种形状：**两种不同的状态被报成同一个值**
+// （「本来就有」和「等到了」）。修法一致——不改控制流（本来就满足也确实该继续），
+// 只把事实说清楚，让模型自己判断这个命中能不能当成"那一步做完了"的证据。
+//
+// 判据取「命中发生在第 1 次检查」：第一次轮询在启动后约 1 秒，人类不可能在这 1 秒里
+// 完成一次登录/授权/安装。capture 分支天然不受影响（它按 _captureFlows 快照只认新流量）。
+// `kind` 必须传：manual 那一支**根本不轮询**（它等的是用户点「已完成，继续」那个按钮），
+// _bmChecks 恒为 0，于是"第一次检查就命中"对它恒成立——用户亲手确认完，模型却被告知
+// 「别把它当成那一步已完成的证据」，直接否定用户唯一的显式表态。恒真判据是这个仓库里
+// 反复出现的坑，这里当场堵掉：没做过任何自动检查（checks < 1）就没有"本来就成立"这回事。
+export function preexistingConditionNote(checks, kind = "") {
+  if (kind === "manual") return "";
+  if (!(Number(checks) >= 1)) return "";
+  if (Number(checks) > 1) return "";
+  return "\n\n⚠️ **这个条件在第一次检查（约 1 秒）时就已经成立**——也就是说它**极可能在你开始等之前就已经是真的**，"
+    + "而不是「你等的那件事刚刚发生了」。别把它当成那一步已完成的证据：端口可能被旧进程占着、"
+    + "文件可能是上一次留下的、命令可能本来就能跑通。要确认是不是新的，先取一条能区分新旧的证据"
+    + "（读进程/PID、看文件时间戳或内容、读终端输出），再决定下一步。";
+}

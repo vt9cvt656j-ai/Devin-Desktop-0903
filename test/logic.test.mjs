@@ -8,6 +8,7 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { setBadgeText } from "../src/agent/escape.js";
 // 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
 // （抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
@@ -26,6 +27,8 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          stackManifestExts as stackExts, formatStackHint as formatStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
+import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
+import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
 // 不再从 main.js 源码里抠函数文本。
 import {
@@ -2833,6 +2836,38 @@ test("the size cache notices the one mutation that does not change object identi
 // Permission rules were two booleans plus a hardcoded regex — nothing a team could express
 // or check into git. This is the `Tool(pattern)` grammar, deliberately the same shape Claude
 // Code uses so anyone already writing those rules does not have to relearn them.
+test("后台监控跑 shell 的那一支必须被 deny 规则和危险命令判据看见", () => {
+  // background_monitor 的 check_type:"command" 把模型给的 pattern 原样交给 shell，
+  // 而且按轮询节奏重复跑几十上百次。它一直不在任何一道授权门里：
+  //   · tool-policy 没注册 → 只读模式不拦、审批不弹（那半边在 tool-policy.test.mjs 里钉）
+  //   · _PERM_TOOL_ALIASES.bash 不含它 → 用户写的 Bash(rm:*) deny 规则连工具名这关都过不去
+  //   · _permRuleSubject 取到空串 → 就算过了工具名也没有命令可比
+  //   · _callIsDangerousCommand 只认 cmd/termtask → 危险命令不弹框
+  // deny 是系统里唯一的静默否决、默认 auto 档下唯一还活着的门。这条钉后三个。
+  const toolMatches = load("_permRuleToolMatches", {
+    _PERM_TOOL_ALIASES: new Function("fileMutationTypes", "return " + SRC.match(/const _PERM_TOOL_ALIASES = (\{[\s\S]*?\n\});/)[1])(toolPolicy.fileMutationTypes),
+  });
+  const subject = load("_permRuleSubject");
+  const dangerous = load("_callIsDangerousCommand", { _isDangerousCmd: (c) => /\brm\s+-rf\b/.test(String(c || "")) });
+  const bm = (checkType, pattern) => ({ type: "background_monitor", checkType, pattern });
+
+  assert.equal(toolMatches("Bash", "background_monitor"), true,
+    "Bash 规则覆盖不到监视器——用户的 deny 规则对这条路等于不存在");
+  assert.equal(subject(bm("command", "rm -rf /tmp/x")), "rm -rf /tmp/x",
+    "跑命令那一支没有把 pattern 当成命令主体，规则没东西可比");
+  assert.equal(dangerous(bm("command", "rm -rf /")), true, "危险命令在监视器里不弹框");
+
+  // 反向同样重要：其余 check_type 是纯观察，不许被拖进 Bash 规则和危险命令判断——
+  // 否则「等端口 3000」「等文件出现」会莫名其妙撞上用户的命令规则。
+  for (const ct of ["port", "file", "url", "screen", "capture", "manual"]) {
+    assert.equal(subject(bm(ct, "3000")), "", `check_type=${ct} 是纯观察，不该有命令主体`);
+    assert.equal(dangerous(bm(ct, "rm -rf /")), false, `check_type=${ct} 不跑 shell，不该被判成危险命令`);
+  }
+  // 对照：cmd 的行为一个字没变。
+  assert.equal(dangerous({ type: "cmd", command: "rm -rf /" }), true);
+  assert.equal(subject({ type: "cmd", command: "npm t" }), "npm t");
+});
+
 test("permission rules match by tool family and pattern", () => {
   const matches = load("_permRuleMatches", {
     _parsePermRule: load("_parsePermRule"),
@@ -4753,7 +4788,7 @@ test("tool cards always have a label and skipped paths settle their spinner", ()
     classList: { add: (name) => classes.add(name) },
     querySelector: (selector) => selector === ".atc-result" ? resultEl : null,
   };
-  const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
+  const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {}, _setBadge: setBadgeText });
   assert.equal(settle(step, { content: "[重复读取·已跳过]" }, "重复 · 已跳过"), true);
   assert.equal(textContent, "重复 · 已跳过");
   assert.equal(step.dataset.toolSettled, "1");
@@ -6859,7 +6894,10 @@ test("盯屏幕这条监视器不许毁掉模型手里的 ref", () => {
   // clear_latest_ax_refs()，一个每几秒读一次的后台监视器会把模型上一次读屏拿到的
   // ref **持续作废**——模型攥着一把废数字，ui_click 只回「ref 已过期」，
   // 而它根本不知道是谁弄没的。所以轮询必须走那条不发 ref 也不毁 ref 的读法。
-  const bm = SRC.slice(SRC.indexOf('call.type === "background_monitor"'), SRC.indexOf('call.type === "designboard"'));
+  // 锚点必须是**执行器分支**那个唯一形状。裸的 `call.type === "background_monitor"`
+  // 现在在授权门那边也出现（deny 规则主体、危险命令判据），indexOf 会命中最早那一处，
+  // 于是切出来的"段"横跨四万行整个文件——里面当然找得到 read_screen，断言就假红了。
+  const bm = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
   assert.ok(bm.length > 2000, "没切到 background_monitor 那段");
   assert.match(bm, /bmType === "screen"/, "没有 screen 这个检查类型的轮询分支");
   assert.match(bm, /backend\.invoke\("probe_screen"/, "screen 分支没走 probe_screen");
@@ -6882,6 +6920,70 @@ test("盯屏幕这条监视器不许毁掉模型手里的 ref", () => {
   assert.match(screenBranch, /if \(_bmScreenFails >= \d\) \{[\s\S]{0,400}_bmFinish\(/,
     "连续探查失败没有真的退场——会用整个超时窗口换一句假的「条件没满足」");
   assert.match(screenBranch, /这\*\*不是\*\*「条件没满足」/, "失败退场时没有把真实原因说清楚");
+});
+
+test("生产者已停：监视器不许空等一件已经失败了的事", () => {
+  // 用户截图里那张卡：终端已打出 `auth error: login was not completed` 并退回提示符，
+  // 卡片还在「等待你在浏览器中完成 Cursor 授权… 17s / 300s」——它在等一件已经失败了
+  // 的事，最后回一句「超时」，读起来像「用户没做」。判据必须真的按行为工作，不是恒真。
+  const authFail = { wasExited: false, nowExited: true, recentOut: "Opening browser...\nauth error: login was not completed\n$ " };
+  const r1 = _monitorProducerStopped(authFail);
+  assert.equal(r1.stopped, true, "命令从运行中变成退出，应判定生产者已停");
+  assert.equal(r1.failed, true, "临终输出里有 login was not completed，应识别为失败退出");
+  assert.match(r1.tail, /login was not completed/, "应把终端临终输出带回给模型定位根因");
+
+  // 开始等的时候它就已经退出了 = 陈旧快照，不是我们在等的那条命令，别误当生产者。
+  assert.equal(_monitorProducerStopped({ wasExited: true, nowExited: true, recentOut: "auth error" }).stopped, false,
+    "开始时就已退出的终端是陈旧快照，不该判生产者已停");
+  // 还在跑：不该收尾。
+  assert.equal(_monitorProducerStopped({ wasExited: false, nowExited: false, recentOut: "waiting..." }).stopped, false,
+    "命令还在跑时不该判生产者已停");
+  // 干净退出（无报错）：保守起见 stopped=true 但 failed=false，主循环只在 failed 时收尾，
+  // 把干净退出留给端口/URL 那条正常轮询——服务可能自我 daemon 化了。
+  const clean = _monitorProducerStopped({ wasExited: false, nowExited: true, recentOut: "Server listening on 3000\n$ " });
+  assert.equal(clean.stopped, true);
+  assert.equal(clean.failed, false, "干净退出不该被当成失败——否则会误杀自我 daemon 化的服务");
+
+  // 主循环里这条判据必须真的接到了 _bmFinish，而不是只声明了变量。
+  const bm2 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
+  assert.match(bm2, /monitorProducerStopped\(\{[\s\S]{0,200}wasExited:/, "轮询里没有真的调用 monitorProducerStopped");
+  assert.match(bm2, /_ps\.stopped && _ps\.failed[\s\S]{0,300}_bmFinish\(/, "生产者失败退出时没有真的收尾");
+  // UI 不再有滴答的秒数倒计时和进度条——用户要的是「监听中」。
+  assert.doesNotMatch(bm2, /\$\{Math\.floor\(elapsed\)\}s \/ \$\{bmTimeout\}s/, "卡片仍在显示 Xs / Ys 倒计时");
+  assert.doesNotMatch(bm2, /class="bm-bar"/, "卡片仍有进度条");
+  assert.match(bm2, /监听中/, "卡片没有「监听中」这个被动监听指示");
+});
+
+test("一开始就已经满足 ≠ 等到了", () => {
+  // 模型重启 dev server：先起新进程，再 background_monitor(port 3000)。而 3000 还被**旧**
+  // 进程占着 → 第一次轮询就命中 → 回执「端口 3000 已被监听，继续执行」→ 模型认定新服务
+  // 起来了。file 同理（上次登录留下的产物文件还在）。两种状态被报成同一个值。
+  assert.notEqual(_preexistingConditionNote(1), "", "第一次检查就命中，必须点明它可能本来就成立");
+  assert.match(_preexistingConditionNote(1), /开始等之前/, "没说清「本来就是真的」这个可能");
+  assert.match(_preexistingConditionNote(1), /旧进程|上一次|时间戳/, "没给出区分新旧的取证办法");
+  // 等了几轮才命中 = 真的等到了，不许加这句噪音。
+  for (const n of [2, 3, 17]) {
+    assert.equal(_preexistingConditionNote(n), "", `第 ${n} 次才命中说明是真的等到了，不该加警告`);
+  }
+  // manual **根本不轮询**（它等的是用户点「已完成，继续」），_bmChecks 恒为 0——
+  // 于是"第一次检查就命中"对它恒成立。用户亲手确认完却被告知「别把它当成做完的证据」，
+  // 直接否定用户唯一的显式表态。恒真判据是这个仓库反复出现的坑，这条钉死它。
+  assert.equal(_preexistingConditionNote(0, "manual"), "", "用户亲手点的确认不许被这句话否定");
+  assert.equal(_preexistingConditionNote(1, "manual"), "", "manual 任何情况下都不该发这句");
+  // 一次自动检查都没做过，也谈不上「本来就成立」。
+  assert.equal(_preexistingConditionNote(0, "port"), "", "没做过检查就不该断言它本来就成立");
+  assert.notEqual(_preexistingConditionNote(1, "port"), "", "port 第一次检查就命中，仍要提示");
+  // 调用点必须把类型传进去，否则上面这条判据在产品里根本不生效。
+  const bm4 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
+  assert.match(bm4, /preexistingConditionNote\(_bmChecks, bmType\)/,
+    "调用点没把 bmType 传进去——manual 那条恒真判据会活着");
+
+  // 必须真的接进 _bmFinish 的回执里，而不是只导入了没用。
+  const bm3 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
+  assert.match(bm3, /preexistingConditionNote\(_bmChecks, bmType\)/, "没有把命中轮次和类型传给判据");
+  assert.match(bm3, /_queueFollowup\(_bmSess, followupText \+ _pre\)/, "警告没有真的拼进给模型的回执");
+  // 只对「等到了」加，超时/取消不加——那两种本来就没有假命中问题。
+  assert.match(bm3, /dotClass === "done" \? preexistingConditionNote/, "对非 done 的收尾也加了这句，属于噪音");
 });
 
 test("盯着界面等不算验证证据", () => {
@@ -18794,7 +18896,12 @@ test("background monitors retire with their run instead of billing a new one", (
   const bmStopAt = bmFinish.indexOf("if (_bmIv) clearTimeout(_bmIv);");
   const bmReleaseAt = bmFinish.indexOf("_bmRelease();");
   const bmRetireAt = bmFinish.indexOf("if (_bmRetired() && !suppressFollowup) return;");
-  const bmQueueAt = bmFinish.indexOf("_queueFollowup(_bmSess, followupText);");
+  // 锚点用 `_queueFollowup(_bmSess,` 而不是整句：followupText 后面会挂东西
+  //（比如"这个条件本来就成立"那句提示），写死整句的话下次一改参数，indexOf 返回 -1，
+  //  上面那串 `<` 比较会因为 -1 最小而**恒真**——这条顺序断言就悄悄变成了摆设。
+  //  这是本仓库记过的「锚点失效」那一种恒真守卫。
+  const bmQueueAt = bmFinish.indexOf("_queueFollowup(_bmSess,");
+  assert.ok(bmQueueAt >= 0, "_bmFinish 里找不到排后续轮次的调用——锚点又失效了");
   assert.ok(bmStopAt >= 0 && bmStopAt < bmReleaseAt && bmReleaseAt < bmRetireAt && bmRetireAt < bmQueueAt,
     "_bmFinish 必须先停表并注销交互，再判断退场，最后才允许排新 run");
   assert.match(SRC, /if \(_bmRetired\(\)\) \{ _bmDone = true; if \(_bmIv\) clearTimeout\(_bmIv\); return; \}/,
@@ -22523,13 +22630,13 @@ test("#88: web_fetch/web_search 错误消息友好化", () => {
 });
 
 test("#88: deferred search 工具错误消息友好化", () => {
-  // 原来钉的是一句固定文案「检查查询参数、网络连接或稍后重试」。意图对（失败要给
-  // 排查建议），但那句话对**被反爬封锁**的源是错的建议 —— 实测 403/202 的源重试
-  // 一万次也不会好，而那句话正好在劝模型再试一次。契约升级为：必须按状态码分因。
-  assert.match(SRC, /const _blocked = /,
-    "必须按状态码判定「被封锁」，不能对所有失败给同一句建议");
-  assert.match(SRC, /重试无用/,
-    "判定为封锁时必须明说重试无用（否则模型会一直换词重试）");
+  // 失败时给模型多条可选路径（重试/换词/换工具/换源），而不是一句固定文案。
+  assert.match(SRC, /const _hint = /,
+    "失败消息必须包含排查建议（_hint）");
+  assert.match(SRC, /换查询词/,
+    "建议里必须包含换查询词选项");
+  assert.match(SRC, /web_search/,
+    "建议里必须包含换用 web_search 的选项");
 });
 
 test("#88: 联网工具保留失败 telemetry 且不缓存显式调用", () => {
@@ -31151,7 +31258,10 @@ test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
 
 test("每个会弹审批框的工具都得有自己的文案，不能只给一句「执行该操作？」", async () => {
   const { approvalTypes } = await import("../src/agent/tool-policy.js");
-  const label = load("_approvalLabel", { _escHtml: String, _dbCallIsDestructive: () => false });
+  // 2026-08-30 搬进 src/agent/approval-label.js —— 直接 import 产品代码，不再抠源码。
+  // 抠源码验得到行为，验不到「这个函数还在不在真实调用链上」；调用链那一头由下面
+  // 对 main.js 薄壳的断言守着。
+  const label = (call) => approvalLabel(call, { mcpSnapshot: () => null });
   const generic = label({ type: "__不存在的类型__" }).title;
   const bland = [];
   for (const t of [...approvalTypes()].sort()) {
@@ -31164,6 +31274,11 @@ test("每个会弹审批框的工具都得有自己的文案，不能只给一�
   }
   // 一个没有信息的框，只会让人闭着眼睛点同意——那时候这道门就只剩摩擦、不剩保护。
   assert.deepEqual(bland, [], "这些工具会弹框，但框上只有一句没信息的默认文案：" + bland.join(", "));
+  // 搬出去之后还要守住调用链：main.js 里的薄壳必须真的调它，并且把 MCP 快照传进去
+  //（那是它唯一的外部依赖；不传的话 MCP 框里就没有"服务自述"那一行）。
+  const shell = extractFn("_approvalLabel", { code: true }) || "";
+  assert.match(shell, /return approvalLabel\(call, \{/, "main.js 的 _approvalLabel 没有调模块");
+  assert.match(shell, /mcpSnapshot:/, "薄壳没把 MCP 快照传进去");
   // 铺一整棵项目树的那两个，必须在框里说清会往工作区写东西——它是这批里代价最大的一个。
   for (const t of ["game_scaffold", "web_scaffold"]) {
     const r = label({ type: t, name: "x", engine: "godot", framework: "react" });

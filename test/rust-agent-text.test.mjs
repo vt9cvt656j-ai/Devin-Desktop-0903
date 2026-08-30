@@ -36,7 +36,11 @@ const RS_DIR = join(ROOT, "src-tauri/src");
 const BASELINE = {
   "accessibility.rs": 3,
   "archive.rs": 1,
-  "browser.rs": 6,
+  // 2026-08-30 6 → 5：「操作不到「X」：disabled/not_visible/covered by」那段诊断原来在
+  // browser_click / browser_type 里**抄了三份**，收进 unactionable_reason() 一处共用。
+  // 措辞本身仍在客户端（它要区分三种形状、且和 click_via_eval 的返回值强耦合），
+  // 但至少不会再改一处漂三份。
+  "browser.rs": 5,
   "capture.rs": 1,
   "git.rs": 1,
   "knowledge.rs": 2,

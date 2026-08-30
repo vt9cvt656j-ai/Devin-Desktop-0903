@@ -33,6 +33,21 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_300（2026-08-30 第二次，**仍在往下**）：实测 81,264 行。抽出
+ *   `src/agent/approval-label.js`（`_approvalLabel` 的 166 行 switch）。判据照 mainlink
+ *   那次：唯一的外部依赖（MCP 快照表 `_mcpStates`）改成**从参数传**，main.js 侧留四行薄壳。
+ *
+ *   这一笔是被一次安全修复逼出来的，值得记：background_monitor 的 check_type:"command"
+ *   会把模型给的串原样交给 shell 并重复跑几十次，而它**四道门一道都没登记过**
+ *   （tool-policy 未注册 → 只读不拦、审批不弹；_PERM_TOOL_ALIASES.bash 不含它 → 用户的
+ *   deny 规则连工具名都匹配不上；_permRuleSubject 取到空串 → 没有命令可比；
+ *   _callIsDangerousCommand 只认 cmd/termtask → 危险命令不弹框）。run_worker 的 type
+ *   "worker" 是同一种漏法：main.js 有四处把它当"改工作区"记账，判定表里却没有它，
+ *   于是 Plan/Explorer/Reviewer 三个只读模式能派出会写文件的子体。补这两处要新增
+ *   审批文案和判据分支，正好撞线——按这条闸的用法，先腾地方再加。
+ *
+ *   **抽完把线收回来。** 剩 36 行余量，留给在飞的活。
+ *
  * · 81_400（2026-08-30，**往下收**）：实测 81,361 行。抽出 `src/agent/verification-evidence.js`
  *   （`freshBuildFailure` 发红灯、`evidenceCertifies` 发绿灯，连注释 103 行）。判据照旧：
  *   两个都只读传进来的 run/记录和一个数字，无 DOM、无模块级状态。
@@ -76,7 +91,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_400;
+const MAIN_JS_MAX_LINES = 81_300;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
