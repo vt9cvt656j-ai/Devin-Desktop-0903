@@ -82,11 +82,53 @@ export function rootDropQuestion({ dirs = [], destDir = "", rootPath = "" } = {}
   const what = n > 1 ? `${n} 个文件夹` : `「${baseName(dirs[0] || "")}」`;
   const here = baseName(destDir) || "项目根目录";
   const cur = baseName(rootPath) || "当前项目";
+  // 一句话就够。VS Code 的原文也只有一句（"Do you want to copy 'X' or add 'X' as a folder
+  // to the workspace?"）——把每个按钮都解释一遍，反而让人不知道该点哪个。
   return {
     title: `${what}要怎么加进来？`,
-    message: `复制到这里 = 放进「${here}」；添加到工作区 = 当前项目继续开着，多一个根目录；`
-      + `打开为新项目 = 关掉当前的「${cur}」，改为打开它。`,
+    message: `复制进「${here}」，还是作为另一个根目录加进工作区？（也可以直接打开它，那会关掉当前的「${cur}」）`,
   };
+}
+
+/**
+ * 树**内部**拖动（把树里的文件/目录拖到另一个目录）的合法性判据。
+ *
+ * VS Code 的 handleDragOver 里对应这几条 return false：目标就是它自己、目标是它的子目录、
+ * 源已经在目标目录里（拖了等于没拖）。前两条要是漏了，`rename` 会把目录搬进它自己，
+ * 整棵子树当场消失。
+ *
+ * 返回空串 = 可以移动；否则是拒绝原因。
+ */
+export function moveRejection({ src = "", destDir = "" } = {}) {
+  const s = trimSlash(src);
+  const d = trimSlash(destDir);
+  if (!s || !d) return "invalid";
+  if (isInsideOrSame(d, s)) return "self";     // 拖进自己 / 自己的子目录
+  if (parentOf(s) === d) return "same";        // 本来就在这个目录里
+  return "";
+}
+
+/**
+ * 一批内部移动的计划。paths 是被拖的那些路径（多选时不止一个）。
+ * 返回 { moves: [{from, to, name}], skipped: [{path, reason}] }，纯计算不碰磁盘。
+ * 同一批里若有两个同名，后一个会被标成 dup —— 后端 rename 在目标已存在时是直接报错的，
+ * 与其让它半路失败，不如在计划期就说清楚。
+ */
+export function planMove({ paths = [], destDir = "" } = {}) {
+  const dest = trimSlash(destDir);
+  const moves = [];
+  const skipped = [];
+  const taken = new Set();
+  for (const raw of paths) {
+    const from = trimSlash(raw);
+    const reason = moveRejection({ src: from, destDir: dest });
+    if (reason) { skipped.push({ path: from, reason }); continue; }
+    const name = baseName(from);
+    if (taken.has(name)) { skipped.push({ path: from, reason: "dup" }); continue; }
+    taken.add(name);
+    moves.push({ from, to: joinPath(dest, name), name });
+  }
+  return { moves, skipped };
 }
 
 /**
