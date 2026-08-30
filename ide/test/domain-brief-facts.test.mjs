@@ -10,8 +10,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { load } from "./helpers/source.mjs";
+import { domainKnowledgeBullets } from "../src/agent/domain-knowledge-brief.js";
 
-const bullets = load("_domainKnowledgeBullets");
+// 2026-08-30 搬进 src/agent/domain-knowledge-brief.js —— 直接 import 产品代码，
+// 不再从 main.js 抠源码 new Function（抠源码验得到行为，验不到「它还在真实调用链上」）。
+const bullets = domainKnowledgeBullets;
 const chunk = (section, body) => `【1·经验｜database/x · ${section}】\n## ${section}\n${body}`;
 
 test("首条要点不再是小节标题的回声", () => {

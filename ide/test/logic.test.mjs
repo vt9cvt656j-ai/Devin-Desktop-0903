@@ -6986,6 +6986,38 @@ test("一开始就已经满足 ≠ 等到了", () => {
   assert.match(bm3, /dotClass === "done" \? preexistingConditionNote/, "对非 done 的收尾也加了这句，属于噪音");
 });
 
+test("后台监控另外三条会静默骗人的规则", () => {
+  const bm5 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
+
+  // ① capture 分支：_captureFlows 是定长 3000 的环形缓冲，拿 length 当基线的话，
+  //    缓冲一满基线恒等于 length，`i < length` 恒假——循环体一次都不执行，
+  //    卡片显示「监听中」、超时回执说「没等到条件」，而实际一次都没检查过。
+  assert.doesNotMatch(bm5, /const _bmSnap = _captureFlows\.length/,
+    "capture 又拿数组下标当基线了——环形缓冲写满后这条判据恒假");
+  assert.match(bm5, /_bmSnapTotal = _captureTotal/, "capture 基线没有改用累计计数");
+  assert.match(SRC, /let _captureTotal = 0;/, "缺累计计数器");
+  assert.match(SRC, /_captureFlows\.push\(flow\);\s*\n\s*_captureTotal\+\+;/,
+    "收到流量时没有累加计数——基线就永远不动");
+
+  // ② screen 分支：失败计数只增不清零，成功一百次也会被三次瞬时失败累计掉，
+  //    还硬说「一次都没成功过、多半是没给辅助功能权限」，把模型引去查不存在的故障。
+  const sAt = bm5.indexOf('} else if (bmType === "screen" && bmPat) {');
+  const screenBranch = bm5.slice(sAt, bm5.indexOf('} else if (bmType === "port" && bmPat) {', sAt));
+  assert.match(screenBranch, /_bmScreenOk = true; _bmScreenFails = 0;/,
+    "探查成功时没有清零失败计数——那是累计失败不是连续失败");
+  assert.match(screenBranch, /_bmScreenOk\s*\n?\s*\?/,
+    "退场文案没按「是否曾经成功过」分叉，仍会硬说一次都没成功过");
+
+  // ③ command 分支：每次检查写死 10 秒，会让所有慢检查结构性地不可能成立，
+  //    而回执只说「用户可能没做完」，把根因藏起来。
+  assert.doesNotMatch(bm5, /taskRunCapture\(bmCwd, bmPat, \{ timeoutSecs: 10 \}\)/,
+    "command 又写死 10 秒了——npm run build 这类检查永远拿不到 exit 0");
+  assert.match(bm5, /_cmdTimeout = Math\.min\(60, Math\.max\(10, Math\.floor\(bmTimeout \/ 6\)\)\)/,
+    "command 的单次超时没有随整体超时伸缩");
+  assert.match(bm5, /_bmCmdTimedOut/, "没有记录「是被自己的超时杀掉的」");
+  assert.match(bm5, /被自己的超时杀掉/, "超时回执没把这个根因说给模型");
+});
+
 test("盯着界面等不算验证证据", () => {
   // background_monitor 整体被算作验证类取证。screen 那一种是**纯观察**：
   // 盯着某个应用的界面等一句话出现，什么都没检查、没跑、没请求。
@@ -11454,7 +11486,7 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
 });
 
 test("tool hints stay capability-neutral while the semantic orchestrator controls live schemas", () => {
-  const build = load("_buildToolHint");
+  const build = load("_buildToolHint", { _staticToolNames: () => new Set(["read_file", "search"]) });
   const hint = build("跑起来了但看不到哪里错", { applies: true, bug: true, backendApi: true });
   assert.match(hint, /动态工具编排/);
   // 情境→工具的映射仍然禁止手写扩张（那会过拟合到昨天的工具集）。但从注册表生成的
@@ -20884,6 +20916,43 @@ test("#51-3 装载 nudge 结构化：工具名带微用途括号（use_cases 首
   assert.match(SRC, /return brief \? `\$\{name\}（\$\{brief\}）` : name;/);
   // 元数据真源核验：db_query 的 use_cases 首条截断后确实是可读微用途
   assert.ok(Array.isArray(TOOL_METADATA.db_query?.use_cases) && TOOL_METADATA.db_query.use_cases.length > 0);
+});
+
+test("子体的「门」和「钥匙」两张表要对得上（有门没钥匙 = 那个能力对子体等于不存在）", () => {
+  // 两张手抄表：_READ_TOOLS 是**发给**子体的工具名单，_READ_TYPES 是执行时**放行**的类型。
+  // 漂一格就会出现两种哑火：
+  //   · 有门没钥匙：_READ_TYPES 放行了，_READ_TOOLS 里没有 → 子体压根拿不到这个工具
+  //     （2026-08-30 实测：liveenvironment 放行了，live_environment 却不在名单里，
+  //      research 类子体查天气/空气质量/地震这类免 key 结构化事实只能退回 web_search）。
+  //   · 有钥匙没门：注释里骂过的 read_logs / read_skill 那次，正好反过来。
+  const sub = extractFn("_runSubAgent");
+  const tools = (sub.match(/const _READ_TOOLS = \[([^\]]+)\]/) || [])[1] || "";
+  const types = (sub.match(/const _READ_TYPES = \[([^\]]+)\]/) || [])[1] || "";
+  assert.ok(tools && types, "两张表都要能取到");
+  const has = (blob, name) => blob.includes(`"${name}"`);
+
+  // 逐对核：类型 ←→ 工具名（这几对是 _mapToolCall 里真实的映射关系）
+  for (const [type, tool] of [
+    ["liveenvironment", "live_environment"],
+    ["localdiscovery", "local_discovery"],
+    ["readscreen", "read_screen"],
+    ["uiextract", "ui_extract"],
+    ["semsearch", "semantic_search"],
+    ["findsymbol", "find_symbol"],
+    ["knowledge", "knowledge_search"],
+    ["termread", "read_terminal"],
+    ["logs", "read_logs"],
+    ["skill", "read_skill"],
+  ]) {
+    if (has(types, type)) {
+      assert.ok(has(tools, tool),
+        `_READ_TYPES 放行了 ${type}，但 _READ_TOOLS 里没有 ${tool}——有门没钥匙，子体拿不到这个工具`);
+    }
+    if (has(tools, tool)) {
+      assert.ok(has(types, type),
+        `_READ_TOOLS 发了 ${tool}，但 _READ_TYPES 不放行 ${type}——有钥匙没门，调了就被拒`);
+    }
+  }
 });
 
 test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op 级把关", () => {
@@ -36135,10 +36204,24 @@ test("能力名录：已在工具列表里的直接调，不许再让它先取�
   assert.doesNotMatch(hint, /名录只给名字。看到贴合目标的那个，用 search_tools/,
     "旧的无条件指令回来了——它对已加载的那批工具是假的");
 
-  // 名录本身必须保持静态：动态化会击穿前缀缓存，这是刻意不选的那条路。
-  assert.match(hint, /toolCapabilityIndex\(\)/, "名录仍然由静态索引提供");
-  assert.doesNotMatch(hint, /toolCapabilityIndex\([^)]+\)/,
-    "名录不许开始接受参数——按窗口过滤会让它变成动态内容，每次窗口变化都击穿缓存前缀");
+  // 名录必须**按轮恒定**：动态化会击穿前缀缓存，这是刻意不选的那条路。
+  //
+  // 2026-08-30 这条断言收紧了一次。原来写的是「不许接受任何参数」，理由栏写的却是
+  // 「按**窗口**过滤会让它变成动态内容」——两者不是一回事，而那个过宽的形式挡住了一个
+  // 必要的修复：名录抬头对模型说「全部可用，按名字直接调用即可自动装载」，可它原来无条件
+  // 列 TOOL_METADATA 全表，网页版（inTauri=false）会把 89 个 desktopOnly 工具一起列出来，
+  // 模型照着调就是一轮白烧（search_tools 里最长等 8 秒 MCP 发现，再吃一句「注册表没有」）。
+  //
+  // 判据改成「用什么过滤」：
+  //   · _staticToolNames() —— 按进程 memo，只在用户改自定义能力声明时失效，**不随轮次变** → 允许
+  //   · 工具窗口 / 本轮画像 / 任务文本 —— 每轮都变 → 禁止
+  // 「按轮恒定」这件事本身由 test/cache-prefix.test.mjs 那条 build() === build(args) 正面钉着。
+  assert.match(hint, /toolCapabilityIndex\(/, "名录不见了");
+  // 允许一层嵌套括号：实参本身就是个函数调用（_staticToolNames()）。
+  const _idxCall = /toolCapabilityIndex\(((?:[^()]|\([^()]*\))*)\)/.exec(extractFn("_buildToolHint"))?.[1]?.trim() ?? "";
+  assert.equal(_idxCall, "_staticToolNames()",
+    `名录的过滤依据必须是按进程 memo 的静态注册表，实际是「${_idxCall}」——`
+    + "按窗口/画像/任务文本过滤会让它每轮变，击穿缓存前缀");
 });
 
 // on_run_end 钩子不许跟着「付费学习调用」那道闸一起被关掉。

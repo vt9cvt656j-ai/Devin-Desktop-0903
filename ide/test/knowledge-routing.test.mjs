@@ -24,6 +24,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+// 2026-08-30 这三样搬进 src/agent/domain-knowledge-brief.js —— 直接 import 真模块。
+import { domainKnowledgeBullets, domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "../src/agent/domain-knowledge-brief.js";
 
 // 正向源码断言跑在**剥掉注释**的源码上：把一条契约从代码里删掉、只在注释里留一句，
 // assert.match 照样绿（本仓库已经这样漏过一整组模型可见的工具契约）。
@@ -268,17 +270,15 @@ const LONG = (tag) => `${tag} 这一条要长过二十四个字符才会被小�
 function preflightDeps({ search, calls = [] } = {}) {
   return {
     _DOMAIN_KNOWLEDGE_RUBRICS: loadConst("_DOMAIN_KNOWLEDGE_RUBRICS"),
-    _DOMAIN_KNOWLEDGE_BRIEF_BUDGET: loadConst("_DOMAIN_KNOWLEDGE_BRIEF_BUDGET"),
+    _DOMAIN_KNOWLEDGE_BRIEF_BUDGET: DOMAIN_KNOWLEDGE_BRIEF_BUDGET,
     _DOMAIN_KNOWLEDGE_MAX_DOMAINS: loadConst("_DOMAIN_KNOWLEDGE_MAX_DOMAINS"),
     _AI_KNOWLEDGE_DOMAINS: DOMAINS,
     _domainKnowledgeFlagDomains: flagDomains,
     _domainKnowledgeResearchPlan: load("_domainKnowledgeResearchPlan", {
       _DOMAIN_KNOWLEDGE_RUBRICS: loadConst("_DOMAIN_KNOWLEDGE_RUBRICS"),
     }),
-    _domainKnowledgeBullets: load("_domainKnowledgeBullets"),
-    _domainKnowledgeBrief: load("_domainKnowledgeBrief", {
-      _DOMAIN_KNOWLEDGE_BRIEF_BUDGET: loadConst("_DOMAIN_KNOWLEDGE_BRIEF_BUDGET"),
-    }),
+    _domainKnowledgeBullets: domainKnowledgeBullets,
+    _domainKnowledgeBrief: domainKnowledgeBrief,
     _toolExecutionSucceeded: (_call, result) => !String(result?.content || "").startsWith("[失败]"),
     _createToolStep: () => null,
     _settleToolStep: () => {},
@@ -350,7 +350,7 @@ test("小抄是条目化的四栏，不是把原文散文倒进去", async () =>
 });
 
 test("小抄有界：总预算 2500 字符，超了截断并说清截了多少", async () => {
-  const budget = loadConst("_DOMAIN_KNOWLEDGE_BRIEF_BUDGET");
+  const budget = DOMAIN_KNOWLEDGE_BRIEF_BUDGET;
   assert.equal(budget, 2500, "预算不是 2500 了——这条断言和实现要一起改");
   const run = { mode: "agent", _originalText: "x" };
   // 每条 rubric 都塞满命中，把小抄撑爆。
@@ -398,8 +398,14 @@ test("检索炸了也只是没有小抄，不炸整轮", async () => {
   });
   assert.equal(out.required, true);
   const brief = out.briefs[0].brief;
-  assert.ok(brief.includes("没有返回任何可用命中"), "没命中时要明说不可用");
-  assert.ok(/不要编造|不要凭印象/.test(brief), "没命中却没拦住「凭印象补」，那比不查更糟");
+  // 2026-08-30：这里断言的从「没有返回任何可用命中」改成失败态的措辞。
+  // 原因不是措辞变了，是这个夹具本来就是**检索抛异常**（search 里 throw），
+  // 而那属于「没拿到结论」，不是「库里确实没有」——两者对模型的含义相反：
+  // 后者可以据此往下走，前者不行。旧断言正好把这两种压成了同一句。
+  assert.ok(brief.includes("没有拿到结果"), "检索炸了要说成「没拿到」，不能说成「库里没有」");
+  assert.ok(brief.includes("不等于") && brief.includes("库里没有"),
+    "必须点明「没拿到 ≠ 库里没有」，否则模型会断言这个领域没有规则");
+  assert.ok(/不要据此断言|不要编造|不要凭印象/.test(brief), "没拦住「凭印象补」，那比不查更糟");
 });
 
 test("单飞：一个 run 只起一条预检 promise；没有旗标时连 promise 都不建", async () => {

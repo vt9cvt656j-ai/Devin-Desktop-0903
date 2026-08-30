@@ -782,7 +782,11 @@ const CATEGORY_LABELS = Object.freeze({
   utility: '杂项',
 });
 
-let _capabilityIndexCache = "";
+// 按「可用工具集合」分桶的缓存。**不能退回单值缓存**：这段文本进 system 提示词，
+// 上游按前缀缓存计费，同一台机、同一模式下必须逐字节一致，否则每轮都击穿缓存。
+// 而桌面版/网页版/只读模式的可用集合不同，单值缓存会让先跑的那个模式把文本钉死。
+// 同一进程里集合数量是个位数（桌面全量 / 网页版 / 只读），Map 不会长。
+const _capabilityIndexCache = new Map();
 
 /**
  * 全量工具能力索引：按类别列出每一个已注册工具的名字。
@@ -826,10 +830,36 @@ function _capabilityNote(name, meta) {
   return note ? `(${note})` : '';
 }
 
-export function toolCapabilityIndex() {
-  if (_capabilityIndexCache) return _capabilityIndexCache;
+/**
+ * @param {Set<string>|null} available 本次真实可用的工具名集合；传 null = 不过滤（旧行为）。
+ *
+ * 必须能过滤：这份名录被拼进 system 提示词，抬头写着「全部可用，按名字直接调用即可自动
+ * 装载」。而它原来无条件遍历冻结的 TOOL_METADATA，网页版（inTauri=false）会把 89 个
+ * desktopOnly 工具一起列出来——模型照名录调 git_status / db_query / run_in_terminal，
+ * 要么在 search_tools 里等最长 8 秒 MCP 发现再吃一句「注册表没有这个工具」，
+ * 要么直接撞执行器的「[不可用] 需要桌面版」。一句承诺换一轮白烧。
+ */
+export function toolCapabilityIndex(available = null) {
+  // 空集合当「不过滤」处理。唯一的调用方 _staticToolNames() 在 _buildToolRegistry 抛异常时
+  // 走 catch 返回 new Set()，而**空 Set 是真值** —— 原样传下来会把 143 个名字一个不剩地滤掉，
+  // 名录静默变成空串，还被那边的 memo 钉住整个进程：模型从此只剩开局窗口那十来个工具，
+  // 而没有任何一处会报错、会红、会打日志。过滤之前这份名录遍历的是冻结常量，
+  // **结构上不可能失败**；加了过滤就得自己把这条兜底补回来。真实注册表不可能是空的，
+  // 所以「空」只可能是上游坏了 —— 退回全量，宁可多列几个也不能让模型以为自己没工具。
+  const avail = available && available.size ? available : null;
+  const key = avail ? [...avail].sort().join(',') : '*';
+  const cached = _capabilityIndexCache.get(key);
+  // 判据是「这个键在不在表里」，不是「值真不真」：空串是合法结果，`if (cached)` 会把它
+  // 当成未命中，于是每一轮都重算一次全表。
+  if (cached !== undefined) return cached;
   const byCategory = new Map();
   for (const [name, meta] of Object.entries(TOOL_METADATA)) {
+    // search_tools 永不过滤。它的 schema 是 main.js 里单独的常量（_SEARCH_TOOLS_SCHEMA，
+    // 在 _selectInitialTools 里 push），**不走 _buildAgentToolSchemas** —— 于是任何由注册表
+    // 建出来的 available 里都没有它，实测桌面 143 个名字里被这道过滤丢掉的有且只有它。
+    // 而名录的收尾句正是「名录里有、你工具列表里没有的，才用 search_tools 取回 schema 再调」：
+    // 把它滤掉，那句话就没有指向的对象了。
+    if (avail && name !== 'search_tools' && !avail.has(name)) continue;
     const cat = meta?.category || 'utility';
     if (!byCategory.has(cat)) byCategory.set(cat, []);
     byCategory.get(cat).push(name + _capabilityNote(name, meta));
@@ -845,8 +875,9 @@ export function toolCapabilityIndex() {
     if (CATEGORY_LABELS[cat] || !names.length) continue;
     lines.push(`${cat}: ${names.slice().sort().join(' ')}`);
   }
-  _capabilityIndexCache = lines.join('\n');
-  return _capabilityIndexCache;
+  const out = lines.join('\n');
+  _capabilityIndexCache.set(key, out);
+  return out;
 }
 
 export { TOOL_METADATA, CATEGORY_LABELS };

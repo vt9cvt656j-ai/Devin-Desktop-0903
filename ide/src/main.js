@@ -206,6 +206,7 @@ import { mountTableView } from "./ui/mount-table-view.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 import { escapeAttr as _escAttr, escapeHtml as _escHtml, setBadgeText as _setBadge } from "./agent/escape.js";
 import { approvalLabel } from "./agent/approval-label.js";
+import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
 import { langBadge as _langBadge } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -22849,9 +22850,13 @@ function _mcpElicitationDialog({ server, message, schema }) {
         <pre class="sheet__sub el-msg" style="white-space:pre-wrap"></pre>
         <div class="el-fields"></div>
         <div class="sheet__actions">
-          <button type="button" data-act="decline">拒绝</button>
-          <button type="button" data-act="cancel">取消</button>
-          <button type="button" data-act="accept" class="btn-primary">提交</button>
+          <!-- 三个按钮原来全裸奔：前两个一个 class 都没有，「提交」写的 btn-primary 在 CSS 里
+               根本不存在（真名是 btn--primary，单双横线之差）。于是这张「某个 MCP 服务反过来
+               要你填东西」的表单上，唯一该被强调的「哪个是提交、哪个是拒绝」完全没有主次，
+               三个都是浏览器默认的灰方块。照 22935 行审批框的写法对齐。 -->
+          <button type="button" class="btn btn--danger" data-act="decline">拒绝</button>
+          <button type="button" class="btn" data-act="cancel">取消</button>
+          <button type="button" class="btn btn--primary" data-act="accept">提交</button>
         </div>
       </form>`;
       document.body.appendChild(_elicitDlg);
@@ -26061,7 +26066,6 @@ function _startMichaelDesignPreflight({ run, body = null, isLive = () => true } 
 // 总预算 2500 字符：小抄的价值在"少而准"。把 4.3MB 语料里几十段原文倒进上下文，对弱模型
 // 是淹没不是帮助——它会开始复述小抄而不是做事。超了就截断并当场记账（告诉模型截了多少，
 // 以及缺的部分自己用 knowledge_search 补），不假装那是全部。
-const _DOMAIN_KNOWLEDGE_BRIEF_BUDGET = 2500;
 // 一轮最多嚼几个域。画像是会话级单调并集，长会话可能累积出好几个 domain_* 旗标；
 // 不设上限就会在开局前打出十几次检索。取最先声明的两个，其余留给模型自己按需 knowledge_search
 // （它现在在开局窗口里，零成本可调——这正是上面那条改动的意义）。
@@ -26127,94 +26131,8 @@ function _domainKnowledgeResearchPlan(domain, task) {
  * 每段只取第一条够实的行：宁可让 6 个不同小节各露一句，也不要把一段原文整个贴进来——
  * 小抄要的是覆盖面，散文才要连贯。
  */
-function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190, seen = null) {
-  const blocks = String(content || "").split("\n\n———\n\n");
-  const bullets = [];
-  for (const block of blocks) {
-    const cut = block.indexOf("】");
-    if (cut < 0) continue;
-    const section = /·\s*([^｜】]+)】\s*$/.exec(block.slice(0, cut + 1))?.[1]?.trim() || "";
-    const rawLines = block.slice(cut + 1).split("\n");
-    let inFence = false;
-    let prose = "";     // 首选：散文/表格数据行
-    let fenced = "";    // 兜底：代码围栏里的第一行
-    // seen：跨 rubric 去重。命中已见的就往下取**同一段的下一条**，而不是把这一栏丢空——
-    // 四条 rubric 各查一次、共 16 个检索位，而多数域的小节数比这还少，重复是结构性的。
-    const _fresh = (t) => !seen || !seen.has(String(t).trim());
-    for (let li = 0; li < rawLines.length && !prose; li++) {
-      const line = rawLines[li];
-      if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
-      // markdown 标题行要在**剥 # 之前**判掉。
-      //
-      // 网关的索引器把小节标题写回了正文第一行（knowledge.rs 里 `cur_buf = format!("## {}\\n", …)`），
-      // 而这里原来先剥 # 再按长度过滤——于是「Database Selection Decision Tree」这种 32 字符的
-      // 标题顺利活过 `< 24` 那道门，成为首条要点。
-      //
-      // 实测（2026-08-23，真语料 + 真函数）：非设计域 683 个小节里 **416 段（60.9%）的首条
-      // 要点就是它自己的小节标题**。而这份小抄的抬头对模型说的是「它是该领域的**既有事实**，
-      // 不是灵感：先按它判断可行性、约束和验收」——给的却是一份标题清单。被这样吞掉的正是
-      // 最该用上的那几条：服务拆分规则、数据库选型决策树、重构策略。
-      //
-      // 判据按**结构**不按字符串：跳所有 markdown 标题行，而不是拿正文和 section 名做前缀
-      // 比较——后者会把「小节名 Rate Limiting + 首句 Rate Limiting must be applied per-tenant…」
-      // 这种真事实一起误杀。
-      if (/^\s*#{1,6}\s/.test(line)) continue;
-      // 表格**不能**一刀切：这份语料里大量事实本身就是表（反模式清单、选型对照表都是），
-      // 砍掉整类会让产不出要点的小节从 13.6% 飙到 51.7%（实测）。只砍两种不带事实的行：
-      // 分隔行 `|---|---|`，以及紧跟着分隔行的那一行（那是表头）。
-      if (/^\s*\|[\s:|-]+\|?\s*$/.test(line)) continue;
-      if (/^\s*\|/.test(line) && /^\s*\|[\s:|-]+\|?\s*$/.test(rawLines[li + 1] || "")) continue;
-      const text = line.replace(/^\s*(?:[-*•·]|\d+[.)])\s*/, "").trim();
-      // 太短的行是空行或"示例："这类粘合词，进了小抄只占预算不带信息。
-      if (text.length < 24) continue;
-      // 代码围栏里的行**留作兜底**，不直接选中。一条孤立的 import 行说不出这个小节想说
-      // 什么；但整节只有代码时，给一行真代码仍然远好过给空。一刀砍掉整类会让产不出要点的
-      // 小节从 13.6% 涨到 49.2%（实测）——那是把一半语料静默扔掉。
-      if (!_fresh(text)) continue;
-      if (inFence) { if (!fenced) fenced = text; continue; }
-      prose = text;
-    }
-    const picked = prose || fenced;
-    if (!picked) continue;
-    if (seen) seen.add(String(picked).trim());
-    const one = picked.length > maxChars ? `${picked.slice(0, maxChars)}…` : picked;
-    bullets.push(section ? `${section} → ${one}` : one);
-    if (bullets.length >= maxBullets) break;
-  }
-  return bullets;
-}
 
 /** 组装小抄正文并按预算截断；截了多少当场写进正文，不假装那是全部。 */
-function _domainKnowledgeBrief(domain, sections) {
-  const filled = sections.filter((s) => s.bullets.length);
-  const head = `[DOMAIN_KNOWLEDGE_PRELOADED_BRIEF · ${domain}]
-本轮在你开始规划前，IDE 已按「${domain}」这个专业领域从平台自有知识库真实检索并压缩出下面这份小抄。
-它是该领域的既有事实，不是灵感：先按它判断可行性、约束和验收，再结合用户要求和项目证据动手。
-没有列出的内容不代表不存在——需要更细的就自己调用 knowledge_search(domain="${domain}")；
-但**不要把没命中的内容说成知识库结论**。`;
-  if (!filled.length) {
-    return `${head}
-
-本轮「${domain}」没有返回任何可用命中。明确记录该领域语料不可用，基于用户约束与项目证据继续，不要编造该领域的规则。`;
-  }
-  // 四栏是**问过的四个维度**，不是「有内容的那几栏」。空栏要如实说，不能整栏消失——
-  // 消失会让模型以为那个维度压根没被问过，而事实是「问了，这个域没有独立的答案」。
-  //（跨 rubric 去重之后这种情况会变多：同一小节对多条 rubric 都高分时，后面的栏
-  // 拿到的是同段的下一条，取不到就空。）
-  const body = sections
-    .map((s) => (s.bullets.length
-      ? `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`
-      : `【${s.heading}】\n- （本域语料里这一栏没有独立内容；需要就自己调 knowledge_search(domain="${domain}") 细查，别当成"没有要求"。）`))
-    .join("\n\n");
-  const full = `${head}\n\n${body}`;
-  if (full.length <= _DOMAIN_KNOWLEDGE_BRIEF_BUDGET) return full;
-  // 记账要在**截断之后**按真实字数算，不是按"计划截多少"。给账目行预留位置，
-  // 否则加完这行又超预算，等于预算没生效。
-  const note = (dropped) => `\n…（本域小抄超出 ${_DOMAIN_KNOWLEDGE_BRIEF_BUDGET} 字符预算，已截断 ${dropped} 字符；缺的部分用 knowledge_search(domain="${domain}") 自取，不要凭印象补。）`;
-  const room = Math.max(0, _DOMAIN_KNOWLEDGE_BRIEF_BUDGET - note(full.length).length);
-  const kept = full.slice(0, room);
-  return kept + note(full.length - kept.length);
-}
 
 /**
  * 真跑一次专业域预检：每个待嚼的域发 4 条 rubric 检索，抽成结构化小抄。
@@ -26222,8 +26140,19 @@ function _domainKnowledgeBrief(domain, sections) {
  */
 async function _runDomainKnowledgePreflight({ run, profile = "", body = null, isLive = () => true } = {}) {
   if (run?.mode !== "agent" || !isLive()) return { required: false, briefs: [] };
-  const done = run._domainKnowledgeDone instanceof Set ? run._domainKnowledgeDone : new Set();
-  run._domainKnowledgeDone = done;
+  // 「这个域已经嚼过了」是**会话级**的事实，不是这一轮的。
+  //
+  // 旗标是会话级单调并集、只增不减（那条粘性是刻意的：改一个字节就作废整条 120k 对话的
+  // 前缀缓存，实测命中率 2%，knowledge-routing/semantic-profile 两处测试逐字钉着，别动）。
+  // 而这个去重集合原来挂在 run 上，run 每条用户消息新建一次——于是第一轮说「做个医疗预约
+  // 系统」点亮 domain_healthcare 之后，第二轮问「这个变量名改成 userId」照样发 4 条 rubric
+  // 检索（两个域就 8 条）、多出一张卡、往上下文塞最多 2500 字符医疗小抄、首 token 前还多等
+  // 最多 6 秒。用户抱怨的「不是随便就出触发的」，症结在**有效期**不在触发判据。
+  // 挂到 session 上：同一会话同一个域只嚼一次，后续轮次由模型按需自己调 knowledge_search
+  //（它就在开局窗口里）——这正是 _DOMAIN_KNOWLEDGE_MAX_DOMAINS 注释里写的设计意图。
+  const _dkSess = run.session || run;
+  const done = _dkSess._domainKnowledgeDone instanceof Set ? _dkSess._domainKnowledgeDone : new Set();
+  _dkSess._domainKnowledgeDone = done;
   const domains = _domainKnowledgeFlagDomains(profile).filter((d) => !done.has(d));
   if (!domains.length) return { required: false, briefs: [] };
   for (const domain of domains) done.add(domain);
@@ -26249,7 +26178,10 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
         //（共享集合塞进并发分支的话，「谁占到某小节」取决于网络返回顺序，同一查询两次结果不同）。
         const _raw = _toolExecutionSucceeded(call, result) ? String(result?.content || "") : "";
         const bullets = _raw ? _domainKnowledgeBullets(_raw) : [];
-        return { heading: plan.heading, bullets, raw: _raw,
+        // hits 是 BM25 真命中的**段数**，和 bullets（抽取器压出来的要点条数）是两回事。
+        // 带上它才分得出第三态：命中了 N 段但一条要点都没抽出来（行级过滤器筛干净了）
+        // ——那不是「本域没有这个主题」，说成零命中是我们自己在误导模型。
+        return { heading: plan.heading, bullets, raw: _raw, hits: Number(result?.knowledge?.hitCount) || 0,
           ...(_toolExecutionSucceeded(call, result) ? {} : { failed: true, failResult: result }) };
       } catch (error) {
         return { heading: plan.heading, bullets: [], failed: true,
@@ -46452,7 +46384,14 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     _shownLen = acc.length;
     const clean = _streamCleanText(acc);
     if (clean.trim()) {
-      if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
+      if (!streamEl) {
+        streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl);
+        // 第二个锚点：模型不吐 reasoning（思考档位 off、或线路本来就不回推理）时，本轮一张
+        // 思考卡都不会建，只锚思考卡的话预检卡就原地留在正文最前面——用户看到的还是
+        // 「还没有任何『它在想』的迹象，先冒出一张知识检索卡」。放在 if (!streamEl) 里，
+        // 整轮只触发一次；模块自己按卡记「安置过」，思考卡后到也不会把它再挪一遍。
+        _movePreflightCardsAfter(body, streamEl);
+      }
       renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
       if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
@@ -48185,7 +48124,7 @@ function _WIKI_PROMPT(focus) {
   const f = String(focus || "").trim();
   return `深入探索这个代码库 / 产品，产出一份**结构化的产品 Wiki（Markdown 正文，直接可存盘）**。多角度检索（search / find_symbol / find_files / list_dir 逐层到第三层）+ 关键文件 read_file 读全，**读源码提炼真实功能，绝不编**。**如果 list_dir 一次已确认工作区是空目录 / 新项目，就停止继续找 package.json、vite.config、src 等不存在的目录内容，直接基于用户描述和现有证据写“空项目 / 待创建项目”蓝图。**按这个结构写：\n# 产品概览（是什么 / 为谁 / 核心价值，一句话讲清）\n# 技术栈 & 架构（语言 / 框架 / 关键依赖 + 目录地图 path→职责）\n# 核心功能（**逐个**列：功能名 + 解决什么 + 关键入口文件 / 组件）\n# 数据流 & 关键模块\n# 约定与模式 / 常见改动入口\n# 亮点与卖点（做官网 / 介绍产品时能直接用的真实卖点）\n**只输出这份 Wiki 的完整 Markdown 正文**，别加寒暄客套。${f ? "\n重点深挖：" + f : ""}`;
 }
-const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. You have screenshot for rendered pages, and **\`browser\` is granted by ROLE**: it is in your toolset only when your role brief carries it (frontend / design / test), and even then only for OBSERVATION — mytabs / navigate / screenshot / viewport / inspect / network / nodes / scroll / wait / close. Clicking, typing, filling, eval, cookies, storage and upload are refused at execution and belong to the main agent. If \`browser\` is not among the tools you were given, use screenshot and hand the rest back. Think, then look: before each retrieval be clear about what you are answering and which piece is still missing; when a result comes back, read it, update the judgement, and only then decide the next lookup. Follow the thread — trace imports, calls, definitions and data flow layer by layer (lsp_references for callers, lsp_definition to jump) until the sub-task is genuinely settled; one file read is where you start, not where you stop. Reply in the user's language.`);
+const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. You have screenshot for rendered pages, and **\`browser\` is granted by ROLE**: it is in your toolset only when your role brief carries it (frontend / design / test), and even then only for OBSERVATION — ${[..._BROWSER_OBSERVE_ACTIONS].join(" / ")}. Clicking, typing, filling, eval, cookies, storage and upload are refused at execution and belong to the main agent. If \`browser\` is not among the tools you were given, use screenshot and hand the rest back. Think, then look: before each retrieval be clear about what you are answering and which piece is still missing; when a result comes back, read it, update the judgement, and only then decide the next lookup. Follow the thread — trace imports, calls, definitions and data flow layer by layer (lsp_references for callers, lsp_definition to jump) until the sub-task is genuinely settled; one file read is where you start, not where you stop. Reply in the user's language.`);
 
 /**
  * Spawn a focused, read-only sub-agent — Claude Code's Task tool in miniature.
@@ -48691,7 +48630,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 否则就是"看得见打不开的钥匙"（read_logs / read_skill 已经这么漂过一次，
   // test/logic.test.mjs 里那条对账测试就是为此加的）。
   // git 和 gh 是单 type 多 op，类型放行之后另有 _GIT_READ_OPS / _GH_READ_OPS 二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "live_environment", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
   // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
   //
   // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
@@ -48952,7 +48891,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
               : _ghWriteBlocked
               ? `[BLOCKED] 子任务只能读 GitHub（${_GH_READ_OPS.join("/")}），不能用 ${tc.name} —— 建 PR / 回复评论是不可逆的对外动作，交回主任务做。`
               : _browserWriteBlocked
-              ? `[BLOCKED] 只读子体的 browser 只能做观察类动作（${[..._BROWSER_OBSERVE_ACTIONS].slice(0, 10).join("/")} …），不能用 action=${String(call.action || "")}。`
+              ? `[BLOCKED] 只读子体的 browser 只能做观察类动作（${[..._BROWSER_OBSERVE_ACTIONS].join("/")}），不能用 action=${String(call.action || "")}。`
                 + "eval 能在页面里跑任意 JS、upload 能传文件，都属于改动，交回主任务做。"
             : _dbWriteBlocked
               ? "[BLOCKED] 只读子体的 db_query 只能跑不改数据的查询，这条语句会写库。把它连同你查到的事实写进结论交回主任务。"
@@ -50055,7 +49994,12 @@ function _buildToolHint() {
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
     // 于是够得着的只有开局那十来个。字节稳定，可以待在 cache 前缀里。
     "\n\n📚 **完整能力名录（全部可用，按名字直接调用即可自动装载；不在开局窗口里不代表不能用）**\n" +
-    toolCapabilityIndex() +
+    // 按**真实注册表**过滤。名录抬头对模型说的是「全部可用，按名字直接调用即可自动装载」，
+    // 而它原来无条件列 TOOL_METADATA 全表：网页版（inTauri=false）会把 89 个 desktopOnly
+    // 工具一起列出来，模型照着调就是一轮白烧。_staticToolNames() 是记忆化的，且正是从
+    // _buildToolRegistry → _buildAgentToolSchemas 建的，那里做的就是这道 desktopOnly 过滤。
+    // 字节稳定性不受影响：名录按集合分桶缓存，同一台机同一模式下集合恒定 → 文本恒定。
+    toolCapabilityIndex(_staticToolNames()) +
     // 这一句原来是「看到贴合目标的那个，用 search_tools 取回 schema 再调用」，而名录里
     // **包含开局窗口那二十来个已经加载好的工具**，且不作区分。于是它对这一批陈述了一件假事：
     // 它们的 schema 就在模型手上，再去 search_tools 取一趟是纯往返。同一个文件另一处的注释
@@ -52723,8 +52667,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (!preflight || run._domainKnowledgePreflightConsumed === preflight) return false;
     run._domainKnowledgePreflightConsumed = preflight;
     if (!preflight.required || !Array.isArray(preflight.briefs) || !preflight.briefs.length) return false;
-    run._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected instanceof Set
-      ? run._domainKnowledgeBriefInjected : new Set();
+    // 同上：注入记账也提到会话级，否则「一会话嚼一次」会被「每轮重新注入」抵消掉。
+    const _dkInjSess = run.session || run;
+    run._domainKnowledgeBriefInjected = _dkInjSess._domainKnowledgeBriefInjected instanceof Set
+      ? _dkInjSess._domainKnowledgeBriefInjected : new Set();
+    _dkInjSess._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected;
     for (const item of preflight.briefs) {
       if (!item?.brief || run._domainKnowledgeBriefInjected.has(item.domain)) continue;
       run._domainKnowledgeBriefInjected.add(item.domain);
@@ -64434,7 +64381,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         card.querySelector("._bmCancel").addEventListener("click", () => _bmFinish("cancelled", "已取消", `[background_monitor 取消] 用户取消了等待「${bmMsg}」。请跳过这个等待步骤继续。`), { once: true });
       }
       if (bmType !== "manual") {
-        const _bmSnap = _captureFlows.length;
+        const _bmSnapTotal = _captureTotal;   // 见 _onCaptureFlow：下标当基线会被环形缓冲吃掉
         const _bmStart = Date.now();
         // 生产者快照：这个条件多半靠刚才那条终端命令去促成（cursor login 的 CLI、npm run dev）。
         // 记下开始等的时候「最近活动的那个终端」以及它当时是不是已经退出——只在**开始时还在跑、
@@ -64442,7 +64389,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const _bmWatchEnt = (() => { try { return _findAgentTerminal(""); } catch { return null; } })();
         const _bmWatchWasExited = !!(_bmWatchEnt && _bmWatchEnt.exited);
         let _bmFileChecking = false;
-        let _bmScreenChecking = false, _bmScreenFails = 0;
+        let _bmScreenChecking = false, _bmScreenFails = 0, _bmScreenOk = false;
+        let _bmCmdTimedOut = false;
         const _bmPoll = async () => {
           if (_bmDone) return;
           // 这一轮已经结束/被 Stop/标签页关了：立刻停表退场，别再轮询也别再排新 run。
@@ -64461,12 +64409,16 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
           // 不再显示「Xs / Ys」倒计时和进度条——用户要的是「监听中」而不是一个滴答的表。
           // 卡片头上的 .bm-dot 一直在脉动，那就是「还在听」的活性指示；这里什么都不刷。
           if (elapsed > bmTimeout) {
-            _bmFinish("timeout", "监听结束（未捕捉到）", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。注意：用户可能已经完成了操作但检测没捕捉到——先用工具检查当前实际状态（读文件/跑命令/看浏览器），确认条件是否其实已满足，然后继续你的原始任务。不要问用户"你想做什么"——回顾上文你知道自己在做什么。`);
+            _bmFinish("timeout", "监听结束（未捕捉到）", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。${_bmCmdTimedOut
+              ? `\n\n⚠️ **注意：你这条检查命令每次都被自己的超时杀掉了**（每次最多给它几十秒）。也就是说条件在结构上就不可能成立，不是"用户没做完"。换一条跑得快的判据（探端口/探 URL/看文件），或者把这条慢命令交给 run_in_terminal 起起来再监听它的产物。`
+              : ""}注意：用户可能已经完成了操作但检测没捕捉到——先用工具检查当前实际状态（读文件/跑命令/看浏览器），确认条件是否其实已满足，然后继续你的原始任务。不要问用户"你想做什么"——回顾上文你知道自己在做什么。`);
             return;
           }
           if (bmType === "capture") {
             const re = bmPat ? (() => { try { return new RegExp(bmPat, "i"); } catch { return null; } })() : null;
-            for (let i = _bmSnap; i < _captureFlows.length; i++) {
+            // 开始等之后新来的条数；缓冲被 shift 过也仍然对（最多就是整个缓冲都是新的）。
+            const _fresh = Math.min(_captureFlows.length, Math.max(0, _captureTotal - _bmSnapTotal));
+            for (let i = _captureFlows.length - _fresh; i < _captureFlows.length; i++) {
               const f = _captureFlows[i];
               const hay = `${f.url||""} ${f.host||""} ${f.path||""} ${f.method||""} ${f.status||""} ${f.respBody||""} ${f.reqBody||""}`;
               if (re ? re.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase())) {
@@ -64491,7 +64443,14 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
             } catch {} finally { _bmFileChecking = false; }
           } else if (bmType === "command" && bmPat) {
             try {
-              const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: 10 });
+              // 每次检查给命令多久：写死 10 秒会让**所有慢检查结构性地不可能成立**——
+              // 模型很自然会写 `npm run build` / `docker compose ps` / `curl .../health`，
+              // 冷启动或网络慢过 10 秒就每次都被杀掉、永远拿不到 exit 0，而回执只说
+              // 「没等到条件，用户可能没做完」，把根因彻底藏起来。按整体超时给，封顶 60 秒。
+              const _cmdTimeout = Math.min(60, Math.max(10, Math.floor(bmTimeout / 6)));
+              const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: _cmdTimeout });
+              // 被自己的超时杀掉 ≠ 条件没满足。记一笔，超时回执里要说出来。
+              if (r && r.timedOut) _bmCmdTimedOut = true;
               if (r && r.code === 0) _bmFinish("done", "命令成功（exit 0）", `[background_monitor 结果] 命令「${bmPat}」返回 exit 0，输出：${(r.stdout || "").slice(0, 500)}。继续执行。`);
             } catch {}
           } else if (bmType === "url" && bmPat) {
@@ -64517,6 +64476,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               const hay = lines.join("\n");
               const sre = (() => { try { return new RegExp(bmPat, "i"); } catch { return null; } })();
               const hit = sre ? sre.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase());
+              // 探查成功了就把失败计数清零，并记一笔「曾经成功过」。原来这个计数只增不减，
+              // 于是盯着用户登录十分钟、前面成功一百多次，只要中途机器忙/用户切走目标 app
+              // 累计（不需要连续）攒够 3 次瞬时失败，监视器就提前收摊——还斩钉截铁地说
+              // 「一次都没成功过、多半是没给辅助功能权限」，把模型引去排查一个不存在的故障。
+              _bmScreenOk = true; _bmScreenFails = 0;
               if (hit) {
                 const _which = lines.find((l) => (sre ? sre.test(l) : l.toLowerCase().includes(bmPat.toLowerCase()))) || "";
                 _bmFinish("done", "界面已出现", `[background_monitor 结果] 「${r?.app || bmApp || "前台应用"}」的界面上出现了「${bmPat}」（命中：${String(_which).slice(0, 160)}），说明那一步已经做完了。继续执行。`);
@@ -64527,7 +64491,9 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               // 最容易骗人的失败形态。
               _bmScreenFails++;
               if (_bmScreenFails >= 3) {
-                _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」——检查一次都没成功过。多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到。换 manual 让用户点确认，或者先用 system 的 window.list 确认应用名。`);
+                _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」。${_bmScreenOk
+                  ? `前面成功探查过，是中途开始连续失败的——多半是目标应用退出了或切走了，别去查权限。`
+                  : `一次都没成功过，多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到；可以先用 system 的 window.list 确认应用名。`} 也可以换 manual 让用户点确认。`);
                 return;
               }
             } finally { _bmScreenChecking = false; }
@@ -67437,9 +67403,17 @@ let _captureSystemProxyEnabled = false;
 let _captureBrowserUsesProxy = false;
 const _CAPTURE_CAP = 3000;
 
+// 累计收到过多少条流量。**不随 shift 回退**——background_monitor 的 capture 分支要靠它
+// 认「哪些是我开始等之后才来的」。原来它拿 _captureFlows.length 当基线，而这是个定长
+// 3000 的环形缓冲：抓包跑久一点缓冲一满，基线恒等于 3000、length 也恒等于 3000，
+// `i < _captureFlows.length` 恒假，循环体一次都不执行——卡片显示「监听中」、超时回执说
+// 「一直在监听但没等到条件」，模型据此去排查用户没登录/没走代理，而实际上一次都没检查过。
+let _captureTotal = 0;
+
 function _onCaptureFlow(flow) {
   if (!flow || typeof flow !== "object") return;
   _captureFlows.push(flow);
+  _captureTotal++;
   if (_captureFlows.length > _CAPTURE_CAP) _captureFlows.shift();
   if (!featureOverlay.hidden && activeFeatureTab === "capture") _renderCaptureList();
 }
