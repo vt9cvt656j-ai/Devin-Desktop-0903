@@ -28,6 +28,7 @@ import assert from "node:assert/strict";
 // 正向源码断言跑在**剥掉注释**的源码上：把一条契约从代码里删掉、只在注释里留一句，
 // assert.match 照样绿（本仓库已经这样漏过一整组模型可见的工具契约）。
 import { CODE as SRC, fnSource, load, loadConst } from "./helpers/source.mjs";
+import { createPreflightCard, settlePreflightCard } from "../src/agent/knowledge-preflight-card.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_DIR = join(HERE, "..", "..", "server", "knowledge");
@@ -281,6 +282,13 @@ function preflightDeps({ search, calls = [] } = {}) {
     _toolExecutionSucceeded: (_call, result) => !String(result?.content || "").startsWith("[失败]"),
     _createToolStep: () => null,
     _settleToolStep: () => {},
+    // 四张卡合成一张之后，建卡/结算搬进了 src/agent/knowledge-preflight-card.js。
+    // 用**真模块**，不打桩：它的兜底（body 为空、step 为 null 时安静返回而不是抛）
+    // 正是这里要跑到的路径——预检在无 UI 的场景（子智能体、后台补跑）本来就没有 body。
+    _createPreflightCard: createPreflightCard,
+    _settlePreflightCard: settlePreflightCard,
+    _knowledgeSettleLabel: () => "",
+    _escHtml: (x) => String(x),
     _searchKnowledgeBase: async (call) => {
       calls.push(call);
       return search ? search(call) : knowledgeHit(call.domain, [

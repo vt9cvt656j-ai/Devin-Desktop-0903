@@ -132,7 +132,11 @@ test("检索失败必须说失败，并带上真实原因", () => {
 test("两个检索落定点都走同一个判据（漏一个就还有半边是错的）", () => {
   // 只数**调用点**：`_knowledgeSettleLabel(call, result,` 也会匹配到函数自己的定义行
   // （这条断言第一次写就被自己的定义喂到 3）。
-  const hits = (SRC.match(/_settleToolStep\(step, result, _knowledgeSettleLabel\(/g) || []).length;
+  // 领域知识那一处搬进了 src/agent/knowledge-preflight-card.js（四张卡合成一张时），
+  // 那边的形参没有下划线前缀，所以两种拼法都数。守的性质一个字没变：
+  // **两个落定点都必须经过 knowledgeSettleLabel**，它是全系统唯一区分
+  // 「检索失败」与「零命中」的地方；谁绕过去，谁那半边就会把失败说成「库里没有」。
+  const hits = (SRC.match(/settleToolStep\(step, result,\s*\n?\s*(?:typeof )?_?knowledgeSettleLabel\b/g) || []).length;
   assert.equal(hits, 2,
     `只有 ${hits} 处走了新判据，应为 2（michael-design 预检 + 领域知识预检）`);
   assert.doesNotMatch(SRC, /_settleToolStep\(step, result, evidence \? [^\n]*: "无可用命中"\)/,
