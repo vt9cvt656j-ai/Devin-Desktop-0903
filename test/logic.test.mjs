@@ -36809,12 +36809,12 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
 // 打开的文件，它的页签一定要看得见
 // ---------------------------------------------------------------------------
 test("激活的页签会被滚进可视区，且不牵动祖先容器", () => {
-  const src = RAW_SRC;
-  const fn = stripJsComments(extractFn("_revealActiveTab"));
+  // 它住在 src/agent/tab-strip.js（main.js 撞行数闸时搬出去的）。
+  const fn = stripJsComments(readFileSync(join(HERE, "../src/agent/tab-strip.js"), "utf8"));
 
   // renderTabs 每次重建 innerHTML，scrollLeft 会归 0 —— 不主动滚过去的话，
   // 打开一个排在右边的文件时页签停在最左边，用户得自己横滑去找。
-  assert.match(stripJsComments(extractFn("renderTabs")), /_revealActiveTab\(\);/,
+  assert.match(stripJsComments(extractFn("renderTabs")), /revealActiveTab\(tabsEl, activePath\);/,
     "renderTabs 之后没有把当前页签滚进可视区");
 
   // **不许用 scrollIntoView**：它会顺带滚动祖先容器（编辑器区、整页），

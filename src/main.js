@@ -35,6 +35,7 @@ import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchiv
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
 import { chipShortLabel as _chipShortLabel } from "./agent/chip-label.js";
+import { revealActiveTab } from "./agent/tab-strip.js";
 import {
   stackTable as _STACK_TABLE, stackManifestNames as _stackManifestNames,
   stackManifestExts as _stackManifestExts, manifestExtra as _MANIFEST_EXTRA,
@@ -4882,7 +4883,7 @@ async function openFile(path, name, activateFile = true, options = {}) {
   // 预览页签在会话里和别的页签一样被保存，恢复时原路走进这里。它背后没有文件，
   // 放它继续往下走的话会读盘失败、被当成"文件已删除"丢掉——重开 IDE 预览就没了。
   if (path === PREVIEW_TAB_PATH) { openLivePreview("", { focus: activateFile }); return true; }
-  // 方案页签同理：背后没有文件，往下走会被当成「文件已删除」清掉。
+  // 方案页签同理（背后没有文件，往下走会被当成「文件已删除」清掉）
   if (path === PLAN_TAB_PATH) { return openPlanTab(_plan.md, { focus: activateFile }); }
   path = _coherentFilePath(path);
   if (openFiles.has(path)) {
@@ -5328,11 +5329,9 @@ const PREVIEW_TAB_PATH = "mrdayone:live-preview";
 const PREVIEW_TAB_NAME = "实时预览";
 const PREVIEW_URL_STORE_KEY = "michael-ide.live-preview-url";
 
-// ---- Plan 模式的「方案」页签 ----
-// 虚拟页签（背后没有文件，openFile 最前面拦下来）。对话区那份保持完整——那是给人读的；
-// 这一屏只放能照着做的部分，见 planCoreFromReply。
-const PLAN_TAB_PATH = "mrdayone:plan";
-const PLAN_TAB_NAME = "方案";
+// Plan 的「方案」页签：虚拟页签（openFile 最前面拦下来）。对话区那份保持完整，
+// 这一屏只放能照着做的部分，见 planCoreFromReply / plan-tab.js。
+const PLAN_TAB_PATH = "mrdayone:plan", PLAN_TAB_NAME = "方案";
 
 const _plan = { md: "", title: PLAN_TAB_NAME };
 let _planTab = null; // 界面层在 src/agent/plan-tab.js，这里只做接线
@@ -5357,8 +5356,7 @@ function _planUI() {
   return _planTab;
 }
 const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts);
-const showPlanPane = () => _planUI().show();
-const hidePlanPane = () => _planTab?.hide();
+const showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
 
 
 const _preview = {
@@ -10021,30 +10019,10 @@ function renderTabs() {
     });
     tabsEl.appendChild(tab);
   }
-  // 让**当前这个**页签一定看得见。
-  //
-  // 页签条是横向滚动容器，而 renderTabs 每次都重建 innerHTML —— scrollLeft 跟着归 0。
-  // 于是打开一个排在右边的文件时，内容出来了、页签却停在最左边看不到，用户得自己横滑
-  // 去找。用户原话「有时候也会懵逼掉，找不到那个 tab 窗口」。
-  //
-  // 只在它确实在视野外时才动，且**不用 scrollIntoView** —— 那个会顺带滚动祖先容器
-  // （编辑器区、整页），在这种嵌套布局里会把别处也带跑。
-  _revealActiveTab();
+  revealActiveTab(tabsEl, activePath); // 让当前页签一定看得见，见 src/agent/tab-strip.js
   _markClippedTabs();
 }
 
-function _revealActiveTab() {
-  if (!tabsEl || !activePath) return;
-  const el = tabsEl.querySelector(`[data-path="${CSS.escape(activePath)}"]`);
-  if (!el) return;
-  const pad = 12; // 贴边等于看不全，留一点余量
-  const left = el.offsetLeft;
-  const right = left + el.offsetWidth;
-  const viewLeft = tabsEl.scrollLeft;
-  const viewRight = viewLeft + tabsEl.clientWidth;
-  if (left < viewLeft + pad) tabsEl.scrollLeft = Math.max(0, left - pad);
-  else if (right > viewRight - pad) tabsEl.scrollLeft = right - tabsEl.clientWidth + pad;
-}
 
 // 文件页签条：纵向滚轮 → 横向滚动（VS Code 同款）。.tabs 是 overflow-x 容器且隐藏了
 // 滚动条，普通鼠标滚轮只产生 deltaY，不转换就完全滚不动（"上下滚无法左右"）。
@@ -30511,7 +30489,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       const postRunMessages = messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
-        // Plan 模式跑完 → 方案单独开成一个页签（抽不出核心内容时它自己返回 false，不开空白页）。
+        // Plan 跑完 → 方案单独开成一个页签（抽不出内容它自己返回 false，不开空白页）
         try {
           if (_normalizeAiMode(sess?.mode || _currentAiMode) === "plan" && inTauri) {
             const last = [...(postRunMessages || [])].reverse()
