@@ -489,7 +489,9 @@ function makeSlashMatcher(mcpRows) {
     _userSlashCommands: () => [],
     promptEl: { value: "", getBoundingClientRect: () => ({ left: 0, top: 0, width: 400 }) },
     _slashMenu: { style: {}, hidden: true },
-    window: { innerHeight: 800 },
+    // 视口高度现在走 viewportH()（CSS 视口，不是物理像素 —— 见 src/agent/layout-density.js）。
+    // 这套注入清单是手工维护的：给热函数加一个辅助函数，这里不补就整组 ReferenceError。
+    viewportH: () => 800,
     _renderSlashActive: () => {},
   };
   const keys = Object.keys(stub);

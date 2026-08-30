@@ -145,8 +145,10 @@ test("对齐算法：宽窗口正居中，贴边时夹进视口，绝不跑出�
     const _menu = { offsetWidth: menuW, style: {} };
     const _capBtn = { getBoundingClientRect: () => ({ left: btnCenter - 14, right: btnCenter + 14 }) };
     const _wrap = { getBoundingClientRect: () => ({ left: wrapLeft }) };
-    new Function("_menu", "_capBtn", "_wrap", "window", `${body}; _alignCapabilitiesMenu();`)(
-      _menu, _capBtn, _wrap, { innerWidth: winW });
+    // 视口宽度现在走 viewportW()（CSS 视口，不是物理像素 —— 见 src/agent/layout-density.js）。
+    // 这套注入清单是手工维护的：给热函数加一个辅助函数，这里不补就整条 ReferenceError。
+    new Function("_menu", "_capBtn", "_wrap", "viewportW", `${body}; _alignCapabilitiesMenu();`)(
+      _menu, _capBtn, _wrap, () => winW);
     return parseInt(_menu.style.left, 10) + wrapLeft;
   };
   // 有地方就真的居中
