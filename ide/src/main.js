@@ -17288,6 +17288,12 @@ async function selectModel(model, modelGroup) {
   // 连线路 id 一起存：请求时要靠它告诉网关"用户点的是这一组"。
   // 存 id 而不是分组名，是因为分组名会被后台改（改完这个偏好就悄悄失效了）。
   const _picked = _modelCatalogEntry(model, modelGroup);
+  // **先钉窗口级，再写共享配置、再刷界面。** 所有读配置的地方都走 `_aiConfigForRuntime`
+  // 那个漏斗，窗口级选择在那里盖过共享配置 —— 所以只要这一行还没执行，`refreshModelBadge`
+  // 读回来的就还是上一个模型：标签纹丝不动，用户看到的是「点了没反应，选不动」。
+  // 也不能挂在下面的 `if (session)` 里：这是**这个窗口**的选择，有没有会话都成立。
+  // 切标签那条路（_switchChatSession）本来就是这个顺序，这里漏了。
+  _setWindowModel(model, modelGroup, _picked?.connId);
   await saveConfig({
     ...c, providerMode: AI_PROVIDER_GATEWAY, gatewayModel: model, model,
     modelGroup: modelGroup || "", gatewayRouteId: String(_picked?.connId || ""),
@@ -17300,8 +17306,6 @@ async function selectModel(model, modelGroup) {
     session.model = model;
     session.modelGroup = modelGroup || "";
     session.gatewayRouteId = String(_picked?.connId || "");
-    // 同时钉在**这个窗口**上：共享配置会被另一个窗口改写，sessionStorage 不会。
-    _setWindowModel(model, modelGroup, _picked?.connId);
     _renderChatTabs();
     saveChatHistory();
     // **不要**在这里批量改历史消息的头像。
