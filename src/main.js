@@ -5339,25 +5339,23 @@ let _planTab = null; // 界面层在 src/agent/plan-tab.js，这里只做接线
 function _planUI() {
   if (!_planTab) {
     _planTab = createPlanTab({
-      editorContainer, renderMarkdownInto, sendPrompt,
-      planCoreFromReply, planTitleFromReply,
+      editorContainer, renderMarkdownInto, sendPrompt, planCoreFromReply, planTitleFromReply,
       tabPath: PLAN_TAB_PATH, tabName: PLAN_TAB_NAME,
       openFiles, renderTabs, syncWelcome, activate,
-      getActivePath: () => activePath,
-      closeTab: () => closeFile(PLAN_TAB_PATH),
-      onAccept: () => {
+      getActivePath: () => activePath, closeTab: () => closeFile(PLAN_TAB_PATH),
+      onAccept: () => { // Plan 是只读模式，照做之前先切回 Agent
         _currentAiMode = "agent";
         try { _updateModeUI(); } catch {}
-        const session = _currentSession();
-        if (session) { session.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
+        const s = _currentSession();
+        if (s) { s.mode = "agent"; try { _renderChatTabs(); saveChatHistory(); } catch {} }
       },
       onDoc: (md, title) => { _plan.md = md; _plan.title = title; },
+      isPlanMode: () => inTauri && _normalizeAiMode(_currentSession()?.mode || _currentAiMode) === "plan",
     });
   }
   return _planTab;
 }
-const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts);
-const showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
+const openPlanTab = (md, opts) => _planUI().openFromReply(md, opts), showPlanPane = () => _planUI().show(), hidePlanPane = () => _planTab?.hide();
 
 
 const _preview = {
@@ -17802,6 +17800,7 @@ function _draftStepsMarkdown(session) {
   return `${head}\n${lines.join("\n")}`;
 }
 
+
 function _streamDraftSave(session, text, reasoning) {
   // NOTE the ordering here — it is the whole point. `text` is the rope built by `acc += delta`,
   // so `.trim()` cannot run on it lazily: it forces a full String::Flatten, an O(n) memcpy of
@@ -17816,6 +17815,8 @@ function _streamDraftSave(session, text, reasoning) {
   // 退出同步 flush 的数据源：节流窗口内被丢掉的尾部也常驻内存（字符串引用，零拷贝），
   // pagehide/关窗/更新重启时由 _streamDraftFlushSync 一次性全量补写。
   session._streamDraftLatest = { text: String(text || ""), reasoning: String(reasoning || "") };
+  // Plan 一边流一边写方案页签：这里是流式中带着累积文本反复被调用的唯一一处。
+  try { _planUI().liveUpdate(session?.id, text); } catch {}
   const now = Date.now();
   // 节流戳挂在 session 上：多标签页并发流式时，模块级全局戳会让两个会话互相卡对方的节流。
   if (now - (Number(session._draftSaveAt) || 0) < 2000) return;
@@ -30490,11 +30491,10 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       const postRunMessages = messages;
       _maybeRenderChoices(sess, postRunMessages); // if the answer offered A/B/C… options → clickable chips
       _maybeSuggestNext(sess, postRunMessages, config); // Codex-style: offer 2-4 clickable next steps from the completed run
-        // Plan 跑完 → 方案单独开成一个页签（抽不出内容它自己返回 false，不开空白页）
+        // Plan 跑完兜底开页签（流式里多半已经开过；抽不出内容它自己返回 false）
         try {
           if (_normalizeAiMode(sess?.mode || _currentAiMode) === "plan" && inTauri) {
-            const last = [...(postRunMessages || [])].reverse()
-              .find((m) => m && m.role === "assistant" && typeof m.content === "string" && m.content.trim());
+            const last = [...(postRunMessages || [])].reverse().find((m) => m && m.role === "assistant" && typeof m.content === "string" && m.content.trim());
             if (last) openPlanTab(last.content);
           }
         } catch (e) { console.warn("[plan] 方案页签打开失败：", e); }

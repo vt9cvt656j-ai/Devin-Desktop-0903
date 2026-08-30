@@ -9,7 +9,7 @@ export function createPlanTab(deps) {
     planCoreFromReply, planTitleFromReply,
     tabPath, tabName,
     openFiles, renderTabs, syncWelcome, activate, getActivePath,
-    closeTab, onAccept, onDoc,
+    closeTab, onAccept, onDoc, isPlanMode,
   } = deps;
   const state = { el: null, md: "", title: tabName };
 
@@ -49,9 +49,33 @@ export function createPlanTab(deps) {
     try { renderMarkdownInto(body, state.md); } catch { body.textContent = state.md; }
   }
 
+  // 流式过程中就往这一屏写，不等回合跑完。300ms 节流 —— 跟得上眼睛，又不会每个
+  // token 都重排一次 markdown。挂在 main.js 的 _streamDraftSave 上，因为那是流式
+  // 过程中**带着累积文本反复被调用**的唯一一处；另找收尾点只会两边各说各话。
+  let liveAt = 0;
+  let liveTurn = null;
+
   return {
     state,
     render,
+    /** @param turn 这一轮的会话 id；@param md 到目前为止累积的回复文本 */
+    liveUpdate(turn, md) {
+      if (!isPlanMode()) return;
+      const text = String(md || "");
+      // **等到出现第一个小节标题再开页签**，不是一有字就开：模型开头总有一两句引子，
+      // 那时开等于刚吐两个字就把编辑区抢走，比不写还烦。
+      if (!openFiles.has(tabPath)) {
+        if (!/^#{1,6}\s+\S/m.test(text)) return;
+        liveTurn = turn; liveAt = Date.now();
+        this.openFromReply(text);           // 第一次开：跟过去，让用户看见它在长
+        return;
+      }
+      if (liveTurn !== turn) return;        // 上一轮留下的页签，这一轮还没轮到它
+      const now = Date.now();
+      if (now - liveAt < 300) return;
+      liveAt = now;
+      this.openFromReply(text, { focus: false }); // 已经开着：只更新，不抢焦点
+    },
     show() { ensure(); state.el.hidden = false; render(); },
     hide() { if (state.el) state.el.hidden = true; },
     /**
