@@ -36844,6 +36844,37 @@ test("方案文档保留全部小节，只摘掉开场白和结尾那句征询",
   assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
 });
 
+test("选了新模型，界面立刻跟着变——窗口级选择必须在刷界面之前钉住", async () => {
+  // 窗口级选择（sessionStorage，每个窗口一份）在 `_aiConfigForRuntime` 那个漏斗里盖过
+  // 共享配置。selectModel 原来的顺序是 saveConfig → refreshModelBadge → _setWindowModel，
+  // 于是刷界面那一下读回来的还是**上一个**模型：标签纹丝不动，用户看到的就是
+  //「模型列表里选其他模型，选择不了了」。
+  //
+  // 这里连着漏斗一起真跑，不是断言调用顺序 —— 顺序只是手段，要守的是「刷界面时读到的
+  // 已经是新模型」这个结果。
+  let win = { model: "qwen3.8-max", modelGroup: "Qwen", gatewayRouteId: "r0" };
+  let shared = { model: "qwen3.8-max", modelGroup: "Qwen", gatewayRouteId: "r0" };
+  const effective = () => (win ? { ...shared, ...win } : { ...shared });
+  let label = null;
+  const fn = load("selectModel", {
+    loadConfigAsync: async () => effective(),
+    saveConfig: async (c) => { shared = { ...c }; },
+    _modelCatalogEntry: () => ({ connId: "r9" }),
+    _setWindowModel: (model, modelGroup, gatewayRouteId) => { win = { model, modelGroup, gatewayRouteId }; },
+    refreshModelBadge: () => { label = effective().model; },
+    _currentSession: () => null,   // 没有会话时也要钉住窗口：这是窗口的选择
+    _renderChatTabs: () => {}, saveChatHistory: () => {},
+    _refreshContextMeterFromDraft: () => {},
+    AI_PROVIDER_GATEWAY: "gateway",
+  });
+  await fn("grok-4.6", "Grok");
+  assert.equal(label, "grok-4.6",
+    "刷界面时读到的还是上一个模型 —— 标签不会变，看起来就是选不动");
+  assert.equal(win.model, "grok-4.6", "窗口级选择没被更新");
+  assert.equal(win.gatewayRouteId, "r9",
+    "线路没跟着切 —— 会变成「显示的是新模型、请求走旧线路」");
+});
+
 test("方案页签接进了编辑器的类型门和触发点", () => {
   const src = RAW_SRC;
   // 虚拟页签必须在 openFile 最前面被拦下 —— 否则会去读盘、读不到被当成「文件已删除」清掉。
