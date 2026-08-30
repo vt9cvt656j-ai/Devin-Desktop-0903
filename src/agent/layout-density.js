@@ -41,3 +41,28 @@ export function applyLayoutDensity(width, rootEl) {
   else delete rootEl.dataset.layout;
   return step;
 }
+
+/*
+ * 视口尺寸有**两种口径，绝不能混用**：
+ *
+ *   · `window.innerWidth/Height` —— **物理**像素，不随界面缩放变（实测 2026-08-29）。
+ *   · `documentElement.clientWidth/Height` —— **CSS** 像素 = 物理 / 缩放，也就是布局坐标系。
+ *
+ * `getBoundingClientRect()`、`clientX/Y`、`style.left/top` 全都是 CSS 像素。所以任何
+ * 「把一个矩形夹进视口」的计算都必须用后者。
+ *
+ * 混用的后果就是用户看到的那一幕：放到 140% 时 innerWidth 比实际布局宽度大 40%，
+ * `Math.min(r.left, innerWidth - w - 8)` 这个上界永远大于 r.left，夹取一次都不触发，
+ * 模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角 ——「放大缩小其他 UI 内容也都会乱飞」。
+ *
+ * 反过来，只有两处该用物理口径：缩放上限（问的是「这块屏幕有多大」）和上面的自适应
+ * 档位（问的是「这块屏幕能放下几栏」）。这两处都在注释里写明了。
+ */
+export function viewportW() {
+  const el = typeof document !== "undefined" ? document.documentElement : null;
+  return (el && el.clientWidth) || (typeof window !== "undefined" ? window.innerWidth : 0) || 0;
+}
+export function viewportH() {
+  const el = typeof document !== "undefined" ? document.documentElement : null;
+  return (el && el.clientHeight) || (typeof window !== "undefined" ? window.innerHeight : 0) || 0;
+}

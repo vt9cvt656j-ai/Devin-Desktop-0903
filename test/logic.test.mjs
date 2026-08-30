@@ -36850,6 +36850,59 @@ test("方案文档保留全部小节，只摘掉开场白和结尾那句征询",
   assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
 });
 
+test("浮层定位一律按 CSS 视口夹取，不许混进物理像素", () => {
+  // 视口有两种口径：window.innerWidth/Height 是**物理**像素（不随界面缩放变，实测），
+  // documentElement.clientWidth/Height 是 **CSS** 像素 = 物理 / 缩放，也就是布局坐标系。
+  // getBoundingClientRect / clientX / style.left 全是 CSS 像素，所以任何「把矩形夹进视口」
+  // 的算式都必须用后者。混用的后果：放到 140% 时 innerWidth 比布局宽度大 40%，
+  // Math.min(r.left, innerWidth - w - 8) 这个上界永远大于 r.left，夹取一次都不触发，
+  // 模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角 ——「放大缩小其他 UI 内容也都会乱飞」。
+  //
+  // 这条是**全文件不变量**，不是逐个调用点的断言：新加一个浮层时照抄旧写法是最可能的
+  // 复发路径，逐点断言拦不住新写的那一个。
+  // 用 RAW_SRC（main.js + src/agent/ 下每个模块拼起来），不自己读 main.js：搬模块时
+  // 自读会假红，反向断言还会悄悄失效 —— wiring.test.mjs 那道闸拦的就是这个。拼起来也
+  // 更严：以后把某个浮层搬进模块，这条照样管得着。
+  let rest = RAW_SRC;
+  // 该用物理口径的，各自问的都是「这块屏幕有多大」，与布局坐标系无关；
+  // viewportW/H 自己的兜底也在里面（量不到 CSS 视口时退回 innerWidth，总比返回 0 强）。
+  for (const name of ["_uiZoomCeiling", "_applyLayoutDensity", "viewportW", "viewportH"]) {
+    const src = extractFn(name);
+    assert.ok(rest.includes(src), `${name} 不见了 —— 白名单失效，这条断言会变成恒真`);
+    rest = rest.replace(src, "");
+  }
+  // 这两行住在 src/agent/browser-page-scripts.js：那段是**注进目标网页**执行的，
+  // 那边没有我们的界面缩放，innerWidth 就是它自己的视口，是对的。
+  const ALLOW = new Set([
+    "var W = window.innerWidth || document.documentElement.clientWidth || 1;",
+    "var H = window.innerHeight || document.documentElement.clientHeight || 1;",
+  ]);
+  const hits = (stripJsComments(rest).match(/.*window\.inner(?:Width|Height).*/g) || [])
+    .map((l) => l.trim()).filter((l) => l && !ALLOW.has(l));
+  assert.deepEqual(hits, [],
+    "这些地方还在用物理像素夹 CSS 坐标 —— 放大后浮层会飞出屏幕，改用 viewportW()/viewportH()");
+});
+
+test("viewportW/H 取的是 CSS 视口，不是物理像素", async () => {
+  const m = await import("../src/agent/layout-density.js");
+  const prevDoc = globalThis.document, prevWin = globalThis.window;
+  try {
+    // 放大到 140% 时的真实形状：物理 1400×980，布局坐标系只有 1000×700。
+    globalThis.document = { documentElement: { clientWidth: 1000, clientHeight: 700 } };
+    globalThis.window = { innerWidth: 1400, innerHeight: 980 };
+    assert.equal(m.viewportW(), 1000, "取到了物理宽度 —— 夹取会失效，浮层飞出屏幕");
+    assert.equal(m.viewportH(), 700, "取到了物理高度");
+    // documentElement 量不到时（嵌入场景、测试台）才退回 innerWidth，总比返回 0 强：
+    // 0 会让 `min(x, 0 - w - 8)` 变成一个负上界，浮层被推到屏幕外。
+    globalThis.document = { documentElement: { clientWidth: 0, clientHeight: 0 } };
+    assert.equal(m.viewportW(), 1400, "量不到 CSS 视口时没有退回物理宽度");
+    assert.equal(m.viewportH(), 980);
+  } finally {
+    if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;
+    if (prevWin === undefined) delete globalThis.window; else globalThis.window = prevWin;
+  }
+});
+
 test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩放不能算两次", async () => {
   // 界面缩放走 documentElement.style.zoom：1 CSS px = zoom 个物理像素。app.css 里各栏
   // 宽度已经除以 --ui-zoom，物理宽度因此与缩放无关。档位要是再按 CSS 像素（= 物理/缩放）

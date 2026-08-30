@@ -29,7 +29,7 @@ window.addEventListener("unhandledrejection", (e) => {
 
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
-import { applyLayoutDensity } from "./agent/layout-density.js";
+import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
@@ -12309,8 +12309,8 @@ function renderMenuAt(x, y, items) {
   menu.style.visibility = "hidden";
   document.body.appendChild(menu);
   const rect = menu.getBoundingClientRect();
-  const px = Math.min(x, window.innerWidth - rect.width - 8);
-  const py = Math.min(y, window.innerHeight - rect.height - 8);
+  const px = Math.min(x, viewportW() - rect.width - 8);
+  const py = Math.min(y, viewportH() - rect.height - 8);
   menu.style.left = Math.max(8, px) + "px";
   menu.style.top = Math.max(8, py) + "px";
   menu.style.visibility = "visible";
@@ -17179,9 +17179,9 @@ function showModelInfoCard(m, anchorEl) {
   const gap = 4, pad = 8;
   let left = menuRect.left - cw - gap;
   if (left < pad) left = menuRect.right + gap; // not enough room left → flip right
-  left = Math.max(pad, Math.min(left, window.innerWidth - cw - pad));
+  left = Math.max(pad, Math.min(left, viewportW() - cw - pad));
   let top = aRect.top;
-  top = Math.max(pad, Math.min(top, window.innerHeight - ch - pad));
+  top = Math.max(pad, Math.min(top, viewportH() - ch - pad));
   card.style.left = left + "px";
   card.style.top = top + "px";
 }
@@ -17414,7 +17414,7 @@ function openModelMenuFor(pickerEl) {
   modelMenu.style.zIndex = "10020";
   modelMenu.hidden = false;
   const mw = modelMenu.offsetWidth || 232;
-  const below = window.innerHeight - r.bottom - 12;
+  const below = viewportH() - r.bottom - 12;
   const above = r.top - 12;
   if (below >= 180 || below >= above) {
     modelMenu.style.top = (r.bottom + 6) + "px";
@@ -17424,7 +17424,7 @@ function openModelMenuFor(pickerEl) {
     modelMenu.style.maxHeight = mh + "px";
     modelMenu.style.top = Math.max(8, r.top - 6 - Math.min(modelMenu.offsetHeight, mh)) + "px";
   }
-  modelMenu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + "px";
+  modelMenu.style.left = Math.max(8, Math.min(r.left, viewportW() - mw - 8)) + "px";
   pickerEl.classList.add("is-open");
   pickerEl.querySelector(".model-picker__btn")?.setAttribute("aria-expanded", "true");
 }
@@ -18272,7 +18272,7 @@ const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
     // 夹紧的顺序不能反：先压上界再抬下界。写成 min(max(margin, x), 上界) 的话，一旦视口比
     // 菜单还窄（上界 < 下界，例如窗口被拖到极窄、或某些嵌入场景里 innerWidth 报 0），
     // min 会选中那个比 margin 还小的上界，菜单直接被推到屏幕外。这样写最差也只是贴左边。
-    const clamped = Math.max(margin, Math.min(centered, window.innerWidth - width - margin));
+    const clamped = Math.max(margin, Math.min(centered, viewportW() - width - margin));
     _menu.style.left = `${Math.round(clamped - wrap.left)}px`;
   };
   const _closeCapabilitiesMenu = () => {
@@ -21748,7 +21748,7 @@ function _openMsgMoreMenu(wrap, anchorBtn) {
   menu.style.zIndex = "10030";
   menu.style.bottom = "auto";
   menu.style.top = Math.round(r.bottom + 6) + "px";
-  menu.style.left = Math.round(Math.max(8, Math.min(r.right - 190, window.innerWidth - 198))) + "px";
+  menu.style.left = Math.round(Math.max(8, Math.min(r.right - 190, viewportW() - 198))) + "px";
   menu.style.minWidth = "190px";
   document.body.appendChild(menu);
   const close = () => { menu.remove(); document.removeEventListener("mousedown", onAway, true); };
@@ -24256,7 +24256,7 @@ function openModeMenuFor(pickerEl) {
   menu.style.overflowY = "auto";
   menu.hidden = false;
   const mw = menu.offsetWidth || 180;
-  const below = window.innerHeight - r.bottom - 12;
+  const below = viewportH() - r.bottom - 12;
   const above = r.top - 12;
   if (below >= 160 || below >= above) {
     menu.style.top = (r.bottom + 6) + "px";
@@ -24266,7 +24266,7 @@ function openModeMenuFor(pickerEl) {
     menu.style.maxHeight = mh + "px";
     menu.style.top = Math.max(8, r.top - 6 - Math.min(menu.offsetHeight, mh)) + "px";
   }
-  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + "px";
+  menu.style.left = Math.max(8, Math.min(r.left, viewportW() - mw - 8)) + "px";
   pickerEl.classList.add("is-open");
   pickerEl.querySelector(".mode-picker__btn")?.setAttribute("aria-expanded", "true");
   const dismiss = (e) => {
@@ -70464,7 +70464,7 @@ function buildSelectControl(options, cur, onPick) {
     menu.style.width = `${r.width}px`;
     menu.style.left = `${r.left}px`;
     const h = menu.offsetHeight;
-    const below = window.innerHeight - r.bottom - 8;
+    const below = viewportH() - r.bottom - 8;
     menu.style.top = h <= below ? `${r.bottom + 4}px` : `${Math.max(8, r.top - h - 4)}px`;
     btn.setAttribute("aria-expanded", "true");
     setActive(Math.max(0, options.findIndex(([v]) => String(v) === value)));
@@ -75847,7 +75847,7 @@ async function _renderAtMenu() {
   const r = promptEl.getBoundingClientRect();
   _atMenu.style.left = r.left + "px";
   _atMenu.style.width = Math.min(r.width, 520) + "px";
-  _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
+  _atMenu.style.bottom = viewportH() - r.top + 6 + "px";
   _atMenu.hidden = false;
 }
 
@@ -77120,7 +77120,7 @@ function _updateSlashMenu() {
   // Narrower than the prompt: two short columns of text do not need its full width, and the
   // old 520px cap made three commands look like a dialog.
   _slashMenu.style.width = Math.min(r.width, 380) + "px";
-  _slashMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
+  _slashMenu.style.bottom = viewportH() - r.top + 6 + "px";
   _slashMenu.hidden = false;
   _renderSlashActive();
 }
@@ -79407,7 +79407,7 @@ $("toggleAssistantBtn")?.addEventListener("click", () => {
     };
     const onMove = (e) => {
       if (!dragging) return;
-      const h = Math.max(140, Math.min(window.innerHeight * 0.7, startH + (startY - e.clientY)));
+      const h = Math.max(140, Math.min(viewportH() * 0.7, startH + (startY - e.clientY)));
       termPanel.style.flex = `0 0 ${h}px`;
       scheduleLayout();
     };
