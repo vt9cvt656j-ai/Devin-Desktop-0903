@@ -119,7 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop } from "./agent/explorer-drop.js";
+import { dropDirFor, dropFeedback, planExplorerDrop } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -80228,8 +80228,12 @@ function _mkDropZone(cls, labelCls, icon, label) {
   z.innerHTML = '<span class="dz-label ' + labelCls + '">' + icon + '<span>' + label + '</span></span>';
   return z;
 }
-if (_explorerEl) _explorerEl.appendChild(_mkDropZone("explorer-dropzone", "dz-label--open", _ICON_OPEN, "打开到工作区"));
 if (_composerEl) _composerEl.appendChild(_mkDropZone("composer-dropzone", "dz-label--ai", _ICON_AI, "引用到对话"));
+// 「换掉整个项目」这一档的反馈落在**编辑器区**——光标在哪儿，反馈就在哪儿。
+// 文案由跟随光标的 drop-chip 说，这层只出一个虚线/实线的框，所以图标和标签都留空。
+const _layoutEl = document.querySelector(".layout");
+const _editorDropzoneEl = _mkDropZone("editor-dropzone", "dz-label--open", "", "");
+if (_layoutEl) _layoutEl.appendChild(_editorDropzoneEl);
 
 let _dropHideTimer = 0;
 // Which target is the cursor over? Checks the composer rect against BOTH the raw position and the
@@ -80252,7 +80256,10 @@ function _dropPointIn(p, el) {
 function _dragTargetAt(payload) {
   const p = payload && payload.position;
   if (_dropPointIn(p, _composerEl)) return "composer";
-  if (rootPath && _dropPointIn(p, _treeEl)) return "tree";
+  // 判据用**整条侧栏**而不是 #tree：切到 Git/搜索/调试视图时 #viewExplorer 被 display:none，
+  // #tree 的矩形塌成 0，落点会悄悄退回 "open" —— 于是往侧栏拖个文件夹会换掉整个项目。
+  // 侧栏永远是「加进这个项目」，看的是哪个视图不该改变这件事。
+  if (rootPath && _dropPointIn(p, _explorerEl)) return "explorer";
   return "open";
 }
 // 光标下面那一行 → 往哪个目录里放。判据是**文件行才有** :scope > .chev-spacer：
@@ -80263,20 +80270,59 @@ function _dropDirAt(payload) {
   const row = pt ? document.elementFromPoint(pt.x, pt.y)?.closest?.(".row") : null;
   return dropDirFor({ rowPath: row?.dataset?.path || "", rowIsDir: !row?.querySelector(":scope > .chev-spacer"), rootPath });
 }
-function _showDrop(target) {
+// 拖进来的是什么：drag-enter 带 paths，drag-over 不带 → 在 enter 那一帧存下来给后续复用。
+let _dragItems = [];
+let _dropChipEl = null;
+// 存**路径**而不是节点引用：fs-watcher 会在拖动途中重建整棵树，存引用的话高亮会挂在
+// 一个已被丢弃的节点上，既清不掉也贴不上。每帧按类名扫一遍再贴，重建后下一帧自愈。
+function _paintDropRow(path) {
+  for (const r of _treeEl?.querySelectorAll(".row.is-drop-into") || []) r.classList.remove("is-drop-into");
+  if (!path) return;
+  _treeEl?.querySelector(`.row[data-path="${cssEscape(path)}"]`)?.classList.add("is-drop-into");
+}
+let _dropSig = "";
+function _showDrop(target, payload) {
   clearTimeout(_dropHideTimer);
-  const composer = target === "composer";
-  if (_explorerEl) {
-    _explorerEl.classList.add("drag-into"); _explorerEl.classList.toggle("is-over", !composer);
-    // 标签要说实话：落在树里是复制进去，落在编辑器区才是打开/换项目。
-    const _lb = _explorerEl.querySelector(".dz-label span:last-child");
-    if (_lb) _lb.textContent = target === "tree" ? "复制到工作区" : "打开到工作区";
+  // P1-3 看门狗：drag-leave **不保证会来**（drop 后 macOS 不发 draggingExited、拖到别的
+  // 应用、ESC 取消、wry 漏发都可能）。没有它，行高亮会残留下来，长得很像"这个文件被选中了"。
+  _dropHideTimer = setTimeout(_hideDrop, 450);
+  const fb = dropFeedback({
+    zone: target, destDir: target === "explorer" ? _dropDirAt(payload) : "",
+    rootPath, items: _dragItems,
+  });
+  // 反馈画在光标**真正所在**的那块区域。以前 target 是 "open"（光标在编辑器上、后果是
+  // 换掉整个项目）时却去点亮**侧栏**，而侧栏恰恰是唯一不会换项目的地方——用户"分不清
+  // 是放文件还是替换整个工作区"的直接来源就在这里。
+  if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", target === "composer"); }
+  if (_explorerEl) _explorerEl.classList.remove("drag-into", "is-over");
+  _layoutEl?.classList.toggle("drag-open", target === "open");
+  _layoutEl?.classList.toggle("drag-open--replace", fb.kind === "replace");
+  _editorDropzoneEl?.classList.toggle("is-benign", fb.kind !== "replace");
+  // 按值去重：同一行内移动光标时不重写 DOM（elementFromPoint 已经强制同步布局了一次）。
+  const _sig = `${target}|${fb.kind}|${fb.rowPath}|${fb.title}|${fb.sub}`;
+  if (_sig !== _dropSig) { _dropSig = _sig; _paintDropRow(fb.rowPath); _paintDropChip(fb); }
+  // 夹取用 viewportW/H 而不是 innerWidth：innerWidth 不随页面缩放变，放大之后浮层会飞出屏幕。
+  const pt = _dropPointIn(payload?.position, document.documentElement);
+  if (pt) {
+    _dropChipEl.style.left = Math.max(4, Math.min(pt.x + 16, viewportW() - 330)) + "px";
+    _dropChipEl.style.top = Math.max(4, Math.min(pt.y + 18, viewportH() - 44)) + "px";
   }
-  if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", composer); }
+}
+// 跟随光标的标签：写清"复制到 renderer"这种具体去向，换项目时还要写出会失去什么。
+function _paintDropChip(fb) {
+  if (!_dropChipEl) { _dropChipEl = document.createElement("div"); document.body.appendChild(_dropChipEl); }
+  _dropChipEl.className = "drop-chip drop-chip--" + (fb.kind === "replace" ? "replace" : fb.kind === "deny" ? "deny" : "copy");
+  _dropChipEl.textContent = fb.title;
+  if (fb.sub) { const s = document.createElement("span"); s.className = "drop-chip__sub"; s.textContent = fb.sub; _dropChipEl.append(" ", s); }
 }
 function _hideDrop() {
+  _dropSig = "";
   clearTimeout(_dropHideTimer);
   for (const el of [_explorerEl, _composerEl]) { if (el) { el.classList.remove("drag-into"); el.classList.remove("is-over"); } }
+  _layoutEl?.classList.remove("drag-open", "drag-open--replace");
+  _paintDropRow("");
+  _dragItems = [];
+  if (_dropChipEl) { _dropChipEl.remove(); _dropChipEl = null; }
 }
 // drag-leave can fire spuriously mid-drag; debounce the hide so the zones don't flicker.
 const _hideDropSoon = () => { clearTimeout(_dropHideTimer); _dropHideTimer = setTimeout(_hideDrop, 130); };
@@ -80319,7 +80365,7 @@ async function _copyIntoWorkspace(paths, destDir) {
 }
 async function _handleDrop(paths, target, payload) {
   if (!paths || !paths.length) return;
-  if (target === "tree") { await _copyIntoWorkspace(paths, _dropDirAt(payload)); return; }
+  if (target === "explorer") { await _copyIntoWorkspace(paths, _dropDirAt(payload)); return; }
   if (target === "composer") {
     for (const p of paths) {
       const normalizedPath = _toPosix(p);
@@ -80352,12 +80398,16 @@ async function _handleDrop(paths, target, payload) {
 editorContainer.addEventListener("dragover", (e) => {
   e.preventDefault();
   e.dataTransfer.dropEffect = "copy";
-  _showDrop(_dragTargetAt({ position: { x: e.clientX, y: e.clientY } }));
+  // client 是 CSS 像素，而 _dropPointIn 先按物理像素试（Tauri 那条给的是物理像素）。
+  // 不乘回去的话 Retina 上 /dpr 之后仍可能落在又窄又高的侧栏里——分档对、坐标偏半屏。
+  const _p = { position: { x: e.clientX * (window.devicePixelRatio || 1), y: e.clientY * (window.devicePixelRatio || 1) } };
+  _showDrop(_dragTargetAt(_p), _p);
 });
 editorContainer.addEventListener("dragleave", () => _hideDropSoon());
 editorContainer.addEventListener("drop", async (e) => {
   e.preventDefault();
-  const payload = { position: { x: e.clientX, y: e.clientY } };
+  const _dpr = window.devicePixelRatio || 1;
+  const payload = { position: { x: e.clientX * _dpr, y: e.clientY * _dpr } };
   const target = _dragTargetAt(payload);
   _hideDrop();
   const files = [...(e.dataTransfer?.files || [])].map((f) => f.path).filter(Boolean);
@@ -80365,9 +80415,26 @@ editorContainer.addEventListener("drop", async (e) => {
 });
 // Tauri path: window-level drag events drive the zones AND route the drop by position.
 if (inTauri) {
-  import("@tauri-apps/api/event").then(({ listen }) => {
-    listen("tauri://drag-enter", (e) => _showDrop(_dragTargetAt(e.payload)));
-    listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload)));
+  // **必须按窗口订阅**：event.js 的 listen() 不传 options 时 target 默认 {kind:"Any"}，
+  // 而 Any 在 Rust 侧会短路掉标签过滤 —— 开了第二个窗口（⇧⌘N / 文件菜单 / 命令面板）之后，
+  // 在 B 窗口拖动会用 B 的坐标驱动 A 的高亮，松手时 A 和 B 各跑一遍 _handleDrop：
+  // 文件被复制两份，甚至一边复制、另一边把项目换掉。getCurrentWebviewWindow().listen()
+  // 写死 {kind:"WebviewWindow", label:自己}，只收自己这扇窗的事件。
+  import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
+    const listen = (name, fn) => getCurrentWebviewWindow().listen(name, fn);
+    // enter 是唯一带 paths 的一帧（over 不带），存下来给整段拖动用：没有它就说不出
+    // "拖的是文件夹还是文件"，也就判不出这一下到底是复制还是换项目。
+    listen("tauri://drag-enter", async (e) => {
+      const paths = e.payload?.paths || [];
+      _dragItems = paths.map((p) => ({ path: _toPosix(p), isDir: false }));
+      _showDrop(_dragTargetAt(e.payload), e.payload);
+      // is_dir 要问后端，异步；先按文件画，探完再补一次。
+      const probed = await Promise.all(paths.map(async (p) => ({
+        path: _toPosix(p), isDir: await backend.readDir(p).then(() => true).catch(() => false),
+      })));
+      if (_dragItems.length) _dragItems = probed;
+    });
+    listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload), e.payload));
     listen("tauri://drag-leave", () => _hideDropSoon());
     listen("tauri://drag-drop", async (event) => {
       const target = _dragTargetAt(event.payload);

@@ -56,6 +56,8 @@
   --active: rgba(0, 0, 0, 0.085);
   --sel: rgba(10, 132, 255, 0.14);
   --shimmer: rgba(10, 132, 255, 0.1);
+  /* 拖放里「这一步会换掉整个项目」那一档的警示色，和 .problems__item--warn 同色系。 */
+  --drop-warn: #d9a000;
   --titlebar-h: 44px;
   --statusbar-h: 26px;
   --radius: 10px;
@@ -122,6 +124,8 @@
   --active: rgba(255, 255, 255, 0.09);
   --sel: rgba(77, 170, 252, 0.22);
   --shimmer: rgba(255, 255, 255, 0.07);
+  /* 琥珀在深底上要提亮，否则和边框糊成一片。 */
+  --drop-warn: #e0a000;
 
   /* 与浅色一一对应。注意 --accent-solid / --accent-on 在这里**关系反过来**：
      暗色 --accent(#4daafc) 当填充底已经够亮，前景必须换成深色（7.73:1），
@@ -14774,6 +14778,94 @@ textarea.settings-input {
 .dz-label svg { width: 15px; height: 15px; }
 .dz-label--open { color: var(--accent, #1a73e8); }
 .dz-label--ai { color: var(--accent, #1a73e8); }
+
+/* ═══ 拖放目标反馈 ═══════════════════════════════════════════════════════════════
+ *
+ * 用户报的：「我不能知道我要拖放文件位置 还是 替换整个工作区目录」。根因不是动画不够花，
+ * 是**三种后果共用同一块矩形**、只有药丸里两个字在换——而文字是最后才被读到的通道。
+ * （更糟的是那块矩形还画错了地方：光标在编辑器上、亮的却是侧栏，见 _showDrop 的注释。）
+ *
+ * 所以这里给三种后果三种**互不相同的几何**，颜色只作冗余通道（色觉障碍下仍可分）：
+ *   落进某个目录  → 那一行亮起 + 它的子树整块染色并挂一条左轨（"东西进到这个盒子里"）
+ *   落到项目根    → 同上，只是高亮的是根行（根行和普通目录行共用一套类）
+ *   换掉整个项目  → 编辑器区一整块**虚线**框 + 侧栏被压暗（"将要失去的东西自己先灰掉"）
+ * 「虚线 + 压暗」是语义映射不是编码：全应用没有第二处会把文件树压暗，不会被误读。
+ */
+
+/* ── 落点行：进这个目录 ─────────────────────────────────────────────────────── */
+/* 行状态已被占用的语汇：中性灰(hover)、accent 淡底(is-active)、紫底(多选)、
+   accent 34% 闪一下(flash)。drop 态要比它们都强，且不能只靠颜色——所以它同时具备
+   **实心底 + 上下实线边 + 左侧粗竖条**三个特征。
+   特异性：根行有 `.workspace-root__row.is-active::before{background:transparent}` 这条
+   覆盖，所以一律加 `#tree` 前缀提高特异性，否则拖到根行时底色会被它抹掉。 */
+#tree .row.is-drop-into::before {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+/* .row::after 在此之前全应用没人用过。用它画边和左竖条，与 ::before 的底色叠加。
+   z-index:-1 让它留在文字**下面**（.row 有 isolation:isolate，不外泄）。 */
+#tree .row.is-drop-into::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 0 -1000px;                      /* 和 ::before 一样铺满整栏，不受缩进影响 */
+  border-top: 1.5px solid var(--accent);
+  border-bottom: 1.5px solid var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);   /* 左侧粗竖条 = "进入这一层" */
+  pointer-events: none;
+}
+/* 目标目录的**子树**整块染色 + 左轨：这是"落到哪一层"最直接的回答。
+   .children 是 .row 的兄弟节点（不是子节点），所以用相邻兄弟选择器；
+   根行的子容器是 .children.workspace-root__children，同一条规则通吃。 */
+#tree .row.is-drop-into + .children {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 0 0 6px 6px;
+}
+#tree .row.is-drop-into .name { color: var(--accent); font-weight: 600; }
+
+/* ── 换掉整个项目：编辑器区虚线框 + 侧栏压暗 ──────────────────────────────────── */
+.editor-dropzone {
+  position: absolute; inset: 6px; z-index: 45; pointer-events: none;
+  visibility: hidden; opacity: 0;
+  border-radius: 10px;
+  border: 2px dashed color-mix(in srgb, var(--drop-warn) 78%, transparent);
+  background: color-mix(in srgb, var(--drop-warn) 7%, transparent);
+  transition: opacity .12s ease, visibility .12s ease;
+}
+.layout.drag-open .editor-dropzone { visibility: visible; opacity: 1; }
+/* 只开一个文件是无损的，不该用警告色吓人 → 实线 + accent。 */
+.editor-dropzone.is-benign {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+/* 将要被换掉的那棵树自己先灰掉——"损失"必须看得见，不能只写在文字里。 */
+.layout.drag-open--replace .explorer::after {
+  content: "";
+  position: absolute; inset: 0; z-index: 40; pointer-events: none;
+  background: color-mix(in srgb, var(--panel-solid) 58%, transparent);
+}
+
+/* ── 跟随光标的目标标签 ─────────────────────────────────────────────────────── */
+/* 固定在面板正中的药丸离用户视线（光标）太远，而且说不出目标目录的名字。这个标签跟着
+   光标走，直接写"复制到 renderer"。**不加 transition**：拖动中任何缓动都会让标签追不上
+   光标，看起来像卡顿。 */
+.drop-chip {
+  position: fixed; z-index: 99998; pointer-events: none;
+  display: inline-flex; align-items: baseline; gap: 7px;
+  max-width: 320px; padding: 6px 11px;
+  font-size: 12.5px; font-weight: 600; line-height: 1.25; white-space: nowrap;
+  color: var(--text);
+  background: var(--panel-solid);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, .16), 0 8px 24px rgba(0, 0, 0, .12);
+}
+.drop-chip__sub { font-weight: 400; opacity: .72; overflow: hidden; text-overflow: ellipsis; }
+.drop-chip--copy { border-left: 3px solid var(--accent); }
+.drop-chip--replace { border-left: 3px solid var(--drop-warn); }
+.drop-chip--deny { border-left: 3px solid var(--destructive, #e5484d); }
+
 .ref-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 8px 3px; }
 .ref-chip {
   display: inline-flex; align-items: center; gap: 5px; max-width: 220px;
