@@ -96,6 +96,11 @@ export function preflightBody(sections, cap = 6000) {
  *
  * 只挪带 `data-knowledge-preflight` 的卡，且只挪**在 anchor 之前**的那些——
  * anchor 之后新出的（下一轮预检）本来就在正确位置，再挪一次会把它推到更后面。
+ *
+ * anchor 是「本轮第一个可见产物」，不是「思考卡」。判成思考卡的话，思考档位选 off、或线路
+ * 根本不回推理内容时，本轮一张 .think-card 都不会建，这个函数一次都不会被调到——预检卡原地
+ * 留在正文最前面，等于没修。调用方为此给了多个锚点：思考卡 / 正文首帧 / 首张工具卡，
+ * 谁先落 DOM 就用谁。
  */
 export function movePreflightCardsAfter(body, anchor) {
   try {
@@ -103,10 +108,24 @@ export function movePreflightCardsAfter(body, anchor) {
     const cards = [...body.querySelectorAll('[data-knowledge-preflight="1"]')];
     let moved = 0, at = anchor;
     for (const card of cards) {
+      // 安置过、且当初那个锚点还在 DOM 里的，一张都不再碰。
+      //
+      // body 整个 run 只建一次，anchor 却是**每轮新建**的（思考卡、正文段、工具卡都是）。
+      // 只按「在 anchor 之前」判的话，上一轮已经摆好的卡对**这一轮**的新锚点仍然是 preceding，
+      // 于是 agent 每多跑一轮就把它再往下拖一次，最后停在整条消息末尾——用户要的是「在思考
+      // 后面」，拿到的是「在所有内容后面」。它作为一张非思考卡停在那儿，还会把
+      // _mergeTrailingThinkCards 的尾部扫描堵住（那边扫到非思考卡就停）。
+      //
+      // 记**锚点引用**而不是布尔位：重来一轮（断流重发 / 工具参数修复重试）会把本轮的思考卡
+      // 整批 remove 掉。布尔位这时是**过期的真**，重来的那一轮再也不会安置它，缺陷就在那条
+      // 路上悄悄复发；记引用则自动失效——parentNode 为 null 就是「锚没了」，这张卡重新变得
+      // 可安置，而且不需要调用方记得来清标记。
+      if (card._preflightAnchor?.parentNode) continue;
       // compareDocumentPosition：2 = card 在 anchor 之前（DOCUMENT_POSITION_PRECEDING）
       if (!(anchor.compareDocumentPosition(card) & 2)) continue;
       at.parentNode.insertBefore(card, at.nextSibling);
-      at = card;                 // 多张时保持它们原来的相对顺序
+      card._preflightAnchor = anchor;   // 「只安置一次」的判据落在卡自己身上
+      at = card;                        // 多张时保持它们原来的相对顺序
       moved++;
     }
     return moved;

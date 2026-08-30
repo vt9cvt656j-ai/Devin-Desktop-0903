@@ -26140,8 +26140,19 @@ function _domainKnowledgeResearchPlan(domain, task) {
  */
 async function _runDomainKnowledgePreflight({ run, profile = "", body = null, isLive = () => true } = {}) {
   if (run?.mode !== "agent" || !isLive()) return { required: false, briefs: [] };
-  const done = run._domainKnowledgeDone instanceof Set ? run._domainKnowledgeDone : new Set();
-  run._domainKnowledgeDone = done;
+  // 「这个域已经嚼过了」是**会话级**的事实，不是这一轮的。
+  //
+  // 旗标是会话级单调并集、只增不减（那条粘性是刻意的：改一个字节就作废整条 120k 对话的
+  // 前缀缓存，实测命中率 2%，knowledge-routing/semantic-profile 两处测试逐字钉着，别动）。
+  // 而这个去重集合原来挂在 run 上，run 每条用户消息新建一次——于是第一轮说「做个医疗预约
+  // 系统」点亮 domain_healthcare 之后，第二轮问「这个变量名改成 userId」照样发 4 条 rubric
+  // 检索（两个域就 8 条）、多出一张卡、往上下文塞最多 2500 字符医疗小抄、首 token 前还多等
+  // 最多 6 秒。用户抱怨的「不是随便就出触发的」，症结在**有效期**不在触发判据。
+  // 挂到 session 上：同一会话同一个域只嚼一次，后续轮次由模型按需自己调 knowledge_search
+  //（它就在开局窗口里）——这正是 _DOMAIN_KNOWLEDGE_MAX_DOMAINS 注释里写的设计意图。
+  const _dkSess = run.session || run;
+  const done = _dkSess._domainKnowledgeDone instanceof Set ? _dkSess._domainKnowledgeDone : new Set();
+  _dkSess._domainKnowledgeDone = done;
   const domains = _domainKnowledgeFlagDomains(profile).filter((d) => !done.has(d));
   if (!domains.length) return { required: false, briefs: [] };
   for (const domain of domains) done.add(domain);
@@ -46373,7 +46384,14 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     _shownLen = acc.length;
     const clean = _streamCleanText(acc);
     if (clean.trim()) {
-      if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
+      if (!streamEl) {
+        streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl);
+        // 第二个锚点：模型不吐 reasoning（思考档位 off、或线路本来就不回推理）时，本轮一张
+        // 思考卡都不会建，只锚思考卡的话预检卡就原地留在正文最前面——用户看到的还是
+        // 「还没有任何『它在想』的迹象，先冒出一张知识检索卡」。放在 if (!streamEl) 里，
+        // 整轮只触发一次；模块自己按卡记「安置过」，思考卡后到也不会把它再挪一遍。
+        _movePreflightCardsAfter(body, streamEl);
+      }
       renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
       if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
@@ -52649,8 +52667,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (!preflight || run._domainKnowledgePreflightConsumed === preflight) return false;
     run._domainKnowledgePreflightConsumed = preflight;
     if (!preflight.required || !Array.isArray(preflight.briefs) || !preflight.briefs.length) return false;
-    run._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected instanceof Set
-      ? run._domainKnowledgeBriefInjected : new Set();
+    // 同上：注入记账也提到会话级，否则「一会话嚼一次」会被「每轮重新注入」抵消掉。
+    const _dkInjSess = run.session || run;
+    run._domainKnowledgeBriefInjected = _dkInjSess._domainKnowledgeBriefInjected instanceof Set
+      ? _dkInjSess._domainKnowledgeBriefInjected : new Set();
+    _dkInjSess._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected;
     for (const item of preflight.briefs) {
       if (!item?.brief || run._domainKnowledgeBriefInjected.has(item.domain)) continue;
       run._domainKnowledgeBriefInjected.add(item.domain);

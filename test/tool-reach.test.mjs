@@ -89,6 +89,31 @@ test("能力名录字节稳定，不会击穿 prompt cache", () => {
   }
 });
 
+// 上面那条「名录列出注册表里的每一个工具名」跑的是 INDEX —— **无参、不过滤**的那一份。
+// 而产品从 2026-08-30 起走的是 toolCapabilityIndex(_staticToolNames())。于是「过滤路径把
+// 某个名字吃掉了」这件事，那条结构上不可能发现：它连 search_tools 都显式补进了期望集、
+// 注释也解释了为什么要补，却仍然全绿，而线上真的少了那个名字。
+// 这是本仓库记着的「断言真实却守错了东西」的活样本。下面两条钉的是**过滤之后**那一份。
+test("按真实注册表过滤之后，名录仍然一个名字都不少", () => {
+  const listed = new Set(toolCapabilityIndex(new Set(REGISTERED)).split("\n").flatMap((line) =>
+    (line.split(": ")[1]?.split(" ") || []).map((e) => e.replace(/\(.*$/, ""))));
+  // search_tools 的 schema 是 main.js 里单独的 _SEARCH_TOOLS_SCHEMA（在 _selectInitialTools
+  // 里 push），不走 _buildAgentToolSchemas —— 所以它落在**任何**由注册表建出来的集合之外，
+  // 是最先被这道过滤吃掉的那个，而它恰恰是名录收尾句唯一指向的工具。
+  assert.ok(listed.has("search_tools"),
+    "search_tools 被过滤掉了——名录收尾句让模型「名录里有、你工具列表里没有的，才用 search_tools 取回 schema」，那句话没了指向的对象");
+  const eaten = REGISTERED.filter((name) => !listed.has(name));
+  assert.deepEqual(eaten, [], `过滤路径把这些名字吃掉了：${eaten.join(", ")}`);
+});
+
+test("拿不到注册表时名录退回全量，而不是静默变成空串", () => {
+  // _staticToolNames() 的 catch 分支返回 new Set()，而**空 Set 是真值**：原样传下来会把
+  // 全部名字滤掉，名录变空串，还被那边的 memo 钉住整个进程——模型从此只剩开局窗口那
+  // 十来个工具，而一处报错都没有。过滤之前这份名录遍历冻结常量、结构上不可能失败；
+  // 加了过滤就必须自己补回这条兜底。
+  assert.equal(toolCapabilityIndex(new Set()), INDEX);
+});
+
 test("能力名录进了随 system 前缀发送的工具提示", () => {
   const hint = extractFn("_buildToolHint");
   // 钉「名录在场」，不钉它的调用形式。2026-08-30 起它按真实注册表过滤

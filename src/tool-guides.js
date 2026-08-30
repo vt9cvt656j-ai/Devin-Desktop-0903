@@ -840,12 +840,26 @@ function _capabilityNote(name, meta) {
  * 要么直接撞执行器的「[不可用] 需要桌面版」。一句承诺换一轮白烧。
  */
 export function toolCapabilityIndex(available = null) {
-  const key = available ? [...available].sort().join(',') : '*';
+  // 空集合当「不过滤」处理。唯一的调用方 _staticToolNames() 在 _buildToolRegistry 抛异常时
+  // 走 catch 返回 new Set()，而**空 Set 是真值** —— 原样传下来会把 143 个名字一个不剩地滤掉，
+  // 名录静默变成空串，还被那边的 memo 钉住整个进程：模型从此只剩开局窗口那十来个工具，
+  // 而没有任何一处会报错、会红、会打日志。过滤之前这份名录遍历的是冻结常量，
+  // **结构上不可能失败**；加了过滤就得自己把这条兜底补回来。真实注册表不可能是空的，
+  // 所以「空」只可能是上游坏了 —— 退回全量，宁可多列几个也不能让模型以为自己没工具。
+  const avail = available && available.size ? available : null;
+  const key = avail ? [...avail].sort().join(',') : '*';
   const cached = _capabilityIndexCache.get(key);
-  if (cached) return cached;
+  // 判据是「这个键在不在表里」，不是「值真不真」：空串是合法结果，`if (cached)` 会把它
+  // 当成未命中，于是每一轮都重算一次全表。
+  if (cached !== undefined) return cached;
   const byCategory = new Map();
   for (const [name, meta] of Object.entries(TOOL_METADATA)) {
-    if (available && !available.has(name)) continue;
+    // search_tools 永不过滤。它的 schema 是 main.js 里单独的常量（_SEARCH_TOOLS_SCHEMA，
+    // 在 _selectInitialTools 里 push），**不走 _buildAgentToolSchemas** —— 于是任何由注册表
+    // 建出来的 available 里都没有它，实测桌面 143 个名字里被这道过滤丢掉的有且只有它。
+    // 而名录的收尾句正是「名录里有、你工具列表里没有的，才用 search_tools 取回 schema 再调」：
+    // 把它滤掉，那句话就没有指向的对象了。
+    if (avail && name !== 'search_tools' && !avail.has(name)) continue;
     const cat = meta?.category || 'utility';
     if (!byCategory.has(cat)) byCategory.set(cat, []);
     byCategory.get(cat).push(name + _capabilityNote(name, meta));

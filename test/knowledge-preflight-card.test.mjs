@@ -101,6 +101,50 @@ test("预检卡挪到思考卡后面，且只挪在它前面的那些", () => {
   }
 });
 
+test("预检卡只安置一次，且不止「思考卡」一个锚点", () => {
+  // 两个缺陷合起来才是用户那句「要在思考中后面显示」真正被兑现：
+  //   A 唯一锚点是思考卡 → 思考档位 off / 线路不回推理时，本轮一张 .think-card 都不建，
+  //     这个函数一次都不会被调到，预检卡原地留在正文最前面。
+  //   B body 整个 run 只建一次、anchor 每轮新建 → 上一轮摆好的卡对**新**锚点仍是 preceding，
+  //     agent 每多跑一轮就再往下拖一次，最后停在整条消息末尾（「在所有内容后面」）。
+  const mk = (id, pf) => {
+    const n = { id, parentNode: null, dataset: pf ? { knowledgePreflight: "1" } : {} };
+    n.compareDocumentPosition = (o) => (body.kids.indexOf(o) < body.kids.indexOf(n) ? 2 : 4);
+    return n;
+  };
+  const body = { kids: [],
+    querySelectorAll: () => body.kids.filter((k) => k.dataset?.knowledgePreflight === "1"),
+    append(n) { n.parentNode = body; body.kids.push(n); },
+    insertBefore(node, ref) {
+      const i = body.kids.indexOf(node); if (i >= 0) body.kids.splice(i, 1);
+      const at = ref ? body.kids.indexOf(ref) : body.kids.length;
+      body.kids.splice(at < 0 ? body.kids.length : at, 0, node); node.parentNode = body;
+    } };
+  const order = () => body.kids.map((k) => k.id).join(">");
+
+  const card = mk("卡", true); body.append(card);
+  const t1 = mk("思考1"); body.append(t1);
+  assert.equal(movePreflightCardsAfter(body, t1), 1);
+  assert.equal(order(), "思考1>卡", "第一次没安置到锚点后面");
+
+  // B：第二轮的新锚点不许把它再拖一次。
+  body.append(mk("工具卡")); const t2 = mk("思考2"); body.append(t2);
+  assert.equal(movePreflightCardsAfter(body, t2), 0, "又被新一轮的锚点拖走了——最后会停在消息末尾");
+  assert.equal(order(), "思考1>卡>工具卡>思考2");
+
+  // 重来一轮会把本轮思考卡整批 remove。判据若写成布尔位，这时是**过期的真**，
+  // 重来的那一轮再也不会安置它；写成锚点引用则自动失效。
+  body.kids = body.kids.filter((k) => k !== t1 && k !== t2);
+  t1.parentNode = null; t2.parentNode = null;
+  const t3 = mk("思考3"); body.append(t3);
+  assert.equal(movePreflightCardsAfter(body, t3), 1, "锚点被重试清场移除后，卡没有重新变得可安置");
+
+  // A：调用点必须不止思考卡一个。正文首帧那条覆盖「模型不吐 reasoning 但正常写正文」。
+  assert.match(SRC, /_movePreflightCardsAfter\(body, reasoningEl\)/, "思考卡锚点没了");
+  assert.match(SRC, /_movePreflightCardsAfter\(body, streamEl\)/,
+    "正文首帧没有锚点——思考档位 off 时预检卡会一直压在最前面");
+});
+
 test("设计预检也走融合卡——不能只修专业域那条路", () => {
   // 融合卡和「挪到思考卡后面」最初只做在专业域（domain_*）那条路上，michael-design
   // 那条一个字都没改：三条 plan 各建一张卡、且从不打 data-knowledge-preflight，
