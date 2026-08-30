@@ -16,7 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
-import { summarizeTiming, summarizeIntentRace } from "../src/agent/turn-timing.js";
+import { summarizeTiming } from "../src/agent/turn-timing.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
@@ -9184,9 +9184,7 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
   // 窗口必须是那个具名常量，不是裸字面量：发送路径的第一轮等待从同一个常量推导，
   // 各写一个数就是上一次留下 1500 的方式——等待短于窗口，race 从此恒定由 timer 赢。
-  // 超时臂多了一笔胜负记账（_mark(false)）——模块里包着 try、调用点 typeof 兜底，
-  // 结构上不可能影响 resolve。被守的性质没变：超时臂只**放行**，不阻断发送。
-  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => \{ _mark\(false\); resolve\(null\); \}, _INTENT_FOREGROUND_WAIT_MS\)/,
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), _INTENT_FOREGROUND_WAIT_MS\)/,
     "前台采用窗口只限制采用、绝不阻断发送，且必须与第一轮等待同源");
   assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
     "前台超时不能取消或废弃仍在运行的物理判定");
@@ -35206,7 +35204,6 @@ function _epForLedger(entries, outcome = "success") {
     // 时间线汇总用真模块，不打桩：它的兜底行为（坏输入返回 null 而不是抛）本身就是
     // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
     _summarizeTiming: summarizeTiming,
-    _summarizeIntentRace: summarizeIntentRace,
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
@@ -36912,7 +36909,7 @@ test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩�
   // 分，就等于把缩放算了两次：放大一次、档位又缩一次，窄窗口里一放大侧栏反而更小。
   const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
   const el = { dataset: {} };
-  const stepAt = (px) => { applyLayoutDensity(px, el); return el.dataset.layout; };
+  const stepAt = (px) => { applyLayoutDensity(px, 1000, el); return el.dataset.layout; };
   assert.equal(stepAt(1440), undefined, "常规笔记本宽度不该有档位 —— 用户拖出来的宽度要原样生效");
   assert.equal(stepAt(1100), "narrow");
   assert.equal(stepAt(900), "tight");
@@ -36939,10 +36936,12 @@ test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩�
 
 test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素算", () => {
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  // 行首锚定，理由同上：`:root[data-layout="narrow"] .layout .explorer {` 里也含
+  // `.layout .explorer {`，按子串取会切到别人家的规则里去。
   const grab = (sel) => {
-    const i = css.indexOf(sel + " {");
-    assert.ok(i >= 0, `${sel} 这条规则不见了`);
-    return css.slice(i, css.indexOf("}", i));
+    const m = new RegExp("^" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{[^}]*\\}", "m").exec(css);
+    assert.ok(m, `${sel} 这条规则不见了`);
+    return m[0];
   };
   // 三栏的宽度和下限都要除以 --ui-zoom。不除的话放大 140% 时两条侧栏各多占 40% 的屏幕，
   // 中间编辑区被挤到 min-width 以下，而 .layout 是 overflow:hidden —— 用户原话
@@ -36973,6 +36972,56 @@ test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素�
     "助手栏宽度没走两层 var");
   for (const step of ["narrow", "tight", "min", "wide", "xwide"]) {
     assert.ok(css.includes(`:root[data-layout="${step}"]`), `缺 ${step} 这一档`);
+  }
+});
+
+test("矮窗口要收紧竖直留白——横向档位一点忙都帮不上", async () => {
+  const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
+  const el = { dataset: {} };
+  const vAt = (h) => { applyLayoutDensity(1440, h, el); return el.dataset.vlayout; };
+
+  // 竖直的空间大头是聊天区内边距、消息 gap、输入框最大高度、空状态那一坨（图标+标题+
+  // 说明+一排 chip 近 200px）、页签条。1280×720 上空状态能把消息区占满。
+  assert.equal(vAt(1080), undefined, "够高的窗口不该收紧");
+  assert.equal(vAt(800), "short", "800 高没进 short 档");
+  assert.equal(vAt(640), "xshort", "640 高没进 xshort 档");
+  assert.equal(vAt(820), undefined, "边界取的是「小于」");
+  assert.equal(vAt(819), "short", "819 高没进 short 档");
+  assert.equal(vAt(680), "short", "680 高该是 short，不该是 xshort");
+  assert.equal(vAt(679), "xshort", "679 高没进 xshort 档");
+  // 窗口拉高要松开，否则一旦矮过就永远紧着。
+  assert.equal(vAt(1080), undefined, "窗口拉高后没松开");
+
+  // **宽和高互不相干**：一个宽而矮的窗口要收竖直、不收横向；窄而高的反过来。
+  // 合成一个档位名会组合爆炸，所以是两个属性。
+  applyLayoutDensity(900, 1080, el);
+  assert.equal(el.dataset.layout, "tight", "横向档位丢了");
+  assert.equal(el.dataset.vlayout, undefined, "窄但高的窗口被误收了竖直留白");
+  applyLayoutDensity(2560, 640, el);
+  assert.equal(el.dataset.layout, "wide", "横向档位丢了");
+  assert.equal(el.dataset.vlayout, "xshort", "宽但矮的窗口没收竖直留白");
+});
+
+test("竖直收紧先压留白、后藏内容，而且不藏能点的东西", () => {
+  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+  const block = (step) => css.split("\n").filter((l) => l.includes(`[data-vlayout="${step}"]`)).join("\n");
+  const short = block("short"), xshort = block("xshort");
+  assert.ok(short && xshort, "两档竖直规则至少要各有一条");
+
+  // short 只压留白，一个字都不少 —— 先让留白，再谈藏东西。
+  assert.ok(!/display:\s*none/.test(short),
+    "最浅的一档就开始藏内容了 —— 留白还没压完就先减信息，顺序反了");
+  assert.match(short, /\.chat\b[^{]*\{[^}]*padding/, "short 没压聊天区内边距");
+  assert.match(short, /textarea[^{]*\{[^}]*max-height/, "short 没压输入框最大高度");
+
+  // xshort 才开始藏，而且只藏装饰和那句说明。
+  assert.match(xshort, /\.chat-empty__icon[^{]*\{[^}]*display:\s*none/, "xshort 没藏掉那个装饰图标");
+  // **标题和 chip 任何时候都不许藏**：那是这一屏唯一能点的东西。
+  for (const src of [short, xshort]) {
+    assert.ok(!/\.chat-empty__chips[^{]*\{[^}]*display:\s*none/.test(src),
+      "把可点的 chip 藏了 —— 空状态那一屏就没有出口了");
+    assert.ok(!/\.chat-empty h3[^{]*\{[^}]*display:\s*none/.test(src),
+      "把标题藏了 —— 用户不知道这一栏是干什么的");
   }
 });
 
@@ -37040,7 +37089,16 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   assert.match(foot, /min-width:\s*\d+px/, "两颗按钮没有定等宽");
   // **正文铺满整块编辑区**，和打开一个文件时一样。原来挂着 max-width: 78ch，而它限的是
   // 滚动容器本身：正文缩在左边一条、右边空一大片、滚动条卡在中间，表格还被挤到换行。
-  const pbody = pcss.slice(pcss.indexOf(".planpane__body {"), pcss.indexOf(".planpane__body > :first-child"));
+  // **按行首锚定取规则块。** 直接 indexOf(".planpane__body {") 会被
+  // `:root[data-vlayout="xshort"] .planpane__body {` 抢先命中（它把选择器整个包在里面，
+  // 而且排在前面），于是切出来的是一大段跨了几十条规则的文本，里面随便哪条的 max-width
+  // 都会让这条断言假红。同一个坑这份文件里已经踩过一次（断言匹配到自己的注释）。
+  const ruleOf = (sel) => {
+    const m = new RegExp("^" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{[^}]*\\}", "m").exec(pcss);
+    assert.ok(m, `${sel} 这条规则不见了`);
+    return m[0];
+  };
+  const pbody = ruleOf(".planpane__body");
   assert.ok(!/max-width/.test(pbody), "方案正文还限着宽 —— 只占左边一条");
   // 「用 Agent 执行此方案」是这条回复末尾唯一的动作，要居中。inline-flex 吃不到 auto
   // 外边距，所以光写 margin auto 没用，两样都得断言。

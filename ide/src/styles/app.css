@@ -640,6 +640,40 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
    自己的选择」两件事同时成立。 */
 :root[data-layout="wide"] { --sidebar-w-default: 300px; --assistant-w-default: 520px; }
 :root[data-layout="xwide"] { --sidebar-w-default: 340px; --assistant-w-default: 620px; }
+
+/* ---------------------------------------------------------------------------
+   竖直方向的自适应（`data-vlayout`，由 _applyLayoutDensity 按 window.innerHeight 打）。
+
+   横向那套档位一点忙都帮不上：它只看宽度。矮窗口里挤掉消息区的是另外一批东西 ——
+   聊天区上下内边距、消息之间的 gap、输入框的最大高度、空状态那一坨（图标 40 + 标题 +
+   说明 + 一排 chip，加起来近 200px）、页签条。1280×720 这种笔记本上，空状态能把整个
+   消息区占满，再放大一档就直接溢出。
+
+   收紧的顺序是**先留白、后内容**：short 只压留白，一个字都不少；xshort 才开始藏
+   （图标和那句说明），因为到那一步留白已经压无可压。标题和 chip 任何时候都不藏 ——
+   它们是这一屏唯一能点的东西。
+   --------------------------------------------------------------------------- */
+:root[data-vlayout="short"] .chat { padding: 10px 22px 10px 14px; gap: 12px; }
+:root[data-vlayout="short"] .composer { padding: 8px; }
+:root[data-vlayout="short"] .composer textarea { max-height: 120px; }
+:root[data-vlayout="short"] .chat-empty { padding: 10px 16px; gap: 5px; }
+:root[data-vlayout="short"] .chat-empty h3 { margin-top: 2px; }
+:root[data-vlayout="short"] .planpane__head { padding: 10px 24px 8px; }
+:root[data-vlayout="short"] .planpane__foot { padding: 8px 24px; }
+
+:root[data-vlayout="xshort"] .chat { padding: 8px 22px 8px 14px; gap: 10px; }
+:root[data-vlayout="xshort"] .composer { padding: 6px; }
+:root[data-vlayout="xshort"] .composer textarea { max-height: 96px; }
+:root[data-vlayout="xshort"] .chat-empty { padding: 6px 16px; gap: 4px; }
+:root[data-vlayout="xshort"] .chat-empty h3 { margin-top: 0; }
+/* 这两样在最矮的一档才让位：图标只是装饰，说明那句标题已经涵盖。 */
+:root[data-vlayout="xshort"] .chat-empty__icon { display: none; }
+:root[data-vlayout="xshort"] .chat-empty p { display: none; }
+:root[data-vlayout="xshort"] .chat-empty__chips { margin-top: 4px; }
+:root[data-vlayout="xshort"] .tabs { height: 32px; }
+:root[data-vlayout="xshort"] .planpane__head { padding: 8px 24px 6px; }
+:root[data-vlayout="xshort"] .planpane__foot { padding: 6px 24px; }
+:root[data-vlayout="xshort"] .planpane__body { padding: 12px 28px 16px; }
 .layout .editorwrap {
   flex: 1;
   /* 同上：下限也按物理像素算，否则放大时它跟着变大，反而更早撑爆。 */
