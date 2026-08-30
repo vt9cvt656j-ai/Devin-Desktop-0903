@@ -35,6 +35,7 @@ import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
+import { movePreflightCardsAfter as _movePreflightCardsAfter, createPreflightCard as _createPreflightCard, settlePreflightCard as _settlePreflightCard } from "./agent/knowledge-preflight-card.js";
 import { summarizeTiming as _summarizeTiming, intentRaceMarker as _intentRaceMarker, summarizeIntentRace as _summarizeIntentRace } from "./agent/turn-timing.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
@@ -26346,6 +26347,9 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
 
   const briefs = await Promise.all(domains.map(async (domain) => {
     const plans = _domainKnowledgeResearchPlan(domain, run._originalText || "");
+    // **一个域一张卡**，不是四张：四条 rubric 是同一次预检的四个面。不套抽屉，
+    // 四个面的命中数直接摆在卡面上——理由见 agent/knowledge-preflight-card.js。
+    const _groupStep = _createPreflightCard(body, domain, _createToolStep);
     const sections = await Promise.all(plans.map(async (plan) => {
       if (!isLive()) return { heading: plan.heading, bullets: [] };
       // 这四条 rubric 问的是「适用条件 / 硬性约束 / 常见坑 / 必须做的检查」，答案在 893 段
@@ -26356,27 +26360,17 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
       // 一轮 4 条 × 最多 2 个域 = 8 条这样的重查询，正是那三张红卡超时的成因。
       // 模型自己调 knowledge_search 去核对真实 API 时不传这个开关，那条腿照旧。
       const call = { type: "knowledge", domain, query: plan.query, topK: 4, corpus: false, _domainKnowledgePreflight: true };
-      let step = null;
       try {
-        if (body?.appendChild) {
-          step = _createToolStep(call);
-          body.appendChild(step);
-        }
         const result = await _searchKnowledgeBase(call);
         // 原文留着：跨 rubric 去重必须在 Promise.all **之后**按固定顺序重算一遍
         //（共享集合塞进并发分支的话，「谁占到某小节」取决于网络返回顺序，同一查询两次结果不同）。
         const _raw = _toolExecutionSucceeded(call, result) ? String(result?.content || "") : "";
         const bullets = _raw ? _domainKnowledgeBullets(_raw) : [];
-        if (step) {
-          const viewport = step.querySelector?.(".atc-viewport");
-          if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
-          _settleToolStep(step, result, _knowledgeSettleLabel(call, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : ""));
-        }
-        return { heading: plan.heading, bullets, raw: _raw };
+        return { heading: plan.heading, bullets, raw: _raw,
+          ...(_toolExecutionSucceeded(call, result) ? {} : { failed: true, failResult: result }) };
       } catch (error) {
-        const result = { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` };
-        if (step) _settleToolStep(step, result, "预取失败");
-        return { heading: plan.heading, bullets: [] };
+        return { heading: plan.heading, bullets: [], failed: true,
+          failResult: { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` } };
       }
     }));
     // 四条 rubric 之间**去重**，且必须在 Promise.all **之后**、按 plans 的固定顺序做。
@@ -26397,6 +26391,10 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
       sec.bullets = _domainKnowledgeBullets(sec.raw, 3, 190, _seenBullet);
       delete sec.raw;
     }
+    // 结算在**去重之后**：卡面上的数要和小抄里真有的条数一致。全失败时标签是空串，
+    // 由 _knowledgeSettleLabel 说「检索失败 · 原因」——区分失败与零命中的判据只有那一处。
+    _settlePreflightCard(_groupStep, sections,
+      { settleToolStep: _settleToolStep, knowledgeSettleLabel: _knowledgeSettleLabel, escapeHtml: _escHtml });
     return {
       domain,
       hitCount: sections.reduce((sum, s) => sum + s.bullets.length, 0),
@@ -46666,6 +46664,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       reasoningEl._t0 = (!acc && !byIndex.size && _activeStreamDiag && _activeStreamDiag.attemptStartedAt) || Date.now();
       reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
       body.appendChild(reasoningEl);
+      _movePreflightCardsAfter(body, reasoningEl); // 预检卡挪到思考卡后面，只动视觉顺序
       _turnThinkCards.push(reasoningEl); // 记账：重试清场时整批移除
     }
     const b = reasoningEl.querySelector(".think-body");
