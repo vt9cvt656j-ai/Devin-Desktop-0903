@@ -10974,7 +10974,20 @@ pub async fn chat_completions(
                                 // 这条线路又能回话了 —— 撤掉短探测预算，下一次拿回完整耐心。
                                 clear_route_stall(candidate.health_id());
                                 // 喂给「这条线路的正常速度」——快切的判据全靠它。
-                                record_route_header_ms(candidate.health_id(), header_ms);
+                                //
+                                // **只喂成功的那些。** 这个分支是 `Ok(response)`，任何状态码
+                                // 都会走到（404 / 429 / 5xx 往往两三百毫秒就回来）。把快速
+                                // 错误也算进「正常速度」，会让「成功慢、失败快」的出口把自己
+                                // 的 EWMA 拖到 10 秒地板上，然后它真正的慢成功被截断成超时、
+                                // 再记一次卡死——自我强化，越截越短。线上正在这个形状上的有
+                                // WE API（成功均值 13.3s）、令牌云（18.5s）、清衍（13.6s），
+                                // 而 WE API 恰好是 GPT 线路最便宜也最稳的那个（76 成 3 败）。
+                                //
+                                // 口径也因此和 route_attempt.ttfb_ms_sum 一致了——那张表同样
+                                // 只在 ok=true 时累加，两边说「多快」时说的是同一件事。
+                                if response.status().is_success() {
+                                    record_route_header_ms(candidate.health_id(), header_ms);
+                                }
                                 // 记住这段会话走通的是哪条线路。下一轮它的提示词缓存在这条
                                 // 线路的上游是热的，换到别处等于按 1.25× 重写一遍。
                                 route_affinity_set(route_affinity_key, candidate.id);
@@ -20323,6 +20336,64 @@ mod route_cooldown_tests {
             "鉴权失败的冷却（{remaining:?}）必须比瞬时冷却（{CHAT_UPSTREAM_ROUTE_COOLDOWN:?}）长——坏 key 不会在 20 秒内变好",
         );
         assert!(remaining <= CHAT_UPSTREAM_AUTH_COOLDOWN);
+    }
+
+    /// 「正常速度」只能由**成功**喂出来——快速错误不许把慢出口按死在地板上。
+    ///
+    /// `record_route_header_ms` 的调用点在 `Ok(response)` 里，**任何状态码都会走到**，
+    /// 而 404/429/5xx 往往两三百毫秒就回来。把它们算进 EWMA，会让「成功慢、失败快」
+    /// 的出口自己把预算拖到 10 秒地板，然后真正的慢成功被截断成超时、再记一次卡死
+    /// ——自我强化。线上正在这个形状上的是 WE API（成功均值 13.3s、76 成 3 败、且是
+    /// GPT 线路最便宜的那个）、令牌云 18.5s、清衍 13.6s。
+    ///
+    /// 这条**必须守调用点**：错的是「那一行外面有没有那道门」，而不是
+    /// `record_route_header_ms` 本身——直接调它是测不出来的（我第一版就这么写的，
+    /// 把门删掉全套照样绿）。所以在源码上钉这道门。
+    #[test]
+    fn the_speed_average_is_only_fed_by_successful_responses() {
+        let src = include_str!("models.rs");
+        // 带上生产缩进（36 空格）——不然会匹配到**本测试自己**写的那几个字面量，
+        // 那正是「断言匹配到自己的注释/代码」那种恒真守卫。
+        const CALL: &str = "\n                                    record_route_header_ms(candidate.health_id(), header_ms);";
+        let at = src.find(CALL).expect("喂平均速度的调用点没了——这条断言失去落点，重新定位");
+        // 往前找最近的一行有效代码：必须是那道 is_success 门。
+        let before = &src[..at];
+        let guard = before
+            .rfind("if response.status().is_success() {")
+            .expect("喂平均速度的调用点外面没有 is_success 门——快速错误会把慢出口按死在地板上");
+        // 门和调用之间不许夹别的语句（只允许空白/注释），否则门管的就不是这一行。
+        let between = &src[guard + "if response.status().is_success() {".len()..at + 1];
+        assert!(
+            between.lines().all(|l| {
+                let t = l.trim();
+                t.is_empty() || t.starts_with("//")
+            }),
+            "is_success 门和喂平均速度之间夹了别的东西，门管的可能不是这一行：{between:?}"
+        );
+        // 反向：整个文件里不许有第二处不带门的喂点。
+        assert_eq!(
+            src.matches(CALL).count(),
+            1,
+            "出现了第二个喂点，逐一确认它也在 is_success 门里之后再改这条断言"
+        );
+    }
+
+    /// 拿真值演示那道门为什么必须存在：没有它，二十发快速错误就能把慢出口拖到地板下。
+    #[test]
+    fn fast_errors_would_drag_a_slow_endpoint_under_its_own_floor() {
+        let ep = uuid::Uuid::new_v4();
+        record_route_header_ms(ep, 13_300); // 一发真实的慢成功
+        for _ in 0..20 {
+            record_route_header_ms(ep, 200); // 二十发快速错误（假如没有那道门）
+        }
+        let mut c = Model::blank();
+        c.id = uuid::Uuid::new_v4();
+        c.endpoint_id = Some(ep);
+        let wait = header_wait_for_candidate(Duration::from_secs(30), &c, Instant::now());
+        assert!(
+            wait < Duration::from_millis(13_300),
+            "本该被拖到 13.3 秒以下（那样慢成功必被截断），实际 {wait:?}"
+        );
     }
 
     /// 出口候选也必须吃到自适应收紧 —— 这条守的是一次真实的键错事故。
