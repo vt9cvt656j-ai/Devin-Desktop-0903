@@ -8984,7 +8984,8 @@ test("bounded MCP failures stay off the cached prefix and surface only through e
 });
 
 test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上下文协议)", () => {
-  const f = load("_sharedCtxDigest");
+  // _fmtModified 注入真实现：它决定「已改文件」按全路径还是 basename 渲染，桩会让这条失真。
+  const f = load("_sharedCtxDigest", { _fmtModified: load("_fmtModified") });
   assert.equal(f(null), "", "no ctx → empty");
   assert.equal(f({}), "", "empty ctx → empty (nothing to share yet)");
   const ctx = {
