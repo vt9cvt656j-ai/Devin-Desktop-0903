@@ -34,6 +34,7 @@ import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js"
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { attachExecutionFacts as _attachExecutionFacts } from "./agent/execution-facts-meta.js";
 import { failedWritePaths as _failedWritePaths } from "./agent/write-ledger.js";
+import { buildCompactionTranscript } from "./agent/compaction-window.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
@@ -42641,9 +42642,8 @@ async function _compactHistoryIfHuge(config, session) {
   if (sess._compactPromise) return sess._compactPromise;
   // 记下**身份**而不是条数：落地时要能分辨哪些消息是这次摘要真正覆盖过的。
   const snapshot = mem.recent.slice();
-  const transcript = mem.recent
-    .map((m, i) => `[#${i}][${m.role}] ${String(m.content || "").slice(0, 4000)}`)
-    .join("\n\n").slice(0, 80000);
+  // 转录和「这次能覆盖到第几条」必须同源——理由见 agent/compaction-window.js。
+  const { transcript, fitCount: _fitCount } = buildCompactionTranscript(mem.recent);
   // 结尾原来写死「中文、分条」。而这份摘要会 compactRecent 掉真实历史、成为之后每一轮的
   // 上下文——于是一场英文对话被压缩后，历史里躺着一段中文，直接顶撞 agent_core:1 和
   // _AI_MODE_PROMPTS 五条里各写了一遍的「用与用户相同的语言，不要默认中文」。
@@ -42695,6 +42695,8 @@ async function _compactHistoryIfHuge(config, session) {
   // 失忆）。只压尾部 6 条之前的部分；摘要里重复覆盖尾部内容无害。
   const KEEP_TAIL = 6;
   covered = Math.min(covered, Math.max(0, snapshot.length - KEEP_TAIL));
+  // 摘要器没看过的一条都不许压掉（见上面 transcript 的预算）。
+  covered = Math.min(covered, _fitCount);
   if (covered < 2) return; // 历史已经被别的路径改写过/可压部分太少，这份摘要不再对得上，放弃
   mem.compactRecent(covered, summary.trim());
   try { saveChatHistory(); } catch {}

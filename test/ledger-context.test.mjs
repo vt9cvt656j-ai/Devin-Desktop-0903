@@ -505,3 +505,28 @@ test("收尾入账处真的调用了它，且喂的是 run._mutatedFiles（调�
   assert.match(win, /_attachExecutionFacts\(\s*_msg\s*,\s*run\?\._mutatedFiles\s*\)/,
     "收尾入账没把本轮改过的文件挂上去，Files: 行又会变空");
 });
+
+test("自动压缩只压摘要器真看过的那些——装不下的不许一起删掉", async () => {
+  const { buildCompactionTranscript } = await import("../src/agent/compaction-window.js");
+  // 实测形状：120 条各约 3400 字。原来整份拼完再 slice(0, 80000)，摘要器只看到前 24 条，
+  // 却按 snapshot.length 删掉 114 条——90 条从没进过转录。它们还在 archive 里，
+  // 但摘要顶头写着「turns 1–114」，模型没有理由去 recall 那 90 轮。
+  const recent = Array.from({ length: 120 }, (_, i) => ({ role: "user", content: `第${i}轮 ` + "x".repeat(3400) }));
+  const { transcript, fitCount } = buildCompactionTranscript(recent, 80_000);
+  assert.ok(fitCount > 0 && fitCount < recent.length, `fitCount=${fitCount}，应当是「装下了一部分」`);
+  assert.ok(transcript.length <= 80_000, "预算失守");
+  // 关键不变量：fitCount 之外的消息，一个字都不在转录里 —— 于是调用方按它算删除范围就是安全的。
+  assert.ok(transcript.includes(`第${fitCount - 1}轮`), "最后装进去的那条应当在转录里");
+  assert.ok(!transcript.includes(`第${fitCount}轮`), "fitCount 之外的消息出现在转录里——两个数不同源了");
+  // 一定有进展：每条上限 4000 字，80000 的预算至少装得下 20 条，压缩不会卡死。
+  assert.ok(fitCount >= 20, `只装下 ${fitCount} 条，压缩推不动`);
+  // 单条超预算也得装，否则永远压不动。
+  assert.equal(buildCompactionTranscript([{ role: "user", content: "y".repeat(50_000) }], 100).fitCount, 1);
+});
+
+test("压缩的删除范围被 fitCount 夹住（调用点）", () => {
+  const loop = extractFn("_compactHistoryIfHuge");
+  assert.match(loop, /buildCompactionTranscript\(mem\.recent\)/, "转录不是从共享实现来的，两个数会再次不同源");
+  assert.match(loop, /covered = Math\.min\(covered, _fitCount\)/,
+    "删除范围没有被摘要器实际看过的条数夹住——装不下的那些又会被悄悄删掉");
+});
