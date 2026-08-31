@@ -122,10 +122,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import {
-  addHidden, clearHidden, dropDirFor, hiddenFor, isHidden,
-  planExplorerDrop, planMove, topLevelOf,
-} from "./agent/explorer-drop.js";
+import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion, topLevelOf } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -80426,10 +80423,24 @@ async function _copyIntoWorkspace(paths, destDir) {
   // 判据是「落在**任意**工作区根上」，不只是活动根：多根工作区里往另一个根上放文件夹，
   // VS Code 同样会问（它的条件就是 e.isRoot）。
   if (_dirs.length && workspaceRoots.includes(destDir)) {
-    await openFolder(_dirs[0].path);
-    // 一次拖进来好几个文件夹：第一个当新项目打开，其余的挂成额外的根，别静默丢掉。
-    for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
-    return;
+    const q = rootDropQuestion({ dirs: _dirs.map((x) => x.path), destDir, rootPath });
+    // 只留三档：打开为新项目（主）/ 添加到工作区 / 取消。
+    // 「复制进来」那一档按用户要求去掉了——把一个**项目文件夹**拖进来，想要的从来不是
+    // 把它复制一份进当前项目，而是打开它或把它挂成另一个根。（拖文件、拖子目录进子文件夹
+    // 走的是另一条路，那条照旧直接复制，不弹框。）
+    const pick = await ioConfirm({
+      title: q.title, message: q.message,
+      okLabel: "打开为新项目", altLabel: "添加到工作区",
+    });
+    if (pick === "cancel" || pick === false) return;
+    if (pick === "alt") { for (const d of _dirs) await _addWorkspaceRoot(d.path); return; }
+    // 打开为新项目：第一个当新根打开，其余的加进工作区（等价于 VS Code 拖多个文件夹
+    // 到编辑器区时的 createAndEnterWorkspace，而不是把多余的静默丢掉）。
+    if (pick === "ok" || pick === true) {
+      await openFolder(_dirs[0].path);
+      for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
+      return;
+    }
   }
   let existingNames = [];
   try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
