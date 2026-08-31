@@ -326,7 +326,9 @@ pub async fn stats(
         .fetch_one(&state.db)
         .await?;
     let revenue_rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT lower(charged_currency), COALESCE(sum(charged_cents), 0) FROM orders \
+                // `sum(bigint)` 在 Postgres 里回的是 **numeric**，不是 bigint —— 不显式转，
+        // sqlx 解码时就是 `i64 is not compatible with SQL type NUMERIC`，整个总览 500。
+        "SELECT lower(charged_currency), COALESCE(sum(charged_cents), 0)::bigint FROM orders \
          WHERE status = 'paid' AND charged_cents IS NOT NULL AND charged_currency IS NOT NULL \
          GROUP BY lower(charged_currency)",
     )

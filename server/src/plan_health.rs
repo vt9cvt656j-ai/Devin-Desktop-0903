@@ -105,7 +105,7 @@ pub async fn admin_plan_health(
              AND m.free_milli_points_spent = 0 \
            GROUP BY 1, 2 \
          ), pu AS ( \
-           SELECT user_id, count(*)::float8 AS active_days, avg(c) AS per_day, sum(reqs) AS reqs \
+           SELECT user_id, count(*)::float8 AS active_days, avg(c)::float8 AS per_day, sum(reqs) AS reqs \
            FROM d GROUP BY 1 \
          ) \
          SELECT count(*)::bigint, \
