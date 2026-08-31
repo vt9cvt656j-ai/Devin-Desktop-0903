@@ -32,6 +32,7 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
+import { _mergeChatArchives as _mergeChatArchivesReal } from "../src/agent/chat-archive.js";
 import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
 import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
@@ -92,7 +93,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst, at, blockFrom, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
 const DAP_CLIENT = readFileSync(join(HERE, "../src/dap-client.js"), "utf8");
 const LSP_CLIENT = readFileSync(join(HERE, "../src/lsp-client.js"), "utf8");
 const TAURI_DEBUG = readFileSync(join(HERE, "../src-tauri/src/debug.rs"), "utf8");
@@ -1438,7 +1439,10 @@ test("file tree delete is single-shot, dedupes nested selections, and locks whil
     "single-item delete should share the same deletion lock");
   assert.match(singleDelete, /finally \{\s*_treeDeleteBusy = false;/,
     "delete lock must always be released after success, cancel, or failure");
-  assert.ok(singleDelete.indexOf("_treeDeleteBusy = true;") < singleDelete.indexOf("const ok = await ioConfirm"),
+  // 用 at()：抬锁那一行被**删掉**时 indexOf 返回 -1，而 `-1 < ioConfirm 的下标` 恒成立，
+  // 于是「连点几下叠出好几个确认框」这个原始 bug 可以整个回来而测试不动。
+  // 本用例其余断言只覆盖「读锁」和「finally 释放」，没有一条证明锁被**置位**过。
+  assert.ok(at(singleDelete, "_treeDeleteBusy = true;", "抬锁") < at(singleDelete, "const ok = await ioConfirm", "确认框"),
     "delete lock should be raised before the confirmation dialog opens so repeated clicks don't stack dialogs");
 
   const confirmStart = RAW_SRC.indexOf("function ioConfirm(");
@@ -3740,7 +3744,11 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
   assert.match(SRC, /import \{ buildLanguageOptions, coerceSupportedLocale, localeDisplayName, localeLanguageCode \} from "\.\/locales\.js";/);
   assert.match(SRC, /locale:\s*"zh-CN"/,
     "Simplified Chinese should be the default software language");
-  const settingsSchema = SRC.slice(RAW_SRC.indexOf("const SETTINGS_SCHEMA"), RAW_SRC.indexOf("async function renderSettingsTool"));
+  // 原来切 [const SETTINGS_SCHEMA, async function renderSettingsTool) = 20682 字，
+  // 而声明本身只有 2618 字。多出的 18064 字里躺着 APPEARANCE_SETTINGS_ITEMS 这种
+  // **形状完全相同**的设置项数组，于是断言实际只问「这 20KB 里某处有这么一段」——
+  // 把语言/国家选择器从设置表里整个删掉，照样绿。按 AST 取声明本身。
+  const settingsSchema = extractConstDecl("SETTINGS_SCHEMA", { code: true });
   assert.match(settingsSchema, /groupKey:\s*"feature\.settings\.group\.language"[\s\S]{0,260}key:\s*"locale"[\s\S]{0,240}labelKey:\s*"feature\.settings\.locale\.label"[\s\S]{0,300}buildLanguageOptions/,
     "Advanced Tools settings should render a language selector before appearance settings");
   assert.match(SRC, /if \(key === "locale"\) value = coerceSupportedLocale/,
@@ -3879,7 +3887,11 @@ test("country preference is selectable and shown as a flag in the profile card",
     "country values must be normalized before persistence and display");
   assert.match(SRC, /function countryFlag\(code\)[\s\S]{0,260}String\.fromCodePoint\(0x1f1e6/,
     "country flags should be derived from ISO region codes instead of hardcoded images");
-  const settingsSchema = SRC.slice(RAW_SRC.indexOf("const SETTINGS_SCHEMA"), RAW_SRC.indexOf("async function renderSettingsTool"));
+  // 原来切 [const SETTINGS_SCHEMA, async function renderSettingsTool) = 20682 字，
+  // 而声明本身只有 2618 字。多出的 18064 字里躺着 APPEARANCE_SETTINGS_ITEMS 这种
+  // **形状完全相同**的设置项数组，于是断言实际只问「这 20KB 里某处有这么一段」——
+  // 把语言/国家选择器从设置表里整个删掉，照样绿。按 AST 取声明本身。
+  const settingsSchema = extractConstDecl("SETTINGS_SCHEMA", { code: true });
   assert.match(settingsSchema, /key:\s*"locale"[\s\S]{0,260}key:\s*"country"[\s\S]{0,240}labelKey:\s*"feature\.settings\.country\.label"[\s\S]{0,260}buildCountryOptions/,
     "Advanced Tools settings should render the country selector directly under language");
   assert.match(SRC, /if \(key === "country"\) value = normalizeCountryCode\(value, DEFAULT_EDITOR_SETTINGS\.country\);/,
@@ -13448,7 +13460,13 @@ test("typed runtime and external evidence stays separate from workspace mutation
 });
 
 test("package search exposes exact version and compatibility metadata", () => {
-  const packageSchemaSnippet = SRC.slice(RAW_SRC.indexOf('name: "package_search"'), RAW_SRC.indexOf('name: "github_search"'));
+  // `name: "package_search"` 在拼接源码里出现两次：main.js 那处是**调用点**
+  // （`? { name: "package_search", query: _gateQuery }`），真 schema 在
+  // src/agent/tool-catalog.js；而结束锚只在 catalog 里。indexOf 命中前者，于是窗口
+  // 变成 1,849,284 字 ≈ 整个 main.js——三条断言实际是在全仓找字符串。
+  const _pkgAt = at(TOOL_CATALOG_SRC, 'name: "package_search"', "package_search 的 schema");
+  const packageSchemaSnippet = TOOL_CATALOG_SRC.slice(
+    _pkgAt, at(TOOL_CATALOG_SRC, 'name: "github_search"', "下一个工具"));
   assert.match(packageSchemaSnippet, /dist-tags\.latest/);
   assert.match(packageSchemaSnippet, /peerDependencies/);
   assert.match(packageSchemaSnippet, /engines/);
@@ -13708,7 +13726,9 @@ test("large streaming writes stay out of Monaco while the bounded tool card keep
   assert.equal(userOpen.entry._editorPreviewOutcome, "card-only");
 
   const ensure = extractFn("_ensureLiveEditorWritePreview");
-  assert.ok(ensure.indexOf("_LIVE_EDITOR_PREVIEW_MAX_CHARS") < ensure.indexOf("backend.readTextFile"),
+  // 同上：上限判断被删掉时 indexOf 是 -1，比较恒成立。而这条顺序断言是那道闸门在
+  // 整个测试里的**唯一**代表（其余断言跑的是 _flushLiveEditorWritePreview 的行为）。
+  assert.ok(at(ensure, "_LIVE_EDITOR_PREVIEW_MAX_CHARS", "大写入上限") < at(ensure, "backend.readTextFile", "读临时 model"),
     "content-first large calls must be rejected before opening/reading a temporary editor model");
 });
 
@@ -26232,8 +26252,15 @@ test("写文件前的预备打开不弹「文件不存在」——新建文件�
     "模型侧的提示要保留：这才是它该收到的那条");
 
   // silentMissing 只在缺文件时生效，别顺手把权限、越界这类真错误也吞掉。
-  const openFn = SRC.slice(RAW_SRC.indexOf("async function openFile("));
-  const guard = openFn.slice(0, openFn.indexOf("// A known write may have completed"));
+  // 结束锚点原来是一句**注释**，而 openFn 切自 SRC（= CODE，注释已抹成空格），
+  // indexOf 永远返回 -1；`slice(0, -1)` 不报错也不返回空串，而是「整份文本少一个字」
+  // ——实测 4,445,317 字，等于从 openFile 一路切到拼接源码的末尾。两条断言于是在
+  // 整个后半截源码里找字符串，越界检查被搬走或删掉都照样绿。
+  // 锚点改用真代码，并按 AST 取整个函数。
+  const openFn = extractFn("openFile", { code: true });
+  const guardEnd = openFn.indexOf("if (opening.externalDeleted) {");
+  assert.ok(guardEnd > 0, "早期错误分支的结束锚点没了——这条守卫会退化成守整份源码");
+  const guard = openFn.slice(0, guardEnd);
   assert.match(guard, /options\.silentMissing && _isMissingFileError\(e\)/,
     "silentMissing 必须与「确实是缺文件」同时成立才吞");
   assert.match(guard, /_isOutsideWorkspaceError\(e\)/,
@@ -33031,8 +33058,9 @@ test("方向检查提前到中途，但闸门要紧，且绝不顶掉收尾那�
   assert.match(loop, /run\._directionChecked[\s\S]{0,200}?run\._wrapUpReviews = \(run\._wrapUpReviews \|\| 0\) \+ 1/,
     "要占用已有预算，不能白开一个新口子");
   // 绝不写 _wrapUpVerdict：那是用户建议卡的来源，中途一份不完整的裁定会顶掉收尾那份好结论。
-  const _dcAt = loop.indexOf("run._directionChecked");
-  const seg = loop.slice(_dcAt, _dcAt + 2600);
+  // 定长窗口（原来 2600）会随着这一段变长而滑出去，反向断言对窗口外恒真。
+  const _dcAt = at(loop, "run._directionChecked", "方向检查段");
+  const seg = loop.slice(_dcAt, loop.indexOf("\n      }", _dcAt) + 8);
   assert.doesNotMatch(seg, /run\._wrapUpVerdict\s*=/, "中途版不许写裁定");
   // 评审挑好的工具要真的装上——「走偏了→去看真实作品」这条路此前整条断在这里。
   assert.match(seg, /_criticRequestedToolSchemas\(_dir\?\.tools, run\._toolRegistry, 4\)/);
@@ -36883,10 +36911,9 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
 // 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
 // ---------------------------------------------------------------------------
 test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
-  const merge = load("_mergeChatArchives", {
-    _archiveHasChats: load("_archiveHasChats", {}),
-    _mergeArchiveList: load("_mergeArchiveList", { _archiveMsgCount: load("_archiveMsgCount", {}) }),
-  });
+  // 直接 import 真模块，不再抠源码手工注入依赖：这个函数每加一个内部 helper，
+  // 手抄的注入表就漏一个（这次漏的是 _archiveAt），测试红得跟被测行为毫无关系。
+  const merge = _mergeChatArchivesReal;
   const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
 
   // 事故形状：退出时同步写的镜像里有一个会话，几分钟前的 SQLite 快照里没有。

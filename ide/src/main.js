@@ -75254,6 +75254,10 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   }
   if (!range.collapsed) range.deleteContents();
   range.insertNode(chip);
+  // 同上：片前面没有文本节点时，光标按左键过不去（片是原子节点）。
+  if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
+    chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
+  }
   // Give the caret a text node to land in: WKWebView renders NO visible caret directly after a
   // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
   // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
@@ -75695,7 +75699,8 @@ function _atRepoRows(kind, query) {
       icon: `i-brand-${kind}`,
       name: r.full_name,
       detail: r.private ? "Private" : "Public",
-      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
+      // 片上只显示仓库名，owner 收进 tooltip：组织名常常比仓库名长，摆在输入框里挤掉正文。
+      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name.split("/").pop() || r.full_name }),
     }));
   if (rows.length) return rows;
   // 三种"没有行"要说三句不同的话。以前只分了两种：缓存空就一律说「Loading…」，于是一个
@@ -76026,6 +76031,12 @@ function _insertAtChip({ kind, value, label }) {
     range.deleteContents();
     const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
+    // 片左边也要有落脚点。片是 contentEditable=false 的原子节点，它**前面**若没有文本节点
+    // （比如它就是输入框里的第一个元素），光标按左键无处可去 —— 表现就是"往左走不动"。
+    // 右边早就补了一个零宽空格，左边一直没有。_ceSerialize 会把零宽空格剥掉，不进发送文本。
+    if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
+      chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
+    }
     let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
       pad = document.createTextNode("​");
