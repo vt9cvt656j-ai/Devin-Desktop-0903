@@ -7525,6 +7525,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-family: var(--font); font-size: 12px;
   max-height: 280px; overflow: auto; overscroll-behavior: contain;
   background: var(--atc-bg);
+  /* 每一行都要铺到**最宽那行**的宽度，不然一横向滚动，增/删的底色就只剩最长的那一两行有，
+     其余全是白的（用户实拍：「被删除的和新增的代码那个背景颜色没覆盖全，后面还是白色的」）。
+     根因不是底色画少了：行是块级 flex，宽度 auto = 容器可视宽；只有最长那行被
+     min-width: fit-content 顶宽，于是它一个人撑出了滚动宽度，别人都停在可视宽的边上。
+     width:100% 治不了——在滚动容器里 100% 就是可视宽，不是滚动宽。
+     单列网格才治得了：轨道宽 = max(可视宽, 最宽那行)，所有行按轨道拉伸。 */
+  display: grid;
+  grid-template-columns: minmax(100%, max-content);
 }
 .atc-diff-header {
   display: flex; align-items: center; gap: 6px;
@@ -7536,7 +7544,9 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .atc-diff-row {
   display: flex; line-height: 1.5; padding: 0 4px 0 0;
   border-left: 3px solid transparent;
-  min-width: fit-content;
+  /* 宽度交给上面那个网格轨道。原来这里是 min-width: fit-content —— 它只让**这一行**长到
+     自己的内容宽，别的行照旧停在可视宽，正是底色铺不满的来源。 */
+  min-width: 0;
 }
 .atc-diff-row:hover { filter: brightness(.97); }
 .atc-diff-row--add {
@@ -7566,9 +7576,12 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .atc-diff-row--add .atc-diff-sign { color: #2ea043; }
 .atc-diff-row--del .atc-diff-sign { color: #f85149; }
 .atc-diff-code {
-  flex: 1; white-space: pre; color: var(--atc-text);
+  /* 1 0 auto：能占满剩余宽（短行的底色才铺得满），但不许被压到比内容窄——压窄了这一行的
+     max-content 就变小，网格轨道跟着变窄，最长的那行反而被截。
+     原来是 flex: 1 + overflow: hidden + 省略号：横向能滚的容器里省略号本来就轮不到出场，
+     而 overflow: hidden 把这一格的最小宽压成 0，等于把「这行有多宽」这件事抹掉了。 */
+  flex: 1 0 auto; white-space: pre; color: var(--atc-text);
   font-size: 12px; padding-left: 4px;
-  overflow: hidden; text-overflow: ellipsis;
 }
 .atc-diff-code .mtk1 { color: inherit; }
 .atc-diff-row--add .atc-diff-code { color: #1f2328; }
