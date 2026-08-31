@@ -293,7 +293,7 @@ test("allowed-tools 比对的必须是工具注册名，不是映射后的内部
   assert.equal(allowed(A("read"), "run_cmd"), false, "allowed-tools 不再是真约束了");
 
   // 钉实现特征：闸必须拿注册名去比，且不许再用 call.name（那对 read_skill 是技能名）。
-  const gate = SRC.slice(RAW_SRC.indexOf("async function _approveToolCall"), RAW_SRC.indexOf("async function _approveToolCall") + 2600);
+  const gate = topLevelFn("_approveToolCall", { code: true });
   assert.match(gate, /\[call\._toolName, call\.tool, call\.type\]\.filter\(Boolean\)/,
     "闸又改回按单一字段比对了——run_cmd/write_file 会被自己声明它们的技能拒掉");
   assert.doesNotMatch(gate, /_skillToolAllowed\(skillGate\.allow, call\.name/,

@@ -8326,8 +8326,7 @@ test("Git and GitHub PR tools are integrated across catalog, aliases, and execut
   assert.match(SRC, /name: "git_status"/);
   // 「完整工具目录」这四个字在 _semanticToolOrchestrator 里只剩一行注释。真正发给编排模型的
   // 是 catalogSystem 那段能力索引 —— 它由 _criticToolCatalog(toolRegistry) 全量生成。钉它。
-  const orchestrator = SRC.slice(RAW_SRC.indexOf("async function _semanticToolOrchestrator"),
-    RAW_SRC.indexOf("async function _semanticToolOrchestrator") + 6000);
+  const orchestrator = extractFn("_semanticToolOrchestrator", { code: true });
   assert.match(orchestrator, /const catalog = _criticToolCatalog\(toolRegistry\);/,
     "Git and PR tools should be discovered from the live registry, not a static reminder string");
   assert.match(orchestrator, /catalog\.map\(\(entry\) => enrichedCatalogLine\(entry\)\)/,
@@ -32225,8 +32224,7 @@ test("上下文溢出要压缩后重试，而不是拿同一份超长负载连�
   // 整套溢出恢复从没被接上过。溢出走的是通用错误路径：_isRetryableAiError 不认它
   // （既不是 5xx 也不是掉线），于是一次都不重试直接报错；就算认了，重发的也是同一份
   // 超长负载，十次重试十次爆。表现就是「长对话到后期突然一直失败，重开会话就好了」。
-  const loop = SRC.slice(RAW_SRC.indexOf("async function _runModelRequestWithRetry"),
-                         RAW_SRC.indexOf("async function _runModelRequestWithRetry") + 12000);
+  const loop = extractFn("_runModelRequestWithRetry", { code: true });
   assert.match(loop, /typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError\(attemptError\)/,
     "重试循环没有识别上下文溢出（或漏了 typeof 兜底——沙箱里会 ReferenceError 把循环带崩）");
   assert.match(loop, /squeezedForOverflow \|\| _isRetryableAiError\(attemptError(?:, attemptStatus)?\)/,
