@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, rootDropQuestion,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
 
@@ -342,6 +342,33 @@ test("三个以上动作的弹框要竖排，标签不许折断", () => {
     "三个以上动作没有改成竖排");
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
   assert.match(src, /classList\.add\("io-confirm-actions--stack"\)/, "竖排类没有被挂上去");
+});
+
+test("嵌套多选必须折叠，否则移动会丢文件", () => {
+  // 同时选中 A/ 和 A/x.txt 一起拖：不折叠的话会先把 A/ 搬走，再拿已经不存在的 A/x.txt
+  // 去 rename，整批停在半路——而 A/ 已经动了，用户只看到一句"移动失败"。
+  // 删除那条路一直在用这个折叠（_treeTopLevelTargets），移动最初漏了。
+  assert.deepEqual(topLevelOf(["/w/A", "/w/A/x.txt"]), ["/w/A"], "子路径没有被折叠掉");
+  assert.deepEqual(topLevelOf(["/w/A/x.txt", "/w/A"]), ["/w/A"], "顺序反过来也要折叠");
+  assert.deepEqual(topLevelOf(["/w/A", "/w/B"]), ["/w/A", "/w/B"], "互不包含的要都留着");
+  assert.deepEqual(topLevelOf(["/w/A", "/w/A"]), ["/w/A"], "重复项要去掉");
+  // 前缀相同但不是子路径：/w/AB 不在 /w/A 底下
+  assert.deepEqual(topLevelOf(["/w/A", "/w/AB"]), ["/w/A", "/w/AB"]);
+
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const mv = src.slice(src.indexOf("async function _moveIntoDir"), src.indexOf("(function _wireTreeDragToComposer"));
+  assert.match(mv, /planMove\(\{ paths: _treeTopLevelTargets\(paths\)/,
+    "移动没有先折叠嵌套选择——会丢文件");
+});
+
+test("移动之后要把原本打开着的文件重新打开", () => {
+  // 移动前必须先关掉受影响的页签（否则 fs watcher 会当成「外部程序删了你的文件」弹框），
+  // 但关了就得开回来——移动不该顺手把用户的页签关掉。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const mv = src.slice(src.indexOf("async function _moveIntoDir"), src.indexOf("(function _wireTreeDragToComposer"));
+  assert.match(mv, /const wasOpen = openFiles\.has\(m\.from\);/, "没有记下哪些文件本来开着");
+  assert.match(mv, /if \(wasOpen\) reopened\.push\(m\.to\);/, "没有记录要在新位置重开的路径");
+  assert.match(mv, /for \(const rp of reopened\)[\s\S]{0,80}openFile\(rp/, "移动后没有把页签开回来");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

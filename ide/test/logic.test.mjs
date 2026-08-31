@@ -27,6 +27,7 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          stackManifestExts as stackExts, formatStackHint as formatStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
+import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
 import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
 import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
@@ -1396,7 +1397,11 @@ test("file tree refresh preserves manual expansion state and refreshes the neare
 });
 
 test("file tree delete is single-shot, dedupes nested selections, and locks while deleting", () => {
+  // _treeTopLevelTargets 的算法已经搬进 src/agent/explorer-drop.js 的 topLevelOf（移动那条路
+  // 漏了这一步会丢文件，所以它成了两条路共用的判据）。main.js 侧只剩一层薄壳，
+  // 所以这里把真模块注进去——比抠源码更能证明"产品用的就是这个实现"。
   const topLevel = load("_treeTopLevelTargets", {
+    topLevelOf: _topLevelOf,
     _treePath: (p) => String(p || "").replace(/\/+$/, ""),
     _pathIsAtOrUnder: (candidate, parent) => candidate === parent || candidate.startsWith(parent.replace(/\/+$/, "") + "/"),
   });
@@ -12891,7 +12896,10 @@ test("natural-language capability queries are routed by the semantic tool orches
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
-    recommendToolsForIntent: load("recommendToolsForIntent"),
+    // recommendToolsForIntent 2026-08-30 删除（零调用点 + 词表对不上，接上也恒为 0）。
+    // 这条注入本来就是多余的：_semanticToolOrchestrator 从来没有引用过它——
+    // 而这条测试的标题正是「不按关键词打分」，那个关键词打分器现在整个不存在了，
+    // 这件事比原来更成立。
     _buildScenarioSignature: scenarioSignature,
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
     // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
@@ -22301,6 +22309,11 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
   // 失败」这类统计的上游。判据必须是**结构**：凡是拿 `it.rawResult` 问
   // `_toolExecutionAttempted` 的地方，同一个条件里就得有 `!it._notAttempted`
   // （或等价的 `it._notAttempted ||` 早退），一处都不许漏。
+  //
+  // 2026-08-30 下限从 5 降到 4：observeToolCall 那个读取点随死岛一起删了（那条"自适应
+  // 学习器"链一次都没跑过——它写的 window._growthState 全仓唯一写入点就在它自己函数体内、
+  // 还被开头的早退挡着）。下限只是"提取器有没有抓全"的地板，真正的判据是下面 unguarded
+  // 必须为空；删掉一个读取点不影响那条，但地板要跟着降，否则它就成了恒假的摆设。
   const NEEDLE = "_toolExecutionAttempted(it.rawResult)";
   const sites = [];
   for (let i = loop.indexOf(NEEDLE); i !== -1; i = loop.indexOf(NEEDLE, i + 1)) {
@@ -22309,7 +22322,7 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
     assert.notEqual(open, -1, "找不到包住它的 if —— 提取器或代码形状变了");
     sites.push(loop.slice(open, i));
   }
-  assert.ok(sites.length >= 5,
+  assert.ok(sites.length >= 4,
     `只找到 ${sites.length} 个 _toolExecutionAttempted(it.rawResult) 读取点，提取器可能没抓全`);
   const unguarded = sites.filter(
     (cond) => !cond.includes("!it._notAttempted") && !cond.includes("it._notAttempted ||"),
@@ -23162,7 +23175,11 @@ test("client modules have no undeclared identifiers", async () => {
     "performance","queueMicrotask","requestAnimationFrame","requestIdleCallback","self","setInterval",
     "setTimeout","window","setImmediate",
     // Feature-detected on purpose, always behind `typeof x !== "undefined"`
-    "module","session",
+    // module 2026-08-30 摘掉：它当初在这张表里，只因为 observeToolCall 末尾有一段
+    // `if (typeof module !== 'undefined') module.exports = ...` 的 CommonJS 尾巴。
+    // 那座死岛（observeToolCall + recommendToolsForIntent）已整体删除，全仓再无 module 引用；
+    // 白名单留着它，下次真有人误用裸 module 就会被这张表放行。白名单只许变短。
+    "session",
     // 构建期常量，不是运行时全局：vite.config.js 的 `define` 在打包/dev 时把它替换成
     // 字面量。这里（node 直接跑测试）没有 define，所以源码里必须一直带 typeof 保护。
     "__APP_VERSION__",
@@ -23200,7 +23217,7 @@ test("client modules have no undeclared identifiers", async () => {
 // guard, the allowlist would hide a real ReferenceError, so pin the guard itself.
 test("typeof-guarded globals keep their guards", () => {
   const code = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读
-  for (const [name, expected] of [["session", 3], ["module", 1]]) {
+  for (const [name, expected] of [["session", 3]]) {   // module 已随死岛删除，见上面白名单注释
     const guards = code.match(new RegExp(`typeof\\s+${name}\\s*!==?\\s*["']undefined["']`, "g")) || [];
     assert.ok(guards.length >= expected,
       `${name} is allowlisted as a feature-detected global but only ${guards.length} typeof guard(s) remain (expected >= ${expected})`);
