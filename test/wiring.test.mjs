@@ -536,9 +536,16 @@ test("没跑成的工具调用必须如实回一条结果，不能在转录里�
 // 跑三五轮就收尾的 run 根本到不了。于是那次删除同时关掉了两个出口，模型下一轮照旧
 // "改完就说能用"。这条守住：交付事实必须有一条不受 iter 门槛约束的注入。
 test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿纸上", () => {
-  const gate = RAW_SRC.indexOf("if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {");
+  // 区间从「门槛那一行」到「交付事实那一段结束」，用真代码当两头的锚，别用固定字符数。
+  // 原来是 `SRC.slice(gate, gate + 3000)`：往这一段里加几行注释就把后面的断言挤出窗口，
+  // 而挤出去之后 assert.match 会**误红**、assert.doesNotMatch 会**恒真**。
+  // 本轮修草稿纸去重时加了 12 行注释，这条当场红了——正是那个形状。
+  const loop = fnSource("_runAgenticLoop", { code: true });
+  const gate = loop.indexOf("if ((iter >= 6 && (iter % 3 === 0 || iter >= 20)) || run._compactedThisTurn) {");
   assert.ok(gate > 0, "草稿纸门槛还在——那么交付事实就必须有自己的出口");
-  const after = SRC.slice(gate, gate + 3000);
+  const end = loop.indexOf("_incompleteReason", gate);
+  assert.ok(end > gate, "交付事实段的结束锚点没了，这条断言会退化成守整个函数");
+  const after = loop.slice(gate, end);
   // 注入点必须存在，且**不在**那个 iter 条件的花括号里：判据是它读的是自己的标签常量
   assert.match(after, /_DELIVERY_FACTS_TAG/,
     "交付事实要有独立注入，不能继续寄生在草稿纸里");
