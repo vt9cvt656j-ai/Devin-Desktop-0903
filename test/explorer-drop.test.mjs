@@ -14,6 +14,7 @@ import {
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
+import { _mergeChatArchives as _mca } from "../src/agent/chat-archive.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -590,6 +591,63 @@ test("蓝气泡上的片不能是纯白块", () => {
   assert.doesNotMatch(blk, /background: rgba\(0, 0, 0/, "又变回黑块了");
   assert.match(blk, /border-color: rgba\(255, 255, 255, \.55\)/, "描边不够清晰，片会立不住");
   assert.match(blk, /color: #fff;/, "字要白");
+});
+
+
+const _S = (id, n = 1) => ({ id, memory: { recent: Array(n).fill(0) } });
+
+test("关掉的会话不许在重启后复活", () => {
+  // 用户实拍：「明明我关闭的会话，他居然自己给我又恢复那些对话 tab 了」。
+  // 存档有三层，退出时只有 localStorage 镜像能**同步**写完（beforeunload/pagehide 跑不了
+  // 异步），SQLite 快照往往停在几分钟前、里面还留着后来被关掉的会话。原来两份按 id 求并集，
+  // 于是关掉的全被并回来。
+  const primary = { sessions: [_S("A", 3), _S("B", 5), _S("C", 2)], closedSessions: [], activeIdx: 0 };
+  const mirror = { sessions: [_S("A", 4), _S("C", 2)], closedSessions: [_S("B", 5)], activeIdx: 0, savedAt: 2 };
+  const r = _mca(primary, mirror);
+  assert.deepEqual(r.sessions.map((x) => x.id), ["A", "C"], "被关掉的 B 又复活了");
+  assert.deepEqual(r.closedSessions.map((x) => x.id), ["B"]);
+  // 内容仍要取更全的那份——镜像被预算截断过，不能整份采用。
+  assert.equal(r.sessions.find((x) => x.id === "A").memory.recent.length, 4, "会话内容没有取更全的那份");
+});
+
+test("新开的会话不能因为快照旧就丢掉", () => {
+  // 反向：快照里没有、只在退出镜像里出现的会话（用户最后新开的那个）必须留下。
+  const primary = { sessions: [_S("A", 2)], closedSessions: [], activeIdx: 0 };
+  const mirror = { sessions: [_S("A", 2), _S("NEW", 1)], closedSessions: [], activeIdx: 0, savedAt: 9 };
+  assert.deepEqual(_mca(primary, mirror).sessions.map((x) => x.id), ["A", "NEW"]);
+});
+
+test("缺 savedAt 时按「镜像更新」判——快照那份历史上不写时间戳", () => {
+  // SQLite 快照没有 savedAt，镜像有。缺失一律当旧：镜像是退出瞬间写的，一定不比快照旧。
+  const primary = { sessions: [_S("A"), _S("GONE")], closedSessions: [], activeIdx: 0 };
+  const mirror = { sessions: [_S("A")], closedSessions: [], activeIdx: 0, savedAt: 1 };
+  assert.deepEqual(_mca(primary, mirror).sessions.map((x) => x.id), ["A"],
+    "镜像更新却没按它的成员资格来");
+  // 两边都没有时间戳 → 谁也不比谁新，这时不该把 primary 独有的删掉（宁可多不可少）。
+  const noTs = _mca(primary, { sessions: [_S("A")], closedSessions: [], activeIdx: 0 });
+  assert.ok(noTs.sessions.length >= 1);
+});
+
+test("没有 id 的会话保留，不能被当成「不在打开列表里」删掉", () => {
+  const primary = { sessions: [{ memory: { recent: [0] } }], closedSessions: [], activeIdx: 0 };
+  const mirror = { sessions: [_S("A")], closedSessions: [], activeIdx: 0, savedAt: 5 };
+  assert.equal(_mca(primary, mirror).sessions.length, 2, "没有 id 的会话被误删了");
+});
+
+test("片的左右两边都要有光标落脚点", () => {
+  // 用户：「我点击 往左 他往左边走不了」。片是 contentEditable=false 的原子节点，
+  // 它前面若没有文本节点（比如它就是输入框第一个元素），光标按左键无处可去。
+  // 右边早就补了零宽空格，左边一直没有。两处插入（@菜单选中 / 从树里拖进来）都要补。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const n = (src.match(/insertBefore\(document\.createTextNode\("\\u200b"\), chip\)/g) || []).length;
+  assert.equal(n, 2, `两处插入都要在片左边补落脚点（当前 ${n} 处）`);
+});
+
+test("输入框里的 GitHub 片也只显示仓库名", () => {
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /label: r\.full_name\.split\("\/"\)\.pop\(\)/, "输入框里的片还在显示 owner/repo");
+  // value 仍然是全名——发送出去的文本要能唯一定位仓库。
+  assert.match(src, /value: r\.full_name, label:/, "片的值不能跟着截短，否则定位不到仓库");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

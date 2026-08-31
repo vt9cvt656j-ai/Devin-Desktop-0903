@@ -32,6 +32,7 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
+import { _mergeChatArchives as _mergeChatArchivesReal } from "../src/agent/chat-archive.js";
 import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
 import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
@@ -36910,10 +36911,9 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
 // 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
 // ---------------------------------------------------------------------------
 test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
-  const merge = load("_mergeChatArchives", {
-    _archiveHasChats: load("_archiveHasChats", {}),
-    _mergeArchiveList: load("_mergeArchiveList", { _archiveMsgCount: load("_archiveMsgCount", {}) }),
-  });
+  // 直接 import 真模块，不再抠源码手工注入依赖：这个函数每加一个内部 helper，
+  // 手抄的注入表就漏一个（这次漏的是 _archiveAt），测试红得跟被测行为毫无关系。
+  const merge = _mergeChatArchivesReal;
   const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
 
   // 事故形状：退出时同步写的镜像里有一个会话，几分钟前的 SQLite 快照里没有。
