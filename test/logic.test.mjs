@@ -18292,7 +18292,15 @@ test("terminal and live-preview background work do not outlive their UI owners",
 
   // Pointer moves can arrive many times in a frame. Layout work must coalesce to
   // one rAF instead of scheduling Monaco and xterm fits for every event.
-  const resizeBlock = SRC.slice(RAW_SRC.indexOf('const resizeHandle = $("terminalResize")'), RAW_SRC.indexOf('// terminal maximize/restore'));
+  // 区间从「起点锚 + 一句注释收尾」换成按 AST 取整个 `if (resizeHandle)` 块。
+  // 原写法的收尾锚是注释 `// terminal maximize/restore`：注释一被改写/翻译，indexOf 回 -1，
+  // `slice(start, -1)` 就从 1383 字的拖拽块悄悄变成「到文件尾的 4,672,xxx 字」，而三条都是
+  // 正向 includes，于是只要文件后半截任何地方出现过同样的字面量就照绿。实测过这一手：
+  // 把那句注释翻成中文 + 删掉拖拽块里的 `if (layoutRaf) return;` + 在后面放一个同样写法的
+  // 面板 splitter —— 老写法全绿，合帧其实已经没了。
+  // 现在锚点是代码（`if (resizeHandle) {` 全文 1 处），区间由语法边界决定（实测 1317 字，
+  // 三条特征都在里面），块外的同形写法一个都进不来；锚点没了会当场抛错，不会闷声放大。
+  const resizeBlock = blockFrom("if (resizeHandle) {", { code: true });
   assert.ok(resizeBlock.includes("let startY = 0, startH = 0, dragging = false, layoutRaf = 0;"));
   assert.ok(resizeBlock.includes("if (layoutRaf) return;"));
   assert.ok(resizeBlock.includes("scheduleLayout();"));
@@ -20441,8 +20449,14 @@ test("方案D：布尔思考开关模型诚实两态——能力表驱动，不�
   // 卡片现在一条**档位说明都不渲染**了（用户要求去掉那几段文字），所以"布尔模型别说
   // 深度话术"这件事的守法也跟着变：不再是检查那句 tip 挑得对，而是检查卡片压根不生成
   // 任何按档位的说明文字——那些话术的来源只有 _thinkTip / profile.levelTips 两个。
-  const thinkRender = SRC.slice(RAW_SRC.indexOf("const think = levels.map("));
-  const thinkBlock = thinkRender.slice(0, thinkRender.indexOf("thinkEl.innerHTML") + 400);
+  // 反向断言（doesNotMatch）配一个偏小的窗口是最容易假绿的组合，原来正是这样：
+  // 开放式切到文件尾（实测 3,919,427 字），再用 `indexOf("thinkEl.innerHTML") + 400`
+  // 这个拍脑袋的尾巴收口，**有效覆盖只有 509 字**——只盖到滑块 html 那几行。卡片里
+  // 还能藏说明文字的地方（_bindMicSlider 的回调、else 分支那句 hint）全在窗口外。
+  // 实测：把 `hint: _thinkTip(o?.lvl)` 加进 _bindMicSlider 的返回值，老写法全绿。
+  // 换成按 AST 取整张卡片的渲染函数（实测 6,074 字，当前既不含 _thinkTip( 也不含
+  // profile.levelTips），窗口再长也盖得住，函数改名会当场抛错而不是闷声放行。
+  const thinkBlock = extractFn("showModelInfoCard", { code: true });
   assert.doesNotMatch(thinkBlock, /_thinkTip\(|profile\.levelTips/,
     "卡片又开始渲染按档位的说明文字了——布尔开关模型只有开和关，" +
     "给它安上「低/中/高深度推理」的解释就是假话");
@@ -20886,9 +20900,19 @@ test("#49-1 傻等事实检测：派发后零其他工具就 await → 结果前
   const r3 = await exec({ type: "awaitsubagent", job: "all" }, { _subAgentJobs: new Map([[1, legacy]]) }, {}, clip, (k, p) => String(k).replace(/^.*\./, "") + (p && p.count != null ? " " + p.count : ""));
   assert.doesNotMatch(r3.content, /\[事实\]/, "存量作业/无账本不误报");
   // 4) 派发路径必须落盘傻等检测锚点；#45 作业结构钉死字段不回退
-  const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
-  assert.match(loopSrc, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\) \? run\._toolLedger\.entries\.length : 0/);
-  assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
+  // 原来两条打在 `runSubagentItem → executeScheduledItem` 这段 23,316 字的宽区间上，
+  // 而这段里躺着**两条文本近亲的派发路**：下面那条作业结构字段在宽区间里命中 **2 次**
+  //（另一次是 spawn_multiple_agents 的作业记录，`dispatchLedgerLen: _smLedgerLen`），
+  // 于是被点名的这条异步路径把 status/startedAt/result/consumed 改掉它照样绿——
+  // 实测把 55118 行那份 job 字面量的 result 去掉，这条用例一声不吭。
+  // 上面那条今天还有效，也纯属侥幸：`dispatchLedgerLen: run._toolLedger && …` 这串长文本
+  // 恰好只有一处，孪生路径写的是短一截的 `_smLedgerLen` 才没撞上。
+  // 收窄到异步派发那个分支块（AST 边界，实测 3,908 字，和 P2.1 那条用例同一个锚点），
+  // 两条各恰好命中 1 次；锚点没了会当场抛错，不会退化成开放式切片。
+  const asyncJob = blockFrom(
+    "if (!isWorker && !it.call._wiki && !it.call.wait && _asyncSpawnNames.has(it.tc.name)) {", { code: true });
+  assert.match(asyncJob, /dispatchLedgerLen: run\._toolLedger && Array\.isArray\(run\._toolLedger\.entries\) \? run\._toolLedger\.entries\.length : 0/);
+  assert.match(asyncJob, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
 });
 
 test("#49-2 启动文本强化：不要立即 await 提示 + 元数据反例，#45 既有文案不回退", () => {
@@ -26380,11 +26404,20 @@ test("写文件前的预备打开不弹「文件不存在」——新建文件�
   // 原因不在写入，而在写入**之前**：_liveStage 会先把目标文件打开到编辑器里做预备，
   // 而 write_file 新建的文件那一刻当然还不存在，openFile 就把 Rust 的 NotFound 原样
   // 弹成 toast。openFile 早就有 silentMissing 选项正是为此，只是这里没传。
-  const stage = SRC.slice(RAW_SRC.indexOf('if (t === "write" || t === "edit" || t === "multiedit") {'));
-  const body = stage.slice(0, stage.indexOf('} else if (t === "read")'));
-  assert.match(body, /await openFile\(/, "预备阶段确实会打开目标文件");
-  assert.match(body, /\{ silentMissing: true \}/,
-    "预备打开必须静默处理「文件还不存在」，否则每次新建文件都会弹一次假报错");
+  // 原来是**两层开放式切片**：外层 `SRC.slice(RAW_SRC.indexOf('if (t === "write" …'))`
+  // 一路切到拼接源码末尾（实测 2,263,371 字），全靠内层
+  // `stage.slice(0, stage.indexOf('} else if (t === "read")'))` 把它砍回 545 字。
+  // 内层那个锚点只是一句普通 else-if：改写成 `t === "read" || t === "readmany"` 之类，
+  // indexOf 就回 -1，而 `slice(0, -1)` 既不报错也不给空串，是「整份少一个字」
+  //（2,263,370 字）——两条断言当场退化成「后半截源码里存在这两个字符串」，
+  // 而 `await openFile(` 全文有 17 处。实测：改写 read 那条 else-if，同时把
+  // silentMissing 从写入路径挪到 read 路径（写入路径重新开始弹假报错），老写法全绿。
+  // 现在按 AST 取 write/edit/multiedit 这一条分支（锚点全文 1 处，实测 490 字），
+  // 并把两条松断言合成一条：openFile 的调用和 silentMissing 必须是**同一个调用**，
+  // 而不是「这个区间里有 openFile，也有 silentMissing」——那两件事可以毫不相干。
+  const stage = blockFrom('if (t === "write" || t === "edit" || t === "multiedit") {', { code: true });
+  assert.match(stage, /await openFile\([\s\S]{0,120}\{ silentMissing: true \}\)/,
+    "写入前的预备打开必须静默处理「文件还不存在」，否则每次新建文件都会弹一次假报错");
 
   // 静默的只是给人看的 toast；模型仍然要从工具结果里拿到真报错，否则路径写错就没人告诉它了。
   assert.match(SRC, /\[ERROR\] 文件不存在: \$\{call\.path\}/,
@@ -27866,9 +27899,20 @@ test("ask_user 有分级下限：第一次原样放行，第三次不再弹卡�
 
 test("连着问两次（中间没调别的工具）直接按上限处理", () => {
   // 两次提问之间一个工具都没调，那不是在收集信息，是原地停摆
-  const branch = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "askuser") {'), RAW_SRC.indexOf('} else if (call.type === "askuser") {') + 3000);
+  // 3000 字固定窗口只盖住 askuser 分支（实测 10,030 字）的 30%，而下面两条分别落在
+  // 分支内偏移 2,128 和 2,494——离窗口边界只剩 872 / 506 字。实测：在分支开头补一段
+  // 515 字的「空问题直接挡回去」预检（和这两条守的东西毫无关系），这条用例当场假红。
+  // 隔壁那条同样守 askuser 分支的用例（切到下一个 else if 为止）在同一个变异下是绿的。
+  // 改成按 AST 取整条分支：区间由语法边界决定，分支长多少都盖得住；锚点不唯一或没了
+  // 会当场抛错（实测这条锚点全文 1 处），不会退化成「锚点后 3000 字」。
+  const branch = blockFrom('} else if (call.type === "askuser") {', { code: true });
   assert.match(branch, /const _auBackToBack = run\._lastToolWasAsk === true;/);
   assert.match(branch, /你连着两次提问，中间一个工具都没调——那不是在收集信息，是原地停摆/);
+  // 上面两条分开写，只验「判据在、话也在」，验不到**它俩的关系**：那句话可以被无条件
+  // 塞进 [BLOCKED] 文案里，_auBackToBack 退化成一个算了不用的死变量——用户第一次提问
+  // 就被告知「你连着问了两次」。所以再钉一条：这句话必须挂在 _auBackToBack 的真分支上。
+  assert.match(branch, /_auBackToBack \? "你连着两次提问，中间一个工具都没调——那不是在收集信息，是原地停摆。"/,
+    "那句话必须只在真的连着问时才说，不能无条件塞进 BLOCKED 文案");
   // 标记要在每个非 askuser 工具入口清掉，否则永远判不出"连着"
   assert.match(SRC, /if \(run && call && call\.type !== "askuser"\) run\._lastToolWasAsk = false;/);
 });
@@ -28750,7 +28794,16 @@ test("分母是猜的就得说出来——不能让 91% 看上去和真实读数
   assert.equal(snap({ contextLimit: 0 }).windowReported, false, "上报了 0 也等于没上报");
   assert.equal(snap({ contextLimit: 200_000 }).windowReported, true);
 
-  const render = SRC.slice(RAW_SRC.indexOf("const lines = [`上下文"), RAW_SRC.indexOf("const lines = [`上下文") + 700);
+  // 原来是「函数体中间的一条语句 + 固定 700 字、没有结束锚点」：两条正则落在偏移
+  // 约 200 和 265，余量只剩四百多字，提示行一多就滑出去（那是吵闹的假红）。
+  // 更隐蔽的是另一头：`const lines = [\`上下文` 只是一句普通语句，indexOf 命中的是
+  // **第一处**——文件里再冒出第二个同样起头的仪表组装（比如状态栏的迷你版），窗口
+  // 就整个搬到那份副本上，主仪表把这段注明删掉照样绿。实测：在 _renderTokenMeter
+  // 前面加一个 _renderTokenMeterMini（同样的首行 + 同样的注明），再把注明从主仪表里
+  // 删掉——老写法全绿，用户看到的 91% 重新变成没有任何标注的数字。
+  // 改成按名字取函数（实测 5,357 字，两条正则在里面各 1 次命中）：取的是**这一个**
+  // 渲染函数，同名声明有多处会当场抛歧义，不会闷声挑一个。
+  const render = extractFn("_renderTokenMeter", { code: true });
   assert.match(render, /state\.windowReported === false && state\.total > 0/,
     "猜出来的分母没有任何标注");
   assert.match(render, /窗口未上报/);
@@ -29477,7 +29530,16 @@ test("记忆卫生·需求账本不再自称「全部仍然有效」", () => {
 test("记忆卫生·项目日志与工作流不再声称没发生过的事", () => {
   assert.match(SRC, /（改了 \$\{files\}）` : "（未改动文件）"/,
     "纯调研轮也记 ✓ 且括号缺席，模型只能去猜东西到底做出来没有");
-  const wf = SRC.slice(RAW_SRC.indexOf("💡 **"), RAW_SRC.indexOf("💡 **") + 300);
+  // 原来是「装饰 emoji 当起点锚 + 固定 300 字」，而这条上挂的是 **doesNotMatch**——
+  // 反向断言配固定窗口只会假绿，不会假红：窗口滑出去了没人知道。被守的正文今天占 190 字，
+  // 只剩 110 字余量，而这是段**提示词文案**，一次正常的补充就能把禁止出现的那句顶出窗口。
+  // 实测：给这段提示补一句 165 字的说明，再在末尾追回「（这份流程已复用 N 次）」——
+  // 那句话落在锚点后偏移 303，老写法一声不吭全绿，模型重新读到那个权威口吻的 N。
+  // 改成按名字取整个函数（实测 391 字），窗口再长也盖得住，锚点也不再是个随时会
+  // 冒出第二处的 emoji。
+  // `{ code: true }` 在这里是**必须**的：函数上面那条注释里就写着「不再声称"已复用 N 次"」，
+  // 用原文取的话这条 doesNotMatch 会被它自己的说明注释打成永远假红。
+  const wf = extractFn("_workflowHintBlock", { code: true });
   assert.doesNotMatch(wf, /已复用/, "那个 N 是归纳时的相似任务数，不是被复用次数");
   assert.match(wf, /未经验证/);
 });
@@ -31966,8 +32028,18 @@ test("会删东西的 find 不许被判成只读命令，批量删除必须弹�
   // 只读，它连「改动前审批」都绕得过去——用户自己打开的闸对它无效。而 find 的动作谓词
   // 就长在参数里（-delete / -exec / -ok / -fprint），白名单原来那句「参数不含 ; & | < > 反引号
   // 就算安全」对它根本不成立。再加上 shell 删除不进 checkpoint，「全部撤销」也救不回来。
-  const roSrc = SRC.slice(RAW_SRC.indexOf("function _looksLikeReadOnlyCommand"));
-  const roBody = roSrc.slice(0, roSrc.indexOf("\nfunction "));
+  // roSrc 原来是**开放式切到文件尾**：从函数头（偏移 2,150,970）一路切到拼接源码末尾，
+  // 实测 2,525,732 字，而真函数只有 2,921 —— 864 倍。下面「破坏性谓词名单完整」那条
+  // 今天还能红，唯一的原因是 _DANGEROUS_CMD_RE 里那份一模一样的字面量声明在函数
+  // **前面**（偏移 1,035,031 < 2,150,970），恰好落在切片外——一次纯粹的声明顺序侥幸。
+  // 实测：把 fprintf 从函数自己的名单里删掉，同时让紧跟其后的
+  // _looksLikeWorkspaceMutationCommand 也带上同一份名单（很自然的一步），老写法全绿，
+  // 而 `find … -fprintf` 重新被判成只读命令、绕过「改动前审批」。
+  // 顺带删掉 `const roBody = roSrc.slice(0, roSrc.indexOf("\nfunction "))`：作者本来就
+  // 打算用有界区间，可它全文一次都没被用过，三条断言全打在开放的 roSrc 上。
+  // 现在按 AST 取函数（实测 2,921 字），三条断言在里面各恰好命中 1 次；函数改名会
+  // 当场抛「找不到声明」，是响的失败，不是闷声放大。
+  const roSrc = extractFn("_looksLikeReadOnlyCommand", { code: true });
   // 这个谓词以前是用 `new Function` + `arguments.callee` 手工拼出来的，然后
   // **一次都没调用**（末尾一句 `void isReadOnly;`），下面三条全是源码断言。
   // 改成用正规提取器装起来真跑：行为断言能抓到「谓词写了但接错了」，源码断言抓不到。
@@ -32223,7 +32295,17 @@ test("阻断性诊断门要覆盖有语言服务的语言，而不是只认 JS/T
     assert.match(tbl, new RegExp('"' + ext + '"'), `诊断门漏了 .${ext}——改坏了拦不住`);
   }
 
-  const fn = SRC.slice(RAW_SRC.indexOf("async function _interleavedDiagnostics"), RAW_SRC.indexOf("\n// Run the project's test command"));
+  // 这个区间今天确实是满覆盖（实测 8,099 字 vs 函数 8,098，起止锚各 1 处），但**终点锚
+  // 是一条英文注释**（`// Run the project's test command`）——全文件最容易被顺手改写、
+  // 顺手翻译的东西，而改它跟这个函数的行为毫无关系。它一变，indexOf 回 -1，
+  // `slice(start, -1)` 不是空串（那样会红），而是「从函数开头到文件末尾」的 1,052,878 字：
+  // 守卫从「守这个函数」悄悄变成「守后半截源码」，当场全绿。
+  // 实测：把那三行注释翻成中文，同时把 didOpen/didClose 从这个函数里删掉、只在紧随其后
+  // 新抽的 _openLspModelFor 里留一份（半落地的抽取，本仓踩过的形状）——老写法一声不吭，
+  // 而诊断门实际上已经不再告诉语言服务器文件存在了。
+  // 换成按名字取函数（实测 8,098 字，和现在切出来的一模一样）：函数改名会抛
+  //「main.js 里找不到声明 _interleavedDiagnostics」，是响的失败。
+  const fn = extractFn("_interleavedDiagnostics", { code: true });
   // 建 model 必须用真实语言 id：写死 typescript/javascript 的话，.py 会被当成 JS 分析，
   // 报一堆无意义的错，而真正的 Python 诊断永远不会附到这个 model 上。
   assert.match(fn, /const langId = _lintableLangId\(rel\)/,
