@@ -224,7 +224,7 @@ const SLICE_BASELINE = {
   "interrupt-transcript.test.mjs": 1,
   "knowledge-preflight-card.test.mjs": 1,
   "knowledge-routing.test.mjs": 1,
-  "logic.test.mjs": 88,
+  "logic.test.mjs": 86,
   
   "mcp.test.mjs": 7,
   "prefix-cache.test.mjs": 14,

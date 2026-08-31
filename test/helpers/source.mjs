@@ -239,11 +239,14 @@ export function fnSource(name, { code = false } = {}) {
  * 正是该分支块的 `{`，于是取到的就是这个分支的完整块。
  *
  * @param {string} anchor 源码里的一段字面文本（含它结尾的 `{` 时最准）
- * @param {{ code?: boolean, nth?: number }} [opts]
+ * @param {{ code?: boolean, nth?: number, enclosing?: boolean }} [opts]
  *   code:true 从剥了注释的那份切（做正向断言时用，免得匹配到注释里引用的旧代码）；
- *   nth 只在确实存在多处同形锚点、且你明确要第 n 个时才传（从 0 数）。
+ *   nth 只在确实存在多处同形锚点、且你明确要第 n 个时才传（从 0 数）；
+ *   enclosing:true 取**包住锚点的那个函数体**，而不是锚点自己所在的最小节点——
+ *   锚点是一行普通语句（`if (…) return;`）而你想要整个回调时用它。不加的话
+ *   `blockFrom("… return;")` 只会还给你那条 return 语句本身。
  */
-export function blockFrom(anchor, { code = false, nth = null } = {}) {
+export function blockFrom(anchor, { code = false, nth = null, enclosing = false } = {}) {
   const hits = [];
   for (let i = SRC.indexOf(anchor); i >= 0; i = SRC.indexOf(anchor, i + 1)) hits.push(i);
   if (!hits.length) throw new Error(`源码里找不到锚点：${JSON.stringify(anchor.slice(0, 80))}`);
@@ -264,6 +267,23 @@ export function blockFrom(anchor, { code = false, nth = null } = {}) {
     for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
   })(_ast);
   if (!best) throw new Error(`锚点落在任何 AST 节点之外：${JSON.stringify(anchor.slice(0, 80))}`);
+  if (enclosing) {
+    // 往上找包住它的那个函数体。第二遍扫：取「包含锚点、且是函数/块」里最小的那个，
+    // 但要比 best 本身大，否则又退回原地。
+    let fn = null;
+    (function walk(node) {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+      const t = node.type;
+      if ((t === "FunctionDeclaration" || t === "FunctionExpression" || t === "ArrowFunctionExpression")
+        && node.start <= pos && pos < node.end
+        && node.end - node.start > best.end - best.start
+        && (!fn || node.end - node.start < fn.end - fn.start)) fn = node;
+      for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
+    })(_ast);
+    if (!fn) throw new Error(`锚点外面没有函数可取：${JSON.stringify(anchor.slice(0, 80))}`);
+    best = fn.body || fn;
+  }
   return (code ? CODE : SRC).slice(best.start, best.end);
 }
 
