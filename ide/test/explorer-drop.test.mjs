@@ -10,7 +10,8 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, rootDropQuestion,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf,
+  addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
 
@@ -252,26 +253,54 @@ test("落点反馈要覆盖整棵可见子树，不只是那一行", () => {
     "子树里的行没有被加上同一个投放态");
 });
 
-test("文件夹落在项目根上要先问，而不是默默复制", () => {
-  // VS Code 在这一刻弹框："Do you want to copy 'X' or add 'X' as a folder to the workspace?"
-  // 我们把次选项换成「打开为新项目」——用户原来靠拖到侧栏换项目，改成复制后那条路没了。
+test("文件夹落到项目根 = 直接换成这个项目，不再弹框", () => {
+  // 用户原话：「直接替换工作区目录内容就行，不然的话没啥意义」。把一个项目文件夹拖到项目
+  // 根上本来就只有这一个合理意图，先问一遍反而多一步。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
   const blk = src.slice(src.indexOf("async function _copyIntoWorkspace"), src.indexOf("async function _handleDrop"));
-  // 判据要和 VS Code 一样是「任意工作区根」（它的条件就是 e.isRoot）：多根工作区里
-  // 往**非活动根**上放文件夹，只认 rootPath 的话会静默复制，问都不问。
-  assert.match(blk, /workspaceRoots\.includes\(destDir\)/,
-    "根落框只认活动根——多根工作区里往另一个根上放文件夹会被静默复制");
-  // 三个动作：打开为新项目（主）/ 添加到工作区 / 取消。
-  // 「复制到这里」按用户要求去掉了——把一个**项目文件夹**拖进来，要的不是复制一份进当前项目。
-  assert.match(blk, /okLabel: "打开为新项目", altLabel: "添加到工作区"/, "弹框的三个动作不对");
-  assert.doesNotMatch(blk, /复制到这里/, "「复制到这里」应该已经去掉了");
-  assert.match(blk, /pick === "ok" \|\| pick === true[\s\S]{0,220}openFolder/, "选了「打开为新项目」没有真的去打开");
-  assert.match(blk, /pick === "alt"[\s\S]{0,160}_addWorkspaceRoot/, "「添加到工作区」没有接上多根");
-  assert.match(blk, /pick === "cancel" \|\| pick === false/, "取消必须什么都不做");
-  // 多个文件夹时不能只处理第一个、把其余静默丢掉。
+  assert.match(blk, /workspaceRoots\.includes\(destDir\)[\s\S]{0,400}openFolder\(_dirs\[0\]\.path\)/,
+    "文件夹落到工作区根没有直接换项目");
+  assert.doesNotMatch(blk, /ioConfirm\(/, "这一档不该再弹框");
+  // 一次拖进来好几个：其余的挂成额外的根，别静默丢掉。
   assert.match(blk, /_dirs\.slice\(1\)[\s\S]{0,90}_addWorkspaceRoot/,
-    "选了「打开为新项目」时，多余的文件夹被静默丢弃了");
-  assert.match(blk, /_dirs = items\.filter\(\(x\) => x\.isDir\)/, "问的条件必须是「拖的是文件夹」");
+    "多个文件夹时，多余的被静默丢弃了");
+  // 只对**文件夹**、且只在根上。拖文件、或把文件夹拖进子目录，照旧走复制。
+  assert.match(blk, /_dirs = items\.filter\(\(x\) => x\.isDir\)/, "判据必须是「拖的是文件夹」");
+});
+
+test("移除 = 从树里藏起来，不是删除", () => {
+  // 用户：「不是移除到废纸篓，而是移除 让用户看不见 而不是真正的删除，我这里写了删除按钮了都」。
+  // 所以这条路一次都不许碰文件系统。
+  let store = {};
+  store = addHidden(store, "/w", "/w/logs");
+  store = addHidden(store, "/w", "/w/a.txt");
+  assert.deepEqual(hiddenFor(store, "/w"), ["/w/logs", "/w/a.txt"]);
+  // 重复移除同一个不该堆两条
+  assert.deepEqual(hiddenFor(addHidden(store, "/w", "/w/logs"), "/w"), ["/w/logs", "/w/a.txt"]);
+  // 按项目分开：换个项目互不影响
+  assert.deepEqual(hiddenFor(store, "/other"), []);
+
+  const list = hiddenFor(store, "/w");
+  assert.equal(isHidden(list, "/w/logs"), true, "被移除的目录本身要藏");
+  assert.equal(isHidden(list, "/w/logs/x.log"), true, "它底下的东西也要藏，否则展开父目录又冒出来");
+  assert.equal(isHidden(list, "/w/logs2"), false, "同前缀的兄弟目录不该被连坐");
+  assert.equal(isHidden(list, "/w/src"), false);
+  // 恢复
+  assert.deepEqual(hiddenFor(clearHidden(store, "/w"), "/w"), []);
+
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  // 菜单项的标签跟着选中的类型走
+  assert.match(src, /isDir \? "移除目录" : "移除文件"/, "菜单没有按类型给标签");
+  // 移除必须只改显示：这条路上不许出现任何文件系统调用
+  const fn = src.slice(src.indexOf("async function _hideEntry"), src.indexOf("async function _restoreHidden"));
+  assert.doesNotMatch(fn, /deletePath|trashPath|renamePath|remove_dir|backend\.\w*[Dd]elete/,
+    "「移除」碰了文件系统——它只该改显示");
+  assert.match(fn, /addHidden\(_hiddenStore, rootPath, path\)/, "没有把它加进隐藏清单");
+  // 渲染时真的过滤掉了
+  assert.match(src, /if \(_hidden\.length && isHidden\(_hidden, item\.path\)\) continue;/,
+    "树渲染没有过滤掉被移除的条目");
+  // 必须有回头路，否则「移除」是单向操作
+  assert.match(src, /恢复已移除的 \$\{_nHidden\} 项/, "没有恢复入口——移除就找不回来了");
 });
 
 test("ioConfirm 的第三按钮是可选的，不影响老调用方", () => {
