@@ -43,7 +43,16 @@ type User = {
   quota_window_cap_cents?: number;
 };
 
-type Stats = { total_users?: number; today_users?: number; online?: number };
+type Stats = {
+  total_users?: number; today_users?: number; online?: number;
+  // 下面三项是服务端的**全量聚合**（realtime.rs 的 stats）。加它们的原因：这一屏原来把
+  // 「已收款 / 已付订单数 / 套餐构成」从两条带硬上限的列表里算（users LIMIT 500、
+  // orders LIMIT 1000），用户过 500、订单过 1000 之后就静默变成"最近 N 条里的合计"，
+  // 而紧挨着的「总用户」是真 count(*) —— 同一屏一个真一个截断，运营看不出来。
+  paid_orders?: number;
+  revenue_cents?: Record<string, number>;
+  plan_mix?: Record<string, number>;
+};
 
 /** pay.rs Order（只取这一屏用得上的字段）。email / amount_cents / status 在库里都是非空。 */
 type Order = {
@@ -151,7 +160,13 @@ export function Overview() {
   // charged_cents」，拿不到就退回 amount_cents（人民币标价）再按美元渲染 —— 于是没进账的
   // 手工单被算成钱，人民币被报成美元。两份抄在一起的东西只要有一处先改，另一处就会
   // 带着一句「Billing.tsx 已经改过」的注释继续错下去，这里原来就是那样。
-  const receivedText = formatTotals(sumByCurrency(paid));
+  // 优先用服务端全量聚合；拿不到（老网关还没这个字段）才退回按列表合计，
+  // 那时它只是"最近 1000 笔里的合计"，所以下面的 hint 会说清是哪一种。
+  const revenueFull = stats?.revenue_cents;
+  const receivedText = revenueFull
+    ? formatTotals(revenueFull)
+    : (orders ? formatTotals(sumByCurrency(paid)) : "—");
+  const paidCount = typeof stats?.paid_orders === "number" ? stats.paid_orders : (orders ? paid.length : null);
 
   const loadedUsers = users ?? [];
   const active = (u: User) =>
@@ -168,13 +183,27 @@ export function Overview() {
   const PLAN_ORDER: string[] = planKeys().slice().reverse();
   const planMix = (() => {
     const by = new Map<string, number>();
-    for (const u of loadedUsers) {
-      if (!active(u)) continue;
-      const k = String(u.plan);
-      by.set(k, (by.get(k) || 0) + 1);
+    // 优先用服务端的全量分组（判据和下面 active() 一致：有套餐、不是 none、没过期）。
+    // 退回按列表统计时，那只是"最近 500 位用户里的构成"——环心的「总客户」也跟着只算这 500 位，
+    // 而它旁边的「总用户」是真 count(*)。两个数并排、一个真一个截断，正是这次要修的。
+    const full = stats?.plan_mix;
+    if (full) {
+      for (const [k, n] of Object.entries(full)) if (n > 0) by.set(k, n);
+    } else {
+      for (const u of loadedUsers) {
+        if (!active(u)) continue;
+        const k = String(u.plan);
+        by.set(k, (by.get(k) || 0) + 1);
+      }
     }
-    const slices = PLAN_ORDER.filter((k) => by.get(k)).map((k) => ({ label: k, value: by.get(k)! }));
-    const none = loadedUsers.length - slices.reduce((a, x) => a + x.value, 0);
+    // PLAN_ORDER 之外的套餐（线上已存在的 ceshi、运营新建的任何一档）不能被静默吞进
+    // 「无会员」——按 rank 排的先画，剩下的按名字补在后面。
+    const ordered = PLAN_ORDER.filter((k) => by.get(k));
+    const extra = [...by.keys()].filter((k) => !PLAN_ORDER.includes(k)).sort();
+    const slices = [...ordered, ...extra].map((k) => ({ label: k, value: by.get(k)! }));
+    // 分母也要用真总数，否则「无会员」= 500 − 有效会员，是个截断出来的数。
+    const totalUsers = typeof stats?.total_users === "number" ? stats.total_users : loadedUsers.length;
+    const none = totalUsers - slices.reduce((a, x) => a + x.value, 0);
     if (none > 0) slices.push({ label: "无会员", value: none });
     return slices;
   })();
@@ -228,8 +257,10 @@ export function Overview() {
       <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Stat
           label="已收款"
-          value={orders ? receivedText : "—"}
-          hint={orders ? `${paid.length} 笔` : "读取中"}
+          value={receivedText}
+          hint={paidCount == null ? "读取中"
+            : revenueFull ? `${paidCount} 笔（全量）`
+            : `${paidCount} 笔（仅最近 ${loadedOrders.length} 笔）`}
         />
         <Stat
           label="未支付订单"

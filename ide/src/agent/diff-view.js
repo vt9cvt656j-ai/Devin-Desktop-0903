@@ -41,6 +41,71 @@ export function diffStat(oldText, newText) {
   return { added, removed };
 }
 
+/**
+ * 把两份文本对齐成一串操作：`{ t: "ctx"|"del"|"add", o, n, s }`
+ * （o/n = 旧/新文件里的 0-based 行号，取不到为 -1；s = 该行文本）。
+ *
+ * # 为什么必须做对齐
+ *
+ * 渲染这块 diff 的循环原来是**按同一个下标配对**（`oldL[i]` vs `newL[i]`）。这在"只改了
+ * 某几行"时凑合，但只要有一行插入/删除，后面全部错位——实测在 40 行文件最前面插一行
+ * import：徽章（diffStat 用行的多重集，算得对）显示 `+1`，而正下方那块 diff 画出
+ * **30 增 30 删**。同一次写入，两个数字差 30 倍，用户不知道该信哪个。
+ *
+ * # 做法与规模守卫
+ *
+ * 先掐掉公共前后缀（真实编辑绝大多数是"中间改一小段"，这一步就把问题缩得很小），
+ * 再对剩下的中段跑 LCS。中段太大时（乘积超过阈值）退回逐行配对——那是旧行为，
+ * 不好但有界；这块 diff 只渲染 60 行，为一个几千行的整体重写去算 O(n·m) 不值得。
+ */
+function alignLines(oldL, newL) {
+  let s = 0;
+  while (s < oldL.length && s < newL.length && oldL[s] === newL[s]) s++;
+  let e = 0;
+  while (e < oldL.length - s && e < newL.length - s
+         && oldL[oldL.length - 1 - e] === newL[newL.length - 1 - e]) e++;
+
+  const ops = [];
+  for (let i = 0; i < s; i++) ops.push({ t: "ctx", o: i, n: i, s: oldL[i] });
+
+  const oMid = oldL.slice(s, oldL.length - e);
+  const nMid = newL.slice(s, newL.length - e);
+  const BUDGET = 4_000_000;   // 约 2000×2000，够覆盖真实编辑；再大就不值得算
+  if (oMid.length * nMid.length > BUDGET) {
+    // 退回旧的逐行配对，但只作用在中段（前后缀已经对齐了，比原来准）。
+    const m = Math.max(oMid.length, nMid.length);
+    for (let i = 0; i < m; i++) {
+      const o = i < oMid.length ? oMid[i] : undefined;
+      const n = i < nMid.length ? nMid[i] : undefined;
+      if (o !== undefined && o === n) { ops.push({ t: "ctx", o: s + i, n: s + i, s: o }); continue; }
+      if (o !== undefined) ops.push({ t: "del", o: s + i, n: -1, s: o });
+      if (n !== undefined) ops.push({ t: "add", o: -1, n: s + i, s: n });
+    }
+  } else {
+    // LCS 表（滚动两行即可，内存 O(min)）——但回溯需要整表，中段已被前后缀夹小，可接受。
+    const L = Array.from({ length: oMid.length + 1 }, () => new Uint32Array(nMid.length + 1));
+    for (let i = oMid.length - 1; i >= 0; i--) {
+      for (let j = nMid.length - 1; j >= 0; j--) {
+        L[i][j] = oMid[i] === nMid[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+      }
+    }
+    let i = 0, j = 0;
+    while (i < oMid.length && j < nMid.length) {
+      if (oMid[i] === nMid[j]) { ops.push({ t: "ctx", o: s + i, n: s + j, s: oMid[i] }); i++; j++; }
+      else if (L[i + 1][j] >= L[i][j + 1]) { ops.push({ t: "del", o: s + i, n: -1, s: oMid[i] }); i++; }
+      else { ops.push({ t: "add", o: -1, n: s + j, s: nMid[j] }); j++; }
+    }
+    while (i < oMid.length) { ops.push({ t: "del", o: s + i, n: -1, s: oMid[i] }); i++; }
+    while (j < nMid.length) { ops.push({ t: "add", o: -1, n: s + j, s: nMid[j] }); j++; }
+  }
+
+  for (let k = 0; k < e; k++) {
+    const oi = oldL.length - e + k, ni = newL.length - e + k;
+    ops.push({ t: "ctx", o: oi, n: ni, s: oldL[oi] });
+  }
+  return ops;
+}
+
 export function buildDiffView(oldText, newText, filePath) {
   oldText = oldText == null ? "" : String(oldText);
   newText = newText == null ? "" : String(newText);
@@ -68,46 +133,34 @@ export function buildDiffView(oldText, newText, filePath) {
       h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${escapeAttr(newL[i])}">${escapeHtml(newL[i])}</span></div>`;
     }
   } else {
-    const maxLen = Math.max(oldL.length, newL.length);
-    let lastShown = -1;
-    for (let i = 0; i < maxLen && rendered < cap; i++, stoppedAt = i) {
-      const oLine = i < oldL.length ? oldL[i] : undefined;
-      const nLine = i < newL.length ? newL[i] : undefined;
+    // 按**对齐后的操作序列**渲染，不再按同一个下标配对（见 alignLines 的说明：
+    // 那样只要有一行插入就整片错位，40 行文件插一行 import 会画成 30 增 30 删，
+    // 而同一张卡上的徽章写着 +1）。
+    const ops = alignLines(oldL, newL);
+    const row = (cls, sign, ln, text) =>
+      `<div class="atc-diff-row atc-diff-row--${cls}"><span class="atc-diff-ln">${ln}</span>`
+      + `<span class="atc-diff-sign">${sign}</span>`
+      + `<span class="atc-diff-code" data-raw="${escapeAttr(text)}">${escapeHtml(text)}</span></div>`;
 
-      if (oLine !== undefined && nLine !== undefined && oLine === nLine) {
-        if (i - lastShown === 2) {
-          h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${escapeAttr(nLine)}">${escapeHtml(nLine)}</span></div>`;
-          rendered++;
-        }
-        continue;
+    // 只画变更点附近；连续未变的大段折成一行 @@ N unchanged lines @@。
+    const CTX = 2;
+    const keep = new Set();
+    for (let i = 0; i < ops.length; i++) {
+      if (ops[i].t === "ctx") continue;
+      for (let k = Math.max(0, i - CTX); k <= Math.min(ops.length - 1, i + CTX); k++) keep.add(k);
+    }
+    let skipped = 0;
+    for (let i = 0; i < ops.length && rendered < cap; i++) {
+      const op = ops[i];
+      stoppedAt = Math.max(op.o, op.n) + 1;
+      if (!keep.has(i)) { skipped++; continue; }
+      if (skipped > 0) {
+        h += `<div class="atc-diff-more">@@ ${skipped} unchanged line${skipped > 1 ? "s" : ""} @@</div>`;
+        skipped = 0;
       }
-
-      if (i - lastShown > 2 && lastShown >= 0) {
-        const skipped = i - lastShown - 1;
-        if (skipped > 0) {
-          h += `<div class="atc-diff-more">@@ ${skipped} unchanged line${skipped > 1 ? 's' : ''} @@</div>`;
-        }
-      }
-
-      if (lastShown < 0 && i > 0) {
-        const ctxStart = Math.max(0, i - 2);
-        for (let c = ctxStart; c < i; c++) {
-          if (c < oldL.length) {
-            h += `<div class="atc-diff-row atc-diff-row--ctx"><span class="atc-diff-ln">${c + 1}</span><span class="atc-diff-sign"> </span><span class="atc-diff-code" data-raw="${escapeAttr(oldL[c])}">${escapeHtml(oldL[c])}</span></div>`;
-            rendered++;
-          }
-        }
-      }
-
-      if (oLine !== undefined && oLine !== nLine) {
-        h += `<div class="atc-diff-row atc-diff-row--del"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">-</span><span class="atc-diff-code" data-raw="${escapeAttr(oLine)}">${escapeHtml(oLine)}</span></div>`;
-        rendered++;
-      }
-      if (nLine !== undefined && oLine !== nLine) {
-        h += `<div class="atc-diff-row atc-diff-row--add"><span class="atc-diff-ln">${i + 1}</span><span class="atc-diff-sign">+</span><span class="atc-diff-code" data-raw="${escapeAttr(nLine)}">${escapeHtml(nLine)}</span></div>`;
-        rendered++;
-      }
-      lastShown = i;
+      if (op.t === "ctx") { h += row("ctx", " ", op.n + 1, op.s); rendered++; }
+      else if (op.t === "del") { h += row("del", "-", op.o + 1, op.s); rendered++; }
+      else { h += row("add", "+", op.n + 1, op.s); rendered++; }
     }
   }
 

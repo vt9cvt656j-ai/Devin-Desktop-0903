@@ -313,10 +313,50 @@ pub async fn stats(
     )
     .fetch_one(&state.db)
     .await?;
+    // 下面三项是**全量聚合**，不是分页列表算出来的。
+    //
+    // 总览页此前把「已收款 / 已付订单数 / 套餐构成」都从两条带硬上限的列表里算：
+    // /api/admin/users 是 `LIMIT 500`、/api/admin/orders 是 `LIMIT 1000`。于是用户过 500、
+    // 订单过 1000 之后，这几个数字**静默变成"最近 N 条里的合计"**，而紧挨着它们的
+    // 「总用户」用的是上面那个真 count(*) —— 同一屏里一个真一个截断，运营看不出来。
+    //
+    // 收款口径和前端 lib/money.ts 一致：只有 charged_cents + charged_currency 是真钱
+    //（Stripe 扣款成功后 webhook 写回的事实），amount_cents 是目录里的人民币标价，不算。
+    let paid_orders: i64 = sqlx::query_scalar("SELECT count(*) FROM orders WHERE status = 'paid'")
+        .fetch_one(&state.db)
+        .await?;
+    let revenue_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT lower(charged_currency), COALESCE(sum(charged_cents), 0) FROM orders \
+         WHERE status = 'paid' AND charged_cents IS NOT NULL AND charged_currency IS NOT NULL \
+         GROUP BY lower(charged_currency)",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let revenue: serde_json::Map<String, serde_json::Value> = revenue_rows
+        .into_iter()
+        .map(|(ccy, cents)| (ccy, serde_json::Value::from(cents)))
+        .collect();
+    // 「有效会员」的判据和前端 active() 一致：有套餐、不是 none、且没过期。
+    let plan_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT plan, count(*) FROM users \
+         WHERE plan IS NOT NULL AND plan <> 'none' \
+           AND (plan_expires_at IS NULL OR plan_expires_at > now()) \
+         GROUP BY plan",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    let plan_mix: serde_json::Map<String, serde_json::Value> = plan_rows
+        .into_iter()
+        .map(|(plan, n)| (plan, serde_json::Value::from(n)))
+        .collect();
+
     Ok(Json(json!({
         "total_users": total,
         "today_users": today,
         "online": online_count(&state).await,
+        "paid_orders": paid_orders,
+        "revenue_cents": revenue,
+        "plan_mix": plan_mix,
     })))
 }
 
