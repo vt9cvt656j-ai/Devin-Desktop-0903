@@ -24941,6 +24941,36 @@ test("命令批次闸门真的接进了执行链——不是又一个零调用�
     "没接进去的话它就是个死函数，而测试照样全绿（本仓库反复踩的那个坑）");
 });
 
+test("写失败后重试成功的文件，不许再每轮告诉模型「它此刻不在磁盘上」", () => {
+  // run._writeLedger 顺序追加、整 run 不剪枝：写失败后重试成功的那条仍留在账上。
+  // 这里原来是 filter(a.ok === false)，于是补救成功之后**每一轮**还在说「没落盘」。
+  // 后果两种都难看：模型把刚写对的文件从头再整篇写一遍覆盖掉，或者收尾对用户说
+  // 「没能保存成功，请手动检查」——而文件好好躺在磁盘上。收尾门读同一本账，
+  // 用的一直是「按 path 取最后一条」，两个消费方的判据必须一致。
+  const facts = load("_deliveryFactsLine", {
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+      _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
+  });
+  const run = (ledger) => facts({
+    _mutatedFiles: new Set(["src/api/invoices.ts"]), _executionEvidence: [], _writeLedger: ledger,
+  });
+  // 第 3 轮 CONFLICT、第 5 轮重试成功 → 不该再报没落盘。
+  assert.doesNotMatch(
+    run([{ path: "src/api/invoices.ts", ok: false }, { path: "src/api/invoices.ts", ok: true }]),
+    /没有落盘/, "补救成功的文件仍被当成没落盘——模型会把它再整篇写一遍或者对用户谎报失败");
+  // 真的还没补救成功的，照样要报——别把这条守卫修成永远不报。
+  assert.match(
+    run([{ path: "src/api/invoices.ts", ok: true }, { path: "src/api/invoices.ts", ok: false }]),
+    /没有落盘/, "最后一次确实失败的，必须报出来");
+  assert.match(run([{ path: "src/api/invoices.ts", ok: false }]), /没有落盘/);
+});
+
 test("交付事实来自执行记录，不做任何推断", () => {
   const facts = load("_deliveryFactsLine", {
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),

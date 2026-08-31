@@ -45996,7 +45996,16 @@ function _deliveryFactsLine(run) {
   //
   // 只报**失败**的尝试：成功的那些本来就由下面的 mutated 计数覆盖，重复说只会占预算。
   const _attempts = Array.isArray(run?._writeLedger) ? run._writeLedger : [];
-  const _failed = [...new Set(_attempts.filter((a) => a && a.ok === false).map((a) => String(a.path || "")).filter(Boolean))];
+  // 按 path 取**最后一条**，不是 filter(ok === false)。账本顺序追加、整 run 不剪枝，
+  // 写失败后重试成功的那条仍留在账上——直接 filter 会把已经补救成功的也算成没落盘。
+  // 实测同一本账 [{invoices.ts,false},{invoices.ts,true}]：这里算出 1、收尾门算出 0。
+  // 后果不是少说一句，是**每一轮**都告诉模型「invoices.ts 此刻不在磁盘上，不要说它
+  // 已保存」——它要么把刚写对的文件从头再整篇写一遍覆盖掉，要么收尾对用户说「没能
+  // 保存成功，请手动检查」，而文件好好躺在磁盘上。收尾门（run._incompleteReason 那处）
+  // 早就是这个算法，两个消费方读同一本账，判据必须是同一个。
+  const _lastByPath = new Map();
+  for (const a of _attempts) if (a?.path) _lastByPath.set(String(a.path), a.ok);
+  const _failed = [..._lastByPath].filter(([, ok]) => !ok).map(([path]) => path).filter(Boolean);
   const _failedLine = _failed.length
     ? `有 ${_failed.length} 次写入**没有落盘**（${_failed.slice(0, 4).join("、")}${_failed.length > 4 ? " 等" : ""}）——这些文件此刻不在磁盘上，不要说它们已保存/已生成`
     : "";
