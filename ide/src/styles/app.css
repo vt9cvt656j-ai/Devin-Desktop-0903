@@ -15052,7 +15052,9 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {
   display: inline-flex; align-items: center; gap: 5px;
-  padding: 1px 7px 1px 5px; margin: 0 1px;
+  /* 左右各留 5px：光标落到片旁边时（按左/右键跨过来的那一下）原来只有 1px，
+     光标紧贴着片边，看着像粘在一起、分不清自己在片的哪一侧。 */
+  padding: 1px 7px 1px 5px; margin: 0 5px;
   vertical-align: baseline;
   font-size: .92em; font-weight: 500; line-height: 1.5;
   color: var(--accent);
