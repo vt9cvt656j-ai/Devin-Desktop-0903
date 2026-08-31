@@ -10,10 +10,10 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside, chipPadMove,
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
-import { load } from "./helpers/source.mjs";
+import { load, fnSource } from "./helpers/source.mjs";
 import { _mergeChatArchives as _mca } from "../src/agent/chat-archive.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -722,16 +722,58 @@ test("退格一次只删一个片，不能把整串都删了", () => {
   assert.match(h, /if \(!sel\?\.isCollapsed/, "有选区时不该接管");
 });
 
-test("光标用方向键跨到片旁边时，才在光标和片之间留一个空格", () => {
-  // 用户否掉了「插入片时就直接加空格」那版：「不是直接空格，而是我光标 我左键往左时候，
-  // 才会开始 光标右边空格」。只有光标真的停到片边上时才需要那点余地。
+test("跨过片时那一格空格跟着光标走：落位那侧垫上，离开那侧收回", () => {
+  // 用户的第二次修正：「光标往左边走时候，往右边减少一个空格；光标往右边走时候，往左边也
+  // 减少一个空格 不然的话 不好看 就很丑了」。只加不减 → 来回按会在片两侧各留一格。
+  const T = (v) => ({ nodeType: 3, nodeValue: v });
+  const pad = T(" ");
+  // 光标本在片右侧（上次往右跨留下的那一格），现在按左键跨回来。
+  let r = chipPadMove({ prev: T("看看"), next: pad, left: true, pad });
+  assert.equal(r.drop, pad, "往左跨没有收回右边那一格——两侧各留一个，越按越宽");
+  assert.equal(r.add, "left", "往左跨没有在光标和片之间垫上");
+  // 反向同理。
+  const pad2 = T(" ");
+  r = chipPadMove({ prev: pad2, next: T("在哪"), left: false, pad: pad2 });
+  assert.equal(r.drop, pad2, "往右跨没有收回左边那一格");
+  assert.equal(r.add, "right");
+});
+
+test("只收回自己垫的那一格：用户敲的空格不动", () => {
+  const T = (v) => ({ nodeType: 3, nodeValue: v });
+  const mine = T(" "), theirs = T(" ");
+  // 记着的是 mine，片右边挨着的却是另一个节点 → 那是别人的，不动。
+  assert.equal(chipPadMove({ prev: T("x"), next: theirs, left: true, pad: mine }).drop, null,
+    "把不是自己垫的那一格也删了——用户敲的空格会凭空消失");
+  // 自己垫的那一格后来被打了字，不再正好是一格 → 也不动。
+  const typed = T(" 哈");
+  assert.equal(chipPadMove({ prev: T("x"), next: typed, left: true, pad: typed }).drop, null,
+    "垫完又被打了字的那一格连同用户的字一起删了");
+  // 没记着任何一格时什么都不收。
+  assert.equal(chipPadMove({ prev: T("x"), next: theirs, left: true, pad: null }).drop, null);
+});
+
+test("落位那一侧已经贴着空格就不重复垫", () => {
+  const T = (v) => ({ nodeType: 3, nodeValue: v });
+  assert.equal(chipPadMove({ prev: T("看看 "), next: null, left: true }).add, null,
+    "重复按方向键会不断累积空格");
+  assert.equal(chipPadMove({ prev: null, next: T(" 在哪"), left: false }).add, null);
+  // 两个方向的判据不能写成同一个：往左看的是尾空格，往右看的是首空格。
+  assert.equal(chipPadMove({ prev: T(" 看看"), next: null, left: true }).add, "left");
+  assert.equal(chipPadMove({ prev: null, next: T("在哪 "), left: false }).add, "right");
+  // 旁边压根没有文本节点（片在最前 / 最后）时照垫。
+  assert.equal(chipPadMove({ prev: null, next: null, left: true }).add, "left");
+});
+
+test("main.js 照着 chipPadMove 的结论改 DOM，且只在方向键路径上", () => {
+  // 决策已经在模块里真跑过了，这里只钉「接上了」：DOM 那三行照做、pad 身份记在 _chipPad、
+  // 调用点在方向键处理器而不是插入路径。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
   assert.doesNotMatch(src, /_padChipNeighbours/, "插入时就垫空格那版应该已经撤掉了");
-  const fn = src.slice(src.indexOf("function _spaceBesideChip"), src.indexOf("function _makeComposerChip"));
-  assert.ok(fn, "找不到 _spaceBesideChip");
-  // 已经有空格就别再加，来回按不能越积越多。
-  assert.match(fn, /if \(has\) return;/, "重复按方向键会不断累积空格");
-  assert.match(fn, /left \? \/ \$\/\.test\(txt\) : \/\^ \/\.test\(txt\)/, "两个方向的判据要分开");
+  const fn = fnSource("_spaceBesideChip");
+  assert.ok(fn.includes("chipPadMove({ prev: chip.previousSibling, next: chip.nextSibling, left, pad: _chipPad })"),
+    "_spaceBesideChip 没有把两侧邻居和记着的那一格交给 chipPadMove");
+  assert.ok(fn.includes("if (drop) drop.parentNode.removeChild(drop)"), "算出要收回的那一格却没真删");
+  assert.match(fn, /_chipPad = sp;/, "垫进去的节点没记下来——下次跨回来就认不出是自己垫的了");
   // 只在方向键处理器里调用——不是插入路径。
   const arrow = src.slice(src.indexOf("// 左右方向键跨过内联的片"), src.indexOf("// 退格 / 删除也要自己接管"));
   assert.match(arrow, /_spaceBesideChip\(chip, left\)/, "方向键落位时没有留空格");

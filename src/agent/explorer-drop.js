@@ -250,3 +250,25 @@ export function chipBeside({ container, node, offset = 0, left = true, isChip } 
   return probe && probe.nodeType === 1 && isChip?.(probe) ? probe : null;
 }
 
+
+/**
+ * 光标用方向键跨过片时，那一个垫在「光标和片之间」的空格该怎么挪。
+ *
+ * 同一时刻只留**一个**：落到哪一侧就在哪一侧垫，光标离开的那一侧把上次垫的收回。
+ * 只加不减的话，来回按会在片两侧各留一格，两个片之间攒成两格，越按越宽 —— 用户的原话：
+ * 「光标往左边走时候，往右边减少一个空格；光标往右边走时候，往左边也减少一个空格。」
+ *
+ * 收回只认**自己垫的那个节点**（pad 按身份比对），而且它必须仍然正好是一个空格：用户自己
+ * 敲的空格、或者垫完又被打了字的那一格，都对不上，一律不动。
+ *
+ * 纯决策，不碰 DOM：返回 { drop, add }，drop 是要收回的节点（没有则 null），
+ * add 是 "left" | "right" | null，指相对片本身垫在哪一侧。
+ */
+export function chipPadMove({ prev = null, next = null, left = true, pad = null } = {}) {
+  const gone = left ? next : prev;                        // 光标离开的那一侧
+  const drop = pad && pad === gone && pad.nodeType === 3 && pad.nodeValue === " " ? pad : null;
+  const at = left ? prev : next;                          // 光标落到的那一侧
+  const txt = at && at.nodeType === 3 ? (at.nodeValue || "") : "";
+  const has = left ? / $/.test(txt) : /^ /.test(txt);     // 那一侧已经贴着空格了
+  return { drop, add: has ? null : left ? "left" : "right" };
+}
