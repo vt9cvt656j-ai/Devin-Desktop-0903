@@ -70228,7 +70228,11 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   if (key === "locale") {
     await setLocale(value);
     _saveAccountLanguage(value);
-    showToast(t("feature.settings.localeSwitched", { language: localeDisplayName(value, value) }));
+    // 编辑器那套菜单（右键、查找框、命令面板）是 Monaco 自己的文案，标题在它被 import 的
+    // 那一刻就定死了（见 src/monaco-nls.js），所以这一栏只能在下次启动时跟上。说清楚，
+    // 别让用户以为切换没生效。
+    showToast(t("feature.settings.localeSwitched", { language: localeDisplayName(value, value) })
+      + " · " + t("feature.settings.localeEditorRestart"));
     renderFeaturePanel();
     return;
   }
@@ -74948,10 +74952,11 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
       // MCP 不是"品牌"，没有 i-brand-mcp 这个符号；拼出来的名字找不到会静默渲染成空白。
       : kind === "mcp"
         ? iconSvg("i-mcp", "ic--doc")
-      // 拖进来的一段代码。同样不能走 `i-brand-<kind>`：没有 i-brand-code 这个符号，
-      // 找不到会静默渲染成空白（这个仓库为此付过账）。
+      // 拖进来的一段代码：用**这个文件真正的图标**，和上面 file 那支一样。
+      // 图标要从 rel 算，不能从 name 算 —— code 片的 name 是「quota.py:275-284」，
+      // 带着行号去查扩展名会落到兜底图标上。
       : kind === "code"
-        ? iconSvg("i-code", "ic--doc")
+        ? iconImg(fileIconUrl(rel.split("/").filter(Boolean).pop() || rel))
         : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
