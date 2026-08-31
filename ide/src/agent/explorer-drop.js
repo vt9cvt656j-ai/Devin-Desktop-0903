@@ -82,11 +82,11 @@ export function rootDropQuestion({ dirs = [], destDir = "", rootPath = "" } = {}
   const what = n > 1 ? `${n} 个文件夹` : `「${baseName(dirs[0] || "")}」`;
   const here = baseName(destDir) || "项目根目录";
   const cur = baseName(rootPath) || "当前项目";
-  // 一句话就够。VS Code 的原文也只有一句（"Do you want to copy 'X' or add 'X' as a folder
-  // to the workspace?"）——把每个按钮都解释一遍，反而让人不知道该点哪个。
+  // 一句话就够。VS Code 的原文也只有一句——把每个按钮都解释一遍，反而让人不知道该点哪个。
+  void here;
   return {
     title: `${what}要怎么加进来？`,
-    message: `复制进「${here}」，还是作为另一个根目录加进工作区？（也可以直接打开它，那会关掉当前的「${cur}」）`,
+    message: `打开为新项目会关掉当前的「${cur}」；添加到工作区则是当前项目继续开着，多一个根目录。`,
   };
 }
 
