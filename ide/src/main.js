@@ -214,9 +214,9 @@ import { getCollaborationEngine } from "./agent/collaboration-engine.js";
 import { escapeAttr as _escAttr, escapeHtml as _escHtml, setBadgeText as _setBadge } from "./agent/escape.js";
 import { approvalLabel } from "./agent/approval-label.js";
 import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
-import { langBadge as _langBadge } from "./agent/language.js";
+import { langBadge as _langBadge, languageIdForPath as _languageIdForPath } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
-import { selectionLabel as _selectionLabel, selectionText as _selectionText } from "./agent/selection-drag.js";
+import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
@@ -2732,7 +2732,12 @@ const monacoEditor = monaco.editor.create(editorEl, {
   mouseWheelScrollSensitivity: 1,
   renderValidationDecorations: "on",
   unfoldOnClickAfterEndOfLine: true,
-  definitionLinkOpensInPeek: true,
+  // ⌘/Ctrl + 单击直接**跳过去**，不弹 Peek 浮层——用户要的是 VS Code 那个手感
+  // （「类似与 vscode 中的 Ctrl+鼠标左键」）。true 的意思是"这个鼠标手势永远只开 Peek"，
+  // 于是点了半天页面不动，看着就像没有跳转功能。跨文件跳转本来就通：下面注册了
+  // registerEditorOpener，把目标文件接进我们自己的页签系统。
+  // 命中多个定义时仍然走 Peek（见下面的 gotoLocation），那和 VS Code 一致。
+  definitionLinkOpensInPeek: false,
   gotoLocation: { multiple: "peek", multipleDefinitions: "peek", multipleDeclarations: "peek", multipleImplementations: "peek", multipleTypeDefinitions: "peek", multipleReferences: "peek" },
   colorDecorators: true,
   folding: true, // 启用代码折叠
@@ -22234,6 +22239,17 @@ function _renderMentionsToHtml(text) {
     const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
     // 带前缀的引用（@github:owner/repo 等）不是本地路径。发送后消息里只剩纯文本，而下面
     // 那条判据只按"有没有扩展名"猜文件/文件夹 —— 仓库会被画成文件夹图标、名字还被截尾。
+    // 从编辑器拖进来的那一段代码：气泡里也画成一枚片（和输入框里那枚一模一样），
+    // 而不是把整段代码摊在消息里。图标用这个文件真正的图标，标签是「文件名:起-止」。
+    const code = _parseSelectionToken(rel);
+    if (code) {
+      const name = code.rel.split("/").filter(Boolean).pop() || code.rel;
+      const label = _selectionLabel(code.rel, code.startLine, code.endLine);
+      out += `<span class="msg-mention msg-mention--code" data-rel="${relAttr}" data-kind="code" title="${relAttr}">`
+        + `${iconImg(fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(label)}</span></span>`;
+      last = re.lastIndex;
+      continue;
+    }
     const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
@@ -30049,7 +30065,7 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
   // element: 是预览里选中的那个 DOM 元素，详情存在 _previewPicked 里，不是磁盘上的路径。
   // 不加进这张表的话，下面 _mentioned 会拿它去 readTextFile/readDir，两次都抛、被静默
   // 吞掉，还白占一个 @ 名额。
-  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element):/i;
+  const _REMOTE_AT = /^(github|gitlab|gitee|codeberg|model|element|code):/i;
   const _mentionedAll = [...text.matchAll(/(?:^|\s)@([^\s]+)/g)].map((m) => m[1]);
   const _mentioned = _mentionedAll.filter((v) => !_REMOTE_AT.test(v));
 
@@ -30189,6 +30205,32 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
       } catch { /* unreadable — skip */ }
     }
     if (_atOmitted > 0) _atContext += `\n\n（另有 ${_atOmitted} 个 @file/@dir 内容因本轮上下文预算未内联；需要时用 read_file / list_dir 精准读取。）`;
+  }
+
+  /*
+   * `@code:<相对路径>#<起>-<止>` → 用户从编辑器里拖进来的那一段代码。
+   *
+   * 和 @element / @文件 同一个道理：他已经指着这段说话了，正确的工具调用数是 0。
+   * 输入框和历史里只留这个短记号（气泡里渲染成一枚片），代码在这里按行号从磁盘取回来。
+   *
+   * 不另存快照是有意的：路径 + 行号就够把那几行拿回来，而且拿到的是**当前**的内容——
+   * 用户拖完又改了这个文件时，给模型看改后的才对。代价是他改动之后行号可能已经飘了，
+   * 这一点和 @文件 引用同源，没有更好的解。
+   */
+  for (const tok of [...text.matchAll(/(?:^|\s)(@code:[^\s]+)/g)]
+    .map((m) => m[1]).filter((v, i, a) => a.indexOf(v) === i).slice(0, 6)) {
+    const ref = _parseSelectionToken(tok);
+    if (!ref || !_contextRoot) continue;
+    try {
+      const fp = ref.rel.startsWith("/") ? ref.rel : _contextRoot.replace(/\/$/, "") + "/" + ref.rel.replace(/^\.?\//, "");
+      const code = _sliceLines(await backend.readTextFile(fp), ref.startLine, ref.endLine);
+      if (code.trim()) {
+        _atContext += _selectionText({
+          rel: ref.rel, lang: _languageIdForPath(ref.rel),
+          startLine: ref.startLine, endLine: ref.endLine, code,
+        });
+      }
+    } catch { /* 文件没了 / 读不了：记号照样留在正文里，模型知道用户指的是哪几行 */ }
   }
   // Per-turn DYNAMIC context lives HERE (end of the message list), not in the
   // system prompt — so it never invalidates the cached static prefix above. Only
@@ -74901,10 +74943,10 @@ async function _voiceStart(btn) {
 function _chipText(chip) {
   const kind = chip?.dataset?.kind || "file";
   const rel = chip?.dataset?.rel || "";
-  // 从编辑器拖进来的那一段代码：片上只显示「文件名:起-止」，发送时展开成带出处的代码块。
-  // 它不是 @ 引用——@ 引用是"去把这个文件读进来"，而这段代码用户已经**指定**了，
-  // 正文直接带着走，不必再让 _atContext 去读一遍整个文件。
-  if (kind === "code") return chip?.dataset?.text || "";
+  // 从编辑器拖进来的那一段代码。序列化成短记号 `@code:路径#起-止`，两侧留空格让提及扫描认得出。
+  // 可见文本和历史里只留这个记号（气泡里因此也是一枚片），真正的几行代码在发送期展开进
+  // 上下文——和 @element: 完全同一条路子。
+  if (kind === "code") return " " + (chip?.dataset?.text || "") + " ";
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
@@ -75483,8 +75525,11 @@ async function _moveIntoDir(paths, destDir) {
     clear();
     if (!hit) return;
     try { window.getSelection().removeAllRanges(); } catch {}
+    // 片带的是**短记号**（@code:路径#起-止），不是整段代码：这样发出去的气泡里也是一枚片，
+    // 而不是一大坨代码（用户：「发出去的内容也要是组件囊」）。代码在发送期按这个记号从磁盘
+    // 取回来，和 @element: 那条同一个路子。
     _insertRefAtCursor(c.rel, "code", _selectionLabel(c.rel, c.a, c.b),
-      _selectionText({ rel: c.rel, lang: c.lang, startLine: c.a, endLine: c.b, code: c.code }));
+      _selectionToken(c.rel, c.a, c.b));
   });
 })();
 
