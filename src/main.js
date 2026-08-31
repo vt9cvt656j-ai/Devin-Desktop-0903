@@ -488,6 +488,10 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   backend.createFile = (p) => _remote.active ? _remoteCall("/fs/write", { path: p, expected_content: null, content: "" }) : _local.createFile(p);
   backend.createDir = (p) => _remote.active ? _remoteCall("/fs/mkdir", { path: p }) : _local.createDir(p);
   backend.copyPath = (from, to) => _remote.active ? _remoteCall("/fs/copy", { from, to }) : _local.copyPath(from, to);
+  // 远程/网页壳没有这两个原生命令：类型探测退回「读得动就是目录」，导入退回普通复制。
+  backend.pathKinds = (paths) => (_local.pathKinds ? _local.pathKinds(paths)
+    : Promise.all((paths || []).map((p) => backend.readDir(p).then(() => 2).catch(() => 1))));
+  backend.importPath = (from, to) => (_local.importPath ? _local.importPath(from, to) : backend.copyPath(from, to));
   backend.renamePath = (from, to) => _remote.active ? _remoteCall("/fs/rename", { from, to }) : _local.renamePath(from, to);
   backend.deletePath = (p) => _remote.active ? _remoteCall("/fs/delete", { path: p }) : _local.deletePath(p);
   backend.searchInProject = (root, query, cs, mode = "literal") => _remote.active
@@ -649,6 +653,10 @@ async function tauriBackend() {
     createFile: (path) => core.invoke("create_file", { path }),
     createDir: (path) => core.invoke("create_dir", { path }),
     copyPath: (from, to) => core.invoke("copy_path", { from, to }),
+    // 拖放导入专用：pathKinds 是 O(1) 的 stat（不像 read_dir 要枚举整个目录），
+    // importPath 允许源在工作区外（用户拖进来的东西按定义就在外面），写入侧照旧受限。
+    pathKinds: (paths) => core.invoke("path_kinds", { paths }),
+    importPath: (from, to) => core.invoke("import_path", { from, to }),
     renamePath: (from, to) => core.invoke("rename_path", { from, to }),
     deletePath: (path) => core.invoke("delete_path", { path }),
     searchInProject: async (root, query, caseSensitive, mode = "literal") => {
@@ -80357,11 +80365,12 @@ function _pathToRefArg(abs) {
 // 文件夹拖进它自己，都在 explorer-drop 模块里算好；这里只管读目录、逐条复制、刷新树。
 async function _copyIntoWorkspace(paths, destDir) {
   if (!destDir) return;
-  const items = [];
-  for (const p of paths) {
-    const abs = _toPosix(p);
-    items.push({ path: abs, isDir: await backend.readDir(abs).then(() => true).catch(() => false) });
-  }
+  // 类型探测走 pathKinds（一次 stat），不要再借 readDir：readDir 会枚举整个目录，
+  // 拖一个大文件夹进来光探测就是几秒卡顿；而且它要求路径在工作区内，
+  // 从 /Volumes 或 /Applications 拖进来的文件夹会被一路误判成文件。
+  const abs = paths.map((p) => _toPosix(p));
+  const kinds = await backend.pathKinds(abs).catch(() => abs.map(() => 1));
+  const items = abs.map((path, i) => ({ path, isDir: kinds[i] === 2 }));
   // 文件夹落在**项目根**上 → 先问，别默默复制。VS Code 在这一刻就是弹框问的：
   // "Do you want to copy 'X' or add 'X' as a folder to the workspace?"
   // 我们把次选项换成「打开为新项目」——用户原来就是靠拖到侧栏换项目的，改成复制之后
@@ -80390,7 +80399,10 @@ async function _copyIntoWorkspace(paths, destDir) {
   const { copies, skipped } = planExplorerDrop({ items, destDir, existingNames });
   let done = 0; let failed = "";
   for (const c of copies) {
-    try { await backend.copyPath(c.from, c.to); done++; } catch (e) { failed = String(e?.message || e); }
+    // importPath 而不是 copyPath：copyPath 要求**源**也在工作区内，而拖进来的东西
+    // 按定义就在外面——用户看到的「access denied: path ... is outside all workspace
+    // roots」就是它。写入侧的边界没松，仍然只能落进已打开的工作区根。
+    try { await backend.importPath(c.from, c.to); done++; } catch (e) { failed = String(e?.message || e); }
   }
   if (done) {
     if (workspaceRoots.includes(destDir)) collapsedWorkspaceRoots.delete(destDir);
@@ -80427,8 +80439,9 @@ async function _handleDrop(paths, target, payload) {
     }
     try { promptEl.focus(); } catch {}
   } else {
-    const kinds = [];
-    for (const p of paths) kinds.push({ p, isDir: await backend.readDir(p).then(() => true).catch(() => false) });
+    // 同上：一次 stat，别拿 readDir 当类型探针（贵，且对工作区外的路径一律失败）。
+    const _k = await backend.pathKinds(paths).catch(() => paths.map(() => 1));
+    const kinds = paths.map((p, i) => ({ p, isDir: _k[i] === 2 }));
     const dirs = kinds.filter((x) => x.isDir).map((x) => x.p);
     // 多个文件夹时原来是逐个 openFolder —— 后一个把前一个换掉，最后只剩一个，前面的静默丢失。
     // VS Code 在这里是：1 个 → 打开它；多个 → 建成多根工作区（createAndEnterWorkspace）。
@@ -80474,9 +80487,8 @@ if (inTauri) {
       _dragItems = paths.map((p) => ({ path: _toPosix(p), isDir: false }));
       _showDrop(_dragTargetAt(e.payload), e.payload);
       // is_dir 要问后端，异步；先按文件画，探完再补一次。
-      const probed = await Promise.all(paths.map(async (p) => ({
-        path: _toPosix(p), isDir: await backend.readDir(p).then(() => true).catch(() => false),
-      })));
+      const _kinds = await backend.pathKinds(paths).catch(() => paths.map(() => 1));
+      const probed = paths.map((p, i) => ({ path: _toPosix(p), isDir: _kinds[i] === 2 }));
       if (_dragItems.length) _dragItems = probed;
     });
     listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload), e.payload));
