@@ -546,18 +546,6 @@ test("内联实体片跟随主题，不再写死 Google 蓝", () => {
   }
 });
 
-test("蓝气泡上的实体片要用实心白底，不能是半透明白", () => {
-  // 用户那条消息的气泡本身就是 accent 渐变。原来在上面铺 22% 的半透明白 —— 蓝上加淡蓝，
-  // 对比很弱，那枚片几乎糊在气泡里（用户实拍）。实心白底 + 强调色字才立得住。
-  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
-  const i = css.indexOf(".msg.user .msg-mention, .msg__body .msg-mention {");
-  const blk = css.slice(i, css.indexOf("}", i));
-  assert.ok(i > 0, "找不到气泡上的覆盖规则");
-  assert.match(blk, /background: #fff;/, "气泡上的片还是半透明白，糊在气泡里");
-  assert.match(blk, /color: var\(--accent-solid\)/, "白底上的字没有用强调色");
-  assert.doesNotMatch(blk, /rgba\(255, 255, 255, 0\.22\)/, "又回到半透明白了");
-});
-
 test("深色覆盖不许再盖住实体片", () => {
   // 那条 [data-theme=dark] 覆盖原本把 .composer-chip 和气泡上的 .msg-mention 一起改成
   // 淡蓝底——前者已经走令牌不需要覆盖，后者盖上去就又糊回蓝上加蓝了。
@@ -566,6 +554,38 @@ test("深色覆盖不许再盖住实体片", () => {
   assert.doesNotMatch(css, /\[data-theme="dark"\] \.msg__body \.msg-mention/, "深色又硬覆盖气泡上的片了");
   // 拖拽幽灵是写死的浅色卡片，那条覆盖要留着。
   assert.match(css, /\[data-theme="dark"\] \.row-drag-ghost/, "拖拽幽灵的深色覆盖被误删了");
+});
+
+test("发出去之后 @github:owner/repo 仍然是 GitHub 图标和全名", () => {
+  // 用户实拍：输入框里那枚是对的（GitHub 图标 + owner/repo），发出去之后变成**文件夹图标**、
+  // 名字还被截成 `ThesisX`。根因是消息端只按"有没有扩展名"猜文件/文件夹——发送后消息里
+  // 只剩纯文本 `@github:owner/repo`，带前缀的引用根本不是本地路径。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("function _renderMentionsToHtml"), src.indexOf("function _renderMentionsToHtml") + 2200);
+  assert.match(fn, /\^\(github\|gitlab\|mcp\):/, "消息端没有识别带前缀的引用");
+  assert.match(fn, /iconSvg\(`i-brand-\$\{kind\}`/, "没有用品牌图标");
+  assert.match(fn, /const shown = pfx\[2\]/, "仓库名被截了——owner/repo 要显示全名");
+  // 本地文件那条老路要留着
+  assert.match(fn, /folderIconUrl\(name, false\) : fileIconUrl\(name\)/, "本地文件/文件夹的图标丢了");
+
+  // 品牌图标符号必须真实存在，否则 <use> 会静默渲染成空白
+  const html = readFileSync(join(HERE, "..", "index.html"), "utf8");
+  for (const id of ["i-brand-github", "i-brand-gitlab"]) {
+    assert.ok(html.includes(`id="${id}"`), `图标符号 ${id} 不存在——<use> 会静默渲染成空白`);
+  }
+});
+
+test("蓝气泡上的片不能是纯白块", () => {
+  // 用户：「样式也丑 还是纯白的」。白底对比够但等于在气泡上挖个洞。
+  // 改成比气泡更深的一层 + 白字：片仍待在蓝色世界里，观感是"凹进去"而不是异物。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  const i = css.indexOf(".msg.user .msg-mention, .msg__body .msg-mention {");
+  const blk = css.slice(i, css.indexOf("}", i));
+  assert.ok(i > 0, "找不到气泡上的覆盖规则");
+  assert.doesNotMatch(blk, /background: #fff;/, "又变回纯白块了");
+  assert.doesNotMatch(blk, /rgba\(255, 255, 255, 0\.22\)/, "也不能回到半透明白（糊在气泡里）");
+  assert.match(blk, /background: rgba\(0, 0, 0, \.22\)/, "气泡上的片应当是压深的一层");
+  assert.match(blk, /color: #fff;/, "深底上的字要白");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

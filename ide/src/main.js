@@ -22233,9 +22233,22 @@ function _renderMentionsToHtml(text) {
   while ((m = re.exec(text))) {
     out += _escHtmlLite(text.slice(last, m.index + m[1].length));
     const rel = m[2];
+    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    // 带前缀的引用（@github:owner/repo、@gitlab:…、@mcp:…）不是本地路径：
+    // 发送之后消息里只剩纯文本，而这里原本只按"有没有扩展名"猜文件/文件夹，于是一个 GitHub
+    // 仓库被画成文件夹图标、名字还被截成最后一段（用户实拍：`ThesisX` 配一个文件夹图标）。
+    const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
+    if (pfx) {
+      const kind = pfx[1];
+      const shown = pfx[2];                       // 仓库要显示 owner/repo 全名，不截尾
+      const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
+      out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
+        + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
+      last = re.lastIndex;
+      continue;
+    }
     const name = rel.split("/").filter(Boolean).pop() || rel;
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name); // heuristic: no extension → folder
-    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
     out += `<span class="msg-mention" data-rel="${relAttr}" data-dir="${isDir ? 1 : 0}" title="${relAttr}">`
       + `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(name)}</span></span>`;
     last = re.lastIndex;
