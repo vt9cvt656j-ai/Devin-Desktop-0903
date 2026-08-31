@@ -9384,7 +9384,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   bottom: auto;
   left: 0;
   top: 0;
-  min-width: 176px;
+  min-width: 148px;
   padding: 4px;
   border-radius: 10px;
   animation: menu-in-down 0.12s ease both;
@@ -9394,8 +9394,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 /* 右键菜单压矮。Cursor / Windsurf 的上下文菜单行高都在 25px 上下，密而不挤；
    这里原本是 6px 上下内边距 + 13px 字，条目一多整张菜单就显得笨重。 */
 .ctx-menu .menu__item {
-  gap: 9px;
-  padding: 3px 9px;
+  gap: 8px;
+  padding: 3px 8px;
   min-height: 25px;
   font-size: 12.5px;
   border-radius: 6px;
@@ -14868,6 +14868,10 @@ textarea.settings-input {
 /* 落点是项目根：整棵树一起亮（VS Code 在没有具体目标行时把 drop-target 加在列表本身）。
    空项目里只有一行根行，不整块亮的话，在一大片空白上拖动完全看不到反馈。 */
 #tree.is-drop-root { background: var(--drop-bg); }
+/* 右键菜单开着时，被右键的那一行要标出来——否则菜单浮在旁边，用户不知道自己正在操作
+   哪一项，而「删除」是不可逆的。比 hover 重一点，但不用 accent，免得和「当前打开的
+   文件」(.row.is-active) 混淆。 */
+#tree .row.is-ctx-target::before { background: var(--active); }
 /* .row::before 平时有 0.1s 背景过渡；VS Code 的 drop-target 没有任何过渡，而子树整块
    满染叠上过渡后，快速划过会拖出一条渐变尾巴。拖放期间关掉。 */
 #tree.is-dropping .row::before { transition: none; }
