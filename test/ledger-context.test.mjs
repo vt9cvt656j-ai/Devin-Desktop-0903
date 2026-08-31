@@ -417,3 +417,29 @@ test("工具结果截断要掐中间，不能把末尾的根因砍掉", async ()
     .split("\n").find((l) => l.startsWith("[user]")) || "";
   assert.ok(!userLine.includes("…"), "用户正文不该掐中间");
 });
+
+test("归档的工具结果也要掐中间——否则 recall 连搜都搜不到", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  // 归档不是"留个念想"：searchArchive 就在这段文本上做关键词检索。从头截断同时毁掉
+  // 两件事——回忆到的内容缺结论，以及**只出现在尾部的关键词整条搜不到**。
+  // 这条 npm 输出修之前归档成 700 字满屏 PASS，末尾那行 FAIL 被砍掉：模型事后回忆
+  // 「ECONNREFUSED」拿到 0 条，而 0 条读起来是"这事没发生过"，于是当成测试全过了。
+  const noise = "npm test 输出：" + "PASS test/foo.test.mjs 全部通过。".repeat(60);
+  const toolResult = noise + " FAIL: Error: ECONNREFUSED 127.0.0.1:8090 网关没起来";
+  m.push({ role: "user", content: "跑一下测试" });
+  m.push({ role: "assistant", content: "好", tool_calls: [{ id: "t1", type: "function", function: { name: "run_cmd", arguments: "{}" } }] });
+  m.push({ role: "tool", tool_call_id: "t1", content: toolResult });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `后续第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+
+  const archived = m.archive.find((e) => e.role === "tool");
+  assert.ok(archived, "工具结果压根没进归档");
+  assert.ok(/ECONNREFUSED/.test(archived.text), "末尾的 FAIL 被砍掉了——归档里只剩满屏 PASS，主动误导");
+  assert.ok(/npm test/.test(archived.text), "开头也要在：得知道这条是什么");
+  assert.ok(archived.text.length <= 700, `归档条目涨到 ${archived.text.length} 字符，预算失守`);
+  // 真正的后果面：模型事后回忆搜得到。
+  assert.equal(m.searchArchive("ECONNREFUSED").length, 1, "recall 搜不到 → 模型以为这事没发生过");
+  assert.equal(m.searchArchive("网关没起来").length, 1, "尾部的中文关键词同样要能搜到");
+});

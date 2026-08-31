@@ -37,6 +37,23 @@ function cleanCorrectionText(value, max = CORRECTION_TEXT_MAX) {
 }
 
 /**
+ * 掐中间的截断：头 55% + 尾 45%，预算不变。
+ *
+ * 工具结果的价值密度在**两头**：开头是它做了什么，结尾是结论（报错、根因、
+ * "3 failing"）。从头截断只留开头，等于把结论扔掉、把噪音留下——一段
+ * "PASS…PASS…FAIL: ECONNREFUSED" 截到 700 字就只剩满屏 PASS，读起来是"全都过了"。
+ * 这是**主动误导**，比不记还糟。本文件 _mergeSummaries 早就是头+尾（0.6/0.35），
+ * 这里两个调用点跟上，别再一边掐中间一边掐尾巴。
+ */
+function cleanEnds(value, max) {
+  const one = String(value || '').replace(/\s+/g, ' ').trim();
+  if (one.length <= max) return one;
+  const head = Math.max(1, Math.floor(max * 0.55));
+  const tail = Math.max(1, max - head - 3);
+  return `${one.slice(0, head)}…${one.slice(-tail)}`;
+}
+
+/**
  * Extract only high-confidence, explicit replacements. General complaints such
  * as "still slow" deliberately do not create a factual correction.
  */
@@ -485,7 +502,11 @@ export class ConversationMemory {
         if (names) text = (text ? text + ' ' : '') + `[调用工具: ${names}]`;
       }
       if (!text) continue;
-      this.archive.push({ turn: startTurn + i, role, text: text.slice(0, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
+      // 归档不只是"留个念想"：searchArchive 就是在这段文本上做关键词检索的。
+      // 从头截断会同时毁掉两件事——回忆起来的内容缺了结论，以及**只出现在尾部的
+      // 关键词整条搜不到**。模型 recall 一次拿到 0 条，读到的是"这事没发生过"
+      // （失败和不存在同一个值），于是从头再来一遍。
+      this.archive.push({ turn: startTurn + i, role, text: cleanEnds(text, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
     }
     if (this.archive.length > MAX_ARCHIVE) this.archive.splice(0, this.archive.length - MAX_ARCHIVE);
   }
@@ -866,13 +887,6 @@ export class ConversationMemory {
     // 5433」被截掉了。于是压缩之后模型知道"连不上库"，却不知道自己上一轮已经查出为什么，
     // 只能从头再查一遍——这正是「跑久了变蠢」。
     // 预算不变（还是 max），只是改成头 55% + 尾 45%，中间用 … 标出来。
-    const cleanEnds = (value, max) => {
-      const one = String(value || "").replace(/\s+/g, " ").trim();
-      if (one.length <= max) return one;
-      const head = Math.max(1, Math.floor(max * 0.55));
-      const tail = Math.max(1, max - head - 3);
-      return `${one.slice(0, head)}…${one.slice(-tail)}`;
-    };
     for (const msg of batch) {
       if (msg.tool_calls) for (const tc of msg.tool_calls) {
         const n = tc.function?.name;
