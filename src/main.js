@@ -7994,7 +7994,13 @@ async function _mpmLoadLive(key, force = false) {
       const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY TABLE_NAME", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: String(r?.[1] || "").toUpperCase().includes("VIEW") ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
     } else if (conn.driver === "postgres") {
-      const out = await backend.invoke("db_query", { driver: "postgres", url: conn.url, query: "SELECT c.relname, CASE WHEN c.relkind IN ('v','m') THEN 'view' ELSE 'table' END, GREATEST(c.reltuples::bigint, 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m') ORDER BY c.relname", limit: 2000 });
+      // reltuples 是**规划器估算**，而且 PG 用 **-1 表示"从没 ANALYZE 过、我不知道"**。
+      // 原来这里写的是 GREATEST(reltuples, 0)：把那个"不知道"哨兵变成一个笃定的 0——
+      // 于是一个刚建好、有真实数据但还没被 autovacuum 分析过的库，整屏表全显示「0 行」。
+      // （实测 PG16：七张表真实行数 1/20/2/2…，面板全是 0。）
+      // NULLIF(...,-1) 让"不知道"如实变成 null，UI 那边本来就把 null 画成「—」。
+      // 仍然不改成 count(*)：那在大表上会把这个面板卡死；估算值配「—」区分未知，是诚实的折中。
+      const out = await backend.invoke("db_query", { driver: "postgres", url: conn.url, query: "SELECT c.relname, CASE WHEN c.relkind IN ('v','m') THEN 'view' ELSE 'table' END, NULLIF(c.reltuples::bigint, -1) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m') ORDER BY c.relname", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: r?.[1] === "view" ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
     } else if (conn.driver === "mssql") {
       const out = await backend.invoke("db_query", { driver: "mssql", url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_NAME", limit: 2000 });
@@ -15744,7 +15750,6 @@ async function showProfile() {
   const usd = (c) => _dispUsd(c); // 统一额度币值，分母由网关下发（默认 663 原始美分 = $1.00）
   const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const planNames = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
-  const planTotals = { trial: 5000, basic: 33000, pro: 65000, power: 180000, ultra: 500000 };
   const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
   const fmtT = (t) => { if (!t) return "—"; const d = new Date(t); return isNaN(d) ? "—" : d.toLocaleString("zh-CN", { hour12: false }); };
   // The dashboard's name fields are the account's own name; the email is the fallback identity
@@ -15807,9 +15812,11 @@ async function showProfile() {
     : `<span class="pf-plan pf-plan--off">未开通会员</span>`;
   const countryBadge = `<span class="pf-loc" title="${esc2(country.name)} (${esc2(country.code)})">${esc2(country.flag)} ${esc2(country.name)}</span>`;
   // metric row with animated progress bar. wallet=true → green bar (uncapped, show full).
+  // p 传 null = **没有可信的分母，就别画条**。画一根按编出来的分母算的进度条，比不画更糟：
+  // 用户会拿它当事实读。见下面「总额度」那一行。
   const metric = (label, valText, p, sub, wallet) =>
     `<div class="pf-row"><div class="pf-rl"><span class="l">${label}</span><span class="v">${valText}</span></div>` +
-    `<div class="pf-bar${wallet ? " w" : ""}"><i data-pct="${p}"></i></div>` +
+    (p == null ? "" : `<div class="pf-bar${wallet ? " w" : ""}"><i data-pct="${p}"></i></div>`) +
     (sub ? `<div class="pf-sub">${esc2(sub)}</div>` : "") + `</div>`;
 
   const weeklyTxt = (u.quota_weekly_cap_cents > 0) ? usd(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents)) : "无上限";
@@ -15830,7 +15837,14 @@ async function showProfile() {
     <div class="pf-body">
       ${metric("小时额度", usd(u.quota_window_cents), pct(u.quota_window_cents, u.quota_window_cap_cents), "每 30 分钟刷新 · 下次 " + fmtT(u.quota_window_reset_at), false)}
       ${metric("周额度", weeklyTxt, u.quota_weekly_cap_cents > 0 ? pct(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents), u.quota_weekly_cap_cents) : 100, u.quota_weekly_cap_cents > 0 ? ("本周已用 " + usd(u.quota_week_used_cents)) : "本套餐无周上限", false)}
-      ${metric("总额度", usd(u.quota_total_cents), pct(u.quota_total_cents, planTotals[u.plan] || u.quota_total_cents || 1), active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "未开通会员", false)}
+      ${/* 这一行原来拿客户端写死的 planTotals 当分母。价目表 2026Q3 调过，而这张表没跟着改——
+           于是刚买完套餐的用户一打开就看到 77.3%（power）/ 66.3%（trial），像已经花掉了一截。
+           真分母在服务端（plan_quotas 表 / settings.rs 的 plan_spec），客户端拿不到，
+           而 User 是 sqlx::FromRow 结构体、加字段要动一批 SELECT，属于单独一笔。
+           在拿到真分母之前**不画这根条**：余额数字本身是真的（服务端下发），
+           一根按错分母算出来的进度条只会让人把假的当真的读。
+           旁边「小时额度」「周额度」的分母都是服务端真下发的 cap，那两根照画。 */ ""}
+      ${metric("总额度", usd(u.quota_total_cents), null, active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "未开通会员", false)}
       ${metric("钱包额度", usd(u.credits_cents), 100, "不受套餐限制 · 随时可用" + (active ? "（会员额度用尽后启用）" : ""), true)}
       ${_freePointsMetric(metric, usd, u)}
       ${_referralRow()}
@@ -51838,11 +51852,21 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
     if (_text == null) return null;
     const j = _safeJsonLoose(_text);
     if (!j || !Array.isArray(j.tools)) return null;
-    const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, 10).map((schema) => schema.function.name);
+    // 真正的裁剪就在这一行。两件事必须在这里做，下游做不到：
+    //  ① 弱模型的窗口上限（8）要在**这里**生效。原来它写在下游 `routeToolNames.length > 10`
+    //     那道分支里，而那时候列表已经被这一行裁到 ≤10 —— 实测喂 3/8/10/14/20/40 个候选，
+    //     那条分支六次全为 false，弱模型窗口从来没有收窄过，_isWeakModel 的唯一消费点因此空转。
+    //  ② 「被裁过」这件事要在这里记账。下游那条 note 同理够不着：它比较的是裁后的长度，
+    //     恒等，于是模型选了 40 个、被静默丢掉 30 个，也一个字都不会说。
+    const _toolCap = _isWeakModel(config?.model) ? 8 : 10;
+    const _picked = Array.isArray(j.tools) ? j.tools.length : 0;
+    const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, _toolCap).map((schema) => schema.function.name);
+    const dropped = Math.max(0, _picked - tools.length);
     // 工具规划思考链：兼容 thought/thought_process/plan_step 三种字段名（弱模型可能不按
     // 格式出）；只在 UI 层可视化 + 随工具结果回传，不进 system prompt 缓存。
     const thought = String(j.thought || j.thought_process || j.plan_step || "").slice(0, 1500);
-    return { tools, instruction: String(j.instruction || "").slice(0, 800), thought, reason: String(j.reason || "").slice(0, 300) };
+    return { tools, dropped, picked: _picked, cap: _toolCap,
+      instruction: String(j.instruction || "").slice(0, 800), thought, reason: String(j.reason || "").slice(0, 300) };
   } catch { return null; }
 }
 
@@ -52891,24 +52915,18 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     
     
     // Weak model tool window convergence: attention budget limited, only load top 8 from >10;
-    // strong models not restricted. Named/preferred tools are preserved via stabilization.
-    if (routeToolNames.length > 10 && _isWeakModel(config?.model)) {
-      // 这里原来先过一遍 _prioritizeNamedTools 再切 8 个。那个函数是**恒等变换**：
-      // 它按 `s.function?.name` 取名，而传进去的 routeToolNames 是**字符串数组**——
-      // 于是 allToolNames 恒为空集，三条加名的路（decision.tools / instruction 子串 /
-      // probePreloads）全都命不中，`if (!namedNames.size) return schemas` 原样返回。
-      // 把类型改对之后对同一批输入跑 slice(0,8) 结果逐字节相同（稳定排序 + named 分区
-      // 覆盖除注入外的全部元素），所以修它没有任何行为差异——删掉。
-      routeToolNames = routeToolNames.slice(0, 8);
-      orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
+    // 弱模型的 8 工具窗口**已挪到 _semanticToolOrchestrator 里真正裁剪的那一行**。
+    // 原来它写在这儿、判据是 `routeToolNames.length > 10`——而那时列表已经被上游裁到 ≤10，
+    // 实测喂 3/8/10/14/20/40 个候选，这条分支六次全为 false：弱模型窗口从来没收窄过，
+    // _isWeakModel 的唯一消费点空转，那本每轮都在写的模型能力账本因此只写不读。
+    //
+    // 「被裁过」这件事同理只有上游说得出：下游比较的是**裁后**的长度，恒等于自己，
+    // 于是模型选了 40 个、被静默丢掉 30 个，一个字都不会说。现在由编排器把
+    // picked/dropped/cap 随返回值带出来，在这里如实转成一条 note。
+    if (decision?.dropped > 0) {
+      orchCheck.notes.push(`编排选了 ${decision.picked} 个工具，按注意力预算（上限 ${decision.cap}）只装载了 ${decision.tools.length} 个；其余用 search_tools 按名请求`);
     }
-    // 真正的裁剪在这里，而且原来是**静默**的：上面那条恒不可达的收敛分支从不出声，
-    // 于是「工具被裁过」这件事用户和排查者都看不到，出问题时会误以为编排器就没选中那个工具。
-    const _beforeCap = routeToolNames.length;
-    const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
-    if (requestedSchemas.length < _beforeCap) {
-      orchCheck.notes.push(`编排选了 ${_beforeCap} 个工具，按注意力预算只装载了 ${requestedSchemas.length} 个；其余用 search_tools 按名请求`);
-    }
+    const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, Math.max(10, routeToolNames.length));
     const update = requestedSchemas.length
       ? _applyToolPayloadWindow(toolSchemas, requestedSchemas, run._toolCoreNames)
       : null;
