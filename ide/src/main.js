@@ -12243,7 +12243,6 @@ function closeContextMenu() {
     ctxMenuEl.remove();
     ctxMenuEl = null;
   }
-  if (_ctxTargetPath) _paintCtxTarget("");
   // Flush any tree reloads that were deferred while the menu was open.
   if (_pendingReloadDirs.size) {
     const dirs = [..._pendingReloadDirs];
@@ -12258,20 +12257,9 @@ function closeContextMenu() {
     }, 150);
   }
 }
-// 右键的那一行要看得出来。以前只有工作区根行会被选中，普通文件/目录右键之后菜单浮在旁边，
-// 用户根本不知道自己正在操作哪一项——「删除」这种不可逆的动作尤其危险。
-// 存路径不存节点：菜单开着的时候 fs-watcher 可能把树重建掉。
-let _ctxTargetPath = "";
-function _paintCtxTarget(path) {
-  for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
-  _ctxTargetPath = path || "";
-  if (!_ctxTargetPath) return;
-  treeEl?.querySelector(`.row[data-path="${cssEscape(_ctxTargetPath)}"]`)?.classList.add("is-ctx-target");
-}
 function openContextMenu(x, y, entry) {
   _suppressNativeSelection();
   closeContextMenu();
-  _paintCtxTarget(entry?.path || "");
   const isDir = !!entry.is_dir;
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isWorkspaceRoot = workspaceRoots.includes(entry.path);
@@ -44877,8 +44865,16 @@ function _toolExecutionSucceeded(call, result) {
   // 于是**一次一个字节都没读到的读取被判成成功**，还能拿去把计划里的"调研"步骤标成完成。
   // 现在它写作 `[ERROR/AMBIGUOUS_PATH]`（和 `[ERROR/UNREADABLE]` 同一招）。
   // 新增 harness 生成的失败回执时照这个来：括号里必须带枚举里的词，别自造新码。
+  //   · knowledge 同理，而且更直白：它的正文**就是别人写的文档原文**。一句普通的
+  //     markdown 链接 `参见 [Error handling](…)` 就会让这次**成功的检索**被判失败。
+  //     代价特别大——_domainKnowledgeBrief 拿 _toolExecutionSucceeded 当闸门，判失败
+  //     就把命中的语料整段丢掉，还当面告诉模型「本轮检索没有拿到结果（检索链路失败）」。
+  //     模型于是按记忆写，用户追问「知识库里不是写着必须支持 Idempotency-Key 吗」，
+  //     它只能答「这轮检索失败了，你可以让我重试」——重试还是同样的结果，因为触发
+  //     条件是语料自己的正文，每次都在。真失败照旧认得出：harness 的回执写作
+  //     `[失败] …` / `[ERROR/…]`，都在首行，实测三种形状全部仍判失败。
   const _failed = (call.type === "logs" || call.type === "termread"
-      || call.type === "read" || call.type === "search")
+      || call.type === "read" || call.type === "search" || call.type === "knowledge")
     ? _toolFailureMarkerAtHead(content)
     : _toolFailureMatch(content);
   if (_failed) return false;
@@ -48171,7 +48167,7 @@ function _sharedCtxDigest(ctx) {
   if (ctx.goal) p.push(`· 总目标：${ctx.goal}`);
   if (ctx.requirements && ctx.requirements.length) p.push(`· 原始需求：${ctx.requirements.map((item, index) => `${index + 1}.${item}`).join(" | ")}`);
   if (ctx.done && ctx.done.length) p.push(`· 主智能体已完成：${ctx.done.slice(-8).join(" → ")}`);
-  if (ctx.modified && ctx.modified.size) p.push(`· 已改的文件：${[...ctx.modified].map(([f, d]) => `${f}(${d})`).join("、")}`);
+  if (ctx.modified && ctx.modified.size) p.push(`· 已改的文件：${_fmtModified(ctx.modified, "、")}`);
   if (ctx.filesRead && ctx.filesRead.size) p.push(`· 已读过（不必重读，除非你要改它）：${[...ctx.filesRead].slice(-40).join("、")}`);
   // P0.1 关键片段：主 run 已读文件的内容摘要（由 _subAgentFileSnippets 从读取缓存提取，
   // 每文件 ≤1500 字、总量 ≤8K）——只传文件名不传内容正是子智能体重复劳动的主因。
@@ -49089,7 +49085,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
         }
         if (run && run.ctx) {
           if (_ok && (call.type === "write" || call.type === "edit" || call.type === "multiedit") && call.path && run.ctx.modified) {
-            run.ctx.modified.set(String(call.path).split("/").pop(), write ? "worker改" : "改");
+            run.ctx.modified.set(_normRel(String(call.path), run?.root || "") || String(call.path), write ? "worker改" : "改");
             if (write && typeof onMutation === "function") onMutation(call.path);
           } else if (_ok && write && (call.type === "format" || call.type === "mkdir") && typeof onMutation === "function") {
             onMutation(call.path || "");
@@ -51568,6 +51564,14 @@ function _classifyToolFailure(resultText) {
 
 // _toolLedgerStats 已搬到 src/agent/tool-ledger.js（失败行优先的理由写在那儿）。
 
+/** 草稿纸的「已改文件」行。键是全路径（basename 会让同名文件互相覆盖），所以要有上界；
+ *  截断必须说出来，否则读起来像「这一轮只改了这 40 个」。 */
+function _fmtModified(map, sep) {
+  const all = [...map];
+  const head = all.slice(0, 40).map(([f, d]) => `${f}(${d})`).join(sep);
+  return all.length > 40 ? `${head}${sep}…等共 ${all.length} 个` : head;
+}
+
 
 // 场景签名提取：从 engineering profile 提取稳定关键字段，拼接短字符串
 function _buildScenarioSignature(profile) {
@@ -53139,7 +53143,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       ).join(" "));
     }
     if (_pad.filesRead.size) parts.push(`已读文件: ${[..._pad.filesRead].slice(-16).join("、")}（未变化时直接复用，不要重新搜索定位）`);
-    if (_pad.modified.size) parts.push(`已改文件: ${[..._pad.modified].map(([f, d]) => `${f}(${d})`).join(", ")}`);
+    if (_pad.modified.size) parts.push(`已改文件: ${_fmtModified(_pad.modified, ", ")}`);
     if (_pad.errors.length) parts.push(`⚠ 当前未解决的错误: ${_pad.errors.slice(-3).join("; ")}`);
     // 账本存 60 条，这里只发最后 5 条——而写进这个数组的还有子智能体简报（一轮并行
     // 扇出就能塞 4~8 条）、上次崩溃留下的检查点提示。5 条一满，前半程的调研结论就
@@ -54147,8 +54151,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               } catch {}
             });
           const _gone = _removedDeclarationsUnchecked(run, _terms);
+          // 空数组也写回去（理由见写时那处）：查过引用之后就得从事实里消失。
+          run._removedDecls = _gone;
           if (_gone.length) {
-            run._removedDecls = _gone;
             run._incompleteReason = run._incompleteReason || `removed_unchecked:${_gone.length}`;
           }
         }
@@ -55882,14 +55887,19 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               const rel = _normRel(wp, root);
               if (rel) {
                 _mutatedFiles.add(rel);
-                _pad.modified.set(rel.split("/").pop(), "worker改");
+                _pad.modified.set(rel, "worker改");
               }
             }
           } else if (mutationPath && t !== "cmd" && t !== "termtask") {
             const actualPath = _normRel(mutationPath, root);
             _mutatedFiles.add(actualPath);
             const _desc = t === "delete" ? "删除" : t === "move" ? "移动" : t === "write" ? "新建/覆写" : "编辑";
-            _pad.modified.set(actualPath.split("/").pop(), _desc);
+            // 存全路径，不是 basename。Map 按 basename 建键，同名文件互相覆盖：
+            // Next.js 那种 3 个 page.tsx + 2 个 layout.tsx 的项目改完 6 个文件，草稿纸上
+            // 只剩 3 条「page.tsx(编辑)」——历史压缩之后这张纸就是模型对「我改过什么」的
+            // 唯一记忆，它既说不出改的是哪个目录下的，也数不对改了几个。同一份还随
+            // _sharedCtxDigest 发给每个子体。旁边那行「已读文件」本来就是全路径。
+            _pad.modified.set(actualPath, _desc);
             // A path that now EXISTS must leave the negative cache. The 2-strike gate at
             // the top of _executeToolStepInner refuses reads of a path that missed twice —
             // with "你已搜索过 N 次且不存在" — and only a successful list_dir cleared it. So
@@ -56158,7 +56168,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             } catch {}
           }
           const _wfGone = _removedDeclarationsUnchecked(run, _wfTerms);
-          if (_wfGone.length) run._removedDecls = _wfGone;
+          // 空数组也要写回去（同 _stubFindings，理由见上一段）：模型第 4 轮真的跑了
+          // lsp_references 确认没人再用，这条事实就不成立了；不清零的话
+          // _deliveryFactsLine 从第 5 轮到 run 结束每轮都还在说「这一轮删掉了 1 个还没
+          // 查过引用的声明」。它要么把同一个符号再查两三遍（用户看到的正是「反复做
+          // 同一件事」），要么开始整体不信这块事实——而同一块里还有「有 N 次写入没有
+          // 落盘」这种真需要看的。
+          run._removedDecls = _wfGone;
           for (const g of _wfGone) {
             const k = `removed:${g.name}@${g.path}`;
             if (_wfSaid.has(k)) continue;
@@ -56630,7 +56646,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // --- Stuck / loop detection → diagnostic rethink (Reflexion-style). ---
       for (let i = 0; i < items.length; i++) {
         const c = items[i].call;
-        if (!c || !_toolExecutionAttempted(items[i].rawResult)) continue;
+        // `_notAttempted` 也要排除：补空洞那段只写消息、不写 rawResult，而
+        // _toolExecutionAttempted(undefined) 是 true，于是"根本没跑"的调用会被算成失败。
+        // 台账那处（_recordToolCall）早就排除了它，注释里点名说的正是**这个**消费方。
+        // 撞上了会两条指令正面对撞：模型收到 4 条「[未执行]…重新发起这次调用」，同一轮
+        // 又收到「你在重复同样的动作/连续失败……别再原样重试，换一种真正不同的策略」。
+        // 后一条更强、更晚到，模型于是不去重发那几次读取，改去「换个思路」或者干脆
+        // ask_user 问一件它自己 read_file 就能知道的事——用户看到的是「它突然放弃了」。
+        if (!c || items[i]._notAttempted || !_toolExecutionAttempted(items[i].rawResult)) continue;
         // Signature must DISTINGUISH distinct calls. Truncating to 80 chars collapsed different
         // commands that share a boilerplate prefix (e.g. many `python3 -c "import requests…"`
         // one-liners hitting DIFFERENT urls) into ONE sig → the loop-detector falsely screamed

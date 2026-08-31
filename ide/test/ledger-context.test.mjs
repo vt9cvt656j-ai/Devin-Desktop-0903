@@ -9,6 +9,7 @@
 // 这里守的是行为：用源码里真实的装配表达式、真实的保留段、真实的差集判据跑一遍，
 // 不手抄任何标题。
 import test from "node:test";
+import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
 import assert from "node:assert/strict";
 // 按名字取真源码 / 取顶层常量的值，只有一份实现：test/helpers/source.mjs。
 // 这个文件的源码断言历来跑在**原文**上（下面自己剥注释），所以 SRC 绑定 main.js 原文。
@@ -580,4 +581,126 @@ test("工具成败台账：只失败没成功的工具不许被截断掉——�
   // 反向：没有失败时不许硬塞尾注/失败行。
   const clean = toolLedgerStats([{ tool: "read_file", category: "file", ok: true }]);
   assert.ok(!/其余/.test(clean), "没截断却挂了截断尾注");
+});
+
+test("草稿纸的「已改文件」按全路径记——同名文件不许互相覆盖", () => {
+  // _pad.modified 是 Map，原来按 basename 建键：Next.js 那种 3 个 page.tsx + 2 个
+  // layout.tsx 的项目改完 6 个文件，纸上只剩 3 条「page.tsx(编辑)」。历史压缩之后
+  // 这张纸就是模型对「我改过什么」的唯一记忆——它既说不出改的是哪个目录下的，
+  // 也数不对改了几个；同一份还随 _sharedCtxDigest 发给每个子体。
+  const src = stripJsComments(SRC);
+  for (const bad of [/_pad\.modified\.set\([^)]*\.split\("\/"\)\.pop\(\)/,
+                     /run\.ctx\.modified\.set\([^)]*\.split\("\/"\)\.pop\(\)/]) {
+    assert.doesNotMatch(src, bad, "又改回按 basename 建键了——同名文件会互相覆盖");
+  }
+  const fmt = load("_fmtModified");
+  const two = fmt(new Map([["src/app/dashboard/page.tsx", "编辑"], ["src/app/settings/page.tsx", "编辑"]]), ", ");
+  assert.ok(two.includes("dashboard/page.tsx") && two.includes("settings/page.tsx"),
+    "两个同名 page.tsx 必须都在，而且看得出是哪个目录下的");
+  // 全路径会变长，所以要有上界；但截断必须说出来，别读成「这一轮只改了这 40 个」。
+  const many = fmt(new Map(Array.from({ length: 45 }, (_, i) => [`src/f${i}.ts`, "编辑"])), ", ");
+  assert.match(many, /…等共 45 个/, "静默截断——被丢掉的那些无声无息");
+});
+
+test("知识库检索成功了就别判成失败——正文本来就是别人写的文档", () => {
+  // _toolExecutionSucceeded 对多数工具按**全文**匹配 [失败]/[ERROR] 这类标记。knowledge
+  // 的正文就是语料原文，一句普通的 markdown 链接「参见 [Error handling](…)」就会命中。
+  // 代价不是记一笔错账：_domainKnowledgeBrief 拿它当闸门，判失败就把命中的语料整段丢掉，
+  // 还当面告诉模型「本轮检索没有拿到结果（检索链路失败）」。重试也没用——触发条件是
+  // 语料自己的正文，每次都在。
+  const f = load("_toolExecutionSucceeded", {
+    _WORKSPACE_MUTATING_TYPES: new Set(),
+    _toolFailureMatch: load("_toolFailureMatch"),
+    _toolFailureMarkerAtHead: load("_toolFailureMarkerAtHead"),
+  });
+  const hit = "知识库命中 2 条：\n1. 幂等：所有写接口必须支持 Idempotency-Key。"
+    + "\n2. 分页：参见 [Error handling](https://example.com/errors) 一节。";
+  assert.equal(f({ type: "knowledge" }, { content: hit }), true,
+    "命中的语料里有 [Error handling] 就被判失败——两段真事实一个字都进不了上下文");
+  // 真失败必须照旧认得出，否则这条守卫是把闸门整个拆了。
+  for (const bad of ["[失败] michael-design 预取异常: timeout", "[ERROR/UNREADABLE] 语料读不出来",
+                     "〔外部数据〕[失败] 检索链路异常"])
+    assert.equal(f({ type: "knowledge" }, { content: bad }), false, `真失败 ${bad.slice(0, 12)} 漏判了`);
+});
+
+test("查过引用之后，「删了没查引用的声明」这条事实要能撤掉", () => {
+  // 两个写回点原来都是 `if (_gone.length) run._removedDecls = _gone`，而全仓没有任何
+  // 一处清零。模型第 4 轮真的跑了 lsp_references 确认没人再用，扫描结果已经是 []，
+  // 但 run._removedDecls 还留着上一轮的值——_deliveryFactsLine 从第 5 轮到 run 结束
+  // 每轮都还在说「这一轮删掉了 1 个还没查过引用的声明」。同门的 _stubFindings 两处
+  // 都已经改成无条件写回，这一对被漏了。
+  const src = stripJsComments(SRC);
+  assert.doesNotMatch(src, /if \(_wfGone\.length\) run\._removedDecls = _wfGone;/,
+    "空数组仍然不写回——已经不成立的事实会每轮重播");
+  assert.match(src, /run\._removedDecls = _wfGone;/, "写回点没了");
+  assert.match(src, /run\._removedDecls = _gone;\s*\n\s*if \(_gone\.length\) \{/,
+    "收尾那处也要无条件写回，只有 _incompleteReason 才按非空挂");
+  // 行为面：事实行本身在空数组时必须是空的。
+  const facts = load("_deliveryFactsLine", {
+    _failedWritePaths,
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"), _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
+  });
+  const run = { _mutatedFiles: new Set(["src/plan.ts"]), _executionEvidence: [], _removedDecls: [] };
+  assert.doesNotMatch(facts(run), /还没查过引用的声明/, "空数组还在报——说明这条事实撤不掉");
+  run._removedDecls = [{ path: "src/plan.ts", name: "renderPlan" }];
+  assert.match(facts(run), /还没查过引用的声明/, "真有未查引用的删除时必须报出来");
+});
+
+test("调度器留下的空洞不算失败——否则「重新发起」和「别再重试」正面对撞", () => {
+  // 补空洞那段只写消息、**不写 rawResult**，而 _toolExecutionAttempted(undefined) 是
+  // true（判据是 result?.failure?.attempted !== false），所以光靠它排不掉。台账那处
+  // （_recordToolCall）早就一起排除了 _notAttempted，注释里点名说的正是死循环检测
+  // 这个消费方，而它自己漏了。
+  //
+  // 撞上了模型会同时收到两条相反的指令：4 条「[未执行] 这次调用没有被执行……仍然
+  // 需要的话，重新发起这次调用」，以及同一轮的「你在重复同样的动作/连续失败，看起来
+  // 卡住了。别再原样重试，换一种真正不同的策略」。后一条更强、更晚到，于是它不去重发
+  // 那几次读取，改去「换个思路」或者 ask_user 问一件自己 read_file 就能知道的事。
+  const loop = extractFn("_runAgenticLoop");
+  const at = loop.indexOf("Stuck / loop detection");
+  assert.ok(at > 0, "死循环检测的锚点没了——这条守卫在守空气，重新定位");
+  assert.match(loop.slice(at, at + 1200), /items\[i\]\._notAttempted/,
+    "死循环检测没排除「根本没执行」的调用，会把调度器的空洞算成连续失败");
+  // 台账那处必须一直是排除的（两个消费方判据要一致）。
+  assert.match(loop, /!it\._skipped && !it\._notAttempted && _toolExecutionAttempted\(it\.rawResult\)/,
+    "台账那处的排除被改掉了");
+});
+
+test("附件压缩后要留下文件名和路径，不能只剩「1 item(s): image」", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  // 用户把构建报错截图拖进来、一个字没打。压缩之后他问「刚才那个报错是哪个文件报的」，
+  // 摘要里只写着「1 item(s): image」——模型既没有文件名也没有磁盘路径，连重新看一眼
+  // 都做不到，只能反问「你说的是哪个报错」，而用户觉得自己十分钟前才给过。
+  m.push({ role: "user", content: "看下这张截图里的报错",
+    attachments: [{ kind: "image", name: "checkout-500.png", path: "/Users/m/Desktop/checkout-500.png" }] });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  // 断言写成 `image:checkout-500.png`，不是光找 "checkout-500.png"——后者会被下面
+  // 那半句括号里的路径顺带满足，于是「标签退回只剩 kind」这种回归照样绿着。
+  assert.match(sum, /image:checkout-500\.png/, "文件名没了——模型说不出用户给的是哪张图");
+  assert.ok(sum.includes("/Users/m/Desktop/checkout-500.png"), "磁盘路径没了——重新看一眼都做不到");
+});
+
+test("摘要要标出它覆盖了第几轮到第几轮", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  m.push({ role: "user", content: "端口是 5433 不是 5432" });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  // range 从两个写入点、一个合并点一路维护下来，却在唯一通往模型的出口被丢掉：
+  // 摘要里的话和 recent 里的话谁先谁后，模型判断不了；而 searchArchive 的条目带 turn。
+  assert.ok(m.summaries[0]?.range, "range 本来就没存下来，先修存的那一头");
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  assert.ok(sum.includes(m.summaries[0].range),
+    `摘要里没有轮次区间（${m.summaries[0].range}）——先后顺序对不上号`);
 });
