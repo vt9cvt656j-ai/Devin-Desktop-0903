@@ -22240,7 +22240,9 @@ function _renderMentionsToHtml(text) {
     const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
-      const shown = pfx[2];                       // 仓库要显示 owner/repo 全名，不截尾
+      // 只显示仓库名，owner 收进 tooltip（title 已经是完整的 github:owner/repo）。
+      // 组织名往往比仓库名还长，摆在气泡里挤掉正文，而用户真正要认的是"哪个项目"。
+      const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
       const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
       out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
         + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;

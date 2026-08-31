@@ -14985,20 +14985,21 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .msg-mention img, .msg-mention .ic { width: 13px; height: 13px; flex: 0 0 auto; }
 .msg-mention__name { white-space: nowrap; }
-/* 用户自己那条是 accent 渐变气泡，片要放在上面。试过两版都不行：
+/* 用户自己那条是 accent 渐变气泡，片要放在上面。前面试过三版都不行：
    ① 22% 半透明**白** —— 蓝上加淡蓝，对比太弱，糊在气泡里；
-   ② 实心**白**底 —— 对比是够了，但等于在气泡上挖了个洞，很扎眼（用户：「还是纯白的」）。
-   改成**往下压**：比气泡更深的一层黑，配白字。片仍然待在蓝色的世界里（不是异物），
-   而"凹进去一块"正是内联引用该有的观感 —— 和代码块在彩色底上的处理同理。 */
+   ② 实心**白**底 —— 对比够了，但等于在气泡上挖个洞，很扎眼；
+   ③ 压深的一层黑 —— 在蓝底上直接读成**黑块**（用户：「怎么是黑色的」）。
+   前三版都在给它找一个**新的面**，那正是问题所在。这一版不加面：几乎透明的底 + 一圈清晰的
+   白描边 + 白字。片靠"轮廓"成立而不是靠"色块"，气泡的蓝直接透上来，不会多出一块异色。 */
 .msg.user .msg-mention, .msg__body .msg-mention {
   color: #fff;
-  background: rgba(0, 0, 0, .22);
-  border-color: rgba(255, 255, 255, .18);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08);
+  background: rgba(255, 255, 255, .1);
+  border-color: rgba(255, 255, 255, .55);
+  box-shadow: none;
 }
 .msg.user .msg-mention:hover, .msg__body .msg-mention:hover {
-  background: rgba(0, 0, 0, .3);
-  border-color: rgba(255, 255, 255, .28);
+  background: rgba(255, 255, 255, .2);
+  border-color: rgba(255, 255, 255, .8);
 }
 /* 品牌图标在深色片上要用白，别继承强调色（那是浅色背景下的规则）。 */
 .msg.user .msg-mention .ic, .msg__body .msg-mention .ic { color: #fff; }
