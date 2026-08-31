@@ -222,20 +222,26 @@ export function saveHidden(storage, key, store) {
 export function chipBeside({ container, node, offset = 0, left = true, isChip } = {}) {
   const bare = (t) => String(t || "").replace(/\u200b/g, "");
   if (!container || !node) return null;
-  let cur = node;
-  if (cur.nodeType === 3) {
-    const txt = cur.nodeValue || "";
-    // 这一侧还有真字符可走 → 交给浏览器，别抢。
+  let probe;
+  if (node.nodeType === 3) {
+    const txt = node.nodeValue || "";
+    // 这一侧还有真字符可走 → 交给浏览器，别抢，否则逐字移动会被吞掉。
     if (bare(left ? txt.slice(0, offset) : txt.slice(offset))) return null;
-  } else if (cur.childNodes && cur.childNodes.length) {
-    const i = Math.max(0, Math.min(offset, cur.childNodes.length - 1));
-    cur = cur.childNodes[i] || cur;
-  }
-  let probe = cur;
-  while (probe && probe !== container) {
-    const sib = left ? probe.previousSibling : probe.nextSibling;
-    if (sib) { probe = sib; break; }
-    probe = probe.parentNode;
+    // 从这个文本节点往外走一步，找到它这一侧的兄弟。
+    probe = node;
+    while (probe && probe !== container) {
+      const sib = left ? probe.previousSibling : probe.nextSibling;
+      if (sib) { probe = sib; break; }
+      probe = probe.parentNode;
+    }
+    if (!probe || probe === container) return null;
+  } else {
+    // 光标停在元素里时，它落在 childNodes[offset-1] 和 childNodes[offset] **之间**。
+    // 所以左边那个是 offset-1、右边那个是 offset —— 早先两边都取 offset 再找兄弟，
+    // 右移时等于把片本身跳过去了，表现就是"按右键没反应"（用户实拍）。
+    const kids = node.childNodes || [];
+    probe = left ? kids[offset - 1] : kids[offset];
+    if (!probe) return null;
   }
   // 跳过垫在中间的零宽空格，再看过去是不是片。
   while (probe && probe.nodeType === 3 && !bare(probe.nodeValue)) {
