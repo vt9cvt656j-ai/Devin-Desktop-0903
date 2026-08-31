@@ -7,6 +7,7 @@ import "./styles/shadcn.css";
 // 靠源码顺序取胜，提前就被 app.css 盖回去了。
 import "./styles/refine.css";
 import "./ui/tailwind.css";
+import { loadMonacoNls } from "./monaco-nls.js";
 
 /**
  * 应用入口。顺序是这里唯一重要的东西。
@@ -32,6 +33,12 @@ const root = createRoot(host);
 flushSync(() => {
   root.render(<Shell />);
 });
+
+// Monaco 自己那套界面文案（右键菜单、查找框、命令面板）在**模块求值时**就把标题定死了，
+// 所以语言包必须赶在 main.js 那行 `import * as monaco` 之前灌进去。排在这里才成立：
+// main.js 是动态 import 的，会等这个 await；换成静态 import 就不会等（同层的静态依赖在
+// 依赖遍历时直接求值）。加载失败只是菜单留在英文，不挡启动。
+await loadMonacoNls();
 
 // 到这里 159 个 ID 都在文档里了，main.js 可以安全地抓它的 ref。
 await import("./main.js");

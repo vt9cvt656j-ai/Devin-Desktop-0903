@@ -77,7 +77,8 @@ test("main.js 真的接上了：按在选区里才算候选，落到输入框才
     "code 片没有直接展开成正文——会被当成 @ 引用，模型收到的是整个文件而不是选中那段");
   assert.match(fnSource("_insertRefAtCursor"), /if \(dataText\) chip\.dataset\.text = dataText;/,
     "插入时没有把正文挂到片上，发送出去会是空的");
-  // 图标不能走拼名字那条路：没有 i-brand-code 这个符号，找不到会静默渲染成空白。
-  assert.match(SRC, /kind === "code"\s*\n?\s*\? iconSvg\("i-code", "ic--doc"\)/,
-    "code 片的图标没有指定，会走 i-brand-code 那条拼名字的路，静默空白");
+  // 图标用这个文件真正的图标，且必须从 rel 算 —— code 片的 name 是「quota.py:275-284」，
+  // 带着行号去查扩展名会落到兜底图标上（用户：「前面图标要用真实的文件图标」）。
+  assert.match(SRC, /kind === "code"\s*\n?\s*\? iconImg\(fileIconUrl\(rel\.split\("\/"\)/,
+    "code 片没有用真实的文件图标，或者图标是从带行号的 name 算的");
 });
