@@ -132,6 +132,32 @@ export function planMove({ paths = [], destDir = "" } = {}) {
 }
 
 /**
+ * 折叠嵌套选择：同时选中 `A/` 和 `A/x.txt` 时只保留 `A/`。
+ *
+ * 删除和移动都必须先过这一步。移动漏了它会**丢文件**：先把 A/ 搬走，再拿已经不存在的
+ * A/x.txt 去 rename，整批停在半路，而 A/ 已经动了。
+ *
+ * treePath / isAtOrUnder 从参数传进来（main.js 侧那两个要读模块级状态），
+ * 这样这里仍然是「给它字符串就能算出答案」的纯函数。
+ */
+export function topLevelOf(paths, { treePath = (p) => p, isAtOrUnder } = {}) {
+  const under = isAtOrUnder || ((child, parent) => isInsideOrSame(child, parent));
+  const out = [];
+  const seen = new Set();
+  for (const raw of paths || []) {
+    const path = treePath(raw);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    if (out.some((parent) => path !== parent && under(path, parent))) continue;
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i] !== path && under(out[i], path)) out.splice(i, 1);
+    }
+    out.push(path);
+  }
+  return out;
+}
+
+/**
  * 整批投放计划：给定拖进来的若干路径和目标目录，算出「从哪儿复制到哪儿」。
  *
  * items: [{ path, isDir }]，existingNames: 目标目录里已有的名字。

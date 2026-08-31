@@ -119,7 +119,7 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion } from "./agent/explorer-drop.js";
+import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion, topLevelOf } from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -11832,21 +11832,8 @@ function _applyTreeSel() {
 function _clearTreeSel() { _treeSel.clear(); _applyTreeSel(); }
 let _treeDeleteBusy = false;
 
-function _treeTopLevelTargets(paths) {
-  const out = [];
-  const seen = new Set();
-  for (const raw of paths || []) {
-    const path = _treePath(raw);
-    if (!path || seen.has(path)) continue;
-    seen.add(path);
-    if (out.some((parent) => path !== parent && _pathIsAtOrUnder(path, parent))) continue;
-    for (let i = out.length - 1; i >= 0; i--) {
-      if (out[i] !== path && _pathIsAtOrUnder(out[i], path)) out.splice(i, 1);
-    }
-    out.push(path);
-  }
-  return out;
-}
+const _treeTopLevelTargets = (paths) =>
+  topLevelOf(paths, { treePath: _treePath, isAtOrUnder: _pathIsAtOrUnder });
 
 function _treeDeleteTargets(paths) {
   const top = _treeTopLevelTargets(paths);
@@ -75296,21 +75283,26 @@ function _treeDropDirAt(x, y, dragging = []) {
 // ——树内拖动只支持"拖到输入框变 @ 引用"，拖到别的文件夹上什么都不发生。
 async function _moveIntoDir(paths, destDir) {
   if (!destDir || !paths?.length) return;
-  const { moves, skipped } = planMove({ paths, destDir });
+  // 先折叠嵌套选择（删除那条路一直在用 _treeTopLevelTargets，移动漏了）：同时选中 A/ 和
+  // A/x.txt 时，搬走 A/ 之后再拿已经不存在的 A/x.txt 去 rename 会半路失败——而 A/ 已经动了。
+  const { moves, skipped } = planMove({ paths: _treeTopLevelTargets(paths), destDir });
   if (!moves.length) {
     if (skipped.some((x) => x.reason === "self")) showToast("不能把文件夹移进它自己里面");
     return;
   }
   const dirs = new Set([destDir]);
+  const reopened = [];
   let done = 0; let failed = "";
   for (const m of moves) {
     // 移动前先把该文件（或该目录下的文件）从编辑器里关掉，和 renameEntry 同一个规矩；
     // 用户在关闭确认里点了取消就整批停下。
+    const wasOpen = openFiles.has(m.from);
     if (!(await _closeOpenFilesUnder(m.from))) break;
     try {
       await backend.renamePath(m.from, m.to);
       _treeMoveExpansionSubtree(m.from, m.to);
       dirs.add(parentDir(m.from));
+      if (wasOpen) reopened.push(m.to);
       done++;
     } catch (e) { failed = String(e?.message || e); break; }
   }
@@ -75318,6 +75310,8 @@ async function _moveIntoDir(paths, destDir) {
   for (const d of dirs) { try { await reloadDir(d); } catch {} }
   _invalidateProjectFileCache();
   try { refreshGitStatus(); } catch {}
+  // 本来开着的文件在新位置重新打开——移动不该顺手把用户的页签关掉。
+  for (const rp of reopened) { try { await openFile(rp, basename(rp)); } catch {} }
   if (failed) showToast(`移动失败：${failed}`);
   else if (done) showToast(`已移动 ${done} 项到 ${basename(destDir) || destDir}`);
 }
