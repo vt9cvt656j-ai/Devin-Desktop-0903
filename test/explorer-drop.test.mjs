@@ -773,17 +773,19 @@ test("跨过片只需要按一下：垫出来的那一格不算「还有字符�
   assert.equal(shape(bx), "_##", "跨到 A 左边之后，A 和 B 中间那一格没收回");
 });
 
-test("片左右要留出间距，否则光标跨过来就贴在片上", () => {
-  // 用户：「左键移动过来时候应该往右边空格2下，不然会挨在一起」。
-  // 方向键接管之后光标会落在片的紧邻位置，原来左右各只有 1px，光标和片边贴在一起，
-  // 看不出自己停在片的哪一侧。
+test("片左右的间距只由 margin 或空格出一份力，不能两份叠着", () => {
+  // 一路改过来的账：原来左右各 1px，光标跨过来贴在片沿上 →「会挨在一起」；于是 margin 拉到
+  // 8px 当两个空格用。后来 chipPadMove 又在光标那一侧放了个真空格，两份间距叠在一起，就成了
+  // 用户这次说的「空格还是多了 你看距离 那么远 左边 和 右边」。
+  // 现在分工：空格管光标那一侧的词距，margin 只保证片别贴着字。所以 margin 必须是小值。
   const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
   const i = css.indexOf(".composer-chip {");
   const blk = css.slice(i, css.indexOf("}", i));
   const m = blk.match(/margin:\s*0\s+(\d+)px/);
   assert.ok(m, "找不到 .composer-chip 的横向 margin");
-  // ≈ 两个空格宽。5px 试过仍嫌挤（用户自己敲了两个空格才觉得对）。
-  assert.ok(Number(m[1]) >= 8, `片左右间距太小（${m[1]}px），光标跨过来会贴在片上`);
+  const px = Number(m[1]);
+  assert.ok(px >= 1, "片左右一点间距都没有，会贴着字");
+  assert.ok(px <= 3, `片左右 ${px}px 又在替空格出力了——和光标那一侧的真空格叠起来就是「距离那么远」`);
 });
 
 test("退格一次只删一个片，不能把整串都删了", () => {
