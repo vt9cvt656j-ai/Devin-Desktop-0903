@@ -56,12 +56,6 @@
   --active: rgba(0, 0, 0, 0.085);
   --sel: rgba(10, 132, 255, 0.14);
   --shimmer: rgba(10, 132, 255, 0.1);
-  /* 拖放里「这一步会换掉整个项目」那一档的警示色，和 .problems__item--warn 同色系。 */
-  --drop-warn: #d9a000;
-  /* 决策弹框的主色。刻意不用满屏都在用的 --accent（那个亮蓝一上大按钮就很吵）：
-     这类「要不要换掉整个项目」的问题该是沉稳的暖色，和 Claude 一致。 */
-  --ask-accent: #c96442;
-  --ask-accent-hover: #b0553a;
   --titlebar-h: 44px;
   --statusbar-h: 26px;
   --radius: 10px;
@@ -128,10 +122,6 @@
   --active: rgba(255, 255, 255, 0.09);
   --sel: rgba(77, 170, 252, 0.22);
   --shimmer: rgba(255, 255, 255, 0.07);
-  /* 琥珀在深底上要提亮，否则和边框糊成一片。 */
-  --drop-warn: #e0a000;
-  --ask-accent: #d97757;
-  --ask-accent-hover: #e08a6d;
 
   /* 与浅色一一对应。注意 --accent-solid / --accent-on 在这里**关系反过来**：
      暗色 --accent(#4daafc) 当填充底已经够亮，前景必须换成深色（7.73:1），
@@ -612,15 +602,13 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
    照样按 CSS 像素算，等于又多吃一份。
    --------------------------------------------------------------------------- */
 .layout .explorer {
-  /* `--sidebar-w` 是用户拖分隔条存下来的；没拖过时落到 `--sidebar-w-default`，
-     而那个默认值按屏幕大小分档（见下）—— 4K 上还端 250px 会细得像条缝。 */
-  width: calc(var(--sidebar-w, var(--sidebar-w-default, 250px)) / var(--ui-zoom, 1));
+  width: calc(var(--sidebar-w, 250px) / var(--ui-zoom, 1));
   min-width: calc(140px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
 }
 .layout .assistant {
-  width: calc(var(--assistant-w, var(--assistant-w-default, 440px)) / var(--ui-zoom, 1));
+  width: calc(var(--assistant-w, 440px) / var(--ui-zoom, 1));
   min-width: calc(240px / var(--ui-zoom, 1));
   max-width: 50vw;
   flex: 0 1 auto;
@@ -641,49 +629,6 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
 :root[data-layout="tight"] .layout .assistant { max-width: calc(330px / var(--ui-zoom, 1)); }
 :root[data-layout="min"] .layout .explorer { max-width: calc(165px / var(--ui-zoom, 1)); }
 :root[data-layout="min"] .layout .assistant { max-width: calc(290px / var(--ui-zoom, 1)); }
-
-/* 大屏是**另一头**的同一个问题：2K/4K 上 250px 的侧栏细得像条缝，助手栏 440px 装不下
-   一段代码，而中间的编辑区宽到一行能排一百多个字符，眼睛要来回扫。
-
-   这里改的是**默认值**（`--sidebar-w-default`），不是 `--sidebar-w` 本身：后者是用户拖出来
-   的，一旦拖过就永远优先。所以「没拖过的人在大屏上得到合适的默认宽度，拖过的人保持
-   自己的选择」两件事同时成立。 */
-:root[data-layout="wide"] { --sidebar-w-default: 300px; --assistant-w-default: 520px; }
-:root[data-layout="xwide"] { --sidebar-w-default: 340px; --assistant-w-default: 620px; }
-
-/* ---------------------------------------------------------------------------
-   竖直方向的自适应（`data-vlayout`，由 _applyLayoutDensity 按 window.innerHeight 打）。
-
-   横向那套档位一点忙都帮不上：它只看宽度。矮窗口里挤掉消息区的是另外一批东西 ——
-   聊天区上下内边距、消息之间的 gap、输入框的最大高度、空状态那一坨（图标 40 + 标题 +
-   说明 + 一排 chip，加起来近 200px）、页签条。1280×720 这种笔记本上，空状态能把整个
-   消息区占满，再放大一档就直接溢出。
-
-   收紧的顺序是**先留白、后内容**：short 只压留白，一个字都不少；xshort 才开始藏
-   （图标和那句说明），因为到那一步留白已经压无可压。标题和 chip 任何时候都不藏 ——
-   它们是这一屏唯一能点的东西。
-   --------------------------------------------------------------------------- */
-:root[data-vlayout="short"] .chat { padding: 10px 22px 10px 14px; gap: 12px; }
-:root[data-vlayout="short"] .composer { padding: 8px; }
-:root[data-vlayout="short"] .composer textarea { max-height: 120px; }
-:root[data-vlayout="short"] .chat-empty { padding: 10px 16px; gap: 5px; }
-:root[data-vlayout="short"] .chat-empty h3 { margin-top: 2px; }
-:root[data-vlayout="short"] .planpane__head { padding: 10px 24px 8px; }
-:root[data-vlayout="short"] .planpane__foot { padding: 8px 24px; }
-
-:root[data-vlayout="xshort"] .chat { padding: 8px 22px 8px 14px; gap: 10px; }
-:root[data-vlayout="xshort"] .composer { padding: 6px; }
-:root[data-vlayout="xshort"] .composer textarea { max-height: 96px; }
-:root[data-vlayout="xshort"] .chat-empty { padding: 6px 16px; gap: 4px; }
-:root[data-vlayout="xshort"] .chat-empty h3 { margin-top: 0; }
-/* 这两样在最矮的一档才让位：图标只是装饰，说明那句标题已经涵盖。 */
-:root[data-vlayout="xshort"] .chat-empty__icon { display: none; }
-:root[data-vlayout="xshort"] .chat-empty p { display: none; }
-:root[data-vlayout="xshort"] .chat-empty__chips { margin-top: 4px; }
-:root[data-vlayout="xshort"] .tabs { height: 32px; }
-:root[data-vlayout="xshort"] .planpane__head { padding: 8px 24px 6px; }
-:root[data-vlayout="xshort"] .planpane__foot { padding: 6px 24px; }
-:root[data-vlayout="xshort"] .planpane__body { padding: 12px 28px 16px; }
 .layout .editorwrap {
   flex: 1;
   /* 同上：下限也按物理像素算，否则放大时它跟着变大，反而更早撑爆。 */
@@ -6549,11 +6494,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   flex-shrink: 1; min-width: 0; max-width: 40%; overflow: hidden;
   display: flex; align-items: center; gap: 4px;
   padding: 3px 10px; border-radius: 999px;
-  /* text-overflow 在 display:flex 上是**死规则**——它只作用于块容器，而这里的裸文本是
-     匿名 flex 项，规则套不上去。实测：405px 的文案塞进 202px，硬切、没有省略号、没有
-     tooltip，用户看到一句读不通的残句还不知道后面有内容。真正生效的是下面的 __t，
-     所以 _settleToolStep 一律把文案包进 .atc-result__t 并同时设 title。
-     留着这两条是给 __t 之外的内联内容兜底，不是给裸文本用的。 */
   white-space: nowrap; text-overflow: ellipsis;
 }
 .atc-result svg { flex: none; }
@@ -6587,13 +6527,6 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 }
 .atc-result--pending {
   color: var(--atc-accent); background: #e8f0fe;
-}
-/* 子体超时被强杀 / 浏览器撞上人机验证——这两个是最需要用户一眼看见的异常，此前
-   全表一条规则都没有：渲染成透明底 + 暗灰字，比表示「12 行」的中性 chip 还淡，
-   扫一屏卡片时会直接漏掉，以为那个子体正常跑完了。用和 --ok/--err 同族的暖色。 */
-.atc-result--timeout,
-.atc-result--warn {
-  color: var(--atc-warning); background: #fef7e0;
 }
 /* Telegram-style link preview card below browser screenshots */
 .browser-url-card {
@@ -6939,6 +6872,9 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
 .bm-dot.cancelled { background: var(--text-dim); animation: none; }
 .bm-msg { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; line-height: 1.4; }
 .bm-meta { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; line-height: 1.6; }
+.bm-bar { height: 3px; border-radius: 2px; background: var(--line); margin-top: 10px; overflow: hidden; }
+.bm-fill { height: 100%; border-radius: 2px; background: var(--accent); transition: width .3s linear; }
+.bm-fill.timeout { background: #f0a030; }
 .bm-actions { display: flex; gap: 8px; margin-top: 10px; }
 .bm-btn {
   padding: 5px 14px; border-radius: 6px; border: 1px solid var(--line);
@@ -7695,11 +7631,6 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 [data-theme="dark"] .atc-diffstat .d, .dark .atc-diffstat .d { color: #f85149; }
 [data-theme="dark"] .atc-result--ok, .dark .atc-result--ok { background: #0d28181a; }
 [data-theme="dark"] .atc-result--err, .dark .atc-result--err { background: #2c10141a; }
-/* --pending 原来只有浅色那一份写死的 #e8f0fe：深色主题下每次落盘都会闪出一圈近白色药丸，
-   裹着一颗深色 diffstat，和整套深色卡片观感断裂。--timeout/--warn 同理，一并补齐。 */
-[data-theme="dark"] .atc-result--pending, .dark .atc-result--pending { background: #0d1b2e1a; }
-[data-theme="dark"] .atc-result--timeout, .dark .atc-result--timeout,
-[data-theme="dark"] .atc-result--warn, .dark .atc-result--warn { background: #2e21051a; }
 [data-theme="dark"] .atc-confirm, .dark .atc-confirm { background: #0d1117; }
 [data-theme="dark"] .atc-confirm-btn--accept, .dark .atc-confirm-btn--accept { background: #238636; border-color: #238636; }
 [data-theme="dark"] .atc-confirm-btn--reject:hover, .dark .atc-confirm-btn--reject:hover { background: #2c1014; }
@@ -9384,28 +9315,19 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   bottom: auto;
   left: 0;
   top: 0;
-  min-width: 176px;
-  padding: 4px;
-  border-radius: 10px;
+  min-width: 184px;
+  padding: 5px;
+  border-radius: 11px;
   animation: menu-in-down 0.12s ease both;
   user-select: none;
   -webkit-user-select: none;
 }
-/* 右键菜单压矮。Cursor / Windsurf 的上下文菜单行高都在 26px 上下，密而不挤；
-   这里原来是 6px 上下内边距 + 13px 字，整张菜单显得笨重。收到 3px/12.5px 之后
-   单行约 25px，条目多也不会拉得很长。 */
 .ctx-menu .menu__item {
-  gap: 9px;
-  padding: 3px 9px;
-  min-height: 25px;
-  font-size: 12.5px;
-  border-radius: 6px;
+  gap: 10px;
+  padding: 6px 9px;
   user-select: none;
   -webkit-user-select: none;
 }
-.ctx-menu .menu__item .ic { width: 14px; height: 14px; }
-/* 分隔线也跟着收：菜单只有五六项时，5px 的上下留白占掉的比例太大。 */
-.ctx-menu .menu__sep { margin: 4px 8px; }
 .ctx-menu .menu__item .name {
   flex: 1;
 }
@@ -9985,98 +9907,41 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: grid;
   place-items: center;
   padding: 24px;
-  background: color-mix(in srgb, #000 34%, transparent);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
+  background: rgba(32, 33, 36, 0.24);
+  backdrop-filter: blur(10px);
 }
-/* 决策弹框。克制、留白、发丝描边——不要大色块和重阴影：这里问的是「要不要换掉整个项目」，
-   越安静越好读。原来写死 #fff/#202124/#e8eaed，深色主题下整张卡是白的，现在全走令牌。 */
 .io-confirm-card {
-  width: min(400px, 92vw);
-  padding: 24px 24px 18px;
-  border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  background: var(--panel-solid);
-  color: var(--text);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 12px 40px rgba(0, 0, 0, .18);
+  width: min(420px, 92vw);
+  border: 1px solid #e8eaed;
+  border-radius: 18px;
+  background: #fff;
+  color: #202124;
+  box-shadow: 0 22px 70px rgba(60, 64, 67, 0.28);
+  padding: 20px;
 }
 .io-confirm-card h2 {
-  margin: 0 0 8px;
-  font-size: 15px;
-  line-height: 1.4;
-  font-weight: 600;
-  letter-spacing: -0.005em;
+  margin: 0 0 10px;
+  font-size: 16px;
+  line-height: 1.35;
+  font-weight: 700;
+  letter-spacing: -0.01em;
 }
 .io-confirm-message {
   margin: 0;
   white-space: pre-wrap;
-  color: var(--text-dim);
+  color: #5f6368;
   font-size: 13px;
-  line-height: 1.6;
+  line-height: 1.55;
 }
 .io-confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
-  margin-top: 20px;
+  gap: 10px;
+  margin-top: 18px;
 }
 .io-confirm-actions .btn {
-  min-width: 84px;
-  min-height: 32px;
-  white-space: nowrap;          /* 「添加到工作区」这种六个字的标签不许从中间折断 */
-}
-/* 三个及以上动作横排必然挤（卡片去掉内边距只剩 350，三个中文标签放不下），改成竖排。
-   DOM 顺序是 取消/次/主，column-reverse 正好把主按钮翻到最上。 */
-.io-confirm-actions--stack {
-  flex-direction: column-reverse;
-  align-items: stretch;
-  gap: 6px;
-  margin-top: 22px;
-}
-/* .btn 的基础样式是**文字按钮**（透明、无边框），竖排后三个标签就是三行蓝字、完全不像
-   按钮。这里补回按钮的面，但保持克制：发丝描边 + 极浅底，不用大色块。 */
-.io-confirm-actions--stack .btn {
-  width: 100%;
-  min-height: 38px;
-  padding: 0 14px;
-  border-radius: 9px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-  background: transparent;
-  border: 1px solid var(--line-strong);
-  transition: background .12s ease, border-color .12s ease;
-}
-.io-confirm-actions--stack .btn:hover { background: var(--hover); }
-.io-confirm-actions--stack .btn:active { transform: none; }
-/* 主动作：实心暖色。只有它有底色，所以「默认点哪个」不用读字也知道。 */
-.io-confirm-actions--stack .btn--primary {
-  color: #fff;
-  font-weight: 600;
-  background: var(--ask-accent);
-  border-color: transparent;
-}
-.io-confirm-actions--stack .btn--primary:hover { background: var(--ask-accent-hover); }
-/* 取消是第三等：连描边都不要，和两个真动作拉开层级。 */
-.io-confirm-actions--stack .io-confirm-cancel {
-  border-color: transparent;
-  color: var(--text-dim);
+  min-width: 86px;
   min-height: 34px;
-  margin-top: 2px;
-}
-.io-confirm-actions--stack .io-confirm-cancel:hover { color: var(--text); }
-/* 点下之后按钮会被禁用（防重复提交）。基础的 .btn:disabled 只有 opacity:.5，落在实心
-   主按钮上就是一块灰底 + 几乎看不见的白字——用户实拍过。禁用时保留可读的文字对比。 */
-.io-confirm-actions--stack .btn:disabled {
-  opacity: 1;
-  color: var(--text-dim);
-  background: var(--hover);
-  border-color: transparent;
-  cursor: default;
-}
-.io-confirm-actions--stack .btn--primary:disabled {
-  color: #fff;
-  background: color-mix(in srgb, var(--ask-accent) 55%, transparent);
 }
 
 /* ---- About dialog ---- */
@@ -14818,12 +14683,17 @@ textarea.settings-input {
    One positive z-index on the container settles it for every popover inside. */
 .explorer { position: relative; }
 .composer { position: relative; z-index: 60; }
-.composer-dropzone {
+.explorer-dropzone, .composer-dropzone {
   position: absolute; z-index: 45; pointer-events: none;
   visibility: hidden; opacity: 0;
   display: flex; align-items: center; justify-content: center;
   border-radius: 8px;
   transition: opacity .12s ease, visibility .12s ease;
+}
+.explorer-dropzone {
+  inset: 3px;
+  background: color-mix(in srgb, var(--accent, #1a73e8) 8%, transparent);
+  border: 1.5px solid color-mix(in srgb, var(--accent, #1a73e8) 60%, transparent);
 }
 .composer-dropzone {
   inset: 2px;
@@ -14831,6 +14701,7 @@ textarea.settings-input {
   border: 1.5px solid color-mix(in srgb, var(--accent, #1a73e8) 60%, transparent);
 }
 /* only the ACTIVE target (cursor over it) shows — keeps it quiet, no dimmed second zone */
+.explorer.drag-into.is-over .explorer-dropzone,
 .composer.drag-into.is-over .composer-dropzone { visibility: visible; opacity: 1; }
 /* small unobtrusive label pill (no big badge, no bounce) */
 .dz-label {
@@ -14842,38 +14713,8 @@ textarea.settings-input {
   box-shadow: 0 1px 4px rgba(0, 0, 0, .14);
 }
 .dz-label svg { width: 15px; height: 15px; }
+.dz-label--open { color: var(--accent, #1a73e8); }
 .dz-label--ai { color: var(--accent, #1a73e8); }
-
-/* ═══ 拖放目标反馈 —— 照 VS Code 的做法 ═══════════════════════════════════════
- *
- * 上一版是我自己发明的：行高亮 + 上下边框 + 左粗条 + 子树染色 + 文字变强调色加粗 +
- * 跟随光标的标签 + 编辑器区虚线框 + 侧栏压暗。用户的评价是「完全和 vscode 不一样」。
- *
- * 去读了 VS Code（Cursor 是它的分支）的真实实现，投放高亮**只有一条规则**：
- *   .monaco-list-row.drop-target { background-color: <list.dropBackground>; color: inherit !important; }
- * 一块纯色底，而且明确 `color: inherit` —— 连文字颜色都不改。
- * list.dropBackground 的实际色值：浅色 #D6EBFF，深色 #062F4A（从 bundle 里读的）。
- * 另外 VS Code 在拖放进行中会**关掉 hover 高亮**（选择器里带 :not(.drop-target)），
- * 免得两种高亮同时亮着分不清哪个是落点。
- *
- * 所以这里照抄：一块底色，别的都不要。
- */
-:root { --drop-bg: #D6EBFF; }
-:root[data-theme="dark"], .dark { --drop-bg: #062F4A; }
-
-/* 落点行。VS Code 用 !important 压过 focus/selected 的底色——同理，这里要压过
-   .row.is-active（var(--sel)）和多选那两条，所以带 #tree 前缀提高特异性。 */
-#tree .row.is-drop-into::before { background: var(--drop-bg); }
-/* 拖放进行中关掉 hover 高亮：两块高亮同时亮着，用户分不清哪个才是落点。 */
-#tree.is-dropping .row:hover::before { background: transparent; }
-/* 落点是项目根：整棵树一起亮（VS Code 在没有具体目标行时把 drop-target 加在列表本身）。
-   空项目里只有一行根行，不整块亮的话，在一大片空白上拖动完全看不到反馈。 */
-#tree.is-drop-root { background: var(--drop-bg); }
-/* .row::before 平时有 0.1s 背景过渡；VS Code 的 drop-target 没有任何过渡，而子树整块
-   满染叠上过渡后，快速划过会拖出一条渐变尾巴。拖放期间关掉。 */
-#tree.is-dropping .row::before { transition: none; }
-#tree.is-dropping .row.is-drop-into::before { background: var(--drop-bg); }
-
 .ref-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 8px 3px; }
 .ref-chip {
   display: inline-flex; align-items: center; gap: 5px; max-width: 220px;

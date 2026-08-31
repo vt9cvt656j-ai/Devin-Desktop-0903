@@ -417,3 +417,146 @@ test("工具结果截断要掐中间，不能把末尾的根因砍掉", async ()
     .split("\n").find((l) => l.startsWith("[user]")) || "";
   assert.ok(!userLine.includes("…"), "用户正文不该掐中间");
 });
+
+test("归档的工具结果也要掐中间——否则 recall 连搜都搜不到", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  // 归档不是"留个念想"：searchArchive 就在这段文本上做关键词检索。从头截断同时毁掉
+  // 两件事——回忆到的内容缺结论，以及**只出现在尾部的关键词整条搜不到**。
+  // 这条 npm 输出修之前归档成 700 字满屏 PASS，末尾那行 FAIL 被砍掉：模型事后回忆
+  // 「ECONNREFUSED」拿到 0 条，而 0 条读起来是"这事没发生过"，于是当成测试全过了。
+  const noise = "npm test 输出：" + "PASS test/foo.test.mjs 全部通过。".repeat(60);
+  const toolResult = noise + " FAIL: Error: ECONNREFUSED 127.0.0.1:8090 网关没起来";
+  m.push({ role: "user", content: "跑一下测试" });
+  m.push({ role: "assistant", content: "好", tool_calls: [{ id: "t1", type: "function", function: { name: "run_cmd", arguments: "{}" } }] });
+  m.push({ role: "tool", tool_call_id: "t1", content: toolResult });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `后续第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+
+  const archived = m.archive.find((e) => e.role === "tool");
+  assert.ok(archived, "工具结果压根没进归档");
+  assert.ok(/ECONNREFUSED/.test(archived.text), "末尾的 FAIL 被砍掉了——归档里只剩满屏 PASS，主动误导");
+  assert.ok(/npm test/.test(archived.text), "开头也要在：得知道这条是什么");
+  assert.ok(archived.text.length <= 700, `归档条目涨到 ${archived.text.length} 字符，预算失守`);
+  // 真正的后果面：模型事后回忆搜得到。
+  assert.equal(m.searchArchive("ECONNREFUSED").length, 1, "recall 搜不到 → 模型以为这事没发生过");
+  assert.equal(m.searchArchive("网关没起来").length, 1, "尾部的中文关键词同样要能搜到");
+});
+
+// ── 压缩摘要的 Files: 行，在出货路径上到底有没有内容 ──────────────────────
+// 样板那条 bug（「压缩会忘掉 multi_edit 改过的文件」）的根因比名单更深一层：
+// _summarizeBatch 的 Files:/Actions: 读的是 msg.tool_calls，而全仓 memory.push
+// **没有一个**带 tool_calls（收尾处注释原话 "Text-only (no tool_calls…)"，
+// 且这条限制必须保持——assistant 带 tool_calls 却无配套 tool 回复是非法请求体）。
+// 于是那两行恒为空：不是漏了某个工具，是一个文件都没有。
+test("压缩摘要的 Files: 有内容——执行事实走 _ideMeta，不靠 tool_calls", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  m.push({ role: "user", content: "把 auth 模块重构一下" });
+  m.push({ role: "assistant", content: "已按你的要求完成 auth 模块重构。", model: "claude",
+    _ideMeta: { files: ["src/auth/session.ts", "src/auth/token.ts", "src/app/login/page.tsx"], filesTotal: 3 } });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  assert.ok(/(^|\n)Files: /.test(sum), "摘要里没有 Files: 行——压缩后模型对「我改过什么」完全失忆");
+  assert.ok(sum.includes("src/auth/session.ts"), "改过的文件没进摘要");
+  // 全路径，不是 basename：同名文件（page.tsx）不带目录等于没说。
+  assert.ok(sum.includes("src/app/login/page.tsx"), "只剩文件名的话，Next.js 那种一堆 page.tsx 的项目里定位不到");
+});
+
+test("_ideMeta 只在本机用，绝不发给上游", async () => {
+  // _sanitizeProviderMessages 是**排除法不是白名单**（它自己的注释写着「未知字段会
+  // 原样发给上游」）。挂执行事实的通道必须是已经在那份解构里的 _ideMeta，
+  // 否则用户的文件路径会跟着每一次请求送到第三方端点去。
+  const san = load("_sanitizeProviderMessages", {
+    _withoutLegacyReasoningSummary: (c) => c,
+    _wellFormedContent: (c) => c,
+    _stripLoneSurrogates: (s) => s,
+  });
+  const out = san([{ role: "assistant", content: "完成了", model: "claude",
+    _ideMeta: { files: ["src/auth/session.ts"], filesTotal: 1 } }]);
+  assert.ok(!("_ideMeta" in out[0]), "_ideMeta 漏给了上游");
+  assert.ok(!JSON.stringify(out).includes("session.ts"), "用户的文件路径跟着请求发出去了");
+});
+
+test("attachExecutionFacts 真的把改过的文件挂成 _ideMeta（全路径、带总数）", async () => {
+  const { attachExecutionFacts } = await import("../src/agent/execution-facts-meta.js");
+  const msg = attachExecutionFacts({ role: "assistant", content: "完成了" },
+    new Set(["src/app/dashboard/page.tsx", "src/app/settings/page.tsx"]));
+  assert.deepEqual(msg._ideMeta.files, ["src/app/dashboard/page.tsx", "src/app/settings/page.tsx"],
+    "必须是全路径——同名的 page.tsx 只留 basename 等于没说");
+  assert.equal(msg._ideMeta.filesTotal, 2);
+  // 没改文件就别挂空壳，省得摘要里多一行空的 Files:。
+  assert.equal(attachExecutionFacts({ role: "assistant", content: "只是回答了个问题" }, new Set())._ideMeta, undefined);
+  // 截断要报总数，别让「只改了 60 个」看起来像全部。
+  const many = attachExecutionFacts({ role: "assistant", content: "x" },
+    new Set(Array.from({ length: 75 }, (_, i) => `src/f${i}.ts`)));
+  assert.equal(many._ideMeta.files.length, 60);
+  assert.equal(many._ideMeta.filesTotal, 75, "总数丢了的话，模型会以为自己只改了 60 个");
+});
+
+test("收尾入账处真的调用了它，且喂的是 run._mutatedFiles（调用点，跑不动只能守源码）", () => {
+  const src = stripJsComments(SRC);
+  const at = src.indexOf('const _record = String(summaryText || "").trim();');
+  assert.ok(at > 0, "收尾入账处的锚点没了——这条守卫已经在守空气，重新定位");
+  const win = src.slice(at, at + 600);
+  assert.match(win, /_attachExecutionFacts\(\s*_msg\s*,\s*run\?\._mutatedFiles\s*\)/,
+    "收尾入账没把本轮改过的文件挂上去，Files: 行又会变空");
+});
+
+test("自动压缩只压摘要器真看过的那些——装不下的不许一起删掉", async () => {
+  const { buildCompactionTranscript } = await import("../src/agent/compaction-window.js");
+  // 实测形状：120 条各约 3400 字。原来整份拼完再 slice(0, 80000)，摘要器只看到前 24 条，
+  // 却按 snapshot.length 删掉 114 条——90 条从没进过转录。它们还在 archive 里，
+  // 但摘要顶头写着「turns 1–114」，模型没有理由去 recall 那 90 轮。
+  const recent = Array.from({ length: 120 }, (_, i) => ({ role: "user", content: `第${i}轮 ` + "x".repeat(3400) }));
+  const { transcript, fitCount } = buildCompactionTranscript(recent, 80_000);
+  assert.ok(fitCount > 0 && fitCount < recent.length, `fitCount=${fitCount}，应当是「装下了一部分」`);
+  assert.ok(transcript.length <= 80_000, "预算失守");
+  // 关键不变量：fitCount 之外的消息，一个字都不在转录里 —— 于是调用方按它算删除范围就是安全的。
+  assert.ok(transcript.includes(`第${fitCount - 1}轮`), "最后装进去的那条应当在转录里");
+  assert.ok(!transcript.includes(`第${fitCount}轮`), "fitCount 之外的消息出现在转录里——两个数不同源了");
+  // 一定有进展：每条上限 4000 字，80000 的预算至少装得下 20 条，压缩不会卡死。
+  assert.ok(fitCount >= 20, `只装下 ${fitCount} 条，压缩推不动`);
+  // 单条超预算也得装，否则永远压不动。
+  assert.equal(buildCompactionTranscript([{ role: "user", content: "y".repeat(50_000) }], 100).fitCount, 1);
+});
+
+test("压缩的删除范围被 fitCount 夹住（调用点）", () => {
+  const loop = extractFn("_compactHistoryIfHuge");
+  assert.match(loop, /buildCompactionTranscript\(mem\.recent\)/, "转录不是从共享实现来的，两个数会再次不同源");
+  assert.match(loop, /covered = Math\.min\(covered, _fitCount\)/,
+    "删除范围没有被摘要器实际看过的条数夹住——装不下的那些又会被悄悄删掉");
+});
+
+test("上下文摘要不许被 Tier 3 当成「模型自己写太长的回复」对折", () => {
+  // Tier 3 折的是「长的 assistant 正文」，而摘要形状上完全符合（assistant / 无
+  // tool_calls / >600 字）且坐在 i=1。实测 3893 → 400：被压掉那段历史唯一的替代物
+  // 就这么没了。而且 _foldAssistantText 贴的话对摘要三项全错（不是「你早先的回复」、
+  // 结尾不是「当时的结论」、也不是「无法取回」——archive 里还在）。
+  const trim = load("_trimMessagesIfHuge", {
+    _gatewayHandlesCompression: () => false,
+    _mcPrefixInvalidate: () => {},
+    _msgSize: (m) => String(m?.content || "").length,
+    _estTokens: (msgs) => msgs.reduce((n, m) => n + String(m?.content || "").length, 0),
+    _readEvidenceCovers: () => false,
+    _REFETCHABLE: new Set(),
+    _IMPORTANT_LINE: /error/i,
+    _smartCompress: (s) => s,
+    _syncRunReadCoverageFromMessages: () => {},
+    _foldAssistantText: () => "FOLDED",
+    _lexCompress: (s) => s,
+  });
+  const summary = { role: "assistant", _ideMeta: { kind: "context_summary" },
+    content: "[对话上下文摘要]\n接口前缀 /api/v2；金额用 amountCents 存。" + "x".repeat(4000) };
+  const plain = { role: "assistant", content: "我分析下来根因是 X。" + "y".repeat(4000) };
+  const msgs = [{ role: "system", content: "s" }, summary, plain,
+    ...Array.from({ length: 30 }, (_, i) => ({ role: "user", content: "z".repeat(4000) + i }))];
+  trim(msgs, { model: "gpt-4o-mini" });
+  assert.ok(!String(msgs[1].content).includes("FOLDED"), "摘要被对折了——压缩的成果整份丢掉");
+  assert.ok(String(msgs[1].content).includes("/api/v2"), "用户定下的硬约束没保住");
+  // 反向：普通的长 assistant 正文照旧要被折，别把这条守卫修成「Tier 3 整个失效」。
+  assert.ok(String(msgs[2].content).includes("FOLDED"), "Tier 3 对普通长正文失效了");
+});

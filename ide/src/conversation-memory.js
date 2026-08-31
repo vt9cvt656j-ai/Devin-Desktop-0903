@@ -37,6 +37,23 @@ function cleanCorrectionText(value, max = CORRECTION_TEXT_MAX) {
 }
 
 /**
+ * 掐中间的截断：头 55% + 尾 45%，预算不变。
+ *
+ * 工具结果的价值密度在**两头**：开头是它做了什么，结尾是结论（报错、根因、
+ * "3 failing"）。从头截断只留开头，等于把结论扔掉、把噪音留下——一段
+ * "PASS…PASS…FAIL: ECONNREFUSED" 截到 700 字就只剩满屏 PASS，读起来是"全都过了"。
+ * 这是**主动误导**，比不记还糟。本文件 _mergeSummaries 早就是头+尾（0.6/0.35），
+ * 这里两个调用点跟上，别再一边掐中间一边掐尾巴。
+ */
+function cleanEnds(value, max) {
+  const one = String(value || '').replace(/\s+/g, ' ').trim();
+  if (one.length <= max) return one;
+  const head = Math.max(1, Math.floor(max * 0.55));
+  const tail = Math.max(1, max - head - 3);
+  return `${one.slice(0, head)}…${one.slice(-tail)}`;
+}
+
+/**
  * Extract only high-confidence, explicit replacements. General complaints such
  * as "still slow" deliberately do not create a factual correction.
  */
@@ -485,7 +502,11 @@ export class ConversationMemory {
         if (names) text = (text ? text + ' ' : '') + `[调用工具: ${names}]`;
       }
       if (!text) continue;
-      this.archive.push({ turn: startTurn + i, role, text: text.slice(0, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
+      // 归档不只是"留个念想"：searchArchive 就是在这段文本上做关键词检索的。
+      // 从头截断会同时毁掉两件事——回忆起来的内容缺了结论，以及**只出现在尾部的
+      // 关键词整条搜不到**。模型 recall 一次拿到 0 条，读到的是"这事没发生过"
+      // （失败和不存在同一个值），于是从头再来一遍。
+      this.archive.push({ turn: startTurn + i, role, text: cleanEnds(text, role === 'tool' ? 700 : ARCHIVE_ENTRY_MAX) });
     }
     if (this.archive.length > MAX_ARCHIVE) this.archive.splice(0, this.archive.length - MAX_ARCHIVE);
   }
@@ -733,7 +754,20 @@ export class ConversationMemory {
       const recallHint = this.archive.length
         ? '\n\n（以上是早期对话的压缩摘要；需要某段早期对话的原文细节时，用 recall_conversation 工具按关键词检索归档）'
         : '';
-      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}${recallHint}` });
+      // _ideMeta 打标，让下游 _trimMessagesIfHuge 的 Tier 3 放过这条。
+      //
+      // Tier 3 把「长的 assistant 正文」对折成 400 字，而这条消息形状上完全符合
+      // （assistant / 无 tool_calls / >600 字）且坐在 i=1。实测 3893 字被折成 400 字：
+      // 用户第一轮定下的硬约束（接口前缀 /api/v2、金额用分存）当场消失——它们既不在
+      // recent 里（已被压掉），也不在摘要里（刚被折掉）。它是被压掉那段历史的**唯一**
+      // 替代物，折它等于把压缩的成果直接扔掉。
+      //
+      // 更糟的是 _foldAssistantText 贴的那句话对摘要三项全错：它不是「你这段早先的
+      // 回复」，结尾不是「当时的结论、以它为准不要重新推导」，也不是「无法取回」
+      // （archive 里还在，recall_conversation 捞得回来）——等于把唯一的退路也劝退了。
+      //
+      // 标记本身不会发给上游：_sanitizeProviderMessages 的解构里已经摘掉 _ideMeta。
+      result.push({ role: 'assistant', _ideMeta: { kind: 'context_summary' }, content: `[对话上下文摘要]\n${merged}${recallHint}` });
     }
     return result;
   }
@@ -866,14 +900,18 @@ export class ConversationMemory {
     // 5433」被截掉了。于是压缩之后模型知道"连不上库"，却不知道自己上一轮已经查出为什么，
     // 只能从头再查一遍——这正是「跑久了变蠢」。
     // 预算不变（还是 max），只是改成头 55% + 尾 45%，中间用 … 标出来。
-    const cleanEnds = (value, max) => {
-      const one = String(value || "").replace(/\s+/g, " ").trim();
-      if (one.length <= max) return one;
-      const head = Math.max(1, Math.floor(max * 0.55));
-      const tail = Math.max(1, max - head - 3);
-      return `${one.slice(0, head)}…${one.slice(-tail)}`;
-    };
     for (const msg of batch) {
+      // 出货路径上**没有一条**历史消息带 tool_calls：assistant 消息带 tool_calls 却没有
+      // 配套的 tool 角色回复是非法请求体，所以入账处一律 text-only（main.js 收尾那段有
+      // 原话）。下面那个 msg.tool_calls 分支因此在真实会话里从不进入——Files:/Actions:
+      // 两行恒为空。真正的来源是入账时挂在 _ideMeta 上的执行事实（_ideMeta 已在
+      // _sanitizeProviderMessages 里被摘掉，不会发给上游）。
+      const meta = msg?._ideMeta;
+      if (meta && Array.isArray(meta.files)) {
+        for (const f of meta.files) if (f) files.add(String(f));
+        // 截断要说出来，别让"只改了 60 个"看起来像全部。
+        if (Number(meta.filesTotal) > meta.files.length) files.add(`…共 ${meta.filesTotal} 个`);
+      }
       if (msg.tool_calls) for (const tc of msg.tool_calls) {
         const n = tc.function?.name;
         if (n) {

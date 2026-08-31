@@ -29,17 +29,13 @@ window.addEventListener("unhandledrejection", (e) => {
 
 import { installBrandSprite, hasBrandMark, MONO_BRANDS } from "./brand-sprite.js";
 import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
-import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
+import { applyLayoutDensity } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
-import { attachExecutionFacts as _attachExecutionFacts } from "./agent/execution-facts-meta.js";
-import { failedWritePaths as _failedWritePaths } from "./agent/write-ledger.js";
-import { buildCompactionTranscript } from "./agent/compaction-window.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
-import { movePreflightCardsAfter as _movePreflightCardsAfter, createPreflightCard as _createPreflightCard, settlePreflightCard as _settlePreflightCard, designPreflightSections as _designPreflightSections } from "./agent/knowledge-preflight-card.js";
-import { summarizeTiming as _summarizeTiming, intentRaceMarker as _intentRaceMarker, summarizeIntentRace as _summarizeIntentRace } from "./agent/turn-timing.js";
+import { summarizeTiming as _summarizeTiming } from "./agent/turn-timing.js";
 import { _archiveMsgCount, _mergeArchiveList, _archiveHasChats, _mergeChatArchives } from "./agent/chat-archive.js";
 import { planCoreFromReply, planTitleFromReply } from "./agent/plan-doc.js";
 import { createPlanTab } from "./agent/plan-tab.js";
@@ -121,14 +117,6 @@ import { createDapManager } from "./dap-client.js";
 import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
-import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion, topLevelOf } from "./agent/explorer-drop.js";
-
-// Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
-// Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
-// mac 正常。在任何编辑器（连带它的 minimap canvas）创建之前，把 Windows 的 2D canvas
-// 默认切到 CPU 后端（willReadFrequently）绕开这个 bug。只在 Windows 生效。
-installWindowsCanvasFix();
 
 // 品牌 sprite 得在任何 <use href="#i-brand-x"> 渲染之前进 DOM，否则那些引用会指向
 // 一个还不存在的 symbol —— 表现是图标位置空一块，而且**不会补画**（浏览器不会因为
@@ -164,7 +152,7 @@ import {
   toolPolicy,
 } from "./agent/tool-policy.js";
 import { _TOOL_ALIASES, _lev } from "./agent/tool-aliases.js";
-import { TERM_COMMON_CMDS, _localDevServerUrl, _detectTerminalReady, _looksLikeServiceCommand, _stripTimeoutWrapper, monitorProducerStopped, preexistingConditionNote } from "./agent/terminal-commands.js";
+import { TERM_COMMON_CMDS, _localDevServerUrl, _detectTerminalReady, _looksLikeServiceCommand, _stripTimeoutWrapper } from "./agent/terminal-commands.js";
 import {
   USER_TOOL_PREFIX, buildHttpCall, compileToolSchema, mergeCapabilities,
   normalizeCapabilities, userToolShortName,
@@ -207,9 +195,7 @@ import { openMemoryCenterIsland } from "./ui/mount-memory-center.jsx";
 import { mountArchiveBrowser } from "./ui/mount-archive-browser.jsx";
 import { mountTableView } from "./ui/mount-table-view.jsx";
 import { getCollaborationEngine } from "./agent/collaboration-engine.js";
-import { escapeAttr as _escAttr, escapeHtml as _escHtml, setBadgeText as _setBadge } from "./agent/escape.js";
-import { approvalLabel } from "./agent/approval-label.js";
-import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
+import { escapeAttr as _escAttr, escapeHtml as _escHtml } from "./agent/escape.js";
 import { langBadge as _langBadge } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
@@ -491,10 +477,6 @@ function _groupRemoteSearchHits(root, query, caseSensitive, hits) {
   backend.createFile = (p) => _remote.active ? _remoteCall("/fs/write", { path: p, expected_content: null, content: "" }) : _local.createFile(p);
   backend.createDir = (p) => _remote.active ? _remoteCall("/fs/mkdir", { path: p }) : _local.createDir(p);
   backend.copyPath = (from, to) => _remote.active ? _remoteCall("/fs/copy", { from, to }) : _local.copyPath(from, to);
-  // 远程/网页壳没有这两个原生命令：类型探测退回「读得动就是目录」，导入退回普通复制。
-  backend.pathKinds = (paths) => (_local.pathKinds ? _local.pathKinds(paths)
-    : Promise.all((paths || []).map((p) => backend.readDir(p).then(() => 2).catch(() => 1))));
-  backend.importPath = (from, to) => (_local.importPath ? _local.importPath(from, to) : backend.copyPath(from, to));
   backend.renamePath = (from, to) => _remote.active ? _remoteCall("/fs/rename", { from, to }) : _local.renamePath(from, to);
   backend.deletePath = (p) => _remote.active ? _remoteCall("/fs/delete", { path: p }) : _local.deletePath(p);
   backend.searchInProject = (root, query, cs, mode = "literal") => _remote.active
@@ -656,10 +638,6 @@ async function tauriBackend() {
     createFile: (path) => core.invoke("create_file", { path }),
     createDir: (path) => core.invoke("create_dir", { path }),
     copyPath: (from, to) => core.invoke("copy_path", { from, to }),
-    // 拖放导入专用：pathKinds 是 O(1) 的 stat（不像 read_dir 要枚举整个目录），
-    // importPath 允许源在工作区外（用户拖进来的东西按定义就在外面），写入侧照旧受限。
-    pathKinds: (paths) => core.invoke("path_kinds", { paths }),
-    importPath: (from, to) => core.invoke("import_path", { from, to }),
     renamePath: (from, to) => core.invoke("rename_path", { from, to }),
     deletePath: (path) => core.invoke("delete_path", { path }),
     searchInProject: async (root, query, caseSensitive, mode = "literal") => {
@@ -765,9 +743,8 @@ async function tauriBackend() {
     marketplaceList: () => core.invoke("marketplace_list"),
     marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
     marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
-    // dbMarketplaceList / dbMarketplaceUpsert 已删：这两个包装自己零调用点，
-    // 而它们指向的 Rust 命令也随本机 auth.db 那套一起摘掉了（扩展列表现在走
-    // ext_available_builtin，读的是真实内置扩展）。
+    dbMarketplaceList: () => core.invoke("db_marketplace_list"),
+    dbMarketplaceUpsert: (ext) => core.invoke("db_marketplace_upsert", { ext }),
     tasksList: (root) => core.invoke("tasks_list", { root }),
     // `sandbox` defaults to ON in Rust. Pass false ONLY for a user-approved escape after a
     // confined attempt was refused; IDE-internal probes (version checks, git plumbing) pass
@@ -8006,13 +7983,7 @@ async function _mpmLoadLive(key, force = false) {
       const out = await backend.invoke("db_query", { driver: conn.driver, url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY TABLE_NAME", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: String(r?.[1] || "").toUpperCase().includes("VIEW") ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
     } else if (conn.driver === "postgres") {
-      // reltuples 是**规划器估算**，而且 PG 用 **-1 表示"从没 ANALYZE 过、我不知道"**。
-      // 原来这里写的是 GREATEST(reltuples, 0)：把那个"不知道"哨兵变成一个笃定的 0——
-      // 于是一个刚建好、有真实数据但还没被 autovacuum 分析过的库，整屏表全显示「0 行」。
-      // （实测 PG16：七张表真实行数 1/20/2/2…，面板全是 0。）
-      // NULLIF(...,-1) 让"不知道"如实变成 null，UI 那边本来就把 null 画成「—」。
-      // 仍然不改成 count(*)：那在大表上会把这个面板卡死；估算值配「—」区分未知，是诚实的折中。
-      const out = await backend.invoke("db_query", { driver: "postgres", url: conn.url, query: "SELECT c.relname, CASE WHEN c.relkind IN ('v','m') THEN 'view' ELSE 'table' END, NULLIF(c.reltuples::bigint, -1) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m') ORDER BY c.relname", limit: 2000 });
+      const out = await backend.invoke("db_query", { driver: "postgres", url: conn.url, query: "SELECT c.relname, CASE WHEN c.relkind IN ('v','m') THEN 'view' ELSE 'table' END, GREATEST(c.reltuples::bigint, 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m') ORDER BY c.relname", limit: 2000 });
       tables = (out?.rows || []).map((r) => ({ name: r?.[0], table_type: r?.[1] === "view" ? "view" : "table", row_count: typeof r?.[2] === "number" ? r[2] : null, columns: null }));
     } else if (conn.driver === "mssql") {
       const out = await backend.invoke("db_query", { driver: "mssql", url: conn.url, query: "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_NAME", limit: 2000 });
@@ -9354,7 +9325,7 @@ window.addEventListener("resize", () => {
 // 三栏自适应档位住在 src/agent/layout-density.js（main.js 撞行数闸时搬出去的）。
 // 量的是物理宽度，理由见那个模块的抬头。
 function _applyLayoutDensity() {
-  try { applyLayoutDensity(window.innerWidth, window.innerHeight, document.documentElement); } catch {}
+  try { applyLayoutDensity(window.innerWidth, document.documentElement); } catch {}
 }
 _applyLayoutDensity();
 // 缩放的键位同样登记在 DEFAULT_KEYBINDINGS 里（view.zoomIn/zoomOut/zoomReset），
@@ -11850,8 +11821,21 @@ function _applyTreeSel() {
 function _clearTreeSel() { _treeSel.clear(); _applyTreeSel(); }
 let _treeDeleteBusy = false;
 
-const _treeTopLevelTargets = (paths) =>
-  topLevelOf(paths, { treePath: _treePath, isAtOrUnder: _pathIsAtOrUnder });
+function _treeTopLevelTargets(paths) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of paths || []) {
+    const path = _treePath(raw);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    if (out.some((parent) => path !== parent && _pathIsAtOrUnder(path, parent))) continue;
+    for (let i = out.length - 1; i >= 0; i--) {
+      if (out[i] !== path && _pathIsAtOrUnder(out[i], path)) out.splice(i, 1);
+    }
+    out.push(path);
+  }
+  return out;
+}
 
 function _treeDeleteTargets(paths) {
   const top = _treeTopLevelTargets(paths);
@@ -12325,8 +12309,8 @@ function renderMenuAt(x, y, items) {
   menu.style.visibility = "hidden";
   document.body.appendChild(menu);
   const rect = menu.getBoundingClientRect();
-  const px = Math.min(x, viewportW() - rect.width - 8);
-  const py = Math.min(y, viewportH() - rect.height - 8);
+  const px = Math.min(x, window.innerWidth - rect.width - 8);
+  const py = Math.min(y, window.innerHeight - rect.height - 8);
   menu.style.left = Math.max(8, px) + "px";
   menu.style.top = Math.max(8, py) + "px";
   menu.style.visibility = "visible";
@@ -12423,9 +12407,7 @@ function ioPrompt({ title, message = "", value = "", placeholder = "", okLabel =
   });
 }
 
-// altLabel 可选：给出时多一个次要按钮，resolve "ok" | "alt" | "cancel"；
-// 不给时行为和返回值（布尔）都和以前一模一样，现有调用方不受影响。
-function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Label = "", danger = false }) {
+function ioConfirm({ title, message = "", okLabel = "OK", danger = false }) {
   return new Promise((resolve) => {
     _cancelActiveIoDialog();
     _cancelActiveIoConfirm();
@@ -12437,8 +12419,6 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
         <p class="io-confirm-message"></p>
         <div class="io-confirm-actions">
           <button class="btn io-confirm-cancel" type="button">取消</button>
-          ${altLabel ? '<button class="btn io-confirm-alt" type="button"></button>' : ""}
-          ${alt2Label ? '<button class="btn io-confirm-alt2" type="button"></button>' : ""}
           <button class="btn io-confirm-ok${danger ? " btn--danger" : " btn--primary"}" type="button"></button>
         </div>
       </section>`;
@@ -12449,13 +12429,6 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
     const ok = overlay.querySelector(".io-confirm-ok");
     ok.textContent = okLabel || "OK";
     const cancel = overlay.querySelector(".io-confirm-cancel");
-    const alt = overlay.querySelector(".io-confirm-alt");
-    if (alt) alt.textContent = altLabel;
-    const alt2 = overlay.querySelector(".io-confirm-alt2");
-    if (alt2) alt2.textContent = alt2Label;
-    // 三个及以上动作横排放不下（中文标签会被折成两行），改成竖排；
-    // 而且 .btn 基础样式是文字按钮，竖排规则里会把它们补成真按钮的样子。
-    if (alt || alt2) overlay.querySelector(".io-confirm-actions").classList.add("io-confirm-actions--stack");
     document.body.appendChild(overlay);
     let done = false;
     const finish = (confirmed = false, returnValue = confirmed ? "ok" : "cancel", event = null) => {
@@ -12472,7 +12445,7 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
       ok.removeEventListener("pointerdown", onAccept);
       ok.removeEventListener("click", onAccept);
       try { overlay.remove(); } catch {}
-      resolve(altLabel ? returnValue : confirmed);
+      resolve(confirmed);
     };
     const cancelActive = () => finish(false, "cancel");
     const onCancel = (event) => finish(false, "cancel", event);
@@ -12496,8 +12469,6 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
     cancel.addEventListener("click", onCancel);
     ok.addEventListener("pointerdown", onAccept);
     ok.addEventListener("click", onAccept);
-    if (alt) alt.addEventListener("click", (e) => finish(false, "alt", e));
-    if (alt2) alt2.addEventListener("click", (e) => finish(false, "alt2", e));
     document.addEventListener("keydown", onKey, true);
     requestAnimationFrame(() => (danger ? cancel : ok).focus());
   });
@@ -14294,8 +14265,6 @@ const _CUSTOM_MODEL_PREFIX = "custom:";
 // 上游线协议：取值、归一化、界面文案。取值必须是 Rust 侧 crate::protocol::PROTOCOLS 的
 // 逐字子集 —— 对不上时不会报错，只会静默退回 openai 打错端点。
 import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel } from "./agent/wire-protocol.js";
-// 协议缺口清单只从 Rust 拉一次（见 syncProto 上方说明）。
-let _protoGapsSynced = false;
 
 function _loadCustomModels() {
   try {
@@ -15765,6 +15734,7 @@ async function showProfile() {
   const usd = (c) => _dispUsd(c); // 统一额度币值，分母由网关下发（默认 663 原始美分 = $1.00）
   const esc2 = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const planNames = { trial: "Trial", basic: "Basic", pro: "Pro", power: "Power", ultra: "Ultra" };
+  const planTotals = { trial: 5000, basic: 33000, pro: 65000, power: 180000, ultra: 500000 };
   const active = u.plan && u.plan !== "none" && (!u.plan_expires_at || new Date(u.plan_expires_at) > new Date());
   const fmtT = (t) => { if (!t) return "—"; const d = new Date(t); return isNaN(d) ? "—" : d.toLocaleString("zh-CN", { hour12: false }); };
   // The dashboard's name fields are the account's own name; the email is the fallback identity
@@ -15827,11 +15797,9 @@ async function showProfile() {
     : `<span class="pf-plan pf-plan--off">未开通会员</span>`;
   const countryBadge = `<span class="pf-loc" title="${esc2(country.name)} (${esc2(country.code)})">${esc2(country.flag)} ${esc2(country.name)}</span>`;
   // metric row with animated progress bar. wallet=true → green bar (uncapped, show full).
-  // p 传 null = **没有可信的分母，就别画条**。画一根按编出来的分母算的进度条，比不画更糟：
-  // 用户会拿它当事实读。见下面「总额度」那一行。
   const metric = (label, valText, p, sub, wallet) =>
     `<div class="pf-row"><div class="pf-rl"><span class="l">${label}</span><span class="v">${valText}</span></div>` +
-    (p == null ? "" : `<div class="pf-bar${wallet ? " w" : ""}"><i data-pct="${p}"></i></div>`) +
+    `<div class="pf-bar${wallet ? " w" : ""}"><i data-pct="${p}"></i></div>` +
     (sub ? `<div class="pf-sub">${esc2(sub)}</div>` : "") + `</div>`;
 
   const weeklyTxt = (u.quota_weekly_cap_cents > 0) ? usd(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents)) : "无上限";
@@ -15852,14 +15820,7 @@ async function showProfile() {
     <div class="pf-body">
       ${metric("小时额度", usd(u.quota_window_cents), pct(u.quota_window_cents, u.quota_window_cap_cents), "每 30 分钟刷新 · 下次 " + fmtT(u.quota_window_reset_at), false)}
       ${metric("周额度", weeklyTxt, u.quota_weekly_cap_cents > 0 ? pct(Math.max(0, u.quota_weekly_cap_cents - u.quota_week_used_cents), u.quota_weekly_cap_cents) : 100, u.quota_weekly_cap_cents > 0 ? ("本周已用 " + usd(u.quota_week_used_cents)) : "本套餐无周上限", false)}
-      ${/* 这一行原来拿客户端写死的 planTotals 当分母。价目表 2026Q3 调过，而这张表没跟着改——
-           于是刚买完套餐的用户一打开就看到 77.3%（power）/ 66.3%（trial），像已经花掉了一截。
-           真分母在服务端（plan_quotas 表 / settings.rs 的 plan_spec），客户端拿不到，
-           而 User 是 sqlx::FromRow 结构体、加字段要动一批 SELECT，属于单独一笔。
-           在拿到真分母之前**不画这根条**：余额数字本身是真的（服务端下发），
-           一根按错分母算出来的进度条只会让人把假的当真的读。
-           旁边「小时额度」「周额度」的分母都是服务端真下发的 cap，那两根照画。 */ ""}
-      ${metric("总额度", usd(u.quota_total_cents), null, active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "未开通会员", false)}
+      ${metric("总额度", usd(u.quota_total_cents), pct(u.quota_total_cents, planTotals[u.plan] || u.quota_total_cents || 1), active ? ("会员到期 " + fmtT(u.plan_expires_at)) : "未开通会员", false)}
       ${metric("钱包额度", usd(u.credits_cents), 100, "不受套餐限制 · 随时可用" + (active ? "（会员额度用尽后启用）" : ""), true)}
       ${_freePointsMetric(metric, usd, u)}
       ${_referralRow()}
@@ -16104,38 +16065,16 @@ async function showCustomModelsDialog() {
   // 选了协议之后地址写法和能力缺口都要跟着变。**这不是装饰**：Anthropic 的地址是
   // https://api.anthropic.com（不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错；
   // 而 gaps 那几句是「不许假装支持」在界面上的唯一落点。
-  // gaps 的**权威来源是 Rust**（protocol.rs 的 Wire::unsupported()，经 ai_protocols 命令出来）。
-  // 前端 CM_PROTOCOL_UI 里那份是手抄的，而且已经漂了：实测 anthropic 那条把中间
-  // 「3.7/4.x 收 thinking.budget_tokens、4.7 之后只收 adaptive+output_config.effort，
-  //  两套互不兼容、发错是硬 400」整句丢了，只剩后半截；旁边还写着一句「protocol.rs 的
-  //  anthropic 臂逐字如此」——那句话本身就不成立了。
-  // 拉到就用真的，拉不到（网页版没有 Tauri）退回本地那份：ph/hint/desktopOnly 是纯 UI
-  // 字段，本来就该留在前端，只有 gaps/label 跟着 Rust 走。
-  if (inTauri && !_protoGapsSynced) {
-    _protoGapsSynced = true;
-    (async () => {
-      try {
-        const rows = await backend.invoke("ai_protocols");
-        for (const r of (Array.isArray(rows) ? rows : [])) {
-          const ui = CM_PROTOCOL_UI[r?.id];
-          if (!ui) continue;
-          if (Array.isArray(r.unsupported)) ui.gaps = r.unsupported.map(String);
-          if (r.label) ui.label = String(r.label);
-        }
-        syncProto();
-      } catch {}
-    })();
-  }
   const syncProto = () => {
     const ui = CM_PROTOCOL_UI[readProto()];
     inBase.placeholder = ui.ph;
     hintProto.textContent = ui.hint;
-    gapsProto.replaceChildren(...(ui.gaps || []).map((g) => {
+    gapsProto.replaceChildren(...ui.gaps.map((g) => {
       const li = document.createElement("li");
       li.textContent = g;
       return li;
     }));
-    gapsProto.hidden = !(ui.gaps || []).length;
+    gapsProto.hidden = ui.gaps.length === 0;
   };
   const writeProto = (p) => {
     const want = cmProtocol(p);
@@ -17072,17 +17011,25 @@ function officialModelDesc(id = "") {
 // model's OFFICIAL pricing. This is intentionally NOT the operator's billing (which is
 // configured + marked-up in the backend and deliberately not exposed). Keyed by exact
 // model id (lowercased). Sources: vendor pricing pages, 2026-06.
-// 这里原来有一张写死的厂商标价表 OFFICIAL_PRICES（12 个模型的 in/out 单价）+ officialPrice()，
-// 网关没给价时拿它顶上，印在「模型价格」下面。三条理由删掉：
-//  ① 它印的是**编的数**：网关已经明说 price_source="unset"，客户端却自己找一个价填进
-//     同一个格子——实测同一张卡上会左边写死的厂商价、右边网关真价，标签都写「模型价格」，
-//     用户无从分辨哪一半是真的。
-//  ② 那张表和服务端目录已经漂了：12 个 id 里有 7 个在服务端模型目录里根本不存在，
-//     恰恰是最容易落到这条兜底上的那批。
-//  ③ 价格写死在发版里，调价就得重发桌面端；而服务端注释里记着刚修完同一类病
-//     （「卡片写 $3/M、账单按 $5/M 扣」），这条客户端兜底把那个口子重新打开了。
-// 现在只认网关下发的价，没有就走 model.price.missing 如实留白。
+const OFFICIAL_PRICES = {
+  "claude-opus-4-8": { in: 5, out: 25 },
+  "claude-opus-4-7": { in: 5, out: 25 },
+  "claude-opus-4-6": { in: 5, out: 25 },
+  "gpt-5.5": { in: 5, out: 30 },
+  "gpt-5.4": { in: 2.5, out: 15 },
+  "deepseek-v4-flash": { in: 0.14, out: 0.28 },
+  "deepseek-v4-pro": { in: 0.435, out: 0.87 },
+  "minimax-m3": { in: 0.3, out: 1.2 },
+  "minimax-m2.7": { in: 0.25, out: 1.0 },
+  "minimax-m2.7-highspeed": { in: 0.25, out: 1.0 },
+  "minimax-m2.5": { in: 0.3, out: 1.2 },
+  "minimax-m2.5-highspeed": { in: 0.3, out: 1.2 },
+};
+function officialPrice(id = "") {
+  return OFFICIAL_PRICES[String(id).toLowerCase()] || null;
+}
 function _modelPriceRows(m) {
+  const p = officialPrice(m.id);
   const title = _escHtml(t("model.price.title"));
   // 四格：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
   // 三级规则（管理员手填 > 实时目录 > 按输入价推算），所以这里显示的价和账单上扣的
@@ -17090,10 +17037,8 @@ function _modelPriceRows(m) {
   const cell = (k, v) =>
     `<div class="mic-price"><div class="mic-price__k">${_escHtml(k)}</div>`
     + `<div class="mic-price__v">${_fmtTokPrice(v)}</div></div>`;
-  // 只认网关下发的价。客户端那张写死的厂商标价表已删（见上面那段说明）：网关说没价
-  // 就如实留白，不自己编一个填进「模型价格」——那个格子里的数必须和账单同源。
-  const inP = Number(m.inPrice) || 0;
-  const outP = Number(m.outPrice) || 0;
+  const inP = (Number(m.inPrice) || 0) > 0 ? Number(m.inPrice) : (p ? p.in : 0);
+  const outP = (Number(m.outPrice) || 0) > 0 ? Number(m.outPrice) : (p ? p.out : 0);
   const cw = Number(m.cacheWritePrice) || 0;
   const cr = Number(m.cacheReadPrice) || 0;
   const cells = [];
@@ -17112,7 +17057,7 @@ function _modelPriceRows(m) {
     return `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.imageBilling"))}</span></div>`;
   }
   return `<div class="mic-plabel mic-plabel--center">${title}</div>`
-    + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.missing"))}</span></div>`;
+    + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.unknown"))}</span></div>`;
 }
 
 function showModelInfoCard(m, anchorEl) {
@@ -17234,9 +17179,9 @@ function showModelInfoCard(m, anchorEl) {
   const gap = 4, pad = 8;
   let left = menuRect.left - cw - gap;
   if (left < pad) left = menuRect.right + gap; // not enough room left → flip right
-  left = Math.max(pad, Math.min(left, viewportW() - cw - pad));
+  left = Math.max(pad, Math.min(left, window.innerWidth - cw - pad));
   let top = aRect.top;
-  top = Math.max(pad, Math.min(top, viewportH() - ch - pad));
+  top = Math.max(pad, Math.min(top, window.innerHeight - ch - pad));
   card.style.left = left + "px";
   card.style.top = top + "px";
 }
@@ -17469,7 +17414,7 @@ function openModelMenuFor(pickerEl) {
   modelMenu.style.zIndex = "10020";
   modelMenu.hidden = false;
   const mw = modelMenu.offsetWidth || 232;
-  const below = viewportH() - r.bottom - 12;
+  const below = window.innerHeight - r.bottom - 12;
   const above = r.top - 12;
   if (below >= 180 || below >= above) {
     modelMenu.style.top = (r.bottom + 6) + "px";
@@ -17479,7 +17424,7 @@ function openModelMenuFor(pickerEl) {
     modelMenu.style.maxHeight = mh + "px";
     modelMenu.style.top = Math.max(8, r.top - 6 - Math.min(modelMenu.offsetHeight, mh)) + "px";
   }
-  modelMenu.style.left = Math.max(8, Math.min(r.left, viewportW() - mw - 8)) + "px";
+  modelMenu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + "px";
   pickerEl.classList.add("is-open");
   pickerEl.querySelector(".model-picker__btn")?.setAttribute("aria-expanded", "true");
 }
@@ -18327,7 +18272,7 @@ const _ICON_CAPS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
     // 夹紧的顺序不能反：先压上界再抬下界。写成 min(max(margin, x), 上界) 的话，一旦视口比
     // 菜单还窄（上界 < 下界，例如窗口被拖到极窄、或某些嵌入场景里 innerWidth 报 0），
     // min 会选中那个比 margin 还小的上界，菜单直接被推到屏幕外。这样写最差也只是贴左边。
-    const clamped = Math.max(margin, Math.min(centered, viewportW() - width - margin));
+    const clamped = Math.max(margin, Math.min(centered, window.innerWidth - width - margin));
     _menu.style.left = `${Math.round(clamped - wrap.left)}px`;
   };
   const _closeCapabilitiesMenu = () => {
@@ -20000,27 +19945,19 @@ async function restoreChatHistory() {
         let _restored = 0;
         for (const _draft of await _streamDraftTake()) {
           const _draftSession = _chatSessions.find((s) => s?.id === _draft.sessionId);
-          const _draftText = String(_draft.text || "");
-          const _draftReasoning = String(_draft.reasoning || "");
-          const _steps = String(_draft.steps || "").trim();
-          // 探针查重：正文优先、正文空退到思考（否则「只思考过还没落正文」的草稿探针为空会被丢）。
-          const _probe = (_draftText.trim() || _draftReasoning.trim()).slice(0, 120);
+          const _probe = String(_draft.text || "").trim().slice(0, 120);
           const _tail = _draftSession?.memory?.recent?.slice(-6) || [];
-          const _already = !!_probe && _tail.some((m) =>
-            (typeof m?.content === "string" && m.content.includes(_probe)) || (typeof m?.reasoning === "string" && m.reasoning.includes(_probe)));
-          // 可恢复内容 = 正文/思考/步骤任一非空。以前只认正文，于是被打断在工具执行途中（满是步骤、正文还没出）的那轮整条消失。
-          const _hasContent = !!(_draftText.trim() || _draftReasoning.trim() || _steps);
-          if (_draftSession && _hasContent && !_already) {
-            // 步骤清单排在叙述**前面**：被打断那轮「做了什么」比「说到哪」更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
-            const _msg = {
+          const _already = !_probe || _tail.some((m) => typeof m?.content === "string" && m.content.includes(_probe));
+          if (_draftSession && !_already) {
+            // 步骤清单排在叙述**前面**：被打断的那一轮里，「它到底做了什么」比「它说到哪」
+            // 更要紧——用户看着满屏工具卡片消失、只剩两句话，正是这条修的现象。
+            const _steps = String(_draft.steps || "").trim();
+            _draftSession.memory.push({
               role: "assistant",
               content: `⚠️（此回复在生成途中因软件重启被打断，以下为已生成的部分）\n\n`
                 + (_steps ? `${_steps}\n\n` : "")
-                + _draftText,
-            };
-            // 思考（reasoning）也存了、也被渲染过，以前只拼 steps+text 把它丢了、「✓ 思考」只剩个勾。带上它，走 assistant.reasoning 老路渲染成可折叠思考块。
-            if (_draftReasoning.trim()) _msg.reasoning = _draftReasoning;
-            _draftSession.memory.push(_msg);
+                + _draft.text,
+            });
             _draftSession._htmlSnapshot = ""; // 快照里没有这条；强制从持久历史重建可见窗口
             _restored++;
           }
@@ -21811,7 +21748,7 @@ function _openMsgMoreMenu(wrap, anchorBtn) {
   menu.style.zIndex = "10030";
   menu.style.bottom = "auto";
   menu.style.top = Math.round(r.bottom + 6) + "px";
-  menu.style.left = Math.round(Math.max(8, Math.min(r.right - 190, viewportW() - 198))) + "px";
+  menu.style.left = Math.round(Math.max(8, Math.min(r.right - 190, window.innerWidth - 198))) + "px";
   menu.style.minWidth = "190px";
   document.body.appendChild(menu);
   const close = () => { menu.remove(); document.removeEventListener("mousedown", onAway, true); };
@@ -22845,11 +22782,158 @@ function _approvalAlwaysLabel(call) {
   }
 }
 function _approvalLabel(call) {
-  // 正文搬进 src/agent/approval-label.js（166 行，尺寸闸要求"能搬就搬"）。
-  // 唯一的外部依赖是 MCP 快照表，按 mainlink 那次的规矩从参数传进去。
-  return approvalLabel(call, {
-    mcpSnapshot: (root) => { try { return _mcpStates.get(root)?.snapshot || null; } catch { return null; } },
-  });
+  switch (call.type) {
+    case "cmd": case "termtask": return { title: "运行命令？", detail: "$ " + (call.command || "") };
+    case "write": return { title: "写入文件？", detail: call.path || "" };
+    case "edit": case "multiedit": return { title: "修改文件？", detail: call.path || "" };
+    case "delete": return { title: "删除（不可恢复）？", detail: call.path || "" };
+    case "move": return { title: "移动 / 重命名？", detail: (call.path || "") + "  →  " + (call.to || "") };
+    case "copy": return { title: "复制？", detail: (call.path || "") + "  →  " + (call.to || "") };
+    case "mkdir": return { title: "新建目录？", detail: call.path || "" };
+    // 只有带 _wiki 的那次落盘会走到这里（纯调研的 subagent 不弹框）。框上必须写清楚
+    // **要覆盖哪个文件**——路径是模型给的，默认 PRODUCT_WIKI.md，但传 README.md 就
+    // 把 README 覆盖掉；只写「执行该操作？」等于让用户闭着眼睛点。
+    case "subagent": return {
+      title: "把生成的 Wiki 写进工作区？（整份覆盖）",
+      detail: (call.path || call.wikiDest || "PRODUCT_WIKI.md") + "\n\n这个路径由模型指定；写入是整份替换，不是追加。",
+    };
+    case "saveskill": return { title: "保存为技能？", detail: `${call.name || ""}\n${String(call.description || "").slice(0, 160)}\n→ ${call.path || ""}` };
+    // learn_design 会往工作区**真的写两个文件**（一份设计体系说明、一份 token CSS），
+    // 路径由被学的站点名派生。框上要把这两个落点摆出来——只写「执行该操作？」等于
+    // 让用户闭着眼同意两次写盘。
+    case "learndesign": {
+      const _slug = String(call.name || call.url || "").replace(/^https?:\/\//, "").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "site";
+      return {
+        title: "学习这个站点的设计体系？（会往工作区写两个文件）",
+        detail: `${call.url || ""}\n→ reference/${_slug}-design-system.md\n→ reference/${_slug}-tokens.css`,
+      };
+    }
+    // 定时任务是一条**将来会在没人看着时被执行的常驻指令**。框上必须把两件事摆出来：
+    // 什么时候跑、跑的时候会拿到哪句话。只写「新建定时任务？」等于让用户闭着眼点同意
+    // 一件他事后才会看见后果的事。
+    case "schedule": return {
+      title: call.action === "add" ? "排一条定时任务？（到点会在没人看着时自己跑）" : "删掉这条定时任务？",
+      detail: call.action === "add"
+        ? `${call.everyMinutes > 0 ? `每 ${call.everyMinutes} 分钟` : `每天 ${call.at}`}\n\n到点时它会收到这句话：\n${String(call.prompt || "").slice(0, 400)}`
+        : `#${call.id}`,
+    };
+    // MCP 服务就是一条任意命令行。框上必须把命令原文摆出来，否则用户等于闭着眼点同意。
+    case "mcpconfig": return {
+      title: call.action === "add" ? "把这个 MCP 服务写进你的配置？"
+        : call.action === "remove" ? "从你的配置里删掉这个 MCP 服务？"
+        : call.action === "enable" ? "启用这个 MCP 服务？" : "停用这个 MCP 服务？",
+      detail: `${call.name || ""}${call.command ? `\n${call.command} ${(call.args || []).join(" ")}`.trimEnd() : ""}${call.url ? `\n${call.url}` : ""}${call.env && Object.keys(call.env).length ? `\nenv: ${Object.keys(call.env).join(", ")}` : ""}`,
+    };
+    case "format": return { title: "格式化文件？", detail: call.path || "" };
+    case "automation": return { title: "桌面自动化？", detail: (call.method || "") + (call.params ? "  " + JSON.stringify(call.params).slice(0, 120) : "") };
+    case "uiclick": return { title: "操作应用界面？", detail: `${call.action || "press"} ref=${Number.isInteger(call.ref) ? call.ref : "?"}` };
+    case "download": return { title: "下载文件到工作区？", detail: (call.url || "") + "  →  " + (call.dest || "") };
+    case "db": return { title: `执行数据库操作（${call.driver || "db"}）？`, detail: (call.query || "").slice(0, 300) };
+    case "gh": return {
+      title: call.op === "pr_create" ? "在 GitHub 上创建 Pull Request？" : "用你的账号在 GitHub 上发表评论？",
+      detail: `${call.owner || ""}/${call.repo || ""}${call.number ? ` #${call.number}` : ""}\n${String(call.title || call.body || "").slice(0, 240)}`,
+    };
+    case "http": return { title: `发送 ${String(call.method || "GET").toUpperCase()} 请求？`, detail: String(call.url || "").slice(0, 300) };
+    // 下面四个 2026-08-17 才进审批门。框上必须说清**这一次**要干什么：browser 的
+    // "点一下链接"和"把 ~/.ssh/id_rsa 传上去"是同一个工具的两个 action，只写"浏览器操作？"
+    // 等于让用户闭着眼睛点同意。
+    case "browser": {
+      const act = String(call.action || "");
+      const what = {
+        eval: "在页面里执行任意 JavaScript？",
+        cookies: "读取该站点的全部 Cookie（含登录态）？",
+        storage: "读取该站点的 localStorage？",
+        upload: "把本机文件上传到该网页？",
+        autofill: "替你填写表单并提交？",
+        click: "在页面上点击？",
+        type: "在页面里输入文字？",
+        navigate: "打开网址？",
+      }[act] || `浏览器操作（${act || "?"}）？`;
+      const extra = act === "upload"
+        ? (Array.isArray(call.paths) ? call.paths : [call.path]).filter(Boolean).join("\n")
+        : String(call.script || call.text || call.selector || "").slice(0, 240);
+      return { title: what, detail: [String(call.url || ""), extra].filter(Boolean).join("\n").slice(0, 400) };
+    }
+    case "docker_compose_up": return {
+      title: "启动一整套容器（后台常驻）？",
+      detail: `${call.path || "docker-compose.yml"}${Array.isArray(call.services) && call.services.length ? "\n服务：" + call.services.join(", ") : ""}`,
+    };
+    case "capture_replay": return {
+      title: `重放请求：${String(call.method || "GET").toUpperCase()}？`,
+      detail: String(call.url || "").slice(0, 300),
+    };
+    // 会弹框的只有 evaluate / continue：前者在真实栈帧里执行一段表达式（可以带副作用），
+    // 后者放走一个停着的进程。框上必须写出是哪一种、表达式是什么，否则就是闭眼点同意。
+    case "debug": return {
+      title: call.op === "evaluate" ? "在调试器里求值这个表达式？" : "让被调试的进程继续跑？",
+      detail: (call.op === "evaluate" ? String(call.expression || "") : "继续执行，等下一次停顿").slice(0, 300),
+    };
+    case "system": return {
+      title: "操作系统 / 其它应用？",
+      detail: `${call.action || call.op || "?"} ${String(call.app || call.target || call.item || "")}`.trim().slice(0, 300),
+    };
+    case "tor": return { title: "经 Tor 网络发送请求？", detail: String(call.url || "").slice(0, 300) };
+    // 关键信息是「改不改系统代理」，不是工具名：改了的话整台机器的流量都会走本地
+    // mitmproxy，接着还要用户 sudo 装一张根证书。这必须写进 detail。
+    case "capture_start": return {
+      title: call.systemProxy ? "修改系统代理并开始抓包？" : "开始抓包？",
+      detail: call.systemProxy
+        ? "整台机器的网络流量（浏览器 / 邮件 / 其他 App）都会经过本地代理，且需要安装根证书。"
+        : `端口 ${call.port || "?"}`,
+    };
+    case "createproject": return { title: "新建项目目录并切换工作区？", detail: `~/MrDayOne/${call.name || call.path || ""}` };
+    case "genimage": return { title: "生成图片并写入工作区？", detail: `${call.prompt || ""}\n→ ${call.name || call.path || "(自动命名)"}` };
+    case "generate_3d": case "generate_texture": case "generate_motion": case "auto_rig":
+      return { title: "生成素材并写入工作区？", detail: `${call.type} · ${(call.prompt || call.name || "").slice(0, 200)}` };
+    case "generate_sound": case "generate_music": case "generate_voice":
+      return { title: "生成音频并写入工作区？", detail: `${call.type} · ${(call.prompt || call.text || "").slice(0, 200)}` };
+    case "download_asset": return { title: "下载素材到工作区？", detail: `${call.url || ""}\n→ ${call.name || ""}` };
+    case "game_scaffold": case "web_scaffold":
+      // 这两个是直接铺一整棵项目树，最该说清会往哪儿写多少东西。
+      return { title: "生成整套项目脚手架？", detail: `${call.type === "game_scaffold" ? "游戏" : "网站"} · ${call.engine || call.framework || ""} · ${call.name || ""}\n会在工作区里创建一整套目录和文件。` };
+    // 这个框是用户**做决定**的地方，也是目前唯一告诉他"这次要干嘛"的地方——
+    // 只给 服务/工具 两个名字，等于让人闭着眼睛点同意。带上服务自己写的能力说明
+    // （已过 _mcpDescriptionBody 消毒；它是第三方文本，所以明说来源）。
+    case "userfolder": {
+      const d = call.userDef;
+      return {
+        title: "检索你接入的知识库？",
+        detail: `${call.userName || "?"}（目录 ${d?.folder?.path || "?"}）`
+          + (d?.source ? `\n声明来自：${d.source}` : ""),
+      };
+    }
+    case "userhttp": {
+      // 审批框里必须说清楚**这条声明是哪来的**：它可能来自 clone 来的仓库里的配置文件，
+      // 而它能往任意 http(s) 地址发请求。只写工具名，用户无从判断该不该点同意。
+      const d = call.userDef;
+      return {
+        title: "调用你接入的能力？",
+        detail: `${call.userName || "?"}（${d?.http?.method || "GET"} ${d?.http?.url || "?"}）`
+          + (d?.source ? `\n声明来自：${d.source}` : "")
+          + (d?.description ? `\n用途：${String(d.description).slice(0, 160)}` : ""),
+      };
+    }
+    case "mcp": {
+      let d = "";
+      try {
+        const snap = _mcpStates.get(String(call.mcpRoot || "").replace(/\/+$/, ""))?.snapshot;
+        d = snap?.toolMap?.get?.(call.mcpName)?.descBody || "";
+      } catch {}
+      return { title: "执行 MCP 工具？", detail: `${call.server || "?"}/${call.tool || call.mcpName || "?"}`
+        + (call.mcpReadOnly ? "\n服务声明：readOnlyHint=true（仅作提示，仍需授权）" : "")
+        + (d ? `\n服务自述（第三方文本）：${String(d).slice(0, 200)}` : "") };
+    }
+    case "git": {
+      const title = call.op === "clone" ? "克隆 Git 仓库？"
+        : call.op === "push" ? "推送 Git 分支到远程？"
+          : call.op === "pull" ? "拉取并合并远程分支？"
+            : call.op === "commit" ? "创建 Git 提交？" : "执行 Git 写操作？";
+      const detail = call.op === "clone" ? `${call.source || ""}\n→ ${call.target || ""}`
+        : call.op === "commit" ? (call.message || "") : (call.branch || call.op || "");
+      return { title, detail };
+    }
+    default: return { title: "执行该操作？", detail: call.path || call.type };
+  }
 }
 // Three-way approval prompt (允许 / 本会话总是允许 / 拒绝). Self-contained dialog so
 // ── MCP elicitation：服务反过来要用户填东西 ──────────────────────────────────
@@ -22894,13 +22978,9 @@ function _mcpElicitationDialog({ server, message, schema }) {
         <pre class="sheet__sub el-msg" style="white-space:pre-wrap"></pre>
         <div class="el-fields"></div>
         <div class="sheet__actions">
-          <!-- 三个按钮原来全裸奔：前两个一个 class 都没有，「提交」写的 btn-primary 在 CSS 里
-               根本不存在（真名是 btn--primary，单双横线之差）。于是这张「某个 MCP 服务反过来
-               要你填东西」的表单上，唯一该被强调的「哪个是提交、哪个是拒绝」完全没有主次，
-               三个都是浏览器默认的灰方块。照 22935 行审批框的写法对齐。 -->
-          <button type="button" class="btn btn--danger" data-act="decline">拒绝</button>
-          <button type="button" class="btn" data-act="cancel">取消</button>
-          <button type="button" class="btn btn--primary" data-act="accept">提交</button>
+          <button type="button" data-act="decline">拒绝</button>
+          <button type="button" data-act="cancel">取消</button>
+          <button type="button" data-act="accept" class="btn-primary">提交</button>
         </div>
       </form>`;
       document.body.appendChild(_elicitDlg);
@@ -23140,10 +23220,7 @@ async function _readFirstExisting(prefix, rels) {
   return { text: "", rel: rels[0] };
 }
 const _PERM_TOOL_ALIASES = {
-  // background_monitor 的 check_type:"command" 也是把模型给的串交给 shell（还重复跑几十次）。
-  // 不列进来的话，用户写的 Bash(rm:*) 这类 deny 规则连工具名这关都过不去 —— 而 deny 是
-  // 系统里唯一的静默否决、默认 auto 档下唯一还活着的那道门。主体见 _permRuleSubject。
-  bash: new Set(["cmd", "termtask", "background_monitor"]),
+  bash: new Set(["cmd", "termtask"]),
   read: new Set(["read", "list"]),
   write: fileMutationTypes(),
   mcp: new Set(["mcp"]),
@@ -23163,9 +23240,6 @@ function _permRuleToolMatches(ruleTool, callType) {
 function _permRuleSubject(call) {
   if (!call) return "";
   if (call.type === "cmd" || call.type === "termtask") return String(call.command || "");
-  // 只有跑命令那一支有命令主体；其余 check_type（等文件/端口/URL/界面）没有命令可比，
-  // 返回空串让规则不匹配，别把「等端口 3000」也拿去撞 Bash 规则。
-  if (call.type === "background_monitor") return call.checkType === "command" ? String(call.pattern || "") : "";
   if (call.type === "mcp") return `${call.server || ""}/${call.tool || call.mcpName || ""}`;
   if (call.type === "http" || call.type === "tor") return String(call.url || "");
   if (call.type === "git") return String(call.op || "");
@@ -23449,11 +23523,6 @@ function _permissionRuleVerdict(rules, call) {
 // `_approvalKey`），所以允许一次 `npm test` 不会顺带授权别的 npm 命令，换项目也不继承。
 function _callIsDangerousCommand(call) {
   if (!call) return false;
-  if (call.type === "background_monitor") {
-    // 同上：只有 command 那一支真的跑 shell，而且它会**重复**跑几十上百次，
-    // 一条危险命令在这里的破坏力只多不少。
-    return call.checkType === "command" && _isDangerousCmd(call.pattern);
-  }
   if (call.type !== "cmd" && call.type !== "termtask") return false;
   return _isDangerousCmd(call.command);
 }
@@ -24187,7 +24256,7 @@ function openModeMenuFor(pickerEl) {
   menu.style.overflowY = "auto";
   menu.hidden = false;
   const mw = menu.offsetWidth || 180;
-  const below = viewportH() - r.bottom - 12;
+  const below = window.innerHeight - r.bottom - 12;
   const above = r.top - 12;
   if (below >= 160 || below >= above) {
     menu.style.top = (r.bottom + 6) + "px";
@@ -24197,7 +24266,7 @@ function openModeMenuFor(pickerEl) {
     menu.style.maxHeight = mh + "px";
     menu.style.top = Math.max(8, r.top - 6 - Math.min(menu.offsetHeight, mh)) + "px";
   }
-  menu.style.left = Math.max(8, Math.min(r.left, viewportW() - mw - 8)) + "px";
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - mw - 8)) + "px";
   pickerEl.classList.add("is-open");
   pickerEl.querySelector(".mode-picker__btn")?.setAttribute("aria-expanded", "true");
   const dismiss = (e) => {
@@ -24947,11 +25016,9 @@ async function _aiIntentProfile(text, config, session = null, context = null) {
       return intents;
     });
     let timer = 0;
-    // 胜负记账（6000 这个数被反复调过，每次都在赌）；typeof 兜底的理由见 agent/turn-timing.js。
-    const _mark = typeof _intentRaceMarker === "function" ? _intentRaceMarker(session, Date.now()) : () => {};
     return Promise.race([
-      adopted.then((v) => { _mark(true); return v; }),
-      new Promise((resolve) => { timer = setTimeout(() => { _mark(false); resolve(null); }, _INTENT_FOREGROUND_WAIT_MS); }),
+      adopted,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), _INTENT_FOREGROUND_WAIT_MS); }),
     ]).finally(() => { if (timer) clearTimeout(timer); });
   };
   const hit = _aiIntentCache.get(key);
@@ -26021,19 +26088,23 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
 
   const researchPlan = _michaelDesignResearchPlan(run._originalText || "", profile);
 
-  // 三条检索是**同一次预检的三个面**，一个操作不是三个：合成一张卡（和专业域那条路同一个
-  // 模块、同一套判据）。此前这里每条 plan 各建一张，于是设计任务——这个产品最主打的场景——
-  // 开局连出三张「知识检索」压在最前面，正是用户原话说的「一下出一堆容易影响大家的视野」。
-  // 而且那三张从不打 data-knowledge-preflight，`movePreflightCardsAfter` 一张都选不到，
-  // 「挪到思考卡后面」在设计场景下等于没做。改用 _createPreflightCard 两个问题一起解决。
-  const card = body?.appendChild ? _createPreflightCard(body, "michael-design", _createToolStep) : null;
-
   const searches = researchPlan.map(async (plan) => {
     if (!isLive()) return null;
     const call = { type: "knowledge", domain: "michael-design", query: plan.query, topK: 6, _michaelDesignPreflight: true };
+    let step = null;
     try {
+      if (body?.appendChild) {
+        step = _createToolStep(call);
+        body.appendChild(step);
+      }
       const result = await _searchKnowledgeBase(call);
       const evidence = _michaelDesignEvidenceFromResult(call, result);
+
+      if (step) {
+        const viewport = step.querySelector?.(".atc-viewport");
+        if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
+        _settleToolStep(step, result, _knowledgeSettleLabel(call, result, evidence ? `${evidence.hitCount} 段 · 已注入` : ""));
+      }
       // 零命中和检索失败要能分开，而且判据必须是**结构**不是文案：_searchKnowledgeBase 的
       // 零命中分支带 `knowledge: { hitCount: 0, domains: [] }`，两条失败分支（HTTP 非 2xx、
       // 预取异常）根本不带 knowledge 字段。简报那边据此决定对模型说哪句话——说错了方向相反：
@@ -26041,18 +26112,12 @@ async function _runMichaelDesignPreflight({ run, body = null, isLive = () => tru
       return { plan, result, evidence, failed: !result?.knowledge };
     } catch (error) {
       const result = { type: "knowledge", path: plan.query, content: `[失败] michael-design 预取异常: ${String(error?.message || error).slice(0, 180)}` };
-      return { plan, result, evidence: null, failed: true, failResult: result };
+      if (step) _settleToolStep(step, result, "预取失败");
+      return { plan, result, evidence: null };
     }
   });
 
   const results = (await Promise.all(searches)).filter(Boolean);
-  // 三个面结算成一张卡。heading 用 plan.purpose（就是这一面在查什么），bullets 用命中段数
-  // 撑起卡面那一行；失败面照样写「失败」而不是 0 —— 全失败时 preflightSettleLabel 返回空串，
-  // 由 _knowledgeSettleLabel 去说「检索失败 · 原因」，判据只有那一处。
-  if (card) {
-    _settlePreflightCard(card, _designPreflightSections(results, _domainKnowledgeBullets),
-      { settleToolStep: _settleToolStep, knowledgeSettleLabel: _knowledgeSettleLabel, escapeHtml: _escHtml });
-  }
   for (const item of results) {
     if (item.evidence) {
       run._michaelDesignEvidence = _mergeMichaelDesignEvidence(run._michaelDesignEvidence, item.evidence);
@@ -26110,6 +26175,7 @@ function _startMichaelDesignPreflight({ run, body = null, isLive = () => true } 
 // 总预算 2500 字符：小抄的价值在"少而准"。把 4.3MB 语料里几十段原文倒进上下文，对弱模型
 // 是淹没不是帮助——它会开始复述小抄而不是做事。超了就截断并当场记账（告诉模型截了多少，
 // 以及缺的部分自己用 knowledge_search 补），不假装那是全部。
+const _DOMAIN_KNOWLEDGE_BRIEF_BUDGET = 2500;
 // 一轮最多嚼几个域。画像是会话级单调并集，长会话可能累积出好几个 domain_* 旗标；
 // 不设上限就会在开局前打出十几次检索。取最先声明的两个，其余留给模型自己按需 knowledge_search
 // （它现在在开局窗口里，零成本可调——这正是上面那条改动的意义）。
@@ -26175,8 +26241,94 @@ function _domainKnowledgeResearchPlan(domain, task) {
  * 每段只取第一条够实的行：宁可让 6 个不同小节各露一句，也不要把一段原文整个贴进来——
  * 小抄要的是覆盖面，散文才要连贯。
  */
+function _domainKnowledgeBullets(content, maxBullets = 3, maxChars = 190, seen = null) {
+  const blocks = String(content || "").split("\n\n———\n\n");
+  const bullets = [];
+  for (const block of blocks) {
+    const cut = block.indexOf("】");
+    if (cut < 0) continue;
+    const section = /·\s*([^｜】]+)】\s*$/.exec(block.slice(0, cut + 1))?.[1]?.trim() || "";
+    const rawLines = block.slice(cut + 1).split("\n");
+    let inFence = false;
+    let prose = "";     // 首选：散文/表格数据行
+    let fenced = "";    // 兜底：代码围栏里的第一行
+    // seen：跨 rubric 去重。命中已见的就往下取**同一段的下一条**，而不是把这一栏丢空——
+    // 四条 rubric 各查一次、共 16 个检索位，而多数域的小节数比这还少，重复是结构性的。
+    const _fresh = (t) => !seen || !seen.has(String(t).trim());
+    for (let li = 0; li < rawLines.length && !prose; li++) {
+      const line = rawLines[li];
+      if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+      // markdown 标题行要在**剥 # 之前**判掉。
+      //
+      // 网关的索引器把小节标题写回了正文第一行（knowledge.rs 里 `cur_buf = format!("## {}\\n", …)`），
+      // 而这里原来先剥 # 再按长度过滤——于是「Database Selection Decision Tree」这种 32 字符的
+      // 标题顺利活过 `< 24` 那道门，成为首条要点。
+      //
+      // 实测（2026-08-23，真语料 + 真函数）：非设计域 683 个小节里 **416 段（60.9%）的首条
+      // 要点就是它自己的小节标题**。而这份小抄的抬头对模型说的是「它是该领域的**既有事实**，
+      // 不是灵感：先按它判断可行性、约束和验收」——给的却是一份标题清单。被这样吞掉的正是
+      // 最该用上的那几条：服务拆分规则、数据库选型决策树、重构策略。
+      //
+      // 判据按**结构**不按字符串：跳所有 markdown 标题行，而不是拿正文和 section 名做前缀
+      // 比较——后者会把「小节名 Rate Limiting + 首句 Rate Limiting must be applied per-tenant…」
+      // 这种真事实一起误杀。
+      if (/^\s*#{1,6}\s/.test(line)) continue;
+      // 表格**不能**一刀切：这份语料里大量事实本身就是表（反模式清单、选型对照表都是），
+      // 砍掉整类会让产不出要点的小节从 13.6% 飙到 51.7%（实测）。只砍两种不带事实的行：
+      // 分隔行 `|---|---|`，以及紧跟着分隔行的那一行（那是表头）。
+      if (/^\s*\|[\s:|-]+\|?\s*$/.test(line)) continue;
+      if (/^\s*\|/.test(line) && /^\s*\|[\s:|-]+\|?\s*$/.test(rawLines[li + 1] || "")) continue;
+      const text = line.replace(/^\s*(?:[-*•·]|\d+[.)])\s*/, "").trim();
+      // 太短的行是空行或"示例："这类粘合词，进了小抄只占预算不带信息。
+      if (text.length < 24) continue;
+      // 代码围栏里的行**留作兜底**，不直接选中。一条孤立的 import 行说不出这个小节想说
+      // 什么；但整节只有代码时，给一行真代码仍然远好过给空。一刀砍掉整类会让产不出要点的
+      // 小节从 13.6% 涨到 49.2%（实测）——那是把一半语料静默扔掉。
+      if (!_fresh(text)) continue;
+      if (inFence) { if (!fenced) fenced = text; continue; }
+      prose = text;
+    }
+    const picked = prose || fenced;
+    if (!picked) continue;
+    if (seen) seen.add(String(picked).trim());
+    const one = picked.length > maxChars ? `${picked.slice(0, maxChars)}…` : picked;
+    bullets.push(section ? `${section} → ${one}` : one);
+    if (bullets.length >= maxBullets) break;
+  }
+  return bullets;
+}
 
 /** 组装小抄正文并按预算截断；截了多少当场写进正文，不假装那是全部。 */
+function _domainKnowledgeBrief(domain, sections) {
+  const filled = sections.filter((s) => s.bullets.length);
+  const head = `[DOMAIN_KNOWLEDGE_PRELOADED_BRIEF · ${domain}]
+本轮在你开始规划前，IDE 已按「${domain}」这个专业领域从平台自有知识库真实检索并压缩出下面这份小抄。
+它是该领域的既有事实，不是灵感：先按它判断可行性、约束和验收，再结合用户要求和项目证据动手。
+没有列出的内容不代表不存在——需要更细的就自己调用 knowledge_search(domain="${domain}")；
+但**不要把没命中的内容说成知识库结论**。`;
+  if (!filled.length) {
+    return `${head}
+
+本轮「${domain}」没有返回任何可用命中。明确记录该领域语料不可用，基于用户约束与项目证据继续，不要编造该领域的规则。`;
+  }
+  // 四栏是**问过的四个维度**，不是「有内容的那几栏」。空栏要如实说，不能整栏消失——
+  // 消失会让模型以为那个维度压根没被问过，而事实是「问了，这个域没有独立的答案」。
+  //（跨 rubric 去重之后这种情况会变多：同一小节对多条 rubric 都高分时，后面的栏
+  // 拿到的是同段的下一条，取不到就空。）
+  const body = sections
+    .map((s) => (s.bullets.length
+      ? `【${s.heading}】\n${s.bullets.map((b) => `- ${b}`).join("\n")}`
+      : `【${s.heading}】\n- （本域语料里这一栏没有独立内容；需要就自己调 knowledge_search(domain="${domain}") 细查，别当成"没有要求"。）`))
+    .join("\n\n");
+  const full = `${head}\n\n${body}`;
+  if (full.length <= _DOMAIN_KNOWLEDGE_BRIEF_BUDGET) return full;
+  // 记账要在**截断之后**按真实字数算，不是按"计划截多少"。给账目行预留位置，
+  // 否则加完这行又超预算，等于预算没生效。
+  const note = (dropped) => `\n…（本域小抄超出 ${_DOMAIN_KNOWLEDGE_BRIEF_BUDGET} 字符预算，已截断 ${dropped} 字符；缺的部分用 knowledge_search(domain="${domain}") 自取，不要凭印象补。）`;
+  const room = Math.max(0, _DOMAIN_KNOWLEDGE_BRIEF_BUDGET - note(full.length).length);
+  const kept = full.slice(0, room);
+  return kept + note(full.length - kept.length);
+}
 
 /**
  * 真跑一次专业域预检：每个待嚼的域发 4 条 rubric 检索，抽成结构化小抄。
@@ -26184,28 +26336,14 @@ function _domainKnowledgeResearchPlan(domain, task) {
  */
 async function _runDomainKnowledgePreflight({ run, profile = "", body = null, isLive = () => true } = {}) {
   if (run?.mode !== "agent" || !isLive()) return { required: false, briefs: [] };
-  // 「这个域已经嚼过了」是**会话级**的事实，不是这一轮的。
-  //
-  // 旗标是会话级单调并集、只增不减（那条粘性是刻意的：改一个字节就作废整条 120k 对话的
-  // 前缀缓存，实测命中率 2%，knowledge-routing/semantic-profile 两处测试逐字钉着，别动）。
-  // 而这个去重集合原来挂在 run 上，run 每条用户消息新建一次——于是第一轮说「做个医疗预约
-  // 系统」点亮 domain_healthcare 之后，第二轮问「这个变量名改成 userId」照样发 4 条 rubric
-  // 检索（两个域就 8 条）、多出一张卡、往上下文塞最多 2500 字符医疗小抄、首 token 前还多等
-  // 最多 6 秒。用户抱怨的「不是随便就出触发的」，症结在**有效期**不在触发判据。
-  // 挂到 session 上：同一会话同一个域只嚼一次，后续轮次由模型按需自己调 knowledge_search
-  //（它就在开局窗口里）——这正是 _DOMAIN_KNOWLEDGE_MAX_DOMAINS 注释里写的设计意图。
-  const _dkSess = run.session || run;
-  const done = _dkSess._domainKnowledgeDone instanceof Set ? _dkSess._domainKnowledgeDone : new Set();
-  _dkSess._domainKnowledgeDone = done;
+  const done = run._domainKnowledgeDone instanceof Set ? run._domainKnowledgeDone : new Set();
+  run._domainKnowledgeDone = done;
   const domains = _domainKnowledgeFlagDomains(profile).filter((d) => !done.has(d));
   if (!domains.length) return { required: false, briefs: [] };
   for (const domain of domains) done.add(domain);
 
   const briefs = await Promise.all(domains.map(async (domain) => {
     const plans = _domainKnowledgeResearchPlan(domain, run._originalText || "");
-    // **一个域一张卡**，不是四张：四条 rubric 是同一次预检的四个面。不套抽屉，
-    // 四个面的命中数直接摆在卡面上——理由见 agent/knowledge-preflight-card.js。
-    const _groupStep = _createPreflightCard(body, domain, _createToolStep);
     const sections = await Promise.all(plans.map(async (plan) => {
       if (!isLive()) return { heading: plan.heading, bullets: [] };
       // 这四条 rubric 问的是「适用条件 / 硬性约束 / 常见坑 / 必须做的检查」，答案在 893 段
@@ -26216,20 +26354,27 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
       // 一轮 4 条 × 最多 2 个域 = 8 条这样的重查询，正是那三张红卡超时的成因。
       // 模型自己调 knowledge_search 去核对真实 API 时不传这个开关，那条腿照旧。
       const call = { type: "knowledge", domain, query: plan.query, topK: 4, corpus: false, _domainKnowledgePreflight: true };
+      let step = null;
       try {
+        if (body?.appendChild) {
+          step = _createToolStep(call);
+          body.appendChild(step);
+        }
         const result = await _searchKnowledgeBase(call);
         // 原文留着：跨 rubric 去重必须在 Promise.all **之后**按固定顺序重算一遍
         //（共享集合塞进并发分支的话，「谁占到某小节」取决于网络返回顺序，同一查询两次结果不同）。
         const _raw = _toolExecutionSucceeded(call, result) ? String(result?.content || "") : "";
         const bullets = _raw ? _domainKnowledgeBullets(_raw) : [];
-        // hits 是 BM25 真命中的**段数**，和 bullets（抽取器压出来的要点条数）是两回事。
-        // 带上它才分得出第三态：命中了 N 段但一条要点都没抽出来（行级过滤器筛干净了）
-        // ——那不是「本域没有这个主题」，说成零命中是我们自己在误导模型。
-        return { heading: plan.heading, bullets, raw: _raw, hits: Number(result?.knowledge?.hitCount) || 0,
-          ...(_toolExecutionSucceeded(call, result) ? {} : { failed: true, failResult: result }) };
+        if (step) {
+          const viewport = step.querySelector?.(".atc-viewport");
+          if (viewport) viewport.textContent = String(result?.content || "").slice(0, 6000);
+          _settleToolStep(step, result, _knowledgeSettleLabel(call, result, bullets.length ? `${bullets.length} 条 · ${plan.heading}` : ""));
+        }
+        return { heading: plan.heading, bullets, raw: _raw };
       } catch (error) {
-        return { heading: plan.heading, bullets: [], failed: true,
-          failResult: { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` } };
+        const result = { type: "knowledge", path: plan.query, content: `[失败] ${domain} 预取异常: ${String(error?.message || error).slice(0, 180)}` };
+        if (step) _settleToolStep(step, result, "预取失败");
+        return { heading: plan.heading, bullets: [] };
       }
     }));
     // 四条 rubric 之间**去重**，且必须在 Promise.all **之后**、按 plans 的固定顺序做。
@@ -26250,10 +26395,6 @@ async function _runDomainKnowledgePreflight({ run, profile = "", body = null, is
       sec.bullets = _domainKnowledgeBullets(sec.raw, 3, 190, _seenBullet);
       delete sec.raw;
     }
-    // 结算在**去重之后**：卡面上的数要和小抄里真有的条数一致。全失败时标签是空串，
-    // 由 _knowledgeSettleLabel 说「检索失败 · 原因」——区分失败与零命中的判据只有那一处。
-    _settlePreflightCard(_groupStep, sections,
-      { settleToolStep: _settleToolStep, knowledgeSettleLabel: _knowledgeSettleLabel, escapeHtml: _escHtml });
     return {
       domain,
       hitCount: sections.reduce((sum, s) => sum + s.bullets.length, 0),
@@ -28072,7 +28213,7 @@ function _authContextBlock({ forSubAgent = false } = {}) {
   //
   // 文本一律留在这个函数体里：本仓库有三条测试用 extractFn("_authContextBlock") 取正文
   // 查「渗透 / CTF / 逆向 / 别拒答 / 攻击未授权的第三方」，抽成外部常量会让它们全部失明。
-  const _scope = `\n\n【场景与授权】你在专业开发者 IDE 里服务开发者本人，默认操作对象是**用户自己的机器 / 项目 / 账号**。逆向 API·协议·签名、抓包分析流量、爬取数据、安全测试 / 渗透 / CTF、写爬虫·写 bot·写自动化脚本·写安全工具·绕过检测·反反爬——都是**正当工程活，直接做，别拒答、别说教、别反问是否合法、别加警告**。用户让你写什么代码就写什么代码，开发什么项目就开发什么项目，这是开发者工具，不是道德审查工具。`;
+  const _scope = `\n\n【场景与授权】你在专业开发者 IDE 里服务开发者本人，默认操作对象是**用户自己的机器 / 项目 / 账号 / 已授权系统**。逆向自己在用的 API·协议·签名、抓包分析自己的流量、爬公开数据、对自己或已授权系统做安全测试 / 渗透 / CTF——都是**正当工程活，直接做，别拒答、别说教、别反问是否合法**（唯一别碰：攻击未授权的第三方系统、或大规模盗他人凭据）。`;
   const _mainOnly = `
 【协作边界】先判断这轮话属于哪类：①用户要你动手（修、改、实现、优化、跑、做一个、搭一个、接上 xxx）→ 直接完成并验证，用户一句话里包含的所有部分都算在内；②**用户要方案**（给个方案/思路/设计一下/怎么做/什么架构/评估一下/建议怎么搞）→ **把方案本身给足给透，然后停下来等他发话**。方案是这轮的交付物，不是动手前的手续：写完方案就交付完了，不要顺手开始建、不要"顺便先把第一步做了"、不要问"我现在开始做？"——他看完自然会说下一步；③询问/吐槽/诊断/让你看看 → 先读证据、分析原因、给建议，不把它扩展成无关施工；④关键信息缺失时先自己查（读项目、读官方文档、看真实响应、选主流默认值），只有查不到、且不同答案会做出完全不同的东西时才问一句。不要把"我没让你做"的场景理解成"先替他做了再说"。
 【直接回答·别打招呼别列菜单】用户问"这个项目是干嘛的 / 我项目干嘛用的 / 黑客软件都是干嘛的"这类问题时，**直接正面回答那个问题本身**。问的是**当前工作区**时：先 list_dir 摸清真实目录，再读**入口和核心模块的源码**下结论——README / package.json / Cargo.toml 这类文档和依赖清单只是对项目的**描述**，不是实现本身，可以当线索，但单凭它们不足以支撑"这个项目是什么 / 怎么实现的"。问的是**外部仓库**（用户用 @github/@gitlab 指定，或给了仓库地址）时**反过来**：你没有 list_dir/read_file，只有一次一个动作的仓库读取工具，逐层爬目录要十几次往返还会撞上限流；**overview + readme 就是权威一手来源，足够回答"这个项目是干嘛的"，拿到就收工作答**。只有当 README 缺失、或用户追问实现细节/架构/某个具体行为时才继续 tree/file，并且先一次说清要读哪几个文件，不要一层层试探。用具体内容讲清它是什么、怎么用、能做什么。**严禁**用"我已准备好 / 工作区已加载 / 有什么需要帮你做的 / 你需要我做什么？例如：添加功能、修改配置…"这种寒暄+功能清单来代替回答——那等于没回答，用户会觉得你是个只会念模板的傻瓜。问的是知识问题（跟当前项目无关，如"黑客软件都是干嘛的"）就正面科普，别硬扯到打开的文件上。答完再自然收尾，不要机械追问"还需要我做什么"。
@@ -36500,13 +36641,80 @@ let _growthPersistLastTime = 0;
 let _growthPersistTimer = null;
 const GROWTH_PERSIST_DEBOUNCE_MS = 500;
 
-// 这里原来有 observeToolCall + 一段"工具用量学习"：每个工具结果都喂给它，它往
-// `window._growthState` 里累计每个工具的成功率。整条链**一次都没跑过**——那个形状全仓
-// 唯一的写入点就在它自己函数体内部、还被开头的 `if (!g) return;` 挡着（鸡生蛋）；
-// 而它唯一的下游消费者 recommendToolsForIntent 不但零调用点，内部也对不上：它拿**工具名**
-// 去查 userSkills，而 growth.js 的技能 id 是 reviewing/authoring/prompting/planning/
-// tooling/verifying——两套词表没有一个重合，就算把数据喂进去权重也恒为 0。整座死岛删掉。
-// 真正在用熟练度的那条（放宽工具窗口）已接到 growth.js 的真实 BKT（getAvgMasteryStrict）。
+function observeToolCall(toolRecord) {
+  try {
+    const g = typeof window !== 'undefined' ? window._growthState || null : null;
+    if (!g) return;
+    
+    // Normalize tool name (strip prefix and extract base command for shell commands)
+    let toolName = String(toolRecord.tool || "").trim();
+    const baseCommand = toolName.split(' ')[0];
+    
+    // Find matching skill or create new one
+    let matchedSkillIndex = -1;
+    if (Array.isArray(g.skills)) {
+      matchedSkillIndex = g.skills.findIndex(s => 
+        s.name === toolName || 
+        s.name === baseCommand || 
+        s.name.includes(baseCommand) ||
+        baseCommand.includes(s.name)
+      );
+    }
+    
+    if (matchedSkillIndex >= 0) {
+      // Update existing skill mastery
+      const current = g.skills[matchedSkillIndex].mastery ?? 0;
+      const success = toolRecord.ok === true;
+      const delta = success ? 0.05 : -0.02; // Success +0.05, failure -0.02
+      g.skills[matchedSkillIndex].mastery = Math.max(0, Math.min(1, current + delta));
+      g.skills[matchedSkillIndex].lastUsed = Date.now();
+      g.skills[matchedSkillIndex].usageCount = (g.skills[matchedSkillIndex].usageCount || 0) + 1;
+    } else {
+      // Create new skill entry for first-time tool
+      const initialMastery = toolRecord.ok === true ? 0.3 : 0.1; // First attempt gets base score
+      g.skills.push({
+        name: toolName,
+        mastery: initialMastery,
+        lastUsed: toolRecord.timestamp || Date.now(),
+        usageCount: 1
+      });
+    }
+    
+    // Store back to window object (browser-compatible)
+    if (typeof window !== 'undefined') {
+      window._growthState = g;
+      // Also persist to localStorage if available (async with debounce to avoid main thread block)
+      const now = Date.now();
+      if (now - _growthPersistLastTime >= GROWTH_PERSIST_DEBOUNCE_MS) {
+        Promise.resolve().then(() => {
+          try {
+            localStorage.setItem("michael-ide.learner-model.v1", JSON.stringify(g));
+          } catch (e) {
+            // Ignore quota errors
+          }
+        });
+        _growthPersistLastTime = now;
+      } else if (!_growthPersistTimer) {
+        // Debounce: only schedule one timer if already within throttle window
+        _growthPersistTimer = Promise.resolve().then(() => {
+          try {
+            localStorage.setItem("michael-ide.learner-model.v1", JSON.stringify(g));
+          } catch (e) {
+            // Ignore quota errors
+          }
+        });
+        _growthPersistTimer = null;
+      }
+    }
+  } catch (e) {
+    console.warn('observeToolCall failed:', e);
+  }
+}
+
+// For testing and external access
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { observeToolCall };
+}
 function _canonicalToolName(name) {
   if (typeof name !== "string") return null;
   let n = name.trim();
@@ -37228,12 +37436,6 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     : _normalizeArgKeys(args || {});
   for (const k of _STR_ARG_KEYS) {
     const v = args[k];
-    // **数组不拍平。** `path` 在绝大多数工具里是文件路径（字符串），但 system 的
-    // action:"menu"/"menu_items" 把它声明成 array（菜单层级），后端签名也是
-    // `path: Vec<String>`。原来这里无差别 String()，["File","New Folder"] 变成
-    // "File,New Folder" —— 两层以上的菜单路径**必然点不中**，而那正是这个动作唯一的用途。
-    // 报错还长得像"找不到菜单项"，看不出是参数在半路被改了形状。
-    if (Array.isArray(v)) continue;
     if (v != null && typeof v !== "string") args[k] = String(v);
   }
   // Resolve weak-model tool-name variants (bash→run_cmd, typos…) to the real tool.
@@ -42554,9 +42756,6 @@ function _trimMessagesIfHuge(messages, run = null, root = "", contextLimitTok = 
     const lastKeep = messages.length - 10;
     for (let i = 1; i < lastKeep; i++) {
       const m = messages[i];
-      // 对话上下文摘要不折——它是被压掉那段历史唯一的替代物，且形状上完全符合下面
-      // 这个条件、坐在 i=1。详见 conversation-memory.js 打标记那处。
-      if (m._ideMeta?.kind === "context_summary") continue;
       if (m.role === "assistant" && !m.tool_calls && m.content && String(m.content).length > 600) {
         // 盲切前缀是最坏的切法：结论写在末尾。`!m.tool_calls` 这个条件恰好把打击面
         // 对准了**纯推理轮**——「我分析下来根因是 X，因此决定用方案 B」这种只说话不
@@ -42645,8 +42844,9 @@ async function _compactHistoryIfHuge(config, session) {
   if (sess._compactPromise) return sess._compactPromise;
   // 记下**身份**而不是条数：落地时要能分辨哪些消息是这次摘要真正覆盖过的。
   const snapshot = mem.recent.slice();
-  // 转录和「这次能覆盖到第几条」必须同源——理由见 agent/compaction-window.js。
-  const { transcript, fitCount: _fitCount } = buildCompactionTranscript(mem.recent);
+  const transcript = mem.recent
+    .map((m, i) => `[#${i}][${m.role}] ${String(m.content || "").slice(0, 4000)}`)
+    .join("\n\n").slice(0, 80000);
   // 结尾原来写死「中文、分条」。而这份摘要会 compactRecent 掉真实历史、成为之后每一轮的
   // 上下文——于是一场英文对话被压缩后，历史里躺着一段中文，直接顶撞 agent_core:1 和
   // _AI_MODE_PROMPTS 五条里各写了一遍的「用与用户相同的语言，不要默认中文」。
@@ -42698,8 +42898,6 @@ async function _compactHistoryIfHuge(config, session) {
   // 失忆）。只压尾部 6 条之前的部分；摘要里重复覆盖尾部内容无害。
   const KEEP_TAIL = 6;
   covered = Math.min(covered, Math.max(0, snapshot.length - KEEP_TAIL));
-  // 摘要器没看过的一条都不许压掉（见上面 transcript 的预算）。
-  covered = Math.min(covered, _fitCount);
   if (covered < 2) return; // 历史已经被别的路径改写过/可压部分太少，这份摘要不再对得上，放弃
   mem.compactRecent(covered, summary.trim());
   try { saveChatHistory(); } catch {}
@@ -46001,8 +46199,8 @@ function _deliveryFactsLine(run) {
   // 手上没有任何与之矛盾的事实。把它说出来，模型自己就会改口。
   //
   // 只报**失败**的尝试：成功的那些本来就由下面的 mutated 计数覆盖，重复说只会占预算。
-  // 读法只有一处（按 path 取最后一条，不是 filter）——理由见 agent/write-ledger.js。
-  const _failed = _failedWritePaths(run?._writeLedger);
+  const _attempts = Array.isArray(run?._writeLedger) ? run._writeLedger : [];
+  const _failed = [...new Set(_attempts.filter((a) => a && a.ok === false).map((a) => String(a.path || "")).filter(Boolean))];
   const _failedLine = _failed.length
     ? `有 ${_failed.length} 次写入**没有落盘**（${_failed.slice(0, 4).join("、")}${_failed.length > 4 ? " 等" : ""}）——这些文件此刻不在磁盘上，不要说它们已保存/已生成`
     : "";
@@ -46151,10 +46349,8 @@ const _READ_ONLY_TYPES = new Set(["read", "list", "search", "find", "web", "webs
   // 却漏在这份并行判据外——于是它们被无谓地串行化：语义检索、找符号、看图、探环境、
   // 抽 UI、读屏，每一个都得等前一个跑完。两份手写名单漂了，这是第 N 次。
   "semsearch", "findsymbol", "viewimage", "probeenv", "uiextract", "readscreen",
-  // 被 `t.endsWith("_search")` 兜不住、但同样纯读（四个执行体都核过，无写盘/建目录/删除）：
-  // package_source 读 node_modules、openapi_parser 拉 spec、qr 解码图片、news 拉新闻。
-  // 漏在这里代价双份：既被当硬屏障串行跑，又被当成"写入动作"触发取证提醒。
-  "search_game_assets", "package_source", "openapi_parser", "qr", "realtime_news_feed"]);
+  // 名字不以 _search 结尾，但同样是纯检索。
+  "search_game_assets"]);
 const _MUTATING_FILE_TOOL_TYPES = fileEditTypes();
 function _isMergedToolItem(item) {
   return item?.merged != null;
@@ -46371,14 +46567,7 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
     _shownLen = acc.length;
     const clean = _streamCleanText(acc);
     if (clean.trim()) {
-      if (!streamEl) {
-        streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl);
-        // 第二个锚点：模型不吐 reasoning（思考档位 off、或线路本来就不回推理）时，本轮一张
-        // 思考卡都不会建，只锚思考卡的话预检卡就原地留在正文最前面——用户看到的还是
-        // 「还没有任何『它在想』的迹象，先冒出一张知识检索卡」。放在 if (!streamEl) 里，
-        // 整轮只触发一次；模块自己按卡记「安置过」，思考卡后到也不会把它再挪一遍。
-        _movePreflightCardsAfter(body, streamEl);
-      }
+      if (!streamEl) { streamEl = document.createElement("div"); streamEl.className = "agent-seg agent-seg--stream"; body.appendChild(streamEl); }
       renderMarkdownStream(streamEl, clean, { streaming: true, showCaret: false, highlighter: highlightCode });
       _agentTimelineMarkVisible(timeline, _timelineTurn, "text");
       if (_activeStreamDiag && _activeStreamDiag.firstRenderMs == null) {
@@ -46475,7 +46664,6 @@ async function _agentModelTurn({ config, messages, toolSchemas, toolRegistry = n
       reasoningEl._t0 = (!acc && !byIndex.size && _activeStreamDiag && _activeStreamDiag.attemptStartedAt) || Date.now();
       reasoningEl.innerHTML = _THINK_CARD_HTML("思考中…");
       body.appendChild(reasoningEl);
-      _movePreflightCardsAfter(body, reasoningEl); // 预检卡挪到思考卡后面，只动视觉顺序
       _turnThinkCards.push(reasoningEl); // 记账：重试清场时整批移除
     }
     const b = reasoningEl.querySelector(".think-body");
@@ -48111,7 +48299,7 @@ function _WIKI_PROMPT(focus) {
   const f = String(focus || "").trim();
   return `深入探索这个代码库 / 产品，产出一份**结构化的产品 Wiki（Markdown 正文，直接可存盘）**。多角度检索（search / find_symbol / find_files / list_dir 逐层到第三层）+ 关键文件 read_file 读全，**读源码提炼真实功能，绝不编**。**如果 list_dir 一次已确认工作区是空目录 / 新项目，就停止继续找 package.json、vite.config、src 等不存在的目录内容，直接基于用户描述和现有证据写“空项目 / 待创建项目”蓝图。**按这个结构写：\n# 产品概览（是什么 / 为谁 / 核心价值，一句话讲清）\n# 技术栈 & 架构（语言 / 框架 / 关键依赖 + 目录地图 path→职责）\n# 核心功能（**逐个**列：功能名 + 解决什么 + 关键入口文件 / 组件）\n# 数据流 & 关键模块\n# 约定与模式 / 常见改动入口\n# 亮点与卖点（做官网 / 介绍产品时能直接用的真实卖点）\n**只输出这份 Wiki 的完整 Markdown 正文**，别加寒暄客套。${f ? "\n重点深挖：" + f : ""}`;
 }
-const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. You have screenshot for rendered pages, and **\`browser\` is granted by ROLE**: it is in your toolset only when your role brief carries it (frontend / design / test), and even then only for OBSERVATION — ${[..._BROWSER_OBSERVE_ACTIONS].join(" / ")}. Clicking, typing, filling, eval, cookies, storage and upload are refused at execution and belong to the main agent. If \`browser\` is not among the tools you were given, use screenshot and hand the rest back. Think, then look: before each retrieval be clear about what you are answering and which piece is still missing; when a result comes back, read it, update the judgement, and only then decide the next lookup. Follow the thread — trace imports, calls, definitions and data flow layer by layer (lsp_references for callers, lsp_definition to jump) until the sub-task is genuinely settled; one file read is where you start, not where you stop. Reply in the user's language.`);
+const _SUBAGENT_SYSTEM = _P("subagent_system", `You are a read-only research subagent. Investigate with the real tools — read_file/list_dir/search/find_files/semantic_search/find_symbol/lsp_definition/lsp_references/get_diagnostics/read_logs/knowledge_search/web_search/web_fetch/screenshot — and never change a file — no writing, deleting or moving. Everything else you may actually do: run_cmd is available for read-only work (probing with ls/cat/grep/find, and read-only verification like node --check, tsc --noEmit, tests, lint; write-ish commands are refused at execution, and that check scans the whole command string — if a search pattern tripped it, use search/find_files/find_symbol instead), and you may dispatch one further layer of sub-agents (run_subagent/run_worker/await_subagent, forced read-only, scope inside yours; a third layer is structurally blocked). Work out the shortest path to evidence first: when the target is known, read that file or symbol directly, and search only when the location is unknown; for an error or a failing service, read the diagnostics and logs first. **If list_dir has already confirmed the root is empty or this is a new project, stop guessing at the contents of paths like package.json, vite.config or src that do not exist, stop hunting for a directory structure, and report the "empty project" fact straight back to the main agent.** Reuse the ledger of what the main agent has already read, changed and established — do not start over. Your output must read like an experienced engineer's brief: (1) the conclusion in one sentence; (2) the evidence list (path:line / symbol / URL / diagnostic, stating what you actually read or found); (3) the root cause or design judgement, marking clearly where fact ends and inference begins; (4) which files the main agent should change next and what verification to run; (5) when you found nothing, the paths and keywords you covered and what is still missing. No vague summaries, and nothing hedged as "should/might" without evidence. Cross-check anything load-bearing: back a key conclusion with **two independent pieces of evidence** (the code plus a real usage, or the code plus an authoritative external source) — one file read is a lead, not a finding. Do not restate the task and do not open with a preamble; start with the conclusion. You have screenshot for rendered pages, and **\`browser\` is granted by ROLE**: it is in your toolset only when your role brief carries it (frontend / design / test), and even then only for OBSERVATION — mytabs / navigate / screenshot / viewport / inspect / network / nodes / scroll / wait / close. Clicking, typing, filling, eval, cookies, storage and upload are refused at execution and belong to the main agent. If \`browser\` is not among the tools you were given, use screenshot and hand the rest back. Think, then look: before each retrieval be clear about what you are answering and which piece is still missing; when a result comes back, read it, update the judgement, and only then decide the next lookup. Follow the thread — trace imports, calls, definitions and data flow layer by layer (lsp_references for callers, lsp_definition to jump) until the sub-task is genuinely settled; one file read is where you start, not where you stop. Reply in the user's language.`);
 
 /**
  * Spawn a focused, read-only sub-agent — Claude Code's Task tool in miniature.
@@ -48617,7 +48805,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
   // 否则就是"看得见打不开的钥匙"（read_logs / read_skill 已经这么漂过一次，
   // test/logic.test.mjs 里那条对账测试就是为此加的）。
   // git 和 gh 是单 type 多 op，类型放行之后另有 _GIT_READ_OPS / _GH_READ_OPS 二次把关。
-  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "live_environment", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
+  const _READ_TOOLS = ["read_file", "list_dir", "search", "find_files", "semantic_search", "find_symbol", "lsp_symbols", "lsp_hover", "lsp_definition", "lsp_references", "get_diagnostics", "read_logs", "knowledge_search", "read_skill", "web_fetch", "web_search", "screenshot", "git_status", "git_diff", "git_log", "git_blame", "arxiv_search", "awwwards_search", "bundlephobia_search", "clinical_trials_search", "codrops_search", "crossref_search", "cve_search", "developer_community_search", "github_search", "hackernews_search", "iconify_search", "mdn_search", "openalex_search", "package_search", "pubchem_search", "pubmed_search", "smashingmag_search", "stackoverflow_search", "steam_search", "wiki_search", "search_game_assets", "github_repo", "gitlab_repo", "gitee_repo", "codeberg_repo", "git_show", "git_conflicts", "git_stash_list", "gh_pr_view", "gh_pr_review_comments", "gh_actions_log", "view_image", "ui_extract", "read_screen", "read_terminal", "list_terminals", "think", "recall_conversation", "current_time", "probe_env"];
   // 这张表必须和上面 _READ_TOOLS 里每个名字的**类型**一一对上。
   //
   // 名字进 _READ_TOOLS 决定"模型看得见"，类型进 _READ_TYPES 决定"派发时放不放行"——
@@ -48878,7 +49066,7 @@ async function _runSubAgent({ config, description, prompt, root, container, run,
               : _ghWriteBlocked
               ? `[BLOCKED] 子任务只能读 GitHub（${_GH_READ_OPS.join("/")}），不能用 ${tc.name} —— 建 PR / 回复评论是不可逆的对外动作，交回主任务做。`
               : _browserWriteBlocked
-              ? `[BLOCKED] 只读子体的 browser 只能做观察类动作（${[..._BROWSER_OBSERVE_ACTIONS].join("/")}），不能用 action=${String(call.action || "")}。`
+              ? `[BLOCKED] 只读子体的 browser 只能做观察类动作（${[..._BROWSER_OBSERVE_ACTIONS].slice(0, 10).join("/")} …），不能用 action=${String(call.action || "")}。`
                 + "eval 能在页面里跑任意 JS、upload 能传文件，都属于改动，交回主任务做。"
             : _dbWriteBlocked
               ? "[BLOCKED] 只读子体的 db_query 只能跑不改数据的查询，这条语句会写库。把它连同你查到的事实写进结论交回主任务。"
@@ -49981,12 +50169,7 @@ function _buildToolHint() {
     // 全量名录。没有它，开局窗口外的工具模型既叫不出名字、search_tools 又是精确名查找，
     // 于是够得着的只有开局那十来个。字节稳定，可以待在 cache 前缀里。
     "\n\n📚 **完整能力名录（全部可用，按名字直接调用即可自动装载；不在开局窗口里不代表不能用）**\n" +
-    // 按**真实注册表**过滤。名录抬头对模型说的是「全部可用，按名字直接调用即可自动装载」，
-    // 而它原来无条件列 TOOL_METADATA 全表：网页版（inTauri=false）会把 89 个 desktopOnly
-    // 工具一起列出来，模型照着调就是一轮白烧。_staticToolNames() 是记忆化的，且正是从
-    // _buildToolRegistry → _buildAgentToolSchemas 建的，那里做的就是这道 desktopOnly 过滤。
-    // 字节稳定性不受影响：名录按集合分桶缓存，同一台机同一模式下集合恒定 → 文本恒定。
-    toolCapabilityIndex(_staticToolNames()) +
+    toolCapabilityIndex() +
     // 这一句原来是「看到贴合目标的那个，用 search_tools 取回 schema 再调用」，而名录里
     // **包含开局窗口那二十来个已经加载好的工具**，且不作区分。于是它对这一批陈述了一件假事：
     // 它们的 schema 就在模型手上，再去 search_tools 取一趟是纯往返。同一个文件另一处的注释
@@ -50874,9 +51057,11 @@ async function _recordEpisode(run, task, root, outcome, config, session = null) 
       // 于是「哪个工具老是失败」在数据上无从回答。这一条把它补上：
       // 同一条墙只记一次（同一个工具连撞五次不该占五个位置），最多 6 条。
       walls: [...new Set(steps.filter((s) => s && s.ok === false && s.fail).map((s) => s.fail))].slice(0, 6),
-      // 时间线 + 裁决等待的胜负。这两个数在此之前两侧都取不到；判据见 agent/turn-timing.js。
-      ...(() => { const t = _summarizeTiming(run.timeline), r = _summarizeIntentRace(session);
-        return { ...(t ? { timing: t } : {}), ...(r ? { intentRace: r } : {}) }; })(),
+      // 时间线汇总。时间戳一直有、一直只喂给界面上那只跑秒表，然后随 run 一起消失——
+      // 于是「典型首字延迟是 3 秒还是 15 秒」「一条消息发几次模型请求」这两个问题，
+      // 客户端和服务端两侧都答不了（服务端的 request_id 是每会话一个，按它分组量不出来）。
+      // 判据见 agent/turn-timing.js，全是时间戳之差，不含任何推断。
+      ...(() => { const t = _summarizeTiming(run.timeline); return t ? { timing: t } : {}; })(),
       // 裁决这轮判的编排模式。没有它，"编排到底通没通"只能从 approach 的动词里反推——
       // 而那恰好分不清两种截然不同的情况：裁决压根没判成要编排，和判了却没派出去。
       // 前者要改判据，后者要改可达性；2026-08-22 实测两者同时存在（939 回合 0 次调用）。
@@ -51119,20 +51304,22 @@ function _criticToolCatalog(toolRegistry, maxTools = Infinity, maxDescriptionCha
 function _criticRequestedToolSchemas(toolNames, toolRegistry, maxTools = 8) {
   if (!Array.isArray(toolNames) || !toolRegistry || typeof toolRegistry.get !== "function") return [];
   
-  // 按用户熟练度放宽工具窗口，数据源是 growth.js 的 BKT 状态——那边 signal() 在四处真实
-  // 记账（message-sent / run-complete / review-diff / edit-applied），是真数据。
-  //
-  // 这里原来读的是 `window._growthState`：一个**从来没有被赋过值**的形状（全仓唯一写入点
-  // 在 observeToolCall 内部，而那函数第一行就是 `if (!g) return;`——先决条件是它自己先被
-  // 写过，鸡生蛋）。于是这段自适应一次都没生效，上限恒等于默认值，代码却摆得像已经接好了。
-  //
-  // 用 getAvgMasteryStrict() 而不是 getAvgMastery()：后者读失败时返回 0.5，而 0.5 恰好越过
-  // 下面 0.45 那道阈值——**失败反而给更多工具**。拿不到就保守，维持传进来的默认值。
+  // P0 #2: Adaptive critic limit based on growth state
   let dynamicMaxTools = Number(maxTools) || 8;
-  const _avgP = (() => { try { return growth.getAvgMasteryStrict(); } catch { return null; } })();
-  if (Number.isFinite(_avgP)) {
-    if (_avgP > 0.7) dynamicMaxTools = 15;
-    else if (_avgP > 0.45) dynamicMaxTools = 12;
+  try {
+    const growthState = typeof window !== 'undefined' ? window._growthState || null : null;
+    if (growthState && typeof growthState.avgMastery === 'function') {
+      const avgP = growthState.avgMastery();
+      // Expert users get more tools in critic window
+      if (avgP > 0.7) {
+        dynamicMaxTools = 15;
+      } else if (avgP > 0.45) {
+        dynamicMaxTools = 12;
+      }
+      // else keep default 10 or provided maxTools
+    }
+  } catch (e) {
+    console.warn('Adaptive critic limit failed, fallback to default:', e.message);
   }
   
   const out = [], seen = new Set();
@@ -51460,12 +51647,73 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   } catch { return null; }
 }
 
-// 这里原来有 recommendToolsForIntent（启发式工具推荐）。删掉，两个理由叠在一起：
-// ① 零调用点——它在 wiring.test 的 KNOWN_UNCALLED 里挂了很久，理由写的是"留着备用"；
-// ② 就算接上也不可能对：它拿**工具名**（read_file / run_cmd…）去查 userSkills，而那份
-//    熟练度的键是 growth.js 的技能 id（reviewing / authoring / prompting / planning /
-//    tooling / verifying）——两套词表零重合，权重恒为 0，排序恒等于不排序。
-// "留着备用"的前提是它将来能用；这个不能。
+/**
+ * recommendToolsForIntent - 启发式工具推荐引擎
+ *
+ * 基于意图关键词匹配推荐工具（仅作为 suggestion 注入 user block，不是硬路由）。
+ * 遵循项目原则："关键词仅作兜底，AI 主判"——推荐结果只是给编排模型的参考提示，
+ * 最终选哪些工具仍由语义编排器根据任务含义和真实证据裁决。
+ */
+function recommendToolsForIntent(intentText, context = {}) {
+  const intentPatternMap = {
+    research: {
+      keywords: ['调研', '选型', '了解', '评估', 'compare', 'alternative', '主流'],
+      tools: ['github_search', 'developer_community_search', 'read_file(documentation)', 'package_search']
+    },
+    debugging: {
+      keywords: ['报错', 'error', 'exception', 'bug', 'fix', 'crash', '异常', '失败'],
+      tools: ['search(error_code)', 'run_cmd(test_command)', 'read_file(log_file)', 'get_diagnostics']
+    },
+    performance: {
+      keywords: ['慢', '性能', 'slow', 'latency', 'timeout', '卡顿', '响应时间'],
+      tools: ['db_query(explain_plan)', 'browser(performance_test)', 'run_cmd(benchmark)', 'read_logs(app_error.log)']
+    },
+    ui_implementation: {
+      keywords: ['界面', 'UI', '页面', 'frontend', 'view', 'component', '设计'],
+      tools: ['browser(headful)', 'screenshot(current_view)', 'design_board', 'read_file(css_files)']
+    },
+    data_operations: {
+      keywords: ['数据库', 'table', 'schema', 'data', 'migrate', 'query', '表结构'],
+      tools: ['db_query(inspect_schema)', 'read_file(migrations/)']
+    }
+  };
+  
+  // P0 #3: Personalize recommendations based on user's skill mastery levels
+  let userSkills = {};
+  try {
+    const growthState = typeof window !== 'undefined' ? window._growthState || null : null;
+    if (growthState && Array.isArray(growthState.skills)) {
+      userSkills = growthState.skills.reduce((acc, skill) => {
+        acc[skill.name] = skill.mastery ?? 0;
+        return acc;
+      }, {});
+    }
+  } catch (e) {
+    console.warn('Growth skill access failed, falling back to default ranking:', e.message);
+  }
+  
+  const normalizedIntent = String(intentText || '').toLowerCase();
+  if (!normalizedIntent) return [];
+  const matchedTools = [];
+
+  for (const config of Object.values(intentPatternMap)) {
+    if (config.keywords.some((keyword) => normalizedIntent.includes(keyword.toLowerCase()))) {
+      matchedTools.push(...config.tools);
+    }
+  }
+
+  // Weight and sort by user skill mastery - higher mastery tools appear first
+  let weightedTools = matchedTools.map(tool => {
+    // Extract base tool name (remove parameters like (documentation), (test_command), etc.)
+    const baseName = tool.replace(/\(.*\)/, '');
+    const mastery = userSkills[baseName] ?? userSkills[tool] ?? 0;
+    return { tool, mastery };
+  });
+  
+  // Sort by mastery descending, then take top 5
+  weightedTools.sort((a, b) => b.mastery - a.mastery);
+  return weightedTools.slice(0, 5).map(w => w.tool);
+}
 
 /**
  * validateToolCall - 增强版工具调用验证
@@ -51725,12 +51973,6 @@ function _validateToolOrchestration(tools, toolRegistry, profile) {
     list = list.filter((name) => !!toolRegistry.get(name));
   }
   // 数量收敛：一次装太多工具，弱模型注意力直接被打散
-  // 注意：这道「>15 收敛到 12」在**当前的生产调用路径上到不了**——唯一调用点传的
-  // decision.tools 在上游 _semanticToolOrchestrator 里已经过了
-  // _criticRequestedToolSchemas(j.tools, toolRegistry, 10)，最多 10 个。
-  // 留着是因为这是个通用校验器（测试直接拿 20 个工具喂它），换个调用方就用得上；
-  // 但**别指望它来告诉用户"工具被裁过"**——真正在裁的是下游那个 10（弱模型 8），
-  // 那处此前完全静默，现在自己出声了（见 requestedSchemas 附近那条 note）。
   if (list.length > 15) {
     list = list.slice(0, 12);
     notes.push("工具过多易分心，已收敛到 12 个；其余可用 search_tools 按需请求");
@@ -51893,21 +52135,11 @@ async function _semanticToolOrchestrator({ config, task, profile, phase, progres
     if (_text == null) return null;
     const j = _safeJsonLoose(_text);
     if (!j || !Array.isArray(j.tools)) return null;
-    // 真正的裁剪就在这一行。两件事必须在这里做，下游做不到：
-    //  ① 弱模型的窗口上限（8）要在**这里**生效。原来它写在下游 `routeToolNames.length > 10`
-    //     那道分支里，而那时候列表已经被这一行裁到 ≤10 —— 实测喂 3/8/10/14/20/40 个候选，
-    //     那条分支六次全为 false，弱模型窗口从来没有收窄过，_isWeakModel 的唯一消费点因此空转。
-    //  ② 「被裁过」这件事要在这里记账。下游那条 note 同理够不着：它比较的是裁后的长度，
-    //     恒等，于是模型选了 40 个、被静默丢掉 30 个，也一个字都不会说。
-    const _toolCap = _isWeakModel(config?.model) ? 8 : 10;
-    const _picked = Array.isArray(j.tools) ? j.tools.length : 0;
-    const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, _toolCap).map((schema) => schema.function.name);
-    const dropped = Math.max(0, _picked - tools.length);
+    const tools = _criticRequestedToolSchemas(j.tools, toolRegistry, 10).map((schema) => schema.function.name);
     // 工具规划思考链：兼容 thought/thought_process/plan_step 三种字段名（弱模型可能不按
     // 格式出）；只在 UI 层可视化 + 随工具结果回传，不进 system prompt 缓存。
     const thought = String(j.thought || j.thought_process || j.plan_step || "").slice(0, 1500);
-    return { tools, dropped, picked: _picked, cap: _toolCap,
-      instruction: String(j.instruction || "").slice(0, 800), thought, reason: String(j.reason || "").slice(0, 300) };
+    return { tools, instruction: String(j.instruction || "").slice(0, 800), thought, reason: String(j.reason || "").slice(0, 300) };
   } catch { return null; }
 }
 
@@ -52607,11 +52839,8 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     if (!preflight || run._domainKnowledgePreflightConsumed === preflight) return false;
     run._domainKnowledgePreflightConsumed = preflight;
     if (!preflight.required || !Array.isArray(preflight.briefs) || !preflight.briefs.length) return false;
-    // 同上：注入记账也提到会话级，否则「一会话嚼一次」会被「每轮重新注入」抵消掉。
-    const _dkInjSess = run.session || run;
-    run._domainKnowledgeBriefInjected = _dkInjSess._domainKnowledgeBriefInjected instanceof Set
-      ? _dkInjSess._domainKnowledgeBriefInjected : new Set();
-    _dkInjSess._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected;
+    run._domainKnowledgeBriefInjected = run._domainKnowledgeBriefInjected instanceof Set
+      ? run._domainKnowledgeBriefInjected : new Set();
     for (const item of preflight.briefs) {
       if (!item?.brief || run._domainKnowledgeBriefInjected.has(item.domain)) continue;
       run._domainKnowledgeBriefInjected.add(item.domain);
@@ -52946,28 +53175,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 强制注入：当意图判定认为需要多角色协作时，确保子智能体工具在列表里——
     // 不依赖编排器自觉返回它们（弱模型常不返回不熟悉的工具名）。
     if (run.engineering?.orchestrationMode === "staged_roles" || run.engineering?.orchestrationMode === "parallel_roles") {
-      // **前置**不是追加。下面两道裁剪都从尾部切（弱模型 slice(0,8)、以及所有模型都过的
-      // _criticRequestedToolSchemas(..., 10)），而编排器返回 ≥7 个已注册工具是难任务的常态
-      // ——追加的话这四个派发工具会被静默切掉，正好把这段注释说的「不依赖编排器自觉返回」
-      // 变成一句空话：多角色协作模式下模型手上根本没有派子体的工具。
-      const _dispatch = ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"];
-      routeToolNames = [..._dispatch, ...routeToolNames.filter((t) => !_dispatch.includes(t))];
+      for (const t of ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"]) {
+        if (!routeToolNames.includes(t)) routeToolNames.push(t);
+      }
     }
     
     
     // Weak model tool window convergence: attention budget limited, only load top 8 from >10;
-    // 弱模型的 8 工具窗口**已挪到 _semanticToolOrchestrator 里真正裁剪的那一行**。
-    // 原来它写在这儿、判据是 `routeToolNames.length > 10`——而那时列表已经被上游裁到 ≤10，
-    // 实测喂 3/8/10/14/20/40 个候选，这条分支六次全为 false：弱模型窗口从来没收窄过，
-    // _isWeakModel 的唯一消费点空转，那本每轮都在写的模型能力账本因此只写不读。
-    //
-    // 「被裁过」这件事同理只有上游说得出：下游比较的是**裁后**的长度，恒等于自己，
-    // 于是模型选了 40 个、被静默丢掉 30 个，一个字都不会说。现在由编排器把
-    // picked/dropped/cap 随返回值带出来，在这里如实转成一条 note。
-    if (decision?.dropped > 0) {
-      orchCheck.notes.push(`编排选了 ${decision.picked} 个工具，按注意力预算（上限 ${decision.cap}）只装载了 ${decision.tools.length} 个；其余用 search_tools 按名请求`);
+    // strong models not restricted. Named/preferred tools are preserved via stabilization.
+    if (routeToolNames.length > 10 && _isWeakModel(config?.model)) {
+      // 这里原来先过一遍 _prioritizeNamedTools 再切 8 个。那个函数是**恒等变换**：
+      // 它按 `s.function?.name` 取名，而传进去的 routeToolNames 是**字符串数组**——
+      // 于是 allToolNames 恒为空集，三条加名的路（decision.tools / instruction 子串 /
+      // probePreloads）全都命不中，`if (!namedNames.size) return schemas` 原样返回。
+      // 把类型改对之后对同一批输入跑 slice(0,8) 结果逐字节相同（稳定排序 + named 分区
+      // 覆盖除注入外的全部元素），所以修它没有任何行为差异——删掉。
+      routeToolNames = routeToolNames.slice(0, 8);
+      orchCheck.notes.push("当前模型注意力预算有限，已聚焦 8 个最相关工具，需要更多能力时用 search_tools 明确请求");
     }
-    const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, Math.max(10, routeToolNames.length));
+    const requestedSchemas = _criticRequestedToolSchemas(routeToolNames, run._toolRegistry, 10);
     const update = requestedSchemas.length
       ? _applyToolPayloadWindow(toolSchemas, requestedSchemas, run._toolCoreNames)
       : null;
@@ -53120,15 +53346,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 所以同时挂到 run 上，走每轮无条件注入的〔执行状态〕那一块。
     run._resumeFact = `上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃）${w.files && w.files.length ? "，当时这些文件已改好并落盘：" + w.files.join("、") : ""}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
     _pad.findings.push(`上次运行在第 ${w.iter || "?"} 步中途中断（应用关闭/崩溃），当时任务：「${w.task || ""}」${w.files && w.files.length ? "；当时已改好并落盘：" + w.files.join("、") : ""}。接着未完成的部分继续，已落盘的改动别重做。`);
-  }
-  // 同会话里点了停止/线路中断之后又继续（不是崩溃重启，走不到上面那条 _wfInterrupted）：
-  // 上一轮结算出的「已落盘」事实存进了 _lastRunState.breakWriteFact。以前它是靠拼进可见
-  // 正文的那条页脚顺带被模型在历史里读到的；页脚拿掉后，这里补一条 run._resumeFact，让
-  // 「别重写已落盘文件」照样经每轮必注入的〔执行状态〕喂到模型。crash 路已置则不覆盖。
-  if (isAgent && !run._resumeFact && session?._lastRunState?.breakWriteFact) {
-    const _bwf = String(session._lastRunState.breakWriteFact).slice(0, 300);
-    run._resumeFact = `上一轮在停止/中断前，${_bwf}。这些改动**已经在磁盘上了**，先读再判断，不要重做、不要整份重写。`;
-    _pad.findings.push(`上一轮停止/中断前，${_bwf}。接着未完成的部分继续，别重写已落盘的文件。`);
   }
   function _padText() {
     const includeRequirements = _shouldIncludeRequirementsInPad(run, _pad);
@@ -53595,11 +53812,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 路是同一个洞（那条今天早些时候已经补上），只是触发方式是用户自己点的停止。
         if (turn.text && turn.text.trim()) summaryText += (summaryText ? "\n\n" : "") + turn.text.trim();
         if (turn.reasoning && turn.reasoning.trim()) reasoningAll += (reasoningAll ? "\n" : "") + turn.reasoning.trim();
-        // 停止前的流式阶段可能已经落盘。结算在途写入（等它们落定），把「改了什么」记成
-        // **状态**（run._breakWriteFact → _lastRunState → 续跑时的 run._resumeFact），
-        // 不再拼进可见正文——那条〔中断前的写入结果〕是 harness 写的字，冒充模型输出；
-        // 中断时用户要看的是完整、自然的聊天记录本身，「改了哪些文件」照样以状态喂给模型。
-        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) run._breakWriteFact = _eagerNote; }
+        // 同上：按了停止，但这一轮流式阶段可能已经写了文件。用户最需要知道的恰恰是
+        // "我点停止之前，它到底改了什么"。
+        { const _eagerNote = await _settleEagerWritesForBreak(run); if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote; }
         break;
       }
       // The classifier ran in parallel with this visible model turn. Adopt it before any
@@ -53665,8 +53880,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 落了盘的文件在消息历史、run 摘要、账本里一个记录都没有。
         {
           const _eagerNote = await _settleEagerWritesForBreak(run);
-          // 「改了什么」记成状态（见上面停止那条的说明），不拼进可见正文。
-          if (_eagerNote) run._breakWriteFact = _eagerNote;
+          if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
           // 同上：这条 break 也绕过了批处理里的记账。落了盘就得认，否则收尾按
           // 「本轮什么都没改」结算，未验证的代码被静默放行。
           let _landed = 0;
@@ -53725,9 +53939,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
         // 字都没有——下一轮模型看不到"本次运行已落盘"清单，会把同一个文件再从头写一遍，
         // 或者收尾时说"我没有改动文件"。和上面两条 break 完全一样地先收账。
         const _eagerNote = await _settleEagerWritesForBreak(run);
-        // 记成状态而非可见正文；插话后 run 继续，模型本就从每轮的运行草稿纸（_padText 带
-        // 「改过的文件」）看到落盘清单，这里不需要把页脚塞进聊天记录。
-        if (_eagerNote) run._breakWriteFact = _eagerNote;
+        if (_eagerNote) summaryText += (summaryText ? "\n\n" : "") + _eagerNote;
         let _landed = 0;
         for (const item of (run._writeLedger || []).slice(_ledgerAtTurnStart)) {
           if (item?.ok && item.path) { _mutatedFiles.add(_normRel(item.path, root)); _landed++; }
@@ -56086,6 +56298,25 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       if (items.length && _live()) {
         run._toolLedger.turnIndex++;  // 每批工具调用后递增回合数
         
+        // P0 #5: Growth feedback loop - record tool usage signals to adaptive learner model
+        for (const it of items) {
+          // `_notAttempted` 同样要排除：这里喂的是「哪个工具成功/失败」的学习信号，
+          // 一次根本没发生的调用会以 ok:false 教给学习器，方向和台账那两处一模一样。
+          if (!it || it._notAttempted || !it.call?.type || !_toolExecutionAttempted(it.rawResult)) continue;
+          try {
+            const ok = _toolExecutionSucceeded(it.call, it.rawResult);
+            observeToolCall({
+              turn: run._toolLedger.turnIndex,
+              tool: String(it.call.type === 'cmd' ? (it.call.command?.split(' ')[0] || '') : it.call.type),
+              ok: !!ok,
+              timestamp: Date.now()
+            });
+          } catch (e) {
+            // Growth recording bug must never break the chat hot-path
+            console.warn('Growth signal recording failed:', e.message);
+          }
+        }
+        
       }
 
       // Investigate-before-edit: edited existing code without reading/searching anything
@@ -56915,7 +57146,11 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
     // （run._writeLedger 逐条记着每次写入尝试的成败），不读模型的任何措辞。
     {
-      const _failedWrites = _failedWritePaths(run._writeLedger);
+      // 按 path 取**最后一条**：账本是顺序追加、整 run 不剪枝的，写失败后重试成功的
+      // 那条仍留在账上，直接 filter 会把已经补救成功的也算进 N。
+      const _lastWrite = new Map();
+      for (const a of (Array.isArray(run._writeLedger) ? run._writeLedger : [])) if (a?.path) _lastWrite.set(String(a.path), a.ok === true);
+      const _failedWrites = [..._lastWrite].filter(([, ok]) => !ok);
       if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
     }
     // 声明了要改工作区，一个文件都没落盘 —— 第七条谎报路径。
@@ -57008,14 +57243,7 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // for compaction + replay. The triggering user turn was already persisted before the run.
     try {
       const _record = String(summaryText || "").trim();
-      // 执行事实（本轮动过哪些文件）挂在 _ideMeta 上跟着入账——为什么不能带 tool_calls、
-      // 为什么只能是 _ideMeta，见 agent/execution-facts-meta.js 的头注释。
-      if (_record) {
-        const _msg = { role: "assistant", content: _record, model: config.model || "" };
-        if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll;
-        _attachExecutionFacts(_msg, run?._mutatedFiles);
-        session.memory.push(_msg);
-      }
+      if (_record) { const _msg = { role: "assistant", content: _record, model: config.model || "" }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; session.memory.push(_msg); }
     } catch {
       if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText, model: config.model || "" }); } catch {} }
     }
@@ -57043,12 +57271,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       task: String(task || "").replace(/\s+/g, " ").trim().slice(0, 700),
       result: String(summaryText || finalErr || "").replace(/\s+/g, " ").trim().slice(0, 1000),
       incompleteReason: String(run._incompleteReason || (hitCap ? "iteration_limit" : "")).slice(0, 260),
-      // 中断/停止前结算出的「已落盘」事实。以前它作为〔中断前的写入结果〕页脚拼进可见
-      // 正文（等于 harness 替模型说话），现在改成状态：只在这一轮**确实没跑完**时留存，
-      // 下一轮由 run._resumeFact 走每轮必注入的执行状态喂给模型（"别重写已落盘文件"）。
-      // 正常收尾（哪怕途中插过话）不留——否则新任务会莫名其妙收到"上一轮中断前已落盘"。
-      breakWriteFact: (finalErr || _stoppedEarly || run._incompleteReason)
-        ? String(run._breakWriteFact || "").replace(/^〔中断前的写入结果〕/, "").slice(0, 300) : "",
       // 收尾评审（_wrapUpCritic 那次付费调用）判"这段改动没实现用户要的东西"时,结论
       // 原来只进交付事实行——而那行如今只喂模型,且评审按设计**不拦回合**,所以运行通常
       // 就在这里结束,没有"下一轮"来读它。等于每次改代码都花一次模型调用,算出一个
@@ -58404,8 +58626,7 @@ function _settleToolStep(step, result, label = "") {
     : result?.type === "cmd" && Number.isFinite(Number(result?.code)) ? Number(result.code) !== 0
     : /^\s*\[[^\]\n]{0,80}(失败|ERROR|BLOCKED|CONFLICT|DENIED|NEEDS_REPO|不可用|未执行|权限问题|interrupted)[^\]\n]{0,80}\]/i.test(head);
   res.className = `atc-result ${failed ? "atc-result--err" : "atc-result--ok"}`;
-  // 不直接 textContent：.atc-result 是 flex，那条 text-overflow 恒不生效（详见 setBadgeText）。
-  _setBadge(res, label || (failed ? "失败" : "完成"));
+  res.textContent = label || (failed ? "失败" : "完成");
   if (failed) step?.classList?.add?.("agent-tool-step--rejected");
   if (step?.dataset) step.dataset.toolSettled = "1";
   _collapseSettledToolSteps(step);
@@ -62371,11 +62592,7 @@ async function _executeToolStepInner(step, call, root, run) {
         return { type: "viewimage", path: _viRel, content: `[ERROR] ${_viRel} 的内容不是图片。` };
       }
       res.className = "atc-result atc-result--ok"; res.textContent = "已读取";
-      // 属性值必须 _escAttr 不是 _escHtml（escape.js 原话：引号故意不转，属性请用 escapeAttr）。
-      // 原来 alt 用 _escHtml：文件名带一个双引号就能闭合 alt="…"，后面的字符变成 <img> 的
-      // 真实属性——含 onerror，等于在带 backend 桥的面板里执行任意 JS。src 同理（data:image/
-      // svg+xml 正文可带引号）。5138 行的兄弟预览早就用 _escAttr，这里对齐。
-      if (vp) vp.innerHTML = `<img src="${_escAttr(_viUrl)}" alt="${_escAttr(_viRel)}" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
+      if (vp) vp.innerHTML = `<img src="${_viUrl}" alt="${_escHtml(_viRel)}" style="max-width:100%;border-radius:8px;display:block;border:1px solid rgba(128,128,128,.25)">`;
       step.classList.add("is-open");
       _chatFollow(run && run.session);
       // `image` 会被主循环挑走，作为图片块喂回模型（文本模型走视觉转写那条路）。
@@ -63847,7 +64064,20 @@ ${bodyPreview}`)}</pre>`;
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 300);
         res.className = "atc-result atc-result--err"; res.textContent = `${_labels[call.type] || call.type} 失败`;
-        const _hint = "可以重试、换查询词、改用 web_search / browser 打开页面读取，或换其他信息源。";
+        // 这 57 个源里有一批是**直接抓公开网站的 HTML**，而不少站点已经封了爬虫。
+// 实测（2026-08-05，完整搜索 URL）：producthunt / codepen / colourlovers /
+// freecodecamp / reddit 返回 403，dribbble / smzdm 返回 202 + 空体（反爬挑战），
+// 闲鱼返回 11KB 的 JS 壳页（抓不到商品）。
+//
+// 这类失败**重试永远不会好**。而这里原来一律回一句"检查查询参数、网络连接或
+// 稍后重试"，于是模型换个词再搜、再搜——把一次注定失败的抓取变成一串失败，
+// 用户看到的就是"这破工具动不动就报错"。真因（对方封了爬虫）一个字都没传达。
+//
+// 按状态码分因：能判定是封锁的就明说"换别的源"，只有真正像网络抖动的才建议重试。
+const _blocked = /\b(403|401|429|202)\b/.test(msg) || /forbidden|blocked|captcha|cloudflare|访问被拒/i.test(msg);
+const _hint = _blocked
+  ? "该站点拒绝了程序化访问（反爬 / 需登录），重试无用——换其他信息源，或改用 web_search / browser 打开页面读取。"
+  : "可能是网络或查询参数问题，可换个查询词重试一次；再失败就换其他信息源。";
 return { type: call.type, path: call.query || "", content: `[失败] ${call.type}: ${msg}。${_hint}` };
       }
 
@@ -64273,13 +64503,11 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         if (vp) {
           const dot = vp.querySelector(".bm-dot"); if (dot) { dot.className = "bm-dot " + dotClass; }
           const meta = vp.querySelector(".bm-meta"); if (meta) meta.textContent = statusText;
+          const fill = vp.querySelector(".bm-fill"); if (fill) { fill.style.width = "100%"; if (dotClass === "timeout") fill.classList.add("timeout"); }
           const acts = vp.querySelector(".bm-actions"); if (acts) acts.remove();
         }
         if (!suppressFollowup) {
-          // 第一次检查就命中 = 极可能「开始等之前就已经成立」，不是「等到了」。不改控制流，
-          // 只说清区别——否则旧进程占的端口/上次留下的文件会被当成"这一步刚做完"的证据。
-          const _pre = dotClass === "done" ? preexistingConditionNote(_bmChecks, bmType) : "";
-          _queueFollowup(_bmSess, followupText + _pre);
+          _queueFollowup(_bmSess, followupText);
           _drainFollowups(_bmSess);
         }
       };
@@ -64297,7 +64525,8 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         const card = document.createElement("div"); card.className = "bm-card";
         card.innerHTML =
           `<div class="bm-head"><div class="bm-dot"></div><div class="bm-msg">${_escHtml(bmMsg)}</div></div>` +
-          `<div class="bm-meta">${_escHtml(_bmTypeLabels[bmType] || bmType)}${bmType !== "manual" ? ` · 监听中` : ""}</div>` +
+          `<div class="bm-meta">${_escHtml(_bmTypeLabels[bmType] || bmType)}${bmType !== "manual" ? ` · ${bmTimeout}s 超时` : ""}</div>` +
+          (bmType !== "manual" ? `<div class="bm-bar"><div class="bm-fill" style="width:0"></div></div>` : "") +
           `<div class="bm-actions">` +
             (bmType === "manual" ? `<button class="bm-btn bm-btn--primary _bmContinue">已完成，继续</button>` : "") +
             `<button class="bm-btn _bmCancel">取消等待</button>` +
@@ -64308,44 +64537,27 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
         card.querySelector("._bmCancel").addEventListener("click", () => _bmFinish("cancelled", "已取消", `[background_monitor 取消] 用户取消了等待「${bmMsg}」。请跳过这个等待步骤继续。`), { once: true });
       }
       if (bmType !== "manual") {
-        const _bmSnapTotal = _captureTotal;   // 见 _onCaptureFlow：下标当基线会被环形缓冲吃掉
+        const _bmSnap = _captureFlows.length;
         const _bmStart = Date.now();
-        // 生产者快照：这个条件多半靠刚才那条终端命令去促成（cursor login 的 CLI、npm run dev）。
-        // 记下开始等的时候「最近活动的那个终端」以及它当时是不是已经退出——只在**开始时还在跑、
-        // 后来退出且带报错**时才判定「它在等一件已经失败了的事」，立刻收尾而不是空等到超时。
-        const _bmWatchEnt = (() => { try { return _findAgentTerminal(""); } catch { return null; } })();
-        const _bmWatchWasExited = !!(_bmWatchEnt && _bmWatchEnt.exited);
         let _bmFileChecking = false;
-        let _bmScreenChecking = false, _bmScreenFails = 0, _bmScreenOk = false;
-        let _bmCmdTimedOut = false;
+        let _bmScreenChecking = false, _bmScreenFails = 0;
         const _bmPoll = async () => {
           if (_bmDone) return;
           // 这一轮已经结束/被 Stop/标签页关了：立刻停表退场，别再轮询也别再排新 run。
           if (_bmRetired()) { _bmDone = true; if (_bmIv) clearTimeout(_bmIv); return; }
-          // 生产者已停：在等的那件事本来靠某条终端命令去促成，那条命令带着报错退出了——
-          // 条件不会再成立，别用整个超时窗口换一句假「超时」。把它临终的输出喂回给模型。
-          if (_bmWatchEnt) {
-            const _ps = monitorProducerStopped({ wasExited: _bmWatchWasExited, nowExited: !!_bmWatchEnt.exited, recentOut: _terminalPlainText(_bmWatchEnt.recentOut || "") });
-            if (_ps.stopped && _ps.failed) {
-              _bmFinish("timeout", "所等命令已失败退出", `[background_monitor 生产者已停] 你在等「${bmMsg}」，但促成它的那条终端命令已经退出、且输出里有失败信号（${_ps.pattern}）——这**不是**「用户没做」，是它在等一件已经失败了的事。终端临终输出：\n${_ps.tail || "(空)"}\n先按这段报错定位根因（凭据/授权/端口/依赖），修好再重试那一步；别继续空等，也别问用户"你想做什么"。`);
-              return;
-            }
-          }
           const elapsed = (Date.now() - _bmStart) / 1000;
           _bmChecks++;
-          // 不再显示「Xs / Ys」倒计时和进度条——用户要的是「监听中」而不是一个滴答的表。
-          // 卡片头上的 .bm-dot 一直在脉动，那就是「还在听」的活性指示；这里什么都不刷。
+          if (vp) {
+            const fill = vp.querySelector(".bm-fill"); if (fill) fill.style.width = Math.min(100, (elapsed / bmTimeout) * 100).toFixed(1) + "%";
+            const meta = vp.querySelector(".bm-meta"); if (meta) meta.textContent = `${_bmTypeLabels[bmType] || bmType} · 已检查 ${_bmChecks} 次 · ${Math.floor(elapsed)}s / ${bmTimeout}s`;
+          }
           if (elapsed > bmTimeout) {
-            _bmFinish("timeout", "监听结束（未捕捉到）", `[background_monitor 超时] 一直在监听「${bmMsg}」但没等到条件（检查 ${_bmChecks} 次）。${_bmCmdTimedOut
-              ? `\n\n⚠️ **注意：你这条检查命令每次都被自己的超时杀掉了**（每次最多给它几十秒）。也就是说条件在结构上就不可能成立，不是"用户没做完"。换一条跑得快的判据（探端口/探 URL/看文件），或者把这条慢命令交给 run_in_terminal 起起来再监听它的产物。`
-              : ""}注意：用户可能已经完成了操作但检测没捕捉到——先用工具检查当前实际状态（读文件/跑命令/看浏览器），确认条件是否其实已满足，然后继续你的原始任务。不要问用户"你想做什么"——回顾上文你知道自己在做什么。`);
+            _bmFinish("timeout", `已超时（${bmTimeout}s，检查 ${_bmChecks} 次）`, `[background_monitor 超时] 等待「${bmMsg}」已超过 ${bmTimeout} 秒（检查 ${_bmChecks} 次）未满足条件。注意：用户可能已经完成了操作但检测没捕捉到——先用工具检查当前实际状态（读文件/跑命令/看浏览器），确认条件是否其实已满足，然后继续你的原始任务。不要问用户"你想做什么"——回顾上文你知道自己在做什么。`);
             return;
           }
           if (bmType === "capture") {
             const re = bmPat ? (() => { try { return new RegExp(bmPat, "i"); } catch { return null; } })() : null;
-            // 开始等之后新来的条数；缓冲被 shift 过也仍然对（最多就是整个缓冲都是新的）。
-            const _fresh = Math.min(_captureFlows.length, Math.max(0, _captureTotal - _bmSnapTotal));
-            for (let i = _captureFlows.length - _fresh; i < _captureFlows.length; i++) {
+            for (let i = _bmSnap; i < _captureFlows.length; i++) {
               const f = _captureFlows[i];
               const hay = `${f.url||""} ${f.host||""} ${f.path||""} ${f.method||""} ${f.status||""} ${f.respBody||""} ${f.reqBody||""}`;
               if (re ? re.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase())) {
@@ -64370,14 +64582,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
             } catch {} finally { _bmFileChecking = false; }
           } else if (bmType === "command" && bmPat) {
             try {
-              // 每次检查给命令多久：写死 10 秒会让**所有慢检查结构性地不可能成立**——
-              // 模型很自然会写 `npm run build` / `docker compose ps` / `curl .../health`，
-              // 冷启动或网络慢过 10 秒就每次都被杀掉、永远拿不到 exit 0，而回执只说
-              // 「没等到条件，用户可能没做完」，把根因彻底藏起来。按整体超时给，封顶 60 秒。
-              const _cmdTimeout = Math.min(60, Math.max(10, Math.floor(bmTimeout / 6)));
-              const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: _cmdTimeout });
-              // 被自己的超时杀掉 ≠ 条件没满足。记一笔，超时回执里要说出来。
-              if (r && r.timedOut) _bmCmdTimedOut = true;
+              const r = await backend.taskRunCapture(bmCwd, bmPat, { timeoutSecs: 10 });
               if (r && r.code === 0) _bmFinish("done", "命令成功（exit 0）", `[background_monitor 结果] 命令「${bmPat}」返回 exit 0，输出：${(r.stdout || "").slice(0, 500)}。继续执行。`);
             } catch {}
           } else if (bmType === "url" && bmPat) {
@@ -64403,11 +64608,6 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               const hay = lines.join("\n");
               const sre = (() => { try { return new RegExp(bmPat, "i"); } catch { return null; } })();
               const hit = sre ? sre.test(hay) : hay.toLowerCase().includes(bmPat.toLowerCase());
-              // 探查成功了就把失败计数清零，并记一笔「曾经成功过」。原来这个计数只增不减，
-              // 于是盯着用户登录十分钟、前面成功一百多次，只要中途机器忙/用户切走目标 app
-              // 累计（不需要连续）攒够 3 次瞬时失败，监视器就提前收摊——还斩钉截铁地说
-              // 「一次都没成功过、多半是没给辅助功能权限」，把模型引去排查一个不存在的故障。
-              _bmScreenOk = true; _bmScreenFails = 0;
               if (hit) {
                 const _which = lines.find((l) => (sre ? sre.test(l) : l.toLowerCase().includes(bmPat.toLowerCase()))) || "";
                 _bmFinish("done", "界面已出现", `[background_monitor 结果] 「${r?.app || bmApp || "前台应用"}」的界面上出现了「${bmPat}」（命中：${String(_which).slice(0, 160)}），说明那一步已经做完了。继续执行。`);
@@ -64418,9 +64618,7 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
               // 最容易骗人的失败形态。
               _bmScreenFails++;
               if (_bmScreenFails >= 3) {
-                _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」。${_bmScreenOk
-                  ? `前面成功探查过，是中途开始连续失败的——多半是目标应用退出了或切走了，别去查权限。`
-                  : `一次都没成功过，多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到；可以先用 system 的 window.list 确认应用名。`} 也可以换 manual 让用户点确认。`);
+                _bmFinish("timeout", "屏幕探查不可用", `[background_monitor 失败] 盯屏幕这条走不通：${String(e?.message || e).slice(0, 200)}。这**不是**「条件没满足」——检查一次都没成功过。多半是没给辅助功能权限，或者目标应用名「${bmApp || "(未指定)"}」找不到。换 manual 让用户点确认，或者先用 system 的 window.list 确认应用名。`);
                 return;
               }
             } finally { _bmScreenChecking = false; }
@@ -65524,22 +65722,29 @@ return { type: call.type, path: call.query || "", content: `[失败] ${call.type
       // 这次拿到的是哪个浏览器（接管了已开着的 / 另起了一个 / 用了临时配置），后端只在
       // 浏览器刚起来的那一次给，所以这里原样带上，不做去重也不做加工。
       if (state.session_note) content += `\n\n[浏览器会话] ${state.session_note}`;
-      // 落在人机验证 / 反爬挑战页上。把事实告知模型，让它自行决定怎么过。
+      // 落在人机验证墙上：这一步没拿到目标页面，拿到的是一道验证。
+      //
+      // 这里唯一正确的动作是**停下来交给人**——窗口本来就是可见的，用户点一下就过了。
+      // 明确禁止模型自己去「想办法过」：换 UA、改 navigator.webdriver、反复重试、找镜像绕，
+      // 都是绕过机器人检测，这个产品不做。不写死这句话，模型会把验证页当正文继续解析，
+      // 或者原地重试到把工具调用次数耗光——那正是现在的表现。
       if (state.blocked) {
-        content = `[人机验证] 当前页面是一道验证/反爬挑战：${state.blocked}\n`
+        content = `[需要你本人操作] 这一步没能拿到目标页面，落在了一道人机验证上：${state.blocked}\n`
           + `当前地址：${state.url || "(未知)"}\n\n`
-          + `你可以尝试：\n`
-          + `1. 用浏览器自动化点击验证按钮/复选框来通过它。\n`
-          + `2. 如果自动化搞不定，告诉用户「这个页面要过一次人机验证，请在浏览器窗口里点一下，完成后我接着做」。\n`
-          + `3. 改用其他途径（web_search / 官方 API / 其它数据源）完成任务。\n`
-          + `注意：下面的截图和文本是验证页面本身，不是目标页面的内容。\n\n`
+          + `**不要尝试绕过它**——不要换 User-Agent、不要改 navigator.webdriver、不要反复重试同一个地址、不要找镜像站绕行。\n`
+          + `按这个顺序处理：\n`
+          + `1. 自动化浏览器窗口现在就开着，验证就显示在上面。直接告诉用户「这个页面要过一次人机验证，请在浏览器窗口里点一下，完成后我接着做」，然后停下等他。他点完之后你再重新导航同一个地址即可。\n`
+          + `2. 如果这件事不需要非得从这个网页拿，改用 web_search / 官方 API / 其它数据源完成，并说明你换了路径。\n`
+          + `3. 不要把下面这张截图和文本当成目标页面的内容来解析或引用。\n\n`
           + content;
-        res.className = "atc-result atc-result--warn";
-        res.textContent = "遇到验证";
+        res.className = "atc-result atc-result--err";
+        res.textContent = "需人工验证";
         if (step) step.classList.add("is-open");
+        // 也说给**人**听。只写进 content 的话，这句话要等模型下一轮才转述出来，
+        // 而这时候需要动手的恰恰是坐在屏幕前的人——浏览器窗口就在旁边开着。
         if (vp) vp.insertAdjacentHTML("beforeend",
-          `<div class="browser-wall-note"><b>页面遇到人机验证（${_escHtml(state.blocked)}）</b>`
-          + `<span>智能体正在尝试处理，如果需要你帮忙会告诉你。</span></div>`);
+          `<div class="browser-wall-note"><b>这一页要过人机验证（${_escHtml(state.blocked)}）</b>`
+          + `<span>自动化浏览器窗口现在就开着，验证就在上面——你点一下完成它，我接着往下做。</span></div>`);
       }
       // 「Dock 里为什么多出一个 Chrome」的答案，就贴在它出现的那一次上。
       if (state.session_note && vp) {
@@ -66702,36 +66907,6 @@ function _initCodeHostTokenFields() {
     input.addEventListener("blur", save);
   }
   _codeHostFieldsBound = true;
-  _initTokenBudgetField();
-}
-
-/**
- * 单次运行 token 预算的**写入端**。
- *
- * 机制一直都在（_readTokenCap 读 michael-ide.token-budget，超限后不再硬扩步数并在收尾
- * 提醒），而且它是整个智能体循环唯一的数值天花板——但那个键全仓只有 getItem、没有任何
- * setItem，也没有任何界面能填，于是 cap 恒为 0（=不限），而代码里两处注释写着
- * 「烧钱由用户自设的 token 预算兜住」。读写两头这才接上。
- * 形状照抄上面 GitHub/GitLab 那两个：change + blur 落盘，只存本机。
- */
-let _tokenBudgetBound = false;
-function _initTokenBudgetField() {
-  const input = $("tokenBudgetInput");
-  if (!input) return;
-  try {
-    const cur = parseInt(localStorage.getItem("michael-ide.token-budget") || "0", 10) || 0;
-    input.value = cur > 0 ? String(cur) : "";
-  } catch {}
-  if (_tokenBudgetBound) return;
-  _tokenBudgetBound = true;
-  const save = () => {
-    // 负数 / 非数字 / 0 一律当"不限"，写回空串而不是留个脏值。
-    const n = Math.max(0, Math.floor(Number(input.value) || 0));
-    try { localStorage.setItem("michael-ide.token-budget", n > 0 ? String(n) : ""); } catch {}
-    input.value = n > 0 ? String(n) : "";
-  };
-  input.addEventListener("change", save);
-  input.addEventListener("blur", save);
 }
 
 // Figma 令牌存本机 localStorage（与 AI 网关配置解耦）；供 figma 工具读取。带「测试」按钮打 /v1/me。
@@ -67360,17 +67535,9 @@ let _captureSystemProxyEnabled = false;
 let _captureBrowserUsesProxy = false;
 const _CAPTURE_CAP = 3000;
 
-// 累计收到过多少条流量。**不随 shift 回退**——background_monitor 的 capture 分支要靠它
-// 认「哪些是我开始等之后才来的」。原来它拿 _captureFlows.length 当基线，而这是个定长
-// 3000 的环形缓冲：抓包跑久一点缓冲一满，基线恒等于 3000、length 也恒等于 3000，
-// `i < _captureFlows.length` 恒假，循环体一次都不执行——卡片显示「监听中」、超时回执说
-// 「一直在监听但没等到条件」，模型据此去排查用户没登录/没走代理，而实际上一次都没检查过。
-let _captureTotal = 0;
-
 function _onCaptureFlow(flow) {
   if (!flow || typeof flow !== "object") return;
   _captureFlows.push(flow);
-  _captureTotal++;
   if (_captureFlows.length > _CAPTURE_CAP) _captureFlows.shift();
   if (!featureOverlay.hidden && activeFeatureTab === "capture") _renderCaptureList();
 }
@@ -70297,7 +70464,7 @@ function buildSelectControl(options, cur, onPick) {
     menu.style.width = `${r.width}px`;
     menu.style.left = `${r.left}px`;
     const h = menu.offsetHeight;
-    const below = viewportH() - r.bottom - 8;
+    const below = window.innerHeight - r.bottom - 8;
     menu.style.top = h <= below ? `${r.bottom + 4}px` : `${Math.max(8, r.top - h - 4)}px`;
     btn.setAttribute("aria-expanded", "true");
     setActive(Math.max(0, options.findIndex(([v]) => String(v) === value)));
@@ -72178,16 +72345,27 @@ function _mktFmtDl(n) {
   return String(n || 0);
 }
 
-// 这里原来是 _BUILTIN_EXTENSIONS：16 条写死的市场条目，带编出来的下载量（"12.3M"）和
-// 五星评分。它零消费方——市场列表当时被硬设成 []，这 16 条一次都没被渲染过。
-// 现在列表来自 extManager.availableBuiltin()（本机真实内置扩展的 manifest），
-// 这份假数据没有存在的理由了。没有商店后端就不假装有社会证明。
+const _BUILTIN_EXTENSIONS = [
+  { id: "bradlc.vscode-tailwindcss", name: "Tailwind CSS IntelliSense", author: "Tailwind Labs", version: "0.14.0", description: "智能 Tailwind CSS 工具 — 自动补全类名、语法高亮、错误提示", category: "Web", tags: ["css", "web", "tailwind"], featured: true, downloads: 16700000, rating: 4.7, icon: "tailwind", details: "## 功能\n- 90+ Tailwind 工具类自动补全\n- 悬停查看类名对应的 CSS\n- 语法错误实时提示\n\n## 使用方法\n安装后在 HTML/JSX 文件中输入 Tailwind 类名即可触发补全。\n\n命令面板：`Tailwind: Lookup Class` — 查询光标处的类名" },
+  { id: "Vue.volar", name: "Vue - Official", author: "Vue", version: "2.2.0", description: "Vue.js 官方语言支持：模板语法高亮、组件智能提示、格式化", category: "Languages", tags: ["vue", "language", "web"], featured: true, downloads: 15600000, rating: 4.5, icon: "vue", details: "## 功能\n- Vue SFC 模板语法高亮\n- 组件 Props 自动补全\n- `<script setup>` 支持\n- TypeScript 集成" },
+  { id: "pkief.material-icon-theme", name: "Material 文件图标", author: "Philipp Kief", version: "5.14.1", description: "Material Design 风格文件图标 — 1000+ 种文件和文件夹图标", category: "Themes", tags: ["theme", "icons"], featured: true, downloads: 28900000, rating: 4.8, icon: "theme", details: "## 功能\n- 1000+ 文件类型图标\n- 特殊文件夹图标（node_modules, src, test 等）\n- 浅色/深色主题自适应\n- 自定义图标映射" },
+  { id: "ms-azuretools.vscode-docker", name: "Docker", author: "Microsoft", version: "1.29.3", description: "Docker 容器管理 — 构建、管理、部署容器化应用", category: "DevOps", tags: ["docker", "devops"], featured: true, downloads: 24100000, rating: 4.5, icon: "docker", details: "## 功能\n- 查看运行中的容器列表\n- 管理 Docker 镜像\n- Dockerfile 语法高亮\n\n## 命令\n- `Docker: 查看运行容器`\n- `Docker: 查看镜像列表`" },
+  { id: "github.copilot", name: "GitHub Copilot", author: "GitHub", version: "1.240.0", description: "AI 编程助手 — 智能代码补全、函数生成、测试编写", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 24800000, rating: 4.3, icon: "copilot", details: "## 功能\n- 智能代码补全（多行）\n- 根据注释生成完整函数\n- 自动编写单元测试\n- 支持 40+ 编程语言\n\n## 注意\n需要 GitHub Copilot 订阅账号" },
+  { id: "tabnine.tabnine-vscode", name: "Tabnine AI", author: "Tabnine", version: "3.128.0", description: "AI 代码助手 — 全行和全函数代码补全，支持所有语言", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 9800000, rating: 4.2, icon: "ai", details: "## 功能\n- 全行代码补全\n- 全函数代码生成\n- 本地模型（隐私保护）\n- 支持所有编程语言" },
+  { id: "zhihu.hanzi-counter", name: "汉字计数器", author: "知乎团队", version: "1.2.0", description: "实时统计中文字符数、英文单词数、总字数，适合写作和翻译", category: "Other", tags: ["chinese", "tools"], featured: true, downloads: 180000, rating: 4.3, icon: "hanzi", details: "## 功能\n- 状态栏实时显示：汉字数 / 英文词数 / 总字符数\n- 统计行数\n- 支持 Markdown 和纯文本\n\n## 命令\n`汉字计数器: 统计当前文件` — 弹窗显示详细统计" },
+  { id: "nicepkg.vscode-translate", name: "翻译助手", author: "NicePkg", version: "2.1.0", description: "代码注释中英互译、变量名翻译、选中文本即时翻译", category: "Other", tags: ["chinese", "tools", "ai"], featured: true, downloads: 350000, rating: 4.4, icon: "translate", details: "## 功能\n- 30+ 编程术语内置字典\n- 选中中文 → 翻译成英文\n- 选中英文 → 翻译成中文\n- 中文变量名转 camelCase\n\n## 命令\n- `翻译: 翻译选中文本`\n- `翻译: 变量名中英转换`" },
+  { id: "pnp.polacode", name: "代码截图", author: "pnp", version: "0.3.4", description: "拍立得风格代码截图 — 选中代码生成精美分享图片", category: "Other", tags: ["tools", "screenshot"], downloads: 2100000, rating: 4.3, icon: "camera", details: "## 功能\n- 选中代码一键生成截图\n- 保留语法高亮颜色\n- 自动适配编辑器主题\n\n## 使用\n命令面板：`代码截图: 截取选中代码`" },
+  { id: "antfu.iconify", name: "图标预览", author: "Anthony Fu", version: "0.18.0", description: "10 万+ 图标在线预览 — 100+ 图标集、行内预览、自动补全", category: "Other", tags: ["icons", "tools", "web"], downloads: 2800000, rating: 4.7, icon: "iconify", details: "## 功能\n- 100,000+ 图标库\n- 支持 100+ 图标集（Material, Heroicons, Lucide 等）\n- 代码中图标名行内预览\n- 图标名自动补全" },
+  { id: "ms-ceintl.vscode-language-pack-zh-hans", name: "简体中文语言包", author: "Microsoft", version: "1.96.0", description: "编辑器界面简体中文翻译 — Chinese (Simplified) Language Pack", category: "Other", tags: ["chinese", "language"], downloads: 15800000, rating: 4.6, icon: "zhcn", details: "## 功能\n- 编辑器所有菜单中文化\n- 状态栏/面板中文翻译\n- 设置页面中文显示\n\n安装后重启即可生效" },
+  { id: "svelte.svelte-vscode", name: "Svelte", author: "Svelte", version: "109.0.0", description: "Svelte 框架语言支持 — 语法高亮、自动补全、诊断", category: "Languages", tags: ["svelte", "language", "web"], downloads: 3200000, rating: 4.5, icon: "web", details: "## 功能\n- .svelte 文件语法高亮\n- 组件属性自动补全\n- 错误诊断\n- 代码格式化" },
+  { id: "prisma.prisma", name: "Prisma", author: "Prisma", version: "5.22.0", description: "Prisma ORM 语法高亮和自动补全 — 数据库模型定义助手", category: "Other", tags: ["database", "tools"], downloads: 4500000, rating: 4.6, icon: "default", details: "## 功能\n- .prisma schema 语法高亮\n- 模型字段自动补全\n- 关系定义智能提示\n- 格式化 Prisma Schema" },
+  { id: "streetsidesoftware.code-spell-checker", name: "拼写检查", author: "Street Side Software", version: "4.0.0", description: "代码拼写检查器 — 支持 camelCase 和编程术语", category: "Other", tags: ["linter", "tools"], downloads: 12300000, rating: 4.4, icon: "linter", details: "## 功能\n- 200+ 编程常用词内置词库\n- 自动拆分 camelCase/snake_case\n- 检测可疑拼写错误\n\n## 命令\n`拼写检查: 检查当前文件`" },
+  { id: "wayou.vscode-todo-highlight", name: "TODO 高亮", author: "Wayou Liu", version: "1.0.5", description: "高亮 TODO/FIXME/HACK 等注释标记 — 一目了然待办事项", category: "Other", tags: ["tools", "highlight"], downloads: 7800000, rating: 4.5, icon: "color", details: "## 功能\n- 高亮 TODO / FIXME / HACK / BUG / NOTE 标记\n- 可自定义高亮颜色\n- 支持自定义关键词" },
+  { id: "alefragnani.project-manager", name: "项目管理器", author: "Alessandro Fragnani", version: "12.8.0", description: "快速切换项目 — 收藏、分组、一键打开多个工作区", category: "Other", tags: ["tools", "workspace"], downloads: 5600000, rating: 4.5, icon: "default", details: "## 功能\n- 快速切换多个项目\n- 项目分组管理\n- 状态栏一键打开项目列表\n\n## 命令\n`项目管理器: 查看项目列表`" },
+];
 
 async function _installExtension(entry) {
-  // 列表现在直接来自本机内置扩展的 manifest，条目的 id 已经**就是**内置 id
-  // （michael.todo-highlight 这种），所以先认它自己；下面那张 VS Code 别名表留给
-  // 用 VS Code 市场 id 进来的调用方（bradlc.vscode-tailwindcss → michael.tailwind-intellisense）。
-  const builtinId = entry?.builtin ? entry.id : _BUILTIN_ID_MAP[entry.id];
+  const builtinId = _BUILTIN_ID_MAP[entry.id];
   if (builtinId) {
     try {
       const result = await extManager.installBuiltin(builtinId);
@@ -72209,15 +72387,11 @@ const _BUILTIN_ID_MAP = {
   "zhihu.hanzi-counter": "michael.hanzi-counter",
   "nicepkg.vscode-translate": "michael.translate-helper",
   "pnp.polacode": "michael.polacode-screenshot",
-  // 这两条的前缀 2026-08-30 从 devin.* 改成 michael.*：src-tauri/extensions/ 下 17 个内置
-  // 扩展里只有 insert-date / word-count 还叫 devin.*，其余 15 个（含这两个）都是 michael.*。
-  // 写错的后果是 installBuiltin 抛「unknown built-in extension」——中文语言包和 TODO
-  // 高亮这两个恰恰是最常被装的。目前双重死代码（市场列表也是空的），接回去那天才会炸。
-  "ms-ceintl.vscode-language-pack-zh-hans": "michael.chinese-language-pack",
+  "ms-ceintl.vscode-language-pack-zh-hans": "devin.chinese-language-pack",
   "svelte.svelte-vscode": "michael.svelte-language",
   "streetsidesoftware.code-spell-checker": "michael.spell-checker",
   "alefragnani.project-manager": "michael.project-manager",
-  "wayou.vscode-todo-highlight": "michael.todo-highlight",
+  "wayou.vscode-todo-highlight": "devin.todo-highlight",
 };
 
 let _mktModal = null;
@@ -72324,12 +72498,11 @@ function openMarketplaceModal() {
           <div class="mktm__meta">
             <span class="mktm__author">${_escHtml(entry.author)}</span>
             <span class="mktm__sep">·</span>
-            <span>v${_escHtml(entry.version || "")}</span>
-            ${/* 下载量和评分**只在真有值时**才画。列表现在来自本机内置扩展的真实
-                 manifest，那里没有这两个数——原来是写死的假数字（"12.4k 次下载 ★4.8"），
-                 一个没有商店后端的本地列表不该凭空长出社会证明。 */ ""}
-            ${Number(entry.downloads) > 0 ? `<span class="mktm__sep">·</span><span>${_mktFmtDl(entry.downloads)} 次下载</span>` : ""}
-            ${Number(entry.rating) > 0 ? `<span class="mktm__sep">·</span><span>★ ${Number(entry.rating).toFixed(1)}</span>` : ""}
+            <span>v${entry.version}</span>
+            <span class="mktm__sep">·</span>
+            <span>${_mktFmtDl(entry.downloads)} 次下载</span>
+            <span class="mktm__sep">·</span>
+            <span>★ ${(entry.rating || 0).toFixed(1)}</span>
           </div>
         </div>
         <button class="mktm__install-btn" type="button">安装</button>
@@ -72392,26 +72565,9 @@ function openMarketplaceModal() {
     detailEl.querySelector(".mktm__det-head").appendChild(installBtn);
   }
 
-  // 列表来自**本机真实内置扩展**的 manifest（extManager.availableBuiltin() → Rust 侧
-  // ext_available_builtin，即 src-tauri/extensions/ 下那 17 个目录）。
-  //
-  // 这里原来是一句 `_mktAllEntries = []` 配注释「扩展市场已清空」——于是三个入口
-  // （⌘⇧X、工具栏按钮、命令面板）点进去永远是「暂无内容」。同一块代码上面还挂着 16 条
-  // 写死的条目，带编出来的下载量和五星评分，全是零引用死代码。
-  // 现在：有什么就列什么，没有商店后端就不假装有社会证明（下载量/评分只在真有值时画）。
+  // 扩展市场已清空——不再展示任何内置 / 远程扩展。
   _mktAllEntries = [];
   renderList();
-  (async () => {
-    try {
-      const list = await extManager.availableBuiltin();
-      _mktAllEntries = (Array.isArray(list) ? list : []).map((mf) => ({
-        id: mf?.id || "", name: mf?.name || mf?.id || "", description: mf?.description || "",
-        author: mf?.author || "", version: mf?.version || "", category: "", tags: [],
-        builtin: true,
-      })).filter((e) => e.id);
-    } catch { _mktAllEntries = []; }
-    renderList();
-  })();
 }
 
 function renderConflictsTool(body) {
@@ -75224,53 +75380,6 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   promptEl.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-// 树内拖动：光标底下那一行 → 收它的那个目录。和外部拖入同一套规则（目录行进它自己、
-// 文件行进它所在目录、空白进活动根），但这里是 mousemove 的 client 坐标，直接可用。
-// 正在被拖的那些行要跳过：不然拖住一个文件夹时，光标下面就是它自己，目标恒等于自己。
-function _treeDropDirAt(x, y, dragging = []) {
-  const row = document.elementFromPoint(x, y)?.closest?.(".row");
-  if (!row || !_treeEl?.contains(row)) return "";
-  const path = row.dataset?.path || "";
-  const isDir = !row.querySelector(":scope > .chev-spacer");
-  const dir = dropDirFor({ rowPath: path, rowIsDir: isDir, rootPath });
-  return dragging.includes(dir) ? "" : dir;
-}
-// 把一批文件/目录移进 destDir。这是 VS Code 资源管理器里最常用的操作，之前我们完全没有
-// ——树内拖动只支持"拖到输入框变 @ 引用"，拖到别的文件夹上什么都不发生。
-async function _moveIntoDir(paths, destDir) {
-  if (!destDir || !paths?.length) return;
-  // 先折叠嵌套选择（删除那条路一直在用 _treeTopLevelTargets，移动漏了）：同时选中 A/ 和
-  // A/x.txt 时，搬走 A/ 之后再拿已经不存在的 A/x.txt 去 rename 会半路失败——而 A/ 已经动了。
-  const { moves, skipped } = planMove({ paths: _treeTopLevelTargets(paths), destDir });
-  if (!moves.length) {
-    if (skipped.some((x) => x.reason === "self")) showToast("不能把文件夹移进它自己里面");
-    return;
-  }
-  const dirs = new Set([destDir]);
-  const reopened = [];
-  let done = 0; let failed = "";
-  for (const m of moves) {
-    // 移动前先把该文件（或该目录下的文件）从编辑器里关掉，和 renameEntry 同一个规矩；
-    // 用户在关闭确认里点了取消就整批停下。
-    const wasOpen = openFiles.has(m.from);
-    if (!(await _closeOpenFilesUnder(m.from))) break;
-    try {
-      await backend.renamePath(m.from, m.to);
-      _treeMoveExpansionSubtree(m.from, m.to);
-      dirs.add(parentDir(m.from));
-      if (wasOpen) reopened.push(m.to);
-      done++;
-    } catch (e) { failed = String(e?.message || e); break; }
-  }
-  _clearTreeSel();
-  for (const d of dirs) { try { await reloadDir(d); } catch {} }
-  _invalidateProjectFileCache();
-  try { refreshGitStatus(); } catch {}
-  // 本来开着的文件在新位置重新打开——移动不该顺手把用户的页签关掉。
-  for (const rp of reopened) { try { await openFile(rp, basename(rp)); } catch {} }
-  if (failed) showToast(`移动失败：${failed}`);
-  else if (done) showToast(`已移动 ${done} 项到 ${basename(destDir) || destDir}`);
-}
 (function _wireTreeDragToComposer() {
   const box = promptEl.closest(".composer__box") || promptEl.parentElement;
   if (!box) return;
@@ -75279,10 +75388,6 @@ async function _moveIntoDir(paths, destDir) {
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   };
   const _blockSelect = (e) => { e.preventDefault(); };
-  // 拖住的那行如果本来就在多选里，就带上整组一起走；否则只拖它自己。
-  const candPaths = () => (_rowDragCandidate
-    ? (_treeSel.has(_rowDragCandidate.path) ? [..._treeSel] : [_rowDragCandidate.path])
-    : []);
   document.addEventListener("mousemove", (e) => {
     if (!_rowDragCandidate) return;
     if (!_rowDragging) {
@@ -75301,14 +75406,7 @@ async function _moveIntoDir(paths, destDir) {
     }
     try { window.getSelection().removeAllRanges(); } catch {}
     if (_rowDragGhost) { _rowDragGhost.style.left = (e.clientX + 14) + "px"; _rowDragGhost.style.top = (e.clientY + 10) + "px"; }
-    const onComposer = _overComposer(e.clientX, e.clientY);
-    box.classList.toggle("drop-target", onComposer);
-    // 落在树里 → 这是一次**移动**，高亮会接收它的那个目录（和外部拖入共用同一套反馈）。
-    _treeEl?.classList.toggle("is-dropping", !onComposer);
-    const _mdest = onComposer ? "" : _treeDropDirAt(e.clientX, e.clientY, candPaths());
-    _paintDropRow(_mdest);
-    // 和外部拖入同一条规则：落点是项目根时整棵树一起亮，否则空白处拖动看不到任何反馈。
-    _treeEl?.classList.toggle("is-drop-root", !!_mdest && _mdest === rootPath);
+    box.classList.toggle("drop-target", _overComposer(e.clientX, e.clientY));
   });
   document.addEventListener("mouseup", (e) => {
     document.body.classList.remove("tree-selecting");
@@ -75319,11 +75417,9 @@ async function _moveIntoDir(paths, destDir) {
     if (_rowDragGhost) { _rowDragGhost.remove(); _rowDragGhost = null; }
     document.body.classList.remove("tree-dragging");
     box.classList.remove("drop-target");
-    _treeEl?.classList.remove("is-dropping", "is-drop-root"); _paintDropRow("");
     if (wasDragging) {
       try { window.getSelection().removeAllRanges(); } catch {}
       if (_overComposer(e.clientX, e.clientY)) _insertRefAtCursor(_pathToRel(cand.path));
-      else void _moveIntoDir(candPaths(), _treeDropDirAt(e.clientX, e.clientY, candPaths()));
       _suppressTreeClick = true;
       setTimeout(() => { _suppressTreeClick = false; }, 80);
     }
@@ -75751,7 +75847,7 @@ async function _renderAtMenu() {
   const r = promptEl.getBoundingClientRect();
   _atMenu.style.left = r.left + "px";
   _atMenu.style.width = Math.min(r.width, 520) + "px";
-  _atMenu.style.bottom = viewportH() - r.top + 6 + "px";
+  _atMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
   _atMenu.hidden = false;
 }
 
@@ -77024,7 +77120,7 @@ function _updateSlashMenu() {
   // Narrower than the prompt: two short columns of text do not need its full width, and the
   // old 520px cap made three commands look like a dialog.
   _slashMenu.style.width = Math.min(r.width, 380) + "px";
-  _slashMenu.style.bottom = viewportH() - r.top + 6 + "px";
+  _slashMenu.style.bottom = window.innerHeight - r.top + 6 + "px";
   _slashMenu.hidden = false;
   _renderSlashActive();
 }
@@ -78454,10 +78550,7 @@ const KB_ACTIONS = {
   "view.zoomOut": () => _applyUiZoom(_uiZoom - 0.1),
   "view.zoomReset": () => _applyUiZoom(1),
   "file.deleteSelected": () => _deleteSelectedTreeItem(),
-  // 和命令面板里同 id 的那条对齐（79585 走的是 extPanel.open()）。原来这里指向
-  // openMarketplaceModal —— 同一个 id 两处指两个东西，而市场那个列表是**刻意清空**的
-  // （见 _mktAllEntries 那处注释：不再展示任何内置/远程扩展），点进去永远「暂无内容」。
-  "view.extensions": () => extPanel.open(),
+  "view.extensions": () => openMarketplaceModal(),
 };
 
 function keyCombo(e) {
@@ -79314,7 +79407,7 @@ $("toggleAssistantBtn")?.addEventListener("click", () => {
     };
     const onMove = (e) => {
       if (!dragging) return;
-      const h = Math.max(140, Math.min(viewportH() * 0.7, startH + (startY - e.clientY)));
+      const h = Math.max(140, Math.min(window.innerHeight * 0.7, startH + (startY - e.clientY)));
       termPanel.style.flex = `0 0 ${h}px`;
       scheduleLayout();
     };
@@ -79648,9 +79741,6 @@ const palette = createCommandPalette({
     { id: "view.livePreviewPick", title: PREVIEW_TAB_NAME + "：指元素给 AI", category: t("menu.view"), run: () => { openLivePreview(); _previewTogglePick(); } },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
-    // 市场这条 2026-08-30 恢复：它一度被摘掉，因为列表被写死成空、点进去永远「暂无内容」。
-    // 现在列表来自本机真实内置扩展，是能用的入口了。它和上面 view.extensions 不是一回事：
-    // 那个是"管理已装的"，这个是"看看有哪些可装"。
     { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
     { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
     { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
@@ -79667,8 +79757,7 @@ const palette = createCommandPalette({
   ],
 });
 
-// 同上：按钮通向能用的扩展面板，不是那个刻意清空的市场弹窗。
-$("extensionsBtn").addEventListener("click", () => extPanel.open());
+$("extensionsBtn").addEventListener("click", () => openMarketplaceModal());
 $("paletteBtn").addEventListener("click", () => palette.open());
 /*
  * 这里原来还有一条硬编码的 mod+shift+p 监听（capture + stopPropagation），和
@@ -80254,7 +80343,8 @@ const _explorerEl = document.getElementById("explorer");
 // Composer input is local-only. Paid intent work starts after Send owns the current
 // settlement requestId, so abandoned drafts cannot compete with the foreground model.
 const _composerEl = document.getElementById("composer");
-// bot 图标 = 引用到 AI 对话（唯一还在用的投放区图标）。
+// Precise Lucide-geometry icons. folder-down = open into workspace; bot = reference in AI chat.
+const _ICON_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/><path d="M12 10v6"/><path d="m9 13 3 3 3-3"/></svg>';
 const _ICON_AI = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>';
 function _mkDropZone(cls, labelCls, icon, label) {
   const z = document.createElement("div");
@@ -80262,138 +80352,34 @@ function _mkDropZone(cls, labelCls, icon, label) {
   z.innerHTML = '<span class="dz-label ' + labelCls + '">' + icon + '<span>' + label + '</span></span>';
   return z;
 }
+if (_explorerEl) _explorerEl.appendChild(_mkDropZone("explorer-dropzone", "dz-label--open", _ICON_OPEN, "打开到工作区"));
 if (_composerEl) _composerEl.appendChild(_mkDropZone("composer-dropzone", "dz-label--ai", _ICON_AI, "引用到对话"));
-// 侧栏不再有整块罩色的投放区：VS Code 的投放反馈只有「目标那一行的底色」，罩整块反而
-// 说不清落点（而且旧标签写的是「打开到工作区」，和现在的复制语义正好相反）。
-// 编辑器区同理，不画自创的虚线框。
 
 let _dropHideTimer = 0;
 // Which target is the cursor over? Checks the composer rect against BOTH the raw position and the
 // devicePixelRatio-divided one, so it works whether Tauri reports physical or logical px (and for the
 // browser path where we pass client px). Anything not over the composer → "open" (sidebar/editor).
-const _treeEl = document.getElementById("tree");
-// 落点是否在某个元素里；命中就把**客户端坐标**还回去（后面 elementFromPoint 要用）。
-// 两套坐标都试：Tauri 报的可能是物理像素也可能是逻辑像素，浏览器路径给的是 client px。
-// 拖放事件里的坐标 → CSS 坐标要除以几。
-//
-// 这里原来是「两套都试，先试除以 devicePixelRatio 的那个」。而侧栏又窄又高：坐标减半之后
-// 往往**仍然落在侧栏矩形里**，于是那个错误候选每次都先命中 —— 用户看到的就是「高亮出现在
-// 光标位置的一半处」，光标在下面、亮的却是上面几行。
-//
-// 换成**实测**：问窗口它的 innerSize（物理像素）是 CSS 宽度的几倍，就除以几。
-// Tauri 报物理像素时算出 dpr、报 CSS 像素时算出 1，两种约定都对，且不用猜。
-// 浏览器路径没有这个对象，_dropScale 保持 1，client 坐标直接就是 CSS 坐标。
-// 拖放事件报来的坐标 → CSS 坐标。
-//
-// 踩过两次，记下来：
-//  ① 最早是「两套坐标都试，先试除以 dpr 的那个」。侧栏又窄又高，坐标减半后**仍然落在
-//     侧栏里**，于是错误候选每次先命中 —— 高亮永远出现在光标位置的一半处。
-//  ② 接着改成「向窗口要 innerSize，除以 CSS 宽算出比例」。但 documentElement.clientWidth
-//     会被界面缩放（--ui-zoom / style.zoom）改掉，于是在缩放不为 1 时又量出个错的倍数，
-//     表现还是「放在下面、亮的是上面」。
-//
-// 所以不再测量、也不假设约定，改成**自校正**：先当它是 CSS 坐标（wry 在 macOS 上报的
-// 就是逻辑点），一旦真的观察到某个坐标越出 CSS 视口——CSS 坐标不可能越出——就说明这台
-// 机器报的是物理像素，当场锁定成 dpr，本次会话之后都按它换算。
-// 好处是不依赖任何一侧的实现细节：报逻辑点时从第一帧就正确，报物理像素时最多错一帧。
-let _dropScale = 1;
-function _dropCssPoint(p) {
-  if (!p) return null;
-  if (_dropScale === 1) {
-    const dpr = window.devicePixelRatio || 1;
-    // 只在 dpr>1 时才有歧义可言；越界即证明是物理像素。
-    if (dpr > 1 && (p.x > viewportW() || p.y > viewportH())) _dropScale = dpr;
-  }
-  return { x: p.x / _dropScale, y: p.y / _dropScale };
-}
-function _dropPointIn(p, el) {
-  const pt = _dropCssPoint(p);
-  if (!pt || !el) return null;
-  const r = el.getBoundingClientRect();
-  if (!r.width || !r.height) return null;
-  return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom ? pt : null;
-}
-// 三个落区。文件树那档是 VS Code 的分工：落进树里 = 复制成子文件/子目录，**不换工作区**；
-// 换项目留给编辑器区那档（"open"）。没打开项目时树里是空状态，这时拖文件夹进来用户要的
-// 正是「打开它」，所以 rootPath 为空就不抢这个落点。
 function _dragTargetAt(payload) {
   const p = payload && payload.position;
-  if (_dropPointIn(p, _composerEl)) return "composer";
-  // 判据用**整条侧栏**而不是 #tree：切到 Git/搜索/调试视图时 #viewExplorer 被 display:none，
-  // #tree 的矩形塌成 0，落点会悄悄退回 "open" —— 于是往侧栏拖个文件夹会换掉整个项目。
-  // 侧栏永远是「加进这个项目」，看的是哪个视图不该改变这件事。
-  if (rootPath && _dropPointIn(p, _explorerEl)) return "explorer";
+  if (p && _composerEl) {
+    const r = _composerEl.getBoundingClientRect();
+    if (r.width && r.height) {
+      const dpr = window.devicePixelRatio || 1;
+      const hit = (x, y) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+      if (hit(p.x / dpr, p.y / dpr) || hit(p.x, p.y)) return "composer";
+    }
+  }
   return "open";
 }
-// 光标下面那一行 → 往哪个目录里放。判据是**文件行才有** :scope > .chev-spacer：
-// 不能反过来认 .chev，因为工作区根行把 .chev 包在 .workspace-root__toggle 按钮里，
-// 认 .chev 会把根行当成文件、把目标算成工作区**外面**的父目录（后端直接拒绝）。
-function _dropDirAt(payload) {
-  const pt = _dropPointIn(payload && payload.position, _treeEl);
-  const row = pt ? document.elementFromPoint(pt.x, pt.y)?.closest?.(".row") : null;
-  return dropDirFor({ rowPath: row?.dataset?.path || "", rowIsDir: !row?.querySelector(":scope > .chev-spacer"), rootPath });
-}
-// 拖进来的是什么：drag-enter 带 paths，drag-over 不带 → 在 enter 那一帧存下来给后续复用。
-let _dragItems = [];
-let _dropSig = "";
-let _springTimer = 0;
-// 存**路径**而不是节点引用：fs-watcher 会在拖动途中重建整棵树，存引用的话高亮会挂在
-// 一个已被丢弃的节点上，既清不掉也贴不上。每帧按类名扫一遍再贴，重建后下一帧自愈。
-function _paintDropRow(path) {
-  for (const r of _treeEl?.querySelectorAll(".row.is-drop-into") || []) r.classList.remove("is-drop-into");
-  if (!path) return;
-  const row = _treeEl?.querySelector(`.row[data-path="${cssEscape(path)}"]`);
-  if (!row) return;
-  row.classList.add("is-drop-into");
-  // VS Code 的落点反馈覆盖的是「目标行 + 它整棵已渲染的子树」，同一个颜色
-  //（onDragOver 结尾 `feedback: L6(u, u+h)`，h = getListRenderCount = 含可见子孙的行数）。
-  // 只染一行说不清"东西进的是这个容器"；.children 是 .row 的兄弟节点，取紧邻那个即可。
-  const kids = row.nextElementSibling;
-  if (kids?.classList?.contains("children")) {
-    for (const r of kids.querySelectorAll(".row")) r.classList.add("is-drop-into");
-  }
-}
-function _showDrop(target, payload) {
+function _showDrop(target) {
   clearTimeout(_dropHideTimer);
-  // 看门狗：drag-leave **不保证会来**（drop 后 macOS 不发 draggingExited、拖到别的应用、
-  // ESC 取消、wry 漏发都可能）。没有它，行高亮会残留，长得很像"这个文件被选中了"。
-  _dropHideTimer = setTimeout(_hideDrop, 450);
-  const dest = target === "explorer" ? _dropDirAt(payload) : "";
-  if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", target === "composer"); }
-  // 拖放进行中关掉 hover 高亮（VS Code 的选择器里带 :not(.drop-target)）：两块高亮同时
-  // 亮着，用户分不清哪个才是落点。
-  _treeEl?.classList.toggle("is-dropping", target === "explorer");
-  const _sig = `${target}|${dest}`;
-  if (_sig === _dropSig) return;
-  _dropSig = _sig;
-  _paintDropRow(dest);
-  // 落点是**项目根**时整棵树一起亮。VS Code 就是这样：没有具体目标行时（onDragOver 拿到的
-  // target 为空），drop-target 加在 .monaco-list 本身上，整块列表都是投放色。
-  // 这一条不是锦上添花——空项目里只有一行根行，不整块亮的话，用户在一大片空白上拖动
-  // 时**什么反馈都看不到**（用户原话：「拖动项目文件夹时候这里却没动画提示了」）。
-  _treeEl?.classList.toggle("is-drop-root", !!dest && dest === rootPath);
-  // 悬停折叠目录 500ms 自动展开（VS Code 的 autoExpand，实测就是 500ms）。只在目标行
-  // **变化**时重新计时，且只展开不收起——拖动中把列表收回去会让落点在脚下跳。
-  clearTimeout(_springTimer);
-  // 根行是另一套展开状态（collapsedWorkspaceRoots + renderWorkspaceRoots），
-  // _treeSetExpanded/expandDir 对根都直接 return —— 不分开处理的话，折叠的根永远展不开。
-  const _rootCollapsed = workspaceRoots.includes(dest) && collapsedWorkspaceRoots.has(dest);
-  if (dest && (_rootCollapsed || (!workspaceRoots.includes(dest) && !_treeIsExpanded(dest)))) {
-    _springTimer = setTimeout(() => {
-      try {
-        if (_rootCollapsed) { collapsedWorkspaceRoots.delete(dest); void renderWorkspaceRoots(); }
-        else { _treeSetExpanded(dest, true); void expandDir(dest); }
-      } catch {}
-    }, 500);
-  }
+  const composer = target === "composer";
+  if (_explorerEl) { _explorerEl.classList.add("drag-into"); _explorerEl.classList.toggle("is-over", !composer); }
+  if (_composerEl) { _composerEl.classList.add("drag-into"); _composerEl.classList.toggle("is-over", composer); }
 }
 function _hideDrop() {
-  _dropSig = "";
-  clearTimeout(_dropHideTimer); clearTimeout(_springTimer);
+  clearTimeout(_dropHideTimer);
   for (const el of [_explorerEl, _composerEl]) { if (el) { el.classList.remove("drag-into"); el.classList.remove("is-over"); } }
-  _treeEl?.classList.remove("is-dropping", "is-drop-root");
-  _paintDropRow("");
-  _dragItems = [];
 }
 // drag-leave can fire spuriously mid-drag; debounce the hide so the zones don't flicker.
 const _hideDropSoon = () => { clearTimeout(_dropHideTimer); _dropHideTimer = setTimeout(_hideDrop, 130); };
@@ -80405,69 +80391,8 @@ function _pathToRefArg(abs) {
     || (rootPath && abs.startsWith(rootPath.replace(/\/$/, "") + "/"));
   return inWs ? _pathToRel(abs) : abs;
 }
-// 拖进文件树 = 复制进工作区（VS Code 那种），成为子文件/子目录。重名让路、拒绝把
-// 文件夹拖进它自己，都在 explorer-drop 模块里算好；这里只管读目录、逐条复制、刷新树。
-async function _copyIntoWorkspace(paths, destDir) {
-  if (!destDir) return;
-  // 类型探测走 pathKinds（一次 stat），不要再借 readDir：readDir 会枚举整个目录，
-  // 拖一个大文件夹进来光探测就是几秒卡顿；而且它要求路径在工作区内，
-  // 从 /Volumes 或 /Applications 拖进来的文件夹会被一路误判成文件。
-  const abs = paths.map((p) => _toPosix(p));
-  const kinds = await backend.pathKinds(abs).catch(() => abs.map(() => 1));
-  const items = abs.map((path, i) => ({ path, isDir: kinds[i] === 2 }));
-  // 文件夹落在**项目根**上 → 先问，别默默复制。VS Code 在这一刻就是弹框问的：
-  // "Do you want to copy 'X' or add 'X' as a folder to the workspace?"
-  // 我们把次选项换成「打开为新项目」——用户原来就是靠拖到侧栏换项目的，改成复制之后
-  // 那条路就没了，这一问正好把它还回来（加进工作区仍在 文件菜单 → 添加文件夹到工作区）。
-  const _dirs = items.filter((x) => x.isDir);
-  // 判据是「落在**任意**工作区根上」，不只是活动根：多根工作区里往另一个根上放文件夹，
-  // VS Code 同样会问（它的条件就是 e.isRoot）。
-  if (_dirs.length && workspaceRoots.includes(destDir)) {
-    const q = rootDropQuestion({ dirs: _dirs.map((x) => x.path), destDir, rootPath });
-    // 只留三档：打开为新项目（主）/ 添加到工作区 / 取消。
-    // 「复制进来」那一档按用户要求去掉了——把一个**项目文件夹**拖进来，想要的从来不是
-    // 把它复制一份进当前项目，而是打开它或把它挂成另一个根。（拖文件、拖子目录进子文件夹
-    // 走的是另一条路，那条照旧直接复制，不弹框。）
-    const pick = await ioConfirm({
-      title: q.title, message: q.message,
-      okLabel: "打开为新项目", altLabel: "添加到工作区",
-    });
-    if (pick === "cancel" || pick === false) return;
-    if (pick === "alt") { for (const d of _dirs) await _addWorkspaceRoot(d.path); return; }
-    // 打开为新项目：第一个当新根打开，其余的加进工作区（等价于 VS Code 拖多个文件夹
-    // 到编辑器区时的 createAndEnterWorkspace，而不是把多余的静默丢掉）。
-    if (pick === "ok" || pick === true) {
-      await openFolder(_dirs[0].path);
-      for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
-      return;
-    }
-  }
-  let existingNames = [];
-  try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
-  const { copies, skipped } = planExplorerDrop({ items, destDir, existingNames });
-  let done = 0; let failed = "";
-  for (const c of copies) {
-    // importPath 而不是 copyPath：copyPath 要求**源**也在工作区内，而拖进来的东西
-    // 按定义就在外面——用户看到的「access denied: path ... is outside all workspace
-    // roots」就是它。写入侧的边界没松，仍然只能落进已打开的工作区根。
-    try { await backend.importPath(c.from, c.to); done++; } catch (e) { failed = String(e?.message || e); }
-  }
-  if (done) {
-    if (workspaceRoots.includes(destDir)) collapsedWorkspaceRoots.delete(destDir);
-    else _treeSetExpanded(destDir, true);
-    if (destDir !== rootPath) await expandDir(destDir);
-    await reloadDir(destDir);
-    _invalidateProjectFileCache();
-    try { refreshGitStatus(); } catch {}
-  }
-  const renamed = copies.filter((c) => c.renamed).length;
-  if (failed) showToast(`复制失败：${failed}`);
-  else if (skipped.some((s) => s.reason === "self")) showToast("不能把文件夹放进它自己里面");
-  else if (done) showToast(`已复制 ${done} 项到 ${basename(destDir) || destDir}${renamed ? `（${renamed} 项重名已改名）` : ""}`);
-}
-async function _handleDrop(paths, target, payload) {
+async function _handleDrop(paths, target) {
   if (!paths || !paths.length) return;
-  if (target === "explorer") { await _copyIntoWorkspace(paths, _dropDirAt(payload)); return; }
   if (target === "composer") {
     for (const p of paths) {
       const normalizedPath = _toPosix(p);
@@ -80487,18 +80412,12 @@ async function _handleDrop(paths, target, payload) {
     }
     try { promptEl.focus(); } catch {}
   } else {
-    // 同上：一次 stat，别拿 readDir 当类型探针（贵，且对工作区外的路径一律失败）。
-    const _k = await backend.pathKinds(paths).catch(() => paths.map(() => 1));
-    const kinds = paths.map((p, i) => ({ p, isDir: _k[i] === 2 }));
-    const dirs = kinds.filter((x) => x.isDir).map((x) => x.p);
-    // 多个文件夹时原来是逐个 openFolder —— 后一个把前一个换掉，最后只剩一个，前面的静默丢失。
-    // VS Code 在这里是：1 个 → 打开它；多个 → 建成多根工作区（createAndEnterWorkspace）。
-    if (dirs.length) {
-      await openFolder(dirs[0]);
-      for (const d of dirs.slice(1)) await _addWorkspaceRoot(d);
-      return;
+    for (const p of paths) {
+      const name = p.split("/").pop() || p;
+      const isDir = await backend.readDir(p).then(() => true).catch(() => false);
+      if (isDir) await openFolder(p);
+      else await openFile(p, name);
     }
-    for (const { p } of kinds) await openFile(p, p.split("/").pop() || p);
   }
 }
 
@@ -80506,45 +80425,26 @@ async function _handleDrop(paths, target, payload) {
 editorContainer.addEventListener("dragover", (e) => {
   e.preventDefault();
   e.dataTransfer.dropEffect = "copy";
-  // client 本来就是 CSS 坐标，_dropScale 在浏览器路径下是 1，直接传。
-  const _p = { position: { x: e.clientX, y: e.clientY } };
-  _showDrop(_dragTargetAt(_p), _p);
+  _showDrop(_dragTargetAt({ position: { x: e.clientX, y: e.clientY } }));
 });
 editorContainer.addEventListener("dragleave", () => _hideDropSoon());
 editorContainer.addEventListener("drop", async (e) => {
   e.preventDefault();
-  const payload = { position: { x: e.clientX, y: e.clientY } };
-  const target = _dragTargetAt(payload);
+  const target = _dragTargetAt({ position: { x: e.clientX, y: e.clientY } });
   _hideDrop();
   const files = [...(e.dataTransfer?.files || [])].map((f) => f.path).filter(Boolean);
-  await _handleDrop(files, target, payload);
+  await _handleDrop(files, target);
 });
 // Tauri path: window-level drag events drive the zones AND route the drop by position.
 if (inTauri) {
-  // **必须按窗口订阅**：event.js 的 listen() 不传 options 时 target 默认 {kind:"Any"}，
-  // 而 Any 在 Rust 侧会短路掉标签过滤 —— 开了第二个窗口（⇧⌘N / 文件菜单 / 命令面板）之后，
-  // 在 B 窗口拖动会用 B 的坐标驱动 A 的高亮，松手时 A 和 B 各跑一遍 _handleDrop：
-  // 文件被复制两份，甚至一边复制、另一边把项目换掉。getCurrentWebviewWindow().listen()
-  // 写死 {kind:"WebviewWindow", label:自己}，只收自己这扇窗的事件。
-  import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
-    const listen = (name, fn) => getCurrentWebviewWindow().listen(name, fn);
-    // enter 是唯一带 paths 的一帧（over 不带），存下来给整段拖动用：没有它就说不出
-    // "拖的是文件夹还是文件"，也就判不出这一下到底是复制还是换项目。
-    listen("tauri://drag-enter", async (e) => {
-      const paths = e.payload?.paths || [];
-      _dragItems = paths.map((p) => ({ path: _toPosix(p), isDir: false }));
-      _showDrop(_dragTargetAt(e.payload), e.payload);
-      // is_dir 要问后端，异步；先按文件画，探完再补一次。
-      const _kinds = await backend.pathKinds(paths).catch(() => paths.map(() => 1));
-      const probed = paths.map((p, i) => ({ path: _toPosix(p), isDir: _kinds[i] === 2 }));
-      if (_dragItems.length) _dragItems = probed;
-    });
-    listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload), e.payload));
+  import("@tauri-apps/api/event").then(({ listen }) => {
+    listen("tauri://drag-enter", (e) => _showDrop(_dragTargetAt(e.payload)));
+    listen("tauri://drag-over", (e) => _showDrop(_dragTargetAt(e.payload)));
     listen("tauri://drag-leave", () => _hideDropSoon());
     listen("tauri://drag-drop", async (event) => {
       const target = _dragTargetAt(event.payload);
       _hideDrop();
-      await _handleDrop(event.payload?.paths || [], target, event.payload);
+      await _handleDrop(event.payload?.paths || [], target);
     });
   }).catch(() => {});
 }

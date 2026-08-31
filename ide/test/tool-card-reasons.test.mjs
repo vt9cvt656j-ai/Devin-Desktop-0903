@@ -14,6 +14,7 @@
 // 拦截本身**不改**：门是「一个 run 只拦一次」，放行后续等于让那道要求彻底落空
 // （logic.test.mjs 正面钉着前项 [BLOCKED] 时后续必须停）。这里改的只有「理由」。
 import { test } from "node:test";
+import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
 import assert from "node:assert/strict";
 import { CODE as SRC, load, fnSource } from "./helpers/source.mjs";
 
@@ -188,6 +189,7 @@ test("「这次是失败还是零命中」用结构字段判，不用文案匹�
 //        → 用户侧：run._incompleteReason = writes_failed:N，结局卡片上看得到
 // 这条链断在任何一环，「已保存」那句话就没有任何机器事实与之矛盾。
 const deliveryLine = load("_deliveryFactsLine", {
+    _failedWritePaths,
   _deliveryFacts: () => ({ code: [], tests: [], ran: [], verifiers: [] }),
   _strayScratchFiles: () => [],
   _projectStacks: new Map(),
