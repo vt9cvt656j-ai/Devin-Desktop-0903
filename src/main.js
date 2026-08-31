@@ -14290,6 +14290,8 @@ const _CUSTOM_MODEL_PREFIX = "custom:";
 // 上游线协议：取值、归一化、界面文案。取值必须是 Rust 侧 crate::protocol::PROTOCOLS 的
 // 逐字子集 —— 对不上时不会报错，只会静默退回 openai 打错端点。
 import { CM_PROTOCOLS, CM_PROTOCOL_DEFAULT, CM_PROTOCOL_UI, cmProtocol, normalizeCustomModel } from "./agent/wire-protocol.js";
+// 协议缺口清单只从 Rust 拉一次（见 syncProto 上方说明）。
+let _protoGapsSynced = false;
 
 function _loadCustomModels() {
   try {
@@ -16098,16 +16100,38 @@ async function showCustomModelsDialog() {
   // 选了协议之后地址写法和能力缺口都要跟着变。**这不是装饰**：Anthropic 的地址是
   // https://api.anthropic.com（不带 /v1），OpenAI 兼容的是 .../v1，用户最容易在这里填错；
   // 而 gaps 那几句是「不许假装支持」在界面上的唯一落点。
+  // gaps 的**权威来源是 Rust**（protocol.rs 的 Wire::unsupported()，经 ai_protocols 命令出来）。
+  // 前端 CM_PROTOCOL_UI 里那份是手抄的，而且已经漂了：实测 anthropic 那条把中间
+  // 「3.7/4.x 收 thinking.budget_tokens、4.7 之后只收 adaptive+output_config.effort，
+  //  两套互不兼容、发错是硬 400」整句丢了，只剩后半截；旁边还写着一句「protocol.rs 的
+  //  anthropic 臂逐字如此」——那句话本身就不成立了。
+  // 拉到就用真的，拉不到（网页版没有 Tauri）退回本地那份：ph/hint/desktopOnly 是纯 UI
+  // 字段，本来就该留在前端，只有 gaps/label 跟着 Rust 走。
+  if (inTauri && !_protoGapsSynced) {
+    _protoGapsSynced = true;
+    (async () => {
+      try {
+        const rows = await backend.invoke("ai_protocols");
+        for (const r of (Array.isArray(rows) ? rows : [])) {
+          const ui = CM_PROTOCOL_UI[r?.id];
+          if (!ui) continue;
+          if (Array.isArray(r.unsupported)) ui.gaps = r.unsupported.map(String);
+          if (r.label) ui.label = String(r.label);
+        }
+        syncProto();
+      } catch {}
+    })();
+  }
   const syncProto = () => {
     const ui = CM_PROTOCOL_UI[readProto()];
     inBase.placeholder = ui.ph;
     hintProto.textContent = ui.hint;
-    gapsProto.replaceChildren(...ui.gaps.map((g) => {
+    gapsProto.replaceChildren(...(ui.gaps || []).map((g) => {
       const li = document.createElement("li");
       li.textContent = g;
       return li;
     }));
-    gapsProto.hidden = ui.gaps.length === 0;
+    gapsProto.hidden = !(ui.gaps || []).length;
   };
   const writeProto = (p) => {
     const want = cmProtocol(p);
