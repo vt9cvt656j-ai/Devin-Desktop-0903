@@ -8,6 +8,9 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { toolLedgerStats } from "../src/agent/tool-ledger.js";
+import { readFileSync as _rfs } from "node:fs";
+const TOOL_LEDGER_SRC = _rfs(new URL("../src/agent/tool-ledger.js", import.meta.url), "utf8");
 import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
 import { setBadgeText } from "../src/agent/escape.js";
 // 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
@@ -19753,8 +19756,8 @@ test("工具失败记账与弱模型收敛接入编排链路", () => {
   assert.match(orch, /dropped = Math\.max\(0, _picked - tools\.length\)/,
     "裁剪事实没有被带出来，下游就说不出「工具被裁过」");
   assert.match(loop, /编排收敛提示/, "收敛 notes 必须拼进编排 nudge 告知主模型");
-  const stats = extractFn("_toolLedgerStats");
-  assert.match(stats, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
+  // _toolLedgerStats 已搬到 src/agent/tool-ledger.js（失败行优先，见那儿的头注释）。
+  assert.match(TOOL_LEDGER_SRC, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
   const retrieve = extractFn("_toolExpRetrieve");
   assert.match(retrieve, /catAdvice/, "跨会话经验必须把失败类别转成行动建议");
 });
@@ -22383,7 +22386,7 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
 });
 
 test("#85 Tool Ledger 分类增强: _toolLedgerStats 输出类别汇总", () => {
-  const statsFn = load("_toolLedgerStats", { _classifyToolFailure: load("_classifyToolFailure") });
+  const statsFn = toolLedgerStats;
   const entries = [
     { tool: "read_file", category: "file", ok: true },
     { tool: "search", category: "search", ok: true },

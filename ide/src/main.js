@@ -35,6 +35,7 @@ import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
 import { attachExecutionFacts as _attachExecutionFacts } from "./agent/execution-facts-meta.js";
 import { failedWritePaths as _failedWritePaths } from "./agent/write-ledger.js";
 import { buildCompactionTranscript } from "./agent/compaction-window.js";
+import { toolLedgerStats as _toolLedgerStats } from "./agent/tool-ledger.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
@@ -51553,60 +51554,8 @@ function _classifyToolFailure(resultText) {
   return "other";
 }
 
-// 工具成功率聚合：按工具统计成功/失败次数、失败类别分布、最近失败原因，返回紧凑文本行
-// 用于注入编排器（当前会话账本）
-function _toolLedgerStats(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) return "";
-  const agg = new Map();
-  const catAgg = new Map(); // 按类别聚合：搜索工具失败了 5 次
-  for (const e of entries) {
-    const k = e.tool;
-    if (!k) continue;
-    if (!agg.has(k)) agg.set(k, { okCount: 0, failCount: 0, lastFailReason: "", failCats: new Map(), category: e.category || "other" });
-    const v = agg.get(k);
-    if (e.ok) v.okCount++;
-    else {
-      v.failCount++;
-      if (e.reason) v.lastFailReason = String(e.reason).slice(0, 60);
-      // 失败类别分布：优先用预计算的 failCategory，兆底用 _classifyToolFailure
-      const cat = e.failCategory || _classifyToolFailure(e.reason || "");
-      v.failCats.set(cat, (v.failCats.get(cat) || 0) + 1);
-      // 类别聚合
-      const toolCat = e.category || "other";
-      if (!catAgg.has(toolCat)) catAgg.set(toolCat, { ok: 0, fail: 0 });
-      catAgg.get(toolCat).fail++;
-    }
-    // 类别聚合（成功）
-    if (e.ok) {
-      const toolCat = e.category || "other";
-      if (!catAgg.has(toolCat)) catAgg.set(toolCat, { ok: 0, fail: 0 });
-      catAgg.get(toolCat).ok++;
-    }
-  }
-  const lines = [];
-  for (const [tool, data] of agg) {
-    const total = data.okCount + data.failCount;
-    if (total === 0) continue;
-    let f = "";
-    if (data.failCount > 0) {
-      const cats = [...data.failCats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}\u00d7${n}`).join(",");
-      f = ` (${cats}${data.lastFailReason ? `\uff1b最近失败：${data.lastFailReason}` : ""})`;
-    }
-    lines.push(`${tool}[${data.category}]: ${data.okCount}\u2713/${data.failCount}\u2717${f}`);
-  }
-  // 类别汇总行：让编排器能看到“搜索工具失败了 5 次”
-  const catLines = [];
-  for (const [cat, data] of catAgg) {
-    if (data.fail > 0) catLines.push(`${cat}\u7c7b\u522b: ${data.ok}\u2713/${data.fail}\u2717`);
-  }
-  lines.sort((a, b) => {
-    const ta = Number(a.match(/\d+\u2713/)?.[0].slice(0,-1)) || 0;
-    const tb = Number(b.match(/\d+\u2713/)?.[0].slice(0,-1)) || 0;
-    return tb - ta;
-  });
-  const header = catLines.length ? `\u3010\u7c7b\u522b\u6c47\u603b\u3011${catLines.join(" | ")}\n` : "";
-  return header + lines.slice(0, 20).join("\n");
-}
+// _toolLedgerStats 已搬到 src/agent/tool-ledger.js（失败行优先的理由写在那儿）。
+
 
 // 场景签名提取：从 engineering profile 提取稳定关键字段，拼接短字符串
 function _buildScenarioSignature(profile) {
