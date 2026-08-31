@@ -75294,7 +75294,10 @@ async function _moveIntoDir(paths, destDir) {
     box.classList.toggle("drop-target", onComposer);
     // 落在树里 → 这是一次**移动**，高亮会接收它的那个目录（和外部拖入共用同一套反馈）。
     _treeEl?.classList.toggle("is-dropping", !onComposer);
-    _paintDropRow(onComposer ? "" : _treeDropDirAt(e.clientX, e.clientY, candPaths()));
+    const _mdest = onComposer ? "" : _treeDropDirAt(e.clientX, e.clientY, candPaths());
+    _paintDropRow(_mdest);
+    // 和外部拖入同一条规则：落点是项目根时整棵树一起亮，否则空白处拖动看不到任何反馈。
+    _treeEl?.classList.toggle("is-drop-root", !!_mdest && _mdest === rootPath);
   });
   document.addEventListener("mouseup", (e) => {
     document.body.classList.remove("tree-selecting");
@@ -75305,7 +75308,7 @@ async function _moveIntoDir(paths, destDir) {
     if (_rowDragGhost) { _rowDragGhost.remove(); _rowDragGhost = null; }
     document.body.classList.remove("tree-dragging");
     box.classList.remove("drop-target");
-    _treeEl?.classList.remove("is-dropping"); _paintDropRow("");
+    _treeEl?.classList.remove("is-dropping", "is-drop-root"); _paintDropRow("");
     if (wasDragging) {
       try { window.getSelection().removeAllRanges(); } catch {}
       if (_overComposer(e.clientX, e.clientY)) _insertRefAtCursor(_pathToRel(cand.path));
@@ -80353,6 +80356,11 @@ function _showDrop(target, payload) {
   if (_sig === _dropSig) return;
   _dropSig = _sig;
   _paintDropRow(dest);
+  // 落点是**项目根**时整棵树一起亮。VS Code 就是这样：没有具体目标行时（onDragOver 拿到的
+  // target 为空），drop-target 加在 .monaco-list 本身上，整块列表都是投放色。
+  // 这一条不是锦上添花——空项目里只有一行根行，不整块亮的话，用户在一大片空白上拖动
+  // 时**什么反馈都看不到**（用户原话：「拖动项目文件夹时候这里却没动画提示了」）。
+  _treeEl?.classList.toggle("is-drop-root", !!dest && dest === rootPath);
   // 悬停折叠目录 500ms 自动展开（VS Code 的 autoExpand，实测就是 500ms）。只在目标行
   // **变化**时重新计时，且只展开不收起——拖动中把列表收回去会让落点在脚下跳。
   clearTimeout(_springTimer);
@@ -80372,7 +80380,7 @@ function _hideDrop() {
   _dropSig = "";
   clearTimeout(_dropHideTimer); clearTimeout(_springTimer);
   for (const el of [_explorerEl, _composerEl]) { if (el) { el.classList.remove("drag-into"); el.classList.remove("is-over"); } }
-  _treeEl?.classList.remove("is-dropping");
+  _treeEl?.classList.remove("is-dropping", "is-drop-root");
   _paintDropRow("");
   _dragItems = [];
 }

@@ -14807,6 +14807,9 @@ textarea.settings-input {
 #tree .row.is-drop-into::before { background: var(--drop-bg); }
 /* 拖放进行中关掉 hover 高亮：两块高亮同时亮着，用户分不清哪个才是落点。 */
 #tree.is-dropping .row:hover::before { background: transparent; }
+/* 落点是项目根：整棵树一起亮（VS Code 在没有具体目标行时把 drop-target 加在列表本身）。
+   空项目里只有一行根行，不整块亮的话，在一大片空白上拖动完全看不到反馈。 */
+#tree.is-drop-root { background: var(--drop-bg); }
 /* .row::before 平时有 0.1s 背景过渡；VS Code 的 drop-target 没有任何过渡，而子树整块
    满染叠上过渡后，快速划过会拖出一条渐变尾巴。拖放期间关掉。 */
 #tree.is-dropping .row::before { transition: none; }
