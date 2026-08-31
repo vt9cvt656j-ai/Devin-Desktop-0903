@@ -72134,27 +72134,16 @@ function _mktFmtDl(n) {
   return String(n || 0);
 }
 
-const _BUILTIN_EXTENSIONS = [
-  { id: "bradlc.vscode-tailwindcss", name: "Tailwind CSS IntelliSense", author: "Tailwind Labs", version: "0.14.0", description: "智能 Tailwind CSS 工具 — 自动补全类名、语法高亮、错误提示", category: "Web", tags: ["css", "web", "tailwind"], featured: true, downloads: 16700000, rating: 4.7, icon: "tailwind", details: "## 功能\n- 90+ Tailwind 工具类自动补全\n- 悬停查看类名对应的 CSS\n- 语法错误实时提示\n\n## 使用方法\n安装后在 HTML/JSX 文件中输入 Tailwind 类名即可触发补全。\n\n命令面板：`Tailwind: Lookup Class` — 查询光标处的类名" },
-  { id: "Vue.volar", name: "Vue - Official", author: "Vue", version: "2.2.0", description: "Vue.js 官方语言支持：模板语法高亮、组件智能提示、格式化", category: "Languages", tags: ["vue", "language", "web"], featured: true, downloads: 15600000, rating: 4.5, icon: "vue", details: "## 功能\n- Vue SFC 模板语法高亮\n- 组件 Props 自动补全\n- `<script setup>` 支持\n- TypeScript 集成" },
-  { id: "pkief.material-icon-theme", name: "Material 文件图标", author: "Philipp Kief", version: "5.14.1", description: "Material Design 风格文件图标 — 1000+ 种文件和文件夹图标", category: "Themes", tags: ["theme", "icons"], featured: true, downloads: 28900000, rating: 4.8, icon: "theme", details: "## 功能\n- 1000+ 文件类型图标\n- 特殊文件夹图标（node_modules, src, test 等）\n- 浅色/深色主题自适应\n- 自定义图标映射" },
-  { id: "ms-azuretools.vscode-docker", name: "Docker", author: "Microsoft", version: "1.29.3", description: "Docker 容器管理 — 构建、管理、部署容器化应用", category: "DevOps", tags: ["docker", "devops"], featured: true, downloads: 24100000, rating: 4.5, icon: "docker", details: "## 功能\n- 查看运行中的容器列表\n- 管理 Docker 镜像\n- Dockerfile 语法高亮\n\n## 命令\n- `Docker: 查看运行容器`\n- `Docker: 查看镜像列表`" },
-  { id: "github.copilot", name: "GitHub Copilot", author: "GitHub", version: "1.240.0", description: "AI 编程助手 — 智能代码补全、函数生成、测试编写", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 24800000, rating: 4.3, icon: "copilot", details: "## 功能\n- 智能代码补全（多行）\n- 根据注释生成完整函数\n- 自动编写单元测试\n- 支持 40+ 编程语言\n\n## 注意\n需要 GitHub Copilot 订阅账号" },
-  { id: "tabnine.tabnine-vscode", name: "Tabnine AI", author: "Tabnine", version: "3.128.0", description: "AI 代码助手 — 全行和全函数代码补全，支持所有语言", category: "AI", tags: ["ai", "completion"], featured: true, downloads: 9800000, rating: 4.2, icon: "ai", details: "## 功能\n- 全行代码补全\n- 全函数代码生成\n- 本地模型（隐私保护）\n- 支持所有编程语言" },
-  { id: "zhihu.hanzi-counter", name: "汉字计数器", author: "知乎团队", version: "1.2.0", description: "实时统计中文字符数、英文单词数、总字数，适合写作和翻译", category: "Other", tags: ["chinese", "tools"], featured: true, downloads: 180000, rating: 4.3, icon: "hanzi", details: "## 功能\n- 状态栏实时显示：汉字数 / 英文词数 / 总字符数\n- 统计行数\n- 支持 Markdown 和纯文本\n\n## 命令\n`汉字计数器: 统计当前文件` — 弹窗显示详细统计" },
-  { id: "nicepkg.vscode-translate", name: "翻译助手", author: "NicePkg", version: "2.1.0", description: "代码注释中英互译、变量名翻译、选中文本即时翻译", category: "Other", tags: ["chinese", "tools", "ai"], featured: true, downloads: 350000, rating: 4.4, icon: "translate", details: "## 功能\n- 30+ 编程术语内置字典\n- 选中中文 → 翻译成英文\n- 选中英文 → 翻译成中文\n- 中文变量名转 camelCase\n\n## 命令\n- `翻译: 翻译选中文本`\n- `翻译: 变量名中英转换`" },
-  { id: "pnp.polacode", name: "代码截图", author: "pnp", version: "0.3.4", description: "拍立得风格代码截图 — 选中代码生成精美分享图片", category: "Other", tags: ["tools", "screenshot"], downloads: 2100000, rating: 4.3, icon: "camera", details: "## 功能\n- 选中代码一键生成截图\n- 保留语法高亮颜色\n- 自动适配编辑器主题\n\n## 使用\n命令面板：`代码截图: 截取选中代码`" },
-  { id: "antfu.iconify", name: "图标预览", author: "Anthony Fu", version: "0.18.0", description: "10 万+ 图标在线预览 — 100+ 图标集、行内预览、自动补全", category: "Other", tags: ["icons", "tools", "web"], downloads: 2800000, rating: 4.7, icon: "iconify", details: "## 功能\n- 100,000+ 图标库\n- 支持 100+ 图标集（Material, Heroicons, Lucide 等）\n- 代码中图标名行内预览\n- 图标名自动补全" },
-  { id: "ms-ceintl.vscode-language-pack-zh-hans", name: "简体中文语言包", author: "Microsoft", version: "1.96.0", description: "编辑器界面简体中文翻译 — Chinese (Simplified) Language Pack", category: "Other", tags: ["chinese", "language"], downloads: 15800000, rating: 4.6, icon: "zhcn", details: "## 功能\n- 编辑器所有菜单中文化\n- 状态栏/面板中文翻译\n- 设置页面中文显示\n\n安装后重启即可生效" },
-  { id: "svelte.svelte-vscode", name: "Svelte", author: "Svelte", version: "109.0.0", description: "Svelte 框架语言支持 — 语法高亮、自动补全、诊断", category: "Languages", tags: ["svelte", "language", "web"], downloads: 3200000, rating: 4.5, icon: "web", details: "## 功能\n- .svelte 文件语法高亮\n- 组件属性自动补全\n- 错误诊断\n- 代码格式化" },
-  { id: "prisma.prisma", name: "Prisma", author: "Prisma", version: "5.22.0", description: "Prisma ORM 语法高亮和自动补全 — 数据库模型定义助手", category: "Other", tags: ["database", "tools"], downloads: 4500000, rating: 4.6, icon: "default", details: "## 功能\n- .prisma schema 语法高亮\n- 模型字段自动补全\n- 关系定义智能提示\n- 格式化 Prisma Schema" },
-  { id: "streetsidesoftware.code-spell-checker", name: "拼写检查", author: "Street Side Software", version: "4.0.0", description: "代码拼写检查器 — 支持 camelCase 和编程术语", category: "Other", tags: ["linter", "tools"], downloads: 12300000, rating: 4.4, icon: "linter", details: "## 功能\n- 200+ 编程常用词内置词库\n- 自动拆分 camelCase/snake_case\n- 检测可疑拼写错误\n\n## 命令\n`拼写检查: 检查当前文件`" },
-  { id: "wayou.vscode-todo-highlight", name: "TODO 高亮", author: "Wayou Liu", version: "1.0.5", description: "高亮 TODO/FIXME/HACK 等注释标记 — 一目了然待办事项", category: "Other", tags: ["tools", "highlight"], downloads: 7800000, rating: 4.5, icon: "color", details: "## 功能\n- 高亮 TODO / FIXME / HACK / BUG / NOTE 标记\n- 可自定义高亮颜色\n- 支持自定义关键词" },
-  { id: "alefragnani.project-manager", name: "项目管理器", author: "Alessandro Fragnani", version: "12.8.0", description: "快速切换项目 — 收藏、分组、一键打开多个工作区", category: "Other", tags: ["tools", "workspace"], downloads: 5600000, rating: 4.5, icon: "default", details: "## 功能\n- 快速切换多个项目\n- 项目分组管理\n- 状态栏一键打开项目列表\n\n## 命令\n`项目管理器: 查看项目列表`" },
-];
+// 这里原来是 _BUILTIN_EXTENSIONS：16 条写死的市场条目，带编出来的下载量（"12.3M"）和
+// 五星评分。它零消费方——市场列表当时被硬设成 []，这 16 条一次都没被渲染过。
+// 现在列表来自 extManager.availableBuiltin()（本机真实内置扩展的 manifest），
+// 这份假数据没有存在的理由了。没有商店后端就不假装有社会证明。
 
 async function _installExtension(entry) {
-  const builtinId = _BUILTIN_ID_MAP[entry.id];
+  // 列表现在直接来自本机内置扩展的 manifest，条目的 id 已经**就是**内置 id
+  // （michael.todo-highlight 这种），所以先认它自己；下面那张 VS Code 别名表留给
+  // 用 VS Code 市场 id 进来的调用方（bradlc.vscode-tailwindcss → michael.tailwind-intellisense）。
+  const builtinId = entry?.builtin ? entry.id : _BUILTIN_ID_MAP[entry.id];
   if (builtinId) {
     try {
       const result = await extManager.installBuiltin(builtinId);
@@ -72176,11 +72165,15 @@ const _BUILTIN_ID_MAP = {
   "zhihu.hanzi-counter": "michael.hanzi-counter",
   "nicepkg.vscode-translate": "michael.translate-helper",
   "pnp.polacode": "michael.polacode-screenshot",
-  "ms-ceintl.vscode-language-pack-zh-hans": "devin.chinese-language-pack",
+  // 这两条的前缀 2026-08-30 从 devin.* 改成 michael.*：src-tauri/extensions/ 下 17 个内置
+  // 扩展里只有 insert-date / word-count 还叫 devin.*，其余 15 个（含这两个）都是 michael.*。
+  // 写错的后果是 installBuiltin 抛「unknown built-in extension」——中文语言包和 TODO
+  // 高亮这两个恰恰是最常被装的。目前双重死代码（市场列表也是空的），接回去那天才会炸。
+  "ms-ceintl.vscode-language-pack-zh-hans": "michael.chinese-language-pack",
   "svelte.svelte-vscode": "michael.svelte-language",
   "streetsidesoftware.code-spell-checker": "michael.spell-checker",
   "alefragnani.project-manager": "michael.project-manager",
-  "wayou.vscode-todo-highlight": "devin.todo-highlight",
+  "wayou.vscode-todo-highlight": "michael.todo-highlight",
 };
 
 let _mktModal = null;
@@ -72287,11 +72280,12 @@ function openMarketplaceModal() {
           <div class="mktm__meta">
             <span class="mktm__author">${_escHtml(entry.author)}</span>
             <span class="mktm__sep">·</span>
-            <span>v${entry.version}</span>
-            <span class="mktm__sep">·</span>
-            <span>${_mktFmtDl(entry.downloads)} 次下载</span>
-            <span class="mktm__sep">·</span>
-            <span>★ ${(entry.rating || 0).toFixed(1)}</span>
+            <span>v${_escHtml(entry.version || "")}</span>
+            ${/* 下载量和评分**只在真有值时**才画。列表现在来自本机内置扩展的真实
+                 manifest，那里没有这两个数——原来是写死的假数字（"12.4k 次下载 ★4.8"），
+                 一个没有商店后端的本地列表不该凭空长出社会证明。 */ ""}
+            ${Number(entry.downloads) > 0 ? `<span class="mktm__sep">·</span><span>${_mktFmtDl(entry.downloads)} 次下载</span>` : ""}
+            ${Number(entry.rating) > 0 ? `<span class="mktm__sep">·</span><span>★ ${Number(entry.rating).toFixed(1)}</span>` : ""}
           </div>
         </div>
         <button class="mktm__install-btn" type="button">安装</button>
@@ -72354,9 +72348,26 @@ function openMarketplaceModal() {
     detailEl.querySelector(".mktm__det-head").appendChild(installBtn);
   }
 
-  // 扩展市场已清空——不再展示任何内置 / 远程扩展。
+  // 列表来自**本机真实内置扩展**的 manifest（extManager.availableBuiltin() → Rust 侧
+  // ext_available_builtin，即 src-tauri/extensions/ 下那 17 个目录）。
+  //
+  // 这里原来是一句 `_mktAllEntries = []` 配注释「扩展市场已清空」——于是三个入口
+  // （⌘⇧X、工具栏按钮、命令面板）点进去永远是「暂无内容」。同一块代码上面还挂着 16 条
+  // 写死的条目，带编出来的下载量和五星评分，全是零引用死代码。
+  // 现在：有什么就列什么，没有商店后端就不假装有社会证明（下载量/评分只在真有值时画）。
   _mktAllEntries = [];
   renderList();
+  (async () => {
+    try {
+      const list = await extManager.availableBuiltin();
+      _mktAllEntries = (Array.isArray(list) ? list : []).map((mf) => ({
+        id: mf?.id || "", name: mf?.name || mf?.id || "", description: mf?.description || "",
+        author: mf?.author || "", version: mf?.version || "", category: "", tags: [],
+        builtin: true,
+      })).filter((e) => e.id);
+    } catch { _mktAllEntries = []; }
+    renderList();
+  })();
 }
 
 function renderConflictsTool(body) {
@@ -78396,7 +78407,10 @@ const KB_ACTIONS = {
   "view.zoomOut": () => _applyUiZoom(_uiZoom - 0.1),
   "view.zoomReset": () => _applyUiZoom(1),
   "file.deleteSelected": () => _deleteSelectedTreeItem(),
-  "view.extensions": () => openMarketplaceModal(),
+  // 和命令面板里同 id 的那条对齐（79585 走的是 extPanel.open()）。原来这里指向
+  // openMarketplaceModal —— 同一个 id 两处指两个东西，而市场那个列表是**刻意清空**的
+  // （见 _mktAllEntries 那处注释：不再展示任何内置/远程扩展），点进去永远「暂无内容」。
+  "view.extensions": () => extPanel.open(),
 };
 
 function keyCombo(e) {
@@ -79587,6 +79601,9 @@ const palette = createCommandPalette({
     { id: "view.livePreviewPick", title: PREVIEW_TAB_NAME + "：指元素给 AI", category: t("menu.view"), run: () => { openLivePreview(); _previewTogglePick(); } },
     { id: "terminal.new", title: t("terminal.new"), category: t("terminal.title"), run: () => { openTerminal(); createTermTab(); } },
     { id: "view.splitEditor", title: "Toggle Split Editor", category: t("menu.view"), run: () => toggleSplitEditor() },
+    // 市场这条 2026-08-30 恢复：它一度被摘掉，因为列表被写死成空、点进去永远「暂无内容」。
+    // 现在列表来自本机真实内置扩展，是能用的入口了。它和上面 view.extensions 不是一回事：
+    // 那个是"管理已装的"，这个是"看看有哪些可装"。
     { id: "marketplace.open", title: "扩展市场", category: "工具", run: () => openMarketplaceModal() },
     { id: "view.zenMode", title: "Toggle Zen Mode", category: t("menu.view"), run: () => toggleZenMode() },
     { id: "tab.pin", title: "Pin/Unpin Tab", category: "Tabs", run: () => activePath && togglePinTab(activePath) },
@@ -79603,7 +79620,8 @@ const palette = createCommandPalette({
   ],
 });
 
-$("extensionsBtn").addEventListener("click", () => openMarketplaceModal());
+// 同上：按钮通向能用的扩展面板，不是那个刻意清空的市场弹窗。
+$("extensionsBtn").addEventListener("click", () => extPanel.open());
 $("paletteBtn").addEventListener("click", () => palette.open());
 /*
  * 这里原来还有一条硬编码的 mod+shift+p 监听（capture + stopPropagation），和
