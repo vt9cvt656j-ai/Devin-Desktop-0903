@@ -9975,12 +9975,14 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 }
 .io-confirm-card {
   width: min(420px, 92vw);
-  border: 1px solid #e8eaed;
+  /* 原来这里写死 #fff / #202124 / #e8eaed，深色主题下整张卡是白的、字是黑的。
+     全仓也没有任何 [data-theme="dark"] 覆盖它——走令牌，两套主题都对。 */
+  border: 1px solid var(--line-strong);
   border-radius: 18px;
-  background: #fff;
-  color: #202124;
-  box-shadow: 0 22px 70px rgba(60, 64, 67, 0.28);
-  padding: 20px;
+  background: var(--panel-solid);
+  color: var(--text);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
+  padding: 22px;
 }
 .io-confirm-card h2 {
   margin: 0 0 10px;
@@ -9992,7 +9994,7 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .io-confirm-message {
   margin: 0;
   white-space: pre-wrap;
-  color: #5f6368;
+  color: var(--text-dim);
   font-size: 13px;
   line-height: 1.55;
 }
@@ -10007,17 +10009,44 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   min-height: 34px;
   white-space: nowrap;          /* 「添加到工作区」这种六个字的标签不许从中间折断 */
 }
-/* 三个以上动作时横排必然挤：卡片 420px 去掉内边距只剩 380，四个按钮光 min-width 就 344。
-   照 macOS 的做法竖排，主按钮在最上、取消在最下。DOM 顺序是 取消/次/次/主，所以用
+/* 多个动作时横排必然挤：卡片 420px 去掉内边距只剩 380，光 min-width 就放不下三个中文标签。
+   照 macOS 的做法竖排，主按钮在最上、取消在最下。DOM 顺序是 取消/次/主，所以用
    column-reverse 正好把主按钮翻到顶上。 */
 .io-confirm-actions--stack {
   flex-direction: column-reverse;
   align-items: stretch;
   gap: 8px;
+  margin-top: 20px;
 }
+/* .btn 的基础样式是**文字按钮**（透明、无边框），竖排之后三个次要项看起来就是三行蓝字、
+   完全不像按钮。这里给它们补回按钮该有的面：底色、描边、统一高度和圆角。 */
 .io-confirm-actions--stack .btn {
   width: 100%;
-  min-height: 38px;
+  min-height: 42px;
+  border-radius: 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-elevated, rgba(128, 128, 128, 0.10));
+  border: 1px solid var(--line-strong);
+}
+.io-confirm-actions--stack .btn:hover { background: var(--hover); }
+/* 主按钮：实心强调色，一眼看出默认选哪个。 */
+.io-confirm-actions--stack .btn--primary {
+  color: #fff;
+  background: var(--accent);
+  border-color: transparent;
+}
+.io-confirm-actions--stack .btn--primary:hover { filter: brightness(0.93); }
+/* 取消是第三等：不画描边和底色，跟两个真动作拉开层级。 */
+.io-confirm-actions--stack .io-confirm-cancel {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
+}
+.io-confirm-actions--stack .io-confirm-cancel:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 /* ---- About dialog ---- */

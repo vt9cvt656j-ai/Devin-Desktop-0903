@@ -261,10 +261,13 @@ test("文件夹落在项目根上要先问，而不是默默复制", () => {
   // 往**非活动根**上放文件夹，只认 rootPath 的话会静默复制，问都不问。
   assert.match(blk, /workspaceRoots\.includes\(destDir\)/,
     "根落框只认活动根——多根工作区里往另一个根上放文件夹会被静默复制");
-  assert.match(blk, /alt2Label: "打开为新项目"/, "用户丢掉的「替换整个项目」没有还回来");
-  assert.match(blk, /pick === "alt2"[\s\S]{0,220}openFolder/, "选了「打开为新项目」没有真的去打开");
+  // 三个动作：打开为新项目（主）/ 添加到工作区 / 取消。
+  // 「复制到这里」按用户要求去掉了——把一个**项目文件夹**拖进来，要的不是复制一份进当前项目。
+  assert.match(blk, /okLabel: "打开为新项目", altLabel: "添加到工作区"/, "弹框的三个动作不对");
+  assert.doesNotMatch(blk, /复制到这里/, "「复制到这里」应该已经去掉了");
+  assert.match(blk, /pick === "ok" \|\| pick === true[\s\S]{0,220}openFolder/, "选了「打开为新项目」没有真的去打开");
   assert.match(blk, /pick === "alt"[\s\S]{0,160}_addWorkspaceRoot/, "「添加到工作区」没有接上多根");
-  assert.match(blk, /pick === "cancel"/, "取消必须什么都不做");
+  assert.match(blk, /pick === "cancel" \|\| pick === false/, "取消必须什么都不做");
   // 多个文件夹时不能只处理第一个、把其余静默丢掉。
   assert.match(blk, /_dirs\.slice\(1\)[\s\S]{0,90}_addWorkspaceRoot/,
     "选了「打开为新项目」时，多余的文件夹被静默丢弃了");
@@ -342,7 +345,16 @@ test("三个以上动作的弹框要竖排，标签不许折断", () => {
   assert.match(css, /\.io-confirm-actions--stack \{[^}]*flex-direction: column-reverse;/s,
     "三个以上动作没有改成竖排");
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  assert.match(src, /classList\.add\("io-confirm-actions--stack"\)/, "竖排类没有被挂上去");
+  assert.match(src, /if \(alt \|\| alt2\) overlay\.querySelector\("\.io-confirm-actions"\)\.classList\.add/,
+    "三个动作（ok/alt/cancel）时没有竖排——中文标签会被挤成两行");
+  // .btn 基础样式是**文字按钮**（透明无边框），竖排后三行蓝字完全不像按钮。
+  assert.match(css, /\.io-confirm-actions--stack \.btn \{[^}]*border: 1px solid var\(--line-strong\);/s,
+    "竖排按钮没有补上描边——看起来还是三行链接");
+  assert.match(css, /\.io-confirm-actions--stack \.btn--primary \{[^}]*background: var\(--accent\);/s,
+    "主按钮没有实心底色");
+  // 这张卡以前写死 #fff/#202124，深色主题下整块是白的。
+  assert.match(css, /\.io-confirm-card \{[\s\S]{0,400}background: var\(--panel-solid\);/,
+    "弹框卡片没走主题令牌——深色下会是白底黑字");
 });
 
 test("嵌套多选必须折叠，否则移动会丢文件", () => {

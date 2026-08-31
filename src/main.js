@@ -12450,8 +12450,9 @@ function ioConfirm({ title, message = "", okLabel = "OK", altLabel = "", alt2Lab
     if (alt) alt.textContent = altLabel;
     const alt2 = overlay.querySelector(".io-confirm-alt2");
     if (alt2) alt2.textContent = alt2Label;
-    // 三个以上动作横排放不下（中文标签会被折成两行），改成竖排。
-    if (alt2) overlay.querySelector(".io-confirm-actions").classList.add("io-confirm-actions--stack");
+    // 三个及以上动作横排放不下（中文标签会被折成两行），改成竖排；
+    // 而且 .btn 基础样式是文字按钮，竖排规则里会把它们补成真按钮的样子。
+    if (alt || alt2) overlay.querySelector(".io-confirm-actions").classList.add("io-confirm-actions--stack");
     document.body.appendChild(overlay);
     let done = false;
     const finish = (confirmed = false, returnValue = confirmed ? "ok" : "cancel", event = null) => {
@@ -80413,15 +80414,19 @@ async function _copyIntoWorkspace(paths, destDir) {
   // VS Code 同样会问（它的条件就是 e.isRoot）。
   if (_dirs.length && workspaceRoots.includes(destDir)) {
     const q = rootDropQuestion({ dirs: _dirs.map((x) => x.path), destDir, rootPath });
+    // 只留三档：打开为新项目（主）/ 添加到工作区 / 取消。
+    // 「复制进来」那一档按用户要求去掉了——把一个**项目文件夹**拖进来，想要的从来不是
+    // 把它复制一份进当前项目，而是打开它或把它挂成另一个根。（拖文件、拖子目录进子文件夹
+    // 走的是另一条路，那条照旧直接复制，不弹框。）
     const pick = await ioConfirm({
       title: q.title, message: q.message,
-      okLabel: "复制到这里", altLabel: "添加到工作区", alt2Label: "打开为新项目",
+      okLabel: "打开为新项目", altLabel: "添加到工作区",
     });
-    if (pick === "cancel") return;
+    if (pick === "cancel" || pick === false) return;
     if (pick === "alt") { for (const d of _dirs) await _addWorkspaceRoot(d.path); return; }
     // 打开为新项目：第一个当新根打开，其余的加进工作区（等价于 VS Code 拖多个文件夹
-    // 到编辑器区时的 createAndEnterWorkspace，而不是像以前那样把多余的静默丢掉）。
-    if (pick === "alt2") {
+    // 到编辑器区时的 createAndEnterWorkspace，而不是把多余的静默丢掉）。
+    if (pick === "ok" || pick === true) {
       await openFolder(_dirs[0].path);
       for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
       return;
