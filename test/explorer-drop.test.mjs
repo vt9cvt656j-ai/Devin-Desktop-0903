@@ -308,8 +308,9 @@ test("树内拖动真的接上了移动，而不是只会 @ 引用", () => {
   const drag = src.slice(src.indexOf("function _wireTreeDragToComposer"));
   assert.match(drag.slice(0, 3000), /_moveIntoDir\(candPaths\(\), _treeDropDirAt\(/,
     "松手落在树里没有触发移动");
-  assert.match(drag.slice(0, 3000), /_paintDropRow\(onComposer \? "" : _treeDropDirAt\(/,
+  assert.match(drag.slice(0, 3000), /_treeDropDirAt\(e\.clientX, e\.clientY, candPaths\(\)\)[\s\S]{0,80}_paintDropRow\(/,
     "拖动中没有高亮将要接收它的那个目录");
+  assert.match(drag.slice(0, 3000), /is-drop-root/, "树内拖动没有整树高亮——空白处拖动看不到反馈");
   // 移动本身要走 renamePath，并且照 renameEntry 的规矩先关掉已打开的文件。
   const mv = src.slice(src.indexOf("async function _moveIntoDir"), src.indexOf("(function _wireTreeDragToComposer"));
   assert.match(mv, /_closeOpenFilesUnder\(m\.from\)/, "移动前没有关掉已打开的文件");
@@ -402,6 +403,20 @@ test("从工作区外拖进来要能复制，但写入侧边界不许松", () =>
   const pk = rs.slice(rs.indexOf("pub fn path_kinds"), rs.indexOf("pub fn import_path"));
   assert.match(pk, /std::fs::metadata\(p\)/, "类型探测要用 stat");
   assert.doesNotMatch(pk, /read_dir/, "类型探测不该枚举目录");
+});
+
+test("落点是项目根时整棵树一起亮", () => {
+  // 用户实拍：项目是空的（树里只有一行根行），在一大片空白上拖文件夹进来，**什么反馈都没有**。
+  // VS Code 在没有具体目标行时把 drop-target 加在列表本身上，整块列表都是投放色。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /classList\.toggle\("is-drop-root", !!dest && dest === rootPath\)/,
+    "外部拖入没有整树高亮");
+  // 收尾必须清掉，否则整棵树会一直亮着，看起来像坏了。
+  assert.ok((src.match(/remove\("is-dropping", "is-drop-root"\)/g) || []).length >= 2,
+    "两条拖动路径的收尾都要清掉整树高亮");
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /#tree\.is-drop-root \{ background: var\(--drop-bg\); \}/,
+    "整树高亮要用和行高亮同一个投放色");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
