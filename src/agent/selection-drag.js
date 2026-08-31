@@ -52,3 +52,47 @@ export function selectionText(opts) {
   const tail = dropped > 0 ? `\n（选区共 ${all.length} 行，这里只带了前 ${kept.length} 行）` : "";
   return `\n引用 ${rel} ${where}：\n${fence}${lang || ""}\n${body}\n${fence}${tail}\n`;
 }
+
+/**
+ * 输入框里那枚片**发送出去时**变成的短记号：`@code:<相对路径>#<起>-<止>`。
+ *
+ * 为什么不是把代码直接拼进正文：那样气泡里就是一大坨代码，而用户要的是"发出去的也是那枚片"。
+ * 和 `@element:<id>` 同一条路子——可见文本和历史里只留这个短记号，真正的代码在**发送期**
+ * 展开进上下文。区别是这里不需要另存一份快照：路径和行号就够把那几行从磁盘上取回来。
+ *
+ * 单行也写成 `#286-286`：标签那边可以省掉范围，记号不行——省了就得在解析处再分一支。
+ */
+export function selectionToken(rel, startLine, endLine) {
+  const a = Math.max(1, Number(startLine) || 1);
+  const b = Math.max(a, Number(endLine) || a);
+  return `@code:${encodeRelForToken(rel)}#${a}-${b}`;
+}
+
+// 提及扫描是按**空白**切的（`@([^\s]+)`），所以记号里一个空格都不能有——路径里带空格的项目
+// 很常见（用户自己那个项目就叫「cursor 反代」）。空白按 %XX 编码，`%` 自己也编，这样是可逆的。
+const encodeRelForToken = (rel) => String(rel || "")
+  .replace(/[\s%]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+const decodeRelFromToken = (rel) => String(rel || "")
+  .replace(/%([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+
+/** 反过来解析。认不出就返回 null —— 调用方据此放行给别的分支，不许猜。 */
+export function parseSelectionToken(token) {
+  const m = /^@?code:(.+)#(\d+)-(\d+)$/.exec(String(token || ""));
+  if (!m) return null;
+  const a = Math.max(1, Number(m[2]) || 1);
+  const b = Math.max(a, Number(m[3]) || a);
+  return { rel: decodeRelFromToken(m[1]), startLine: a, endLine: b };
+}
+
+/**
+ * 从整份文件里切出记号指的那几行。
+ *
+ * 行号按 1 起算、两端都含。越界不报错只取交集：文件在拖进来之后被改短了是常事，
+ * 这时给出剩下的部分远好过整条丢掉。
+ */
+export function sliceLines(content, startLine, endLine) {
+  const all = String(content ?? "").split("\n");
+  const a = Math.max(1, Number(startLine) || 1);
+  const b = Math.max(a, Number(endLine) || a);
+  return all.slice(a - 1, b).join("\n");
+}

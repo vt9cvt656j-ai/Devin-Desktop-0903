@@ -5,7 +5,7 @@
 // 下面用锚点钉住它确实接上了。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { selectionLabel, selectionText } from "../src/agent/selection-drag.js";
+import { selectionLabel, selectionText, selectionToken, parseSelectionToken, sliceLines } from "../src/agent/selection-drag.js";
 import { SRC, blockFrom, fnSource } from "./helpers/source.mjs";
 
 test("片上的标签：只留文件名 + 行号范围，单行不写范围", () => {
@@ -70,15 +70,77 @@ test("main.js 真的接上了：按在选区里才算候选，落到输入框才
   // 阈值：不走够距离不算拖，否则点一下就插一枚片。
   assert.match(h, /< 6\) return;/, "没有拖拽阈值——点一下就会插片");
   // 只在落到输入框上时才插，且插的是 code 片 + 展开的正文。
-  assert.match(h, /_insertRefAtCursor\(c\.rel, "code", _selectionLabel\([\s\S]{0,80}_selectionText\(/,
-    "落点没有接到 code 片上");
-  // 片自己带正文；_chipText 发送时读它，而不是把它当成 @ 引用去读整个文件。
-  assert.match(fnSource("_chipText"), /if \(kind === "code"\) return chip\?\.dataset\?\.text \|\| "";/,
-    "code 片没有直接展开成正文——会被当成 @ 引用，模型收到的是整个文件而不是选中那段");
+  assert.match(h, /_insertRefAtCursor\(c\.rel, "code", _selectionLabel\([\s\S]{0,80}_selectionToken\(/,
+    "落点没有接到 code 片上，或者又把整段代码塞进片里了");
+  // 片带的是短记号；_chipText 序列化时两侧要留空格，否则提及扫描（按空白切）认不出它。
+  assert.match(fnSource("_chipText"), /if \(kind === "code"\) return " " \+ \(chip\?\.dataset\?\.text \|\| ""\) \+ " ";/,
+    "code 片的记号没有两侧留空格——提及扫描按空白切，贴着别的字就认不出来");
   assert.match(fnSource("_insertRefAtCursor"), /if \(dataText\) chip\.dataset\.text = dataText;/,
-    "插入时没有把正文挂到片上，发送出去会是空的");
+    "插入时没有把记号挂到片上，发送出去会是空的");
+  // 记号不许被当成本地路径去读：那会 readTextFile("code:…") 抛错、被吞掉，还白占一个提及名额。
+  assert.match(SRC, /_REMOTE_AT = \/\^\(github\|gitlab\|gitee\|codeberg\|model\|element\|code\):/,
+    "@code: 没有从本地路径扫描里摘出去");
+  // 发送期真的按记号把那几行读回来，展开进上下文。
+  assert.match(SRC, /const ref = _parseSelectionToken\(tok\);/, "发送期没有解析 @code: 记号");
+  assert.match(SRC, /_sliceLines\(await backend\.readTextFile\(fp\), ref\.startLine, ref\.endLine\)/,
+    "没有按行号把那几行读回来——模型只会收到一个记号，看不到代码");
+  // 气泡里也画成片，而不是把代码摊出来。
+  assert.match(fnSource("_renderMentionsToHtml"), /const code = _parseSelectionToken\(rel\);/,
+    "气泡里没有把 @code: 记号画成片");
   // 图标用这个文件真正的图标，且必须从 rel 算 —— code 片的 name 是「quota.py:275-284」，
   // 带着行号去查扩展名会落到兜底图标上（用户：「前面图标要用真实的文件图标」）。
   assert.match(SRC, /kind === "code"\s*\n?\s*\? iconImg\(fileIconUrl\(rel\.split\("\/"\)/,
     "code 片没有用真实的文件图标，或者图标是从带行号的 name 算的");
+});
+
+test("发出去的是短记号，不是一大坨代码", () => {
+  // 用户：「发出去的内容也要是组件囊」。片直接展开成代码块的话，气泡里就是一整屏代码。
+  // 和 @element: 同一条路子：可见文本只留短记号，代码在发送期展开进上下文。
+  assert.equal(selectionToken("cursor_proxy/quota.py", 286, 303), "@code:cursor_proxy/quota.py#286-303");
+  // 单行也写成 #286-286：标签那边可以省掉范围，记号不行——省了解析处就得多一支。
+  assert.equal(selectionToken("a.py", 5, 5), "@code:a.py#5-5");
+  // 记号里不能有空格，否则提及扫描（按空白切）会把它切断。
+  assert.doesNotMatch(selectionToken("a b/c.py", 1, 2), / /,
+    "路径带空格时记号会被提及扫描切断——那样气泡里画不出片，上下文也展不开");
+  // 编码必须可逆，否则展开时按错误的路径去读文件。
+  for (const rel of ["a b/c.py", "有 空格/x.py", "100%/y.py", "a\tb/z.py", "plain/ok.py"]) {
+    assert.equal(parseSelectionToken(selectionToken(rel, 1, 2))?.rel, rel, `${rel} 没有原样还原`);
+  }
+});
+
+test("记号解析：认得出就还原，认不出一律 null", () => {
+  assert.deepEqual(parseSelectionToken("@code:a/b.py#286-303"), { rel: "a/b.py", startLine: 286, endLine: 303 });
+  assert.deepEqual(parseSelectionToken("code:a/b.py#1-1"), { rel: "a/b.py", startLine: 1, endLine: 1 });
+  // 路径里带 # 或 : 也要还原对：正则取的是**最后**一个 #。
+  assert.deepEqual(parseSelectionToken("@code:a#b/c.py#2-3"), { rel: "a#b/c.py", startLine: 2, endLine: 3 });
+  // 别的前缀不许被它抢走——@github:owner/repo 有自己的分支。
+  for (const bad of ["@github:o/r", "@a.py", "@code:a.py", "@code:a.py#x-y", "", null, undefined]) {
+    assert.equal(parseSelectionToken(bad), null, `不该认下 ${String(bad)}`);
+  }
+});
+
+test("按行号切片：1 起算、两端都含、越界只取交集", () => {
+  const f = "l1\nl2\nl3\nl4\nl5";
+  assert.equal(sliceLines(f, 2, 4), "l2\nl3\nl4");
+  assert.equal(sliceLines(f, 3, 3), "l3", "单行没取到");
+  // 文件在拖进来之后被改短了是常事：给出剩下的部分，好过整条丢掉。
+  assert.equal(sliceLines(f, 4, 99), "l4\nl5", "越界应该只取交集");
+  assert.equal(sliceLines(f, 0, 1), "l1", "行号从 1 起算");
+  assert.doesNotThrow(() => sliceLines(null, 1, 2));
+});
+
+test("⌘/Ctrl + 单击直接跳过去，不弹 Peek", () => {
+  // 用户：「ide 没有点击变量、函数的跳转功能吗，类似与 vscode 中的 Ctrl+鼠标左键」。
+  // 跳转链路本来就通（lsp-client 注册了 definition provider，main.js 注册了
+  // registerEditorOpener 把跨文件的目标接进页签系统），卡在这个选项上：
+  // definitionLinkOpensInPeek: true 的意思是"这个鼠标手势永远只开 Peek 浮层"，
+  // 于是点了半天页面不动，看着就像没有跳转功能。VS Code 的默认是 false。
+  const opts = blockFrom("const monacoEditor = monaco.editor.create(editorEl, {");
+  assert.match(opts, /definitionLinkOpensInPeek:\s*false/,
+    "⌘+单击又只弹 Peek 了——用户要的是像 VS Code 那样直接跳过去");
+  // 命中多个定义时仍然 Peek，这和 VS Code 一致，别一起改掉。
+  assert.match(opts, /multipleDefinitions:\s*"peek"/, "多个定义时的 Peek 被顺手改掉了");
+  // 跨文件跳转靠这个 opener 接进我们自己的页签系统；它没了就只能在同一个文件里跳。
+  assert.match(SRC, /monaco\.editor\.registerEditorOpener\(\{/,
+    "跨文件跳转的 opener 没了——跳到别的文件会静默什么都不发生");
 });

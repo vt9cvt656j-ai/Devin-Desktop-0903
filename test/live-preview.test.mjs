@@ -299,7 +299,9 @@ test("选中的元素进输入框，而不是弹面板或冲掉已打的字", ()
   assert.ok(!CODE.includes("_previewShowPickPanel"), "旧的弹面板路径还在");
 
   // @element: 不能被当成本地路径去读盘
-  assert.match(CODE, /_REMOTE_AT = \/\^\(github\|gitlab\|gitee\|codeberg\|model\|element\)/,
+  // 只要求 element 在这张"不是本地路径"的名单里，不钉死整条候选列表——
+  // 钉死的话，别处新增一种前缀（@code: 就是）会让这条无关的断言变红。
+  assert.match(CODE, /_REMOTE_AT = \/\^\((?:[a-z]+\|)*element(?:\|[a-z]+)*\):/,
     "@element: 会被拿去 readTextFile/readDir，两次都抛、还白占一个 @ 名额");
 
   // 胶囊序列化成 " @element:<id> "，发送时按这个形状展开
