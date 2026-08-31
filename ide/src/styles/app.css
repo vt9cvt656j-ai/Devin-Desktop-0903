@@ -58,6 +58,10 @@
   --shimmer: rgba(10, 132, 255, 0.1);
   /* 拖放里「这一步会换掉整个项目」那一档的警示色，和 .problems__item--warn 同色系。 */
   --drop-warn: #d9a000;
+  /* 决策弹框的主色。刻意不用满屏都在用的 --accent（那个亮蓝一上大按钮就很吵）：
+     这类「要不要换掉整个项目」的问题该是沉稳的暖色，和 Claude 一致。 */
+  --ask-accent: #c96442;
+  --ask-accent-hover: #b0553a;
   --titlebar-h: 44px;
   --statusbar-h: 26px;
   --radius: 10px;
@@ -126,6 +130,8 @@
   --shimmer: rgba(255, 255, 255, 0.07);
   /* 琥珀在深底上要提亮，否则和边框糊成一片。 */
   --drop-warn: #e0a000;
+  --ask-accent: #d97757;
+  --ask-accent-hover: #e08a6d;
 
   /* 与浅色一一对应。注意 --accent-solid / --accent-on 在这里**关系反过来**：
      暗色 --accent(#4daafc) 当填充底已经够亮，前景必须换成深色（7.73:1），
@@ -9970,83 +9976,98 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(32, 33, 36, 0.24);
-  backdrop-filter: blur(10px);
+  background: color-mix(in srgb, #000 34%, transparent);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
 }
+/* 决策弹框。克制、留白、发丝描边——不要大色块和重阴影：这里问的是「要不要换掉整个项目」，
+   越安静越好读。原来写死 #fff/#202124/#e8eaed，深色主题下整张卡是白的，现在全走令牌。 */
 .io-confirm-card {
-  width: min(420px, 92vw);
-  /* 原来这里写死 #fff / #202124 / #e8eaed，深色主题下整张卡是白的、字是黑的。
-     全仓也没有任何 [data-theme="dark"] 覆盖它——走令牌，两套主题都对。 */
+  width: min(400px, 92vw);
+  padding: 24px 24px 18px;
   border: 1px solid var(--line-strong);
-  border-radius: 18px;
+  border-radius: 14px;
   background: var(--panel-solid);
   color: var(--text);
-  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
-  padding: 22px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 12px 40px rgba(0, 0, 0, .18);
 }
 .io-confirm-card h2 {
-  margin: 0 0 10px;
-  font-size: 16px;
-  line-height: 1.35;
-  font-weight: 700;
-  letter-spacing: -0.01em;
+  margin: 0 0 8px;
+  font-size: 15px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: -0.005em;
 }
 .io-confirm-message {
   margin: 0;
   white-space: pre-wrap;
   color: var(--text-dim);
   font-size: 13px;
-  line-height: 1.55;
+  line-height: 1.6;
 }
 .io-confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
-  margin-top: 18px;
-}
-.io-confirm-actions .btn {
-  min-width: 86px;
-  min-height: 34px;
-  white-space: nowrap;          /* 「添加到工作区」这种六个字的标签不许从中间折断 */
-}
-/* 多个动作时横排必然挤：卡片 420px 去掉内边距只剩 380，光 min-width 就放不下三个中文标签。
-   照 macOS 的做法竖排，主按钮在最上、取消在最下。DOM 顺序是 取消/次/主，所以用
-   column-reverse 正好把主按钮翻到顶上。 */
-.io-confirm-actions--stack {
-  flex-direction: column-reverse;
-  align-items: stretch;
   gap: 8px;
   margin-top: 20px;
 }
-/* .btn 的基础样式是**文字按钮**（透明、无边框），竖排之后三个次要项看起来就是三行蓝字、
-   完全不像按钮。这里给它们补回按钮该有的面：底色、描边、统一高度和圆角。 */
+.io-confirm-actions .btn {
+  min-width: 84px;
+  min-height: 32px;
+  white-space: nowrap;          /* 「添加到工作区」这种六个字的标签不许从中间折断 */
+}
+/* 三个及以上动作横排必然挤（卡片去掉内边距只剩 350，三个中文标签放不下），改成竖排。
+   DOM 顺序是 取消/次/主，column-reverse 正好把主按钮翻到最上。 */
+.io-confirm-actions--stack {
+  flex-direction: column-reverse;
+  align-items: stretch;
+  gap: 6px;
+  margin-top: 22px;
+}
+/* .btn 的基础样式是**文字按钮**（透明、无边框），竖排后三个标签就是三行蓝字、完全不像
+   按钮。这里补回按钮的面，但保持克制：发丝描边 + 极浅底，不用大色块。 */
 .io-confirm-actions--stack .btn {
   width: 100%;
-  min-height: 42px;
-  border-radius: 10px;
-  font-size: 13.5px;
-  font-weight: 600;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text);
-  background: var(--bg-elevated, rgba(128, 128, 128, 0.10));
+  background: transparent;
   border: 1px solid var(--line-strong);
+  transition: background .12s ease, border-color .12s ease;
 }
 .io-confirm-actions--stack .btn:hover { background: var(--hover); }
-/* 主按钮：实心强调色，一眼看出默认选哪个。 */
+.io-confirm-actions--stack .btn:active { transform: none; }
+/* 主动作：实心暖色。只有它有底色，所以「默认点哪个」不用读字也知道。 */
 .io-confirm-actions--stack .btn--primary {
   color: #fff;
-  background: var(--accent);
+  font-weight: 600;
+  background: var(--ask-accent);
   border-color: transparent;
 }
-.io-confirm-actions--stack .btn--primary:hover { filter: brightness(0.93); }
-/* 取消是第三等：不画描边和底色，跟两个真动作拉开层级。 */
+.io-confirm-actions--stack .btn--primary:hover { background: var(--ask-accent-hover); }
+/* 取消是第三等：连描边都不要，和两个真动作拉开层级。 */
 .io-confirm-actions--stack .io-confirm-cancel {
-  background: transparent;
   border-color: transparent;
   color: var(--text-dim);
+  min-height: 34px;
+  margin-top: 2px;
 }
-.io-confirm-actions--stack .io-confirm-cancel:hover {
+.io-confirm-actions--stack .io-confirm-cancel:hover { color: var(--text); }
+/* 点下之后按钮会被禁用（防重复提交）。基础的 .btn:disabled 只有 opacity:.5，落在实心
+   主按钮上就是一块灰底 + 几乎看不见的白字——用户实拍过。禁用时保留可读的文字对比。 */
+.io-confirm-actions--stack .btn:disabled {
+  opacity: 1;
+  color: var(--text-dim);
   background: var(--hover);
-  color: var(--text);
+  border-color: transparent;
+  cursor: default;
+}
+.io-confirm-actions--stack .btn--primary:disabled {
+  color: #fff;
+  background: color-mix(in srgb, var(--ask-accent) 55%, transparent);
 }
 
 /* ---- About dialog ---- */

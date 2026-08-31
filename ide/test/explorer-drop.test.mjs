@@ -350,8 +350,16 @@ test("三个以上动作的弹框要竖排，标签不许折断", () => {
   // .btn 基础样式是**文字按钮**（透明无边框），竖排后三行蓝字完全不像按钮。
   assert.match(css, /\.io-confirm-actions--stack \.btn \{[^}]*border: 1px solid var\(--line-strong\);/s,
     "竖排按钮没有补上描边——看起来还是三行链接");
-  assert.match(css, /\.io-confirm-actions--stack \.btn--primary \{[^}]*background: var\(--accent\);/s,
+  assert.match(css, /\.io-confirm-actions--stack \.btn--primary \{[^}]*background: var\(--ask-accent\);/s,
     "主按钮没有实心底色");
+  // 主色不用满屏都在用的 --accent：那个亮蓝一上大按钮就很吵。两套主题各一份。
+  assert.equal((css.match(/--ask-accent:/g) || []).length, 2, "决策弹框主色缺深浅两套");
+  // 点下之后按钮会被禁用防重复提交。基础 .btn:disabled 只有 opacity:.5，落在实心主按钮上
+  // 就是一块灰底 + 几乎看不见的字（用户实拍过），所以竖排里要单独给禁用态。
+  assert.match(css, /\.io-confirm-actions--stack \.btn:disabled \{[^}]*opacity: 1;/s,
+    "禁用态还是靠 opacity 变淡——实心主按钮会糊成一块灰、字看不见");
+  assert.match(css, /\.io-confirm-actions--stack \.btn--primary:disabled \{[^}]*color: #fff;/s,
+    "禁用的主按钮没有保住文字对比");
   // 这张卡以前写死 #fff/#202124，深色主题下整块是白的。
   assert.match(css, /\.io-confirm-card \{[\s\S]{0,400}background: var\(--panel-solid\);/,
     "弹框卡片没走主题令牌——深色下会是白底黑字");
