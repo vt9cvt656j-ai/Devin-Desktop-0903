@@ -36455,85 +36455,13 @@ let _growthPersistLastTime = 0;
 let _growthPersistTimer = null;
 const GROWTH_PERSIST_DEBOUNCE_MS = 500;
 
-function observeToolCall(toolRecord) {
-  try {
-    // `window._growthState` 全仓只有下面那一处写入，而那处在本函数**内部**、且被这一行的
-    // 早退挡在前面——先决条件是它自己先被写过。鸡生蛋：这个函数每次都在这里 return，
-    // 整条工具用量学习从来没收到过任何信号。留着不是"以后会用上"，是让人以为已经在用。
-    // 真正在记账的是 growth.signal()（message-sent / run-complete / review-diff /
-    // edit-applied 四处）；这条学习链要接就该接那边，并且单独一笔带实测。
-    const g = typeof window !== 'undefined' ? window._growthState || null : null;
-    if (!g) return;
-    
-    // Normalize tool name (strip prefix and extract base command for shell commands)
-    let toolName = String(toolRecord.tool || "").trim();
-    const baseCommand = toolName.split(' ')[0];
-    
-    // Find matching skill or create new one
-    let matchedSkillIndex = -1;
-    if (Array.isArray(g.skills)) {
-      matchedSkillIndex = g.skills.findIndex(s => 
-        s.name === toolName || 
-        s.name === baseCommand || 
-        s.name.includes(baseCommand) ||
-        baseCommand.includes(s.name)
-      );
-    }
-    
-    if (matchedSkillIndex >= 0) {
-      // Update existing skill mastery
-      const current = g.skills[matchedSkillIndex].mastery ?? 0;
-      const success = toolRecord.ok === true;
-      const delta = success ? 0.05 : -0.02; // Success +0.05, failure -0.02
-      g.skills[matchedSkillIndex].mastery = Math.max(0, Math.min(1, current + delta));
-      g.skills[matchedSkillIndex].lastUsed = Date.now();
-      g.skills[matchedSkillIndex].usageCount = (g.skills[matchedSkillIndex].usageCount || 0) + 1;
-    } else {
-      // Create new skill entry for first-time tool
-      const initialMastery = toolRecord.ok === true ? 0.3 : 0.1; // First attempt gets base score
-      g.skills.push({
-        name: toolName,
-        mastery: initialMastery,
-        lastUsed: toolRecord.timestamp || Date.now(),
-        usageCount: 1
-      });
-    }
-    
-    // Store back to window object (browser-compatible)
-    if (typeof window !== 'undefined') {
-      window._growthState = g;
-      // Also persist to localStorage if available (async with debounce to avoid main thread block)
-      const now = Date.now();
-      if (now - _growthPersistLastTime >= GROWTH_PERSIST_DEBOUNCE_MS) {
-        Promise.resolve().then(() => {
-          try {
-            localStorage.setItem("michael-ide.learner-model.v1", JSON.stringify(g));
-          } catch (e) {
-            // Ignore quota errors
-          }
-        });
-        _growthPersistLastTime = now;
-      } else if (!_growthPersistTimer) {
-        // Debounce: only schedule one timer if already within throttle window
-        _growthPersistTimer = Promise.resolve().then(() => {
-          try {
-            localStorage.setItem("michael-ide.learner-model.v1", JSON.stringify(g));
-          } catch (e) {
-            // Ignore quota errors
-          }
-        });
-        _growthPersistTimer = null;
-      }
-    }
-  } catch (e) {
-    console.warn('observeToolCall failed:', e);
-  }
-}
-
-// For testing and external access
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { observeToolCall };
-}
+// 这里原来有 observeToolCall + 一段"工具用量学习"：每个工具结果都喂给它，它往
+// `window._growthState` 里累计每个工具的成功率。整条链**一次都没跑过**——那个形状全仓
+// 唯一的写入点就在它自己函数体内部、还被开头的 `if (!g) return;` 挡着（鸡生蛋）；
+// 而它唯一的下游消费者 recommendToolsForIntent 不但零调用点，内部也对不上：它拿**工具名**
+// 去查 userSkills，而 growth.js 的技能 id 是 reviewing/authoring/prompting/planning/
+// tooling/verifying——两套词表没有一个重合，就算把数据喂进去权重也恒为 0。整座死岛删掉。
+// 真正在用熟练度的那条（放宽工具窗口）已接到 growth.js 的真实 BKT（getAvgMasteryStrict）。
 function _canonicalToolName(name) {
   if (typeof name !== "string") return null;
   let n = name.trim();
@@ -51136,18 +51064,21 @@ function _criticToolCatalog(toolRegistry, maxTools = Infinity, maxDescriptionCha
 function _criticRequestedToolSchemas(toolNames, toolRegistry, maxTools = 8) {
   if (!Array.isArray(toolNames) || !toolRegistry || typeof toolRegistry.get !== "function") return [];
   
-  // 上限就是传进来的那个。
+  // 按用户熟练度放宽工具窗口，数据源是 growth.js 的 BKT 状态——那边 signal() 在四处真实
+  // 记账（message-sent / run-complete / review-diff / edit-applied），是真数据。
   //
-  // 这里原来还有一段「按用户熟练度自适应放宽到 12 / 15」，读的是 `window._growthState` ——
-  // 而那个形状**从来没有被赋过值**：全仓唯一的写入点在 observeToolCall 里，那个函数第一行
-  // 就是 `if (!g) return;`，先决条件是它自己先被写过。鸡生蛋，于是这段自适应一次都没生效，
-  // 上限恒等于默认值；读它的代码却让人以为「按熟练度放宽窗口」已经在做了。
+  // 这里原来读的是 `window._growthState`：一个**从来没有被赋过值**的形状（全仓唯一写入点
+  // 在 observeToolCall 内部，而那函数第一行就是 `if (!g) return;`——先决条件是它自己先被
+  // 写过，鸡生蛋）。于是这段自适应一次都没生效，上限恒等于默认值，代码却摆得像已经接好了。
   //
-  // 删掉之后**没有接**真数据源（growth.js 的 getAvgMastery()，那边 BKT 是真的、signal() 已在
-  // 四处记账）。接上会静默改所有人的行为：getAvgMastery 失败返回 0.5，0.5 > 0.45 就抬到 12
-  // ——失败路径反而给更多工具。而工具窗口每轮都收注意力税（本文件多处记着「窗口从 11 涨到
-  // 20，每个都按轮收税」）。放宽窗口是产品决定，要开该单独一笔并带实测。
-  const dynamicMaxTools = Number(maxTools) || 8;
+  // 用 getAvgMasteryStrict() 而不是 getAvgMastery()：后者读失败时返回 0.5，而 0.5 恰好越过
+  // 下面 0.45 那道阈值——**失败反而给更多工具**。拿不到就保守，维持传进来的默认值。
+  let dynamicMaxTools = Number(maxTools) || 8;
+  const _avgP = (() => { try { return growth.getAvgMasteryStrict(); } catch { return null; } })();
+  if (Number.isFinite(_avgP)) {
+    if (_avgP > 0.7) dynamicMaxTools = 15;
+    else if (_avgP > 0.45) dynamicMaxTools = 12;
+  }
   
   const out = [], seen = new Set();
   for (const rawName of toolNames) {
@@ -51474,71 +51405,12 @@ async function _wrapUpCritic({ config, task, padText, draft, readList, execution
   } catch { return null; }
 }
 
-/**
- * recommendToolsForIntent - 启发式工具推荐引擎
- *
- * 基于意图关键词匹配推荐工具（仅作为 suggestion 注入 user block，不是硬路由）。
- * 遵循项目原则："关键词仅作兜底，AI 主判"——推荐结果只是给编排模型的参考提示，
- * 最终选哪些工具仍由语义编排器根据任务含义和真实证据裁决。
- */
-function recommendToolsForIntent(intentText, context = {}) {
-  const intentPatternMap = {
-    research: {
-      keywords: ['调研', '选型', '了解', '评估', 'compare', 'alternative', '主流'],
-      tools: ['github_search', 'developer_community_search', 'read_file(documentation)', 'package_search']
-    },
-    debugging: {
-      keywords: ['报错', 'error', 'exception', 'bug', 'fix', 'crash', '异常', '失败'],
-      tools: ['search(error_code)', 'run_cmd(test_command)', 'read_file(log_file)', 'get_diagnostics']
-    },
-    performance: {
-      keywords: ['慢', '性能', 'slow', 'latency', 'timeout', '卡顿', '响应时间'],
-      tools: ['db_query(explain_plan)', 'browser(performance_test)', 'run_cmd(benchmark)', 'read_logs(app_error.log)']
-    },
-    ui_implementation: {
-      keywords: ['界面', 'UI', '页面', 'frontend', 'view', 'component', '设计'],
-      tools: ['browser(headful)', 'screenshot(current_view)', 'design_board', 'read_file(css_files)']
-    },
-    data_operations: {
-      keywords: ['数据库', 'table', 'schema', 'data', 'migrate', 'query', '表结构'],
-      tools: ['db_query(inspect_schema)', 'read_file(migrations/)']
-    }
-  };
-  
-  // P0 #3: Personalize recommendations based on user's skill mastery levels
-  let userSkills = {};
-  try {
-    // 同 _criticRequestedToolSchemas 那处：`window._growthState` 从没被赋过值（唯一写入点
-    // 在 observeToolCall 内部、而它开头就 `if (!g) return;`），所以 userSkills 恒为空对象、
-    // 下面那套「按熟练度加权排序」恒等于不加权。留着读取只会让人以为个性化已经在生效。
-    // 真数据在 growth.js（BKT + signal() 四处记账）；接上属于产品决定，不在这一笔里做。
-    userSkills = {};
-  } catch (e) {
-    console.warn('Growth skill access failed, falling back to default ranking:', e.message);
-  }
-  
-  const normalizedIntent = String(intentText || '').toLowerCase();
-  if (!normalizedIntent) return [];
-  const matchedTools = [];
-
-  for (const config of Object.values(intentPatternMap)) {
-    if (config.keywords.some((keyword) => normalizedIntent.includes(keyword.toLowerCase()))) {
-      matchedTools.push(...config.tools);
-    }
-  }
-
-  // Weight and sort by user skill mastery - higher mastery tools appear first
-  let weightedTools = matchedTools.map(tool => {
-    // Extract base tool name (remove parameters like (documentation), (test_command), etc.)
-    const baseName = tool.replace(/\(.*\)/, '');
-    const mastery = userSkills[baseName] ?? userSkills[tool] ?? 0;
-    return { tool, mastery };
-  });
-  
-  // Sort by mastery descending, then take top 5
-  weightedTools.sort((a, b) => b.mastery - a.mastery);
-  return weightedTools.slice(0, 5).map(w => w.tool);
-}
+// 这里原来有 recommendToolsForIntent（启发式工具推荐）。删掉，两个理由叠在一起：
+// ① 零调用点——它在 wiring.test 的 KNOWN_UNCALLED 里挂了很久，理由写的是"留着备用"；
+// ② 就算接上也不可能对：它拿**工具名**（read_file / run_cmd…）去查 userSkills，而那份
+//    熟练度的键是 growth.js 的技能 id（reviewing / authoring / prompting / planning /
+//    tooling / verifying）——两套词表零重合，权重恒为 0，排序恒等于不排序。
+// "留着备用"的前提是它将来能用；这个不能。
 
 /**
  * validateToolCall - 增强版工具调用验证
@@ -56154,25 +56026,6 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // retain their synchronous semantic recovery paths; steering still reroutes immediately.
       if (items.length && _live()) {
         run._toolLedger.turnIndex++;  // 每批工具调用后递增回合数
-        
-        // P0 #5: Growth feedback loop - record tool usage signals to adaptive learner model
-        for (const it of items) {
-          // `_notAttempted` 同样要排除：这里喂的是「哪个工具成功/失败」的学习信号，
-          // 一次根本没发生的调用会以 ok:false 教给学习器，方向和台账那两处一模一样。
-          if (!it || it._notAttempted || !it.call?.type || !_toolExecutionAttempted(it.rawResult)) continue;
-          try {
-            const ok = _toolExecutionSucceeded(it.call, it.rawResult);
-            observeToolCall({
-              turn: run._toolLedger.turnIndex,
-              tool: String(it.call.type === 'cmd' ? (it.call.command?.split(' ')[0] || '') : it.call.type),
-              ok: !!ok,
-              timestamp: Date.now()
-            });
-          } catch (e) {
-            // Growth recording bug must never break the chat hot-path
-            console.warn('Growth signal recording failed:', e.message);
-          }
-        }
         
       }
 

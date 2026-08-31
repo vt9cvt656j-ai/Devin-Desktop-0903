@@ -46,11 +46,14 @@ const { data, isLoading } = useQuery({
 
 ## Design-to-Code Pipeline
 ```
-1. Get design spec — with a Figma URL, use the built-in `figma` tool (structured tokens,
-   Auto Layout, real colours; no external connector needed). Screenshots are the fallback
-   when there is no source file: never rebuild a design by eyeballing pixels from an image.
+1. Get the design spec from what the user actually gave you:
+   a reference product/URL -> learn_design (pulls the real design system: palette, type
+   scale, spacing, radii); a described style or no reference -> the platform's own
+   michael-design corpus via knowledge_search(domain="michael-design"), which is what the
+   design preflight already loads. Never rebuild a design by eyeballing pixels off a
+   screenshot -- get tokens, not guesses.
 2. Decompose into sections; generate each independently
-3. Map to existing components first (Code Connect pattern)
+3. Map to components that already exist in this project first
 4. Generate only unmapped elements
 5. Evaluate at section level: Text Accuracy, Layout, Spacing, Media Position
 6. Fix sections scoring below threshold; recompose
