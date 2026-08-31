@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside, chipSpacers,
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
@@ -704,6 +704,46 @@ test("片左右要留出间距，否则光标跨过来就贴在片上", () => {
   assert.ok(m, "找不到 .composer-chip 的横向 margin");
   // ≈ 两个空格宽。5px 试过仍嫌挤（用户自己敲了两个空格才觉得对）。
   assert.ok(Number(m[1]) >= 8, `片左右间距太小（${m[1]}px），光标跨过来会贴在片上`);
+});
+
+test("退格一次只删一个片，不能把整串都删了", () => {
+  // 用户实拍：「本来有3个组件囊，一个delete 会删除3个」。片是 contentEditable=false 的原子
+  // 节点、彼此之间只隔着零宽空格，WKWebView 会把这一串当成**一个**删除单元。
+  // 和方向键同源：不能指望浏览器的默认行为，要自己接管。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const h = src.slice(src.indexOf("// 退格 / 删除也要自己接管"), src.indexOf("// ---- @file mentions"));
+  assert.ok(h, "找不到退格处理器");
+  assert.match(h, /e\.key !== "Backspace" && e\.key !== "Delete"/, "没有接管退格/删除");
+  assert.match(h, /const back = e\.key === "Backspace"/, "退格删左边、Delete 删右边——两个方向要分开");
+  assert.match(h, /chipBeside\(\{ container: promptEl[\s\S]{0,160}left: back/, "没有复用同一套判据");
+  assert.match(h, /chip\.remove\(\)/, "没有只移除那一个片");
+  assert.match(h, /e\.preventDefault\(\)/, "没有阻止默认行为——浏览器那套会把整串删掉");
+  // 有选区时是用户自己框的，交给浏览器。
+  assert.match(h, /if \(!sel\?\.isCollapsed/, "有选区时不该接管");
+});
+
+test("两个片相邻时要垫真空格", () => {
+  // 用户：「左边和右边卡片就挨在一起了」。CSS margin 不够——两片之间没有可编辑的文本节点，
+  // 光标无处停；零宽空格宽度为 0，视觉上一样贴着。
+  const TXT = (v) => ({ nodeType: 3, nodeValue: v, previousSibling: null, nextSibling: null });
+  const CHIP = () => ({ nodeType: 1, _chip: true, previousSibling: null, nextSibling: null });
+  const link = (ns) => { ns.forEach((n, k) => { n.previousSibling = ns[k - 1] || null; n.nextSibling = ns[k + 1] || null; }); return ns; };
+  const isChip = (n) => !!n._chip;
+
+  const a = CHIP(), b = CHIP();
+  link([a, TXT("\u200b"), b]);
+  assert.deepEqual(chipSpacers(b, isChip), { before: true, after: false },
+    "紧邻另一个片（中间只有零宽空格）没被认出来");
+  assert.deepEqual(chipSpacers(a, isChip), { before: false, after: true });
+  // 两侧是普通文本就不用垫。
+  const c = CHIP();
+  link([TXT("hi"), c, TXT(" x")]);
+  assert.deepEqual(chipSpacers(c, isChip), { before: false, after: false });
+
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /function _padChipNeighbours\(chip\)/, "没有把垫空格接进插入路径");
+  assert.ok((src.match(/_padChipNeighbours\(chip\)/g) || []).length >= 3,
+    "两处插入点（@菜单 / 从树里拖进来）都要垫");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

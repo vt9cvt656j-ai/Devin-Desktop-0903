@@ -33,6 +33,16 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_640（2026-08-30 第六次）：实测 81,584 行。买到的是输入框里那些内联「片」
+ *   （@文件 / @github:owner/repo）真正能用：方向键跨过去、退格一次只删一个、相邻两片之间
+ *   垫真空格。这三件都不是锦上添花——片是 contentEditable=false 的原子节点，WKWebView 在
+ *   这种结构上**不给可用的默认行为**：光标跨不过去、一次退格把三个片全删了、两片贴在一起
+ *   没有可编辑位置。三条都是用户实拍报回来的。
+ *   纯判断都进了 src/agent/explorer-drop.js（chipBeside / chipSpacers，节点从参数进，
+ *   用假 DOM 真跑）；留在 main.js 的是两个键盘处理器和一个三行的插入垫片，
+ *   它们要读 promptEl、window.getSelection、document.createRange —— 搬出去只会变成
+ *   把这些再传回来的假模块。
+ *
  * · 81_560（2026-08-30 第五次）：实测 81,510 行。买到的是右键菜单里的「移除文件 / 移除目录」
  *   ——把条目从文件树里藏起来，**磁盘上原样不动**（用户原话：「不是移除到废纸篓，而是移除
  *   让用户看不见 而不是真正的删除，我这里写了删除按钮了都」）。隐藏清单按项目分开存，
@@ -138,7 +148,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_560;
+const MAIN_JS_MAX_LINES = 81_640;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
