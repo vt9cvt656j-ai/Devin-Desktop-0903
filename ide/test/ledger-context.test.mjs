@@ -704,3 +704,47 @@ test("摘要要标出它覆盖了第几轮到第几轮", async () => {
   assert.ok(sum.includes(m.summaries[0].range),
     `摘要里没有轮次区间（${m.summaries[0].range}）——先后顺序对不上号`);
 });
+
+test("草稿纸只进不出——40 轮攒出 25 份，占掉一半以上的请求体", () => {
+  // 注入时前面拼了 _ORCH_NOTE（71 字信封），而删除判据写的是
+  // `content.startsWith("[运行进度草稿纸")` —— 内容开头是「〔系统编排提示…」，
+  // 所以恒为 false，一份都删不掉。注入排期是 iter>=6 && (iter%3===0 || iter>=20)，
+  // 第 20 轮之后每轮一份。线上实测同一个 run 第 47 步累计 497,109 字节 = 请求体的 53.2%，
+  // 那 247k prompt token 原样进了模型——同时解释了「慢」和「笨」。
+  const ORCH = loadConst("_ORCH_NOTE");
+  const TAG = loadConst("_PAD_TAG");
+  const inject = (msgs, iter, dedupe) => {
+    if (!(iter >= 6 && (iter % 3 === 0 || iter >= 20))) return;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user" && typeof msgs[i].content === "string" && dedupe(msgs[i].content)) {
+        msgs.splice(i, 1);
+      }
+    }
+    msgs.push({ role: "user", content: ORCH + `${TAG}——你在长任务第 ${iter} 步]\n已改文件: a.ts(编辑)` });
+  };
+  const count = (msgs) => msgs.filter((m) => String(m.content).includes(TAG)).length;
+
+  // 旧判据（startsWith）：一份都删不掉。
+  const oldWay = [];
+  for (let i = 1; i <= 40; i++) inject(oldWay, i, (c) => c.startsWith(TAG));
+  assert.ok(count(oldWay) >= 20, `旧判据本该攒一堆，只攒了 ${count(oldWay)} 份，用例前提不成立`);
+
+  // 新判据（includes）：任何时候都只留一份。
+  const newWay = [];
+  for (let i = 1; i <= 40; i++) inject(newWay, i, (c) => c.includes(TAG));
+  assert.equal(count(newWay), 1, `草稿纸又开始堆积了：留下 ${count(newWay)} 份`);
+  // 留下的必须是**最新**那一份，不能是第一份。
+  assert.match(String(newWay[newWay.length - 1].content), /第 40 步/, "留下的不是最新那份");
+});
+
+test("生产代码里草稿纸的去重用 includes，不是 startsWith（守调用点）", () => {
+  // 上面那条只证明「includes 对、startsWith 错」，不证明生产代码用的是哪个——
+  // 把生产那行改回 startsWith，上面那条照样绿。所以这一条钉调用点。
+  const src = stripJsComments(SRC);
+  const at = src.indexOf("_padInjectedThisTurn = false;");
+  assert.ok(at > 0, "草稿纸注入段的锚点没了，这条守卫失去落点");
+  const seg = src.slice(at, at + 900);
+  assert.match(seg, /content\.includes\(_PAD_TAG\)/,
+    "草稿纸去重又变回按前缀匹配了——注入时前面拼了 _ORCH_NOTE，前缀判据恒为 false，会只进不出");
+  assert.doesNotMatch(seg, /startsWith\("\[运行进度草稿纸/, "旧的前缀判据回来了");
+});
