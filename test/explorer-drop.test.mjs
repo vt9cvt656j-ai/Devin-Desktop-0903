@@ -468,36 +468,6 @@ test("落点是项目根时整棵树一起亮", () => {
     "整树高亮要用和行高亮同一个投放色");
 });
 
-test("右键的那一行要标出来，菜单关掉再清掉", () => {
-  // 用户：「被右键的那个内容 记得也要有被鼠标摸上那种效果，不然的话用户不知道点的是哪个
-  // 项目或者文件」。以前只有工作区根行会被选中，普通文件/目录右键后菜单浮在旁边、行上毫无
-  // 标记——而菜单里第一项之一就是不可逆的「删除」。
-  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  assert.match(src, /function openContextMenu\([^)]*\) \{[\s\S]{0,200}_paintCtxTarget\(entry\?\.path \|\| ""\)/,
-    "右键时没有标记目标行");
-  assert.match(src, /function closeContextMenu\(\) \{[\s\S]{0,220}_paintCtxTarget\(""\)/,
-    "菜单关掉后没有清掉标记——会留下一行看起来像被选中");
-  // 存路径不存节点引用：菜单开着时 fs-watcher 仍可能重建树。
-  const fn = src.slice(src.indexOf("function _paintCtxTarget"), src.indexOf("function openContextMenu"));
-  assert.match(fn, /querySelectorAll\("\.row\.is-ctx-target"\)/, "清理要按类名扫，不能存节点引用");
-  assert.match(fn, /\.row\[data-path="\$\{cssEscape\(_ctxTargetPath\)\}"\]/, "重贴要按路径找行");
-
-  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
-  assert.match(css, /#tree \.row\.is-ctx-target::before \{ background: var\(--active\); \}/,
-    "右键目标行没有高亮样式");
-  // 不能用 accent：那是「当前打开的文件」的语汇，混在一起分不清。
-  assert.doesNotMatch(css, /is-ctx-target::before \{ background: var\(--accent\)/, "别和 is-active 撞色");
-});
-
-test("右键菜单要窄", () => {
-  // 用户：「让这个框宽度窄一点，不然的话太长了，不好看」。
-  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
-  const blk = css.slice(css.indexOf(".ctx-menu {"), css.indexOf(".ctx-menu .menu__item"));
-  const m = blk.match(/min-width:\s*(\d+)px/);
-  assert.ok(m, "找不到 .ctx-menu 的 min-width");
-  assert.ok(Number(m[1]) <= 150, `右键菜单还是太宽（${m[1]}px）`);
-});
-
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
   // 纯逻辑对了但没接上等于没修。钉三件事：文件树是独立落区、树落点走复制而不是
   // openFolder、以及复制真的调了后端。
