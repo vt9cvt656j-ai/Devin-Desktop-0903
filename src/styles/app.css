@@ -14985,19 +14985,23 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 .msg-mention img, .msg-mention .ic { width: 13px; height: 13px; flex: 0 0 auto; }
 .msg-mention__name { white-space: nowrap; }
-/* 用户自己那条是 accent 渐变气泡。原来在上面铺一层 22% 的半透明白 —— 蓝上加淡蓝，
-   对比很弱，那个片几乎糊在气泡里（用户实拍就是这样）。改成**实心白底 + 强调色字**：
-   在彩色气泡上这是对比最强、也最像"一枚被引用的实体"的做法。 */
+/* 用户自己那条是 accent 渐变气泡，片要放在上面。试过两版都不行：
+   ① 22% 半透明**白** —— 蓝上加淡蓝，对比太弱，糊在气泡里；
+   ② 实心**白**底 —— 对比是够了，但等于在气泡上挖了个洞，很扎眼（用户：「还是纯白的」）。
+   改成**往下压**：比气泡更深的一层黑，配白字。片仍然待在蓝色的世界里（不是异物），
+   而"凹进去一块"正是内联引用该有的观感 —— 和代码块在彩色底上的处理同理。 */
 .msg.user .msg-mention, .msg__body .msg-mention {
-  color: var(--accent-solid);
-  background: #fff;
-  border-color: transparent;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+  color: #fff;
+  background: rgba(0, 0, 0, .22);
+  border-color: rgba(255, 255, 255, .18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .08);
 }
 .msg.user .msg-mention:hover, .msg__body .msg-mention:hover {
-  background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .2);
+  background: rgba(0, 0, 0, .3);
+  border-color: rgba(255, 255, 255, .28);
 }
+/* 品牌图标在深色片上要用白，别继承强调色（那是浅色背景下的规则）。 */
+.msg.user .msg-mention .ic, .msg__body .msg-mention .ic { color: #fff; }
 
 /* ---- Rich composer (contenteditable): #prompt is now a div, so style it directly ---- */
 #prompt {
