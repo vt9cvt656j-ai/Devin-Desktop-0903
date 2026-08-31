@@ -7751,8 +7751,10 @@ test("model card shows backend input output pricing as model price", () => {
     { inPrice: 0.25, outPrice: 1.5, flatPrice: 0.09, rate: 0 },
   );
 
+  // officialPrice 那个桩已删：客户端那张写死的厂商标价表 2026-08-30 整个删掉了。
+  // 它原来桩成恒返 {in:5,out:15}，于是「网关说没价、客户端自己编一个填进同一个格子」
+  // 这件事在测试里结构上看不见——桩总是给得出价。
   const rows = load("_modelPriceRows", {
-    officialPrice: () => ({ in: 5, out: 15 }),
     _fmtTokPrice: (n) => "$" + n,
     _escHtml: (s) => String(s),
     t: (key, params = {}) => {
@@ -14604,6 +14606,22 @@ test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
   const exec = extractFn("_executeToolStepInner");
   assert.match(exec, /_all\.filter\(\(j\) => String\(j\.id\) === _want\.replace\(\/\^job#\?\/, ""\)\)/,
     "await_subagent 的查找判据变了，上面那条回执格式要跟着改");
+});
+
+test("单次运行 token 预算必须有写入端——只读的键等于这道天花板不存在", () => {
+  // _readTokenCap 读 michael-ide.token-budget，超限后不再硬扩步数并在收尾提醒；
+  // 它是整个智能体循环**唯一的数值天花板**。但那个键一度全仓只有 getItem、没有任何
+  // setItem，也没有任何界面能填 —— cap 恒为 0（不限），而代码里两处注释写着
+  // 「烧钱由用户自设的 token 预算兜住」。这条钉住读写两头都在。
+  const KEY = "michael-ide.token-budget";
+  const reads = (SRC.match(new RegExp(`getItem\\("${KEY}"`, "g")) || []).length;
+  const writes = (SRC.match(new RegExp(`setItem\\("${KEY}"`, "g")) || []).length;
+  assert.ok(reads >= 1, "读取端没了");
+  assert.ok(writes >= 1,
+    "这个键只有读没有写——那道 token 天花板永远是 0（不限），而注释说它兜着烧钱");
+  // 写入端要真的接在界面上，不是一个没人调的函数。
+  assert.match(SRC, /_initTokenBudgetField\(\)/, "写入端没有调用点");
+  assert.match(SRC, /\$\("tokenBudgetInput"\)/, "写入端没接到设置里的那个输入框");
 });
 
 test("入参归一不许把数组拍平——system 的菜单路径就是数组", () => {

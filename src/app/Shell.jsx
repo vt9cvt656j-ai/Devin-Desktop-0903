@@ -543,6 +543,17 @@ export function Shell() {
               </div>
               <div className="settings-figma__hint">gitlab.com → 用户设置 → 访问令牌（read_api 即可）。只存在本机。</div>
             </div>
+            {/* 单次运行的 token 天花板。这个机制一直都在（_readTokenCap → 超限就不再硬扩
+                步数、并在收尾提醒），但**从来没有任何界面能填它**——localStorage 那个键
+                全仓只有读、没有一处写，于是 cap 恒为 0（=不限），而代码里两处注释写着
+                「烧钱由用户自设的 token 预算兜住」。它是整个智能体循环唯一的数值天花板。 */}
+            <div className="settings-figma">
+              <label className="settings-figma__label" htmlFor="tokenBudgetInput">单次运行 token 预算 <small>（可选，0 或留空 = 不限）</small></label>
+              <div className="settings-figma__row">
+                <input id="tokenBudgetInput" className="settings-figma__input" type="number" min="0" step="1000" inputMode="numeric" autoComplete="off" placeholder="例如 200000" />
+              </div>
+              <div className="settings-figma__hint">一次运行累计消耗超过这个数之后，不再自动扩展步数，并在收尾时提醒你。只存在本机。</div>
+            </div>
             <div className="sheet__actions">
               <Button variant="outline" value="cancel" formNoValidate data-i18n="dialog.cancel">取消</Button>
               <Button id="settingsSaveBtn" value="default" data-i18n="settings.gotIt">知道了</Button>

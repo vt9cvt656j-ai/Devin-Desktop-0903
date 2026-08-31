@@ -862,7 +862,13 @@ export class ConversationMemory {
         const n = tc.function?.name;
         if (n) {
           actions.add(n);
-          if (['write_file','edit_file','read_file'].includes(n)) {
+          // multi_edit 一度不在这张名单里，而它正是主力重构工具（它自己的工具描述写着
+          // 「faster and more reliable than firing multiple edit_file calls」，鼓励模型优先用）。
+          // 后果很具体：压缩掉最老那批消息之后，摘要是模型对那段历史的**唯一**替代物，
+          // 而 multi_edit 改过的文件从 Files: 里静默消失——只剩一句「做过 multi_edit」。
+          // 越是按建议用它做大改，压缩后越想不起来自己动过哪些文件。这是「跑久了变笨」
+          // 的一种具体机制。format_file / create_dir / delete_path 同理，一并补上。
+          if (['write_file', 'edit_file', 'multi_edit', 'read_file', 'format_file', 'create_dir', 'delete_path'].includes(n)) {
             try {
               const a = JSON.parse(tc.function.arguments || '{}');
               if (a.path) files.add(String(a.path));

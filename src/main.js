@@ -17035,25 +17035,17 @@ function officialModelDesc(id = "") {
 // model's OFFICIAL pricing. This is intentionally NOT the operator's billing (which is
 // configured + marked-up in the backend and deliberately not exposed). Keyed by exact
 // model id (lowercased). Sources: vendor pricing pages, 2026-06.
-const OFFICIAL_PRICES = {
-  "claude-opus-4-8": { in: 5, out: 25 },
-  "claude-opus-4-7": { in: 5, out: 25 },
-  "claude-opus-4-6": { in: 5, out: 25 },
-  "gpt-5.5": { in: 5, out: 30 },
-  "gpt-5.4": { in: 2.5, out: 15 },
-  "deepseek-v4-flash": { in: 0.14, out: 0.28 },
-  "deepseek-v4-pro": { in: 0.435, out: 0.87 },
-  "minimax-m3": { in: 0.3, out: 1.2 },
-  "minimax-m2.7": { in: 0.25, out: 1.0 },
-  "minimax-m2.7-highspeed": { in: 0.25, out: 1.0 },
-  "minimax-m2.5": { in: 0.3, out: 1.2 },
-  "minimax-m2.5-highspeed": { in: 0.3, out: 1.2 },
-};
-function officialPrice(id = "") {
-  return OFFICIAL_PRICES[String(id).toLowerCase()] || null;
-}
+// 这里原来有一张写死的厂商标价表 OFFICIAL_PRICES（12 个模型的 in/out 单价）+ officialPrice()，
+// 网关没给价时拿它顶上，印在「模型价格」下面。三条理由删掉：
+//  ① 它印的是**编的数**：网关已经明说 price_source="unset"，客户端却自己找一个价填进
+//     同一个格子——实测同一张卡上会左边写死的厂商价、右边网关真价，标签都写「模型价格」，
+//     用户无从分辨哪一半是真的。
+//  ② 那张表和服务端目录已经漂了：12 个 id 里有 7 个在服务端模型目录里根本不存在，
+//     恰恰是最容易落到这条兜底上的那批。
+//  ③ 价格写死在发版里，调价就得重发桌面端；而服务端注释里记着刚修完同一类病
+//     （「卡片写 $3/M、账单按 $5/M 扣」），这条客户端兜底把那个口子重新打开了。
+// 现在只认网关下发的价，没有就走 model.price.missing 如实留白。
 function _modelPriceRows(m) {
-  const p = officialPrice(m.id);
   const title = _escHtml(t("model.price.title"));
   // 四格：输入 / 输出 / 缓存写 / 缓存读。缓存两项来自网关，走的是和报价接口同一条
   // 三级规则（管理员手填 > 实时目录 > 按输入价推算），所以这里显示的价和账单上扣的
@@ -17061,8 +17053,10 @@ function _modelPriceRows(m) {
   const cell = (k, v) =>
     `<div class="mic-price"><div class="mic-price__k">${_escHtml(k)}</div>`
     + `<div class="mic-price__v">${_fmtTokPrice(v)}</div></div>`;
-  const inP = (Number(m.inPrice) || 0) > 0 ? Number(m.inPrice) : (p ? p.in : 0);
-  const outP = (Number(m.outPrice) || 0) > 0 ? Number(m.outPrice) : (p ? p.out : 0);
+  // 只认网关下发的价。客户端那张写死的厂商标价表已删（见上面那段说明）：网关说没价
+  // 就如实留白，不自己编一个填进「模型价格」——那个格子里的数必须和账单同源。
+  const inP = Number(m.inPrice) || 0;
+  const outP = Number(m.outPrice) || 0;
   const cw = Number(m.cacheWritePrice) || 0;
   const cr = Number(m.cacheReadPrice) || 0;
   const cells = [];
@@ -66664,6 +66658,36 @@ function _initCodeHostTokenFields() {
     input.addEventListener("blur", save);
   }
   _codeHostFieldsBound = true;
+  _initTokenBudgetField();
+}
+
+/**
+ * 单次运行 token 预算的**写入端**。
+ *
+ * 机制一直都在（_readTokenCap 读 michael-ide.token-budget，超限后不再硬扩步数并在收尾
+ * 提醒），而且它是整个智能体循环唯一的数值天花板——但那个键全仓只有 getItem、没有任何
+ * setItem，也没有任何界面能填，于是 cap 恒为 0（=不限），而代码里两处注释写着
+ * 「烧钱由用户自设的 token 预算兜住」。读写两头这才接上。
+ * 形状照抄上面 GitHub/GitLab 那两个：change + blur 落盘，只存本机。
+ */
+let _tokenBudgetBound = false;
+function _initTokenBudgetField() {
+  const input = $("tokenBudgetInput");
+  if (!input) return;
+  try {
+    const cur = parseInt(localStorage.getItem("michael-ide.token-budget") || "0", 10) || 0;
+    input.value = cur > 0 ? String(cur) : "";
+  } catch {}
+  if (_tokenBudgetBound) return;
+  _tokenBudgetBound = true;
+  const save = () => {
+    // 负数 / 非数字 / 0 一律当"不限"，写回空串而不是留个脏值。
+    const n = Math.max(0, Math.floor(Number(input.value) || 0));
+    try { localStorage.setItem("michael-ide.token-budget", n > 0 ? String(n) : ""); } catch {}
+    input.value = n > 0 ? String(n) : "";
+  };
+  input.addEventListener("change", save);
+  input.addEventListener("blur", save);
 }
 
 // Figma 令牌存本机 localStorage（与 AI 网关配置解耦）；供 figma 工具读取。带「测试」按钮打 /v1/me。
@@ -80198,7 +80222,10 @@ let _dropScale = 1;
 if (inTauri) {
   import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
     const size = await getCurrentWindow().innerSize();
-    const w = window.innerWidth || 1;
+    // viewportW() 而不是 window.innerWidth：这里要的正是 **CSS 视口宽**（拿它和物理
+    // innerSize 相除得缩放比）。仓库里那条「浮层定位一律按 CSS 视口夹取」的守卫扫的
+    // 就是裸 innerWidth——documentElement.clientWidth 才是排除滚动条后的真 CSS 宽。
+    const w = viewportW() || 1;
     const k = size?.width ? size.width / w : 1;
     // 只认接近整数的比例（1 / 2 / 3）；量出别的数说明这次读数不可信，宁可不缩放。
     if (Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1) _dropScale = Math.round(k);
