@@ -12243,6 +12243,7 @@ function closeContextMenu() {
     ctxMenuEl.remove();
     ctxMenuEl = null;
   }
+  if (_ctxTargetPath) _paintCtxTarget("");
   // Flush any tree reloads that were deferred while the menu was open.
   if (_pendingReloadDirs.size) {
     const dirs = [..._pendingReloadDirs];
@@ -12257,9 +12258,20 @@ function closeContextMenu() {
     }, 150);
   }
 }
+// 右键的那一行要看得出来。以前只有工作区根行会被选中，普通文件/目录右键之后菜单浮在旁边，
+// 用户根本不知道自己正在操作哪一项——「删除」这种不可逆的动作尤其危险。
+// 存路径不存节点：菜单开着的时候 fs-watcher 可能把树重建掉。
+let _ctxTargetPath = "";
+function _paintCtxTarget(path) {
+  for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
+  _ctxTargetPath = path || "";
+  if (!_ctxTargetPath) return;
+  treeEl?.querySelector(`.row[data-path="${cssEscape(_ctxTargetPath)}"]`)?.classList.add("is-ctx-target");
+}
 function openContextMenu(x, y, entry) {
   _suppressNativeSelection();
   closeContextMenu();
+  _paintCtxTarget(entry?.path || "");
   const isDir = !!entry.is_dir;
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isWorkspaceRoot = workspaceRoots.includes(entry.path);
