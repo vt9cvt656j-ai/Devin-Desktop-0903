@@ -15052,10 +15052,10 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {
   display: inline-flex; align-items: center; gap: 5px;
-  /* 左右各留 8px ≈ 两个空格宽。光标按左/右键跨到片旁边时会紧挨着它，间距太小就"粘"在
-     一起、看不出自己停在哪一侧（用户先试 5px 仍嫌挤，自己敲了两个空格才觉得对）。
-     两侧对称：往左走时片右边有空，往右走时片左边也有空。 */
-  padding: 1px 7px 1px 5px; margin: 0 8px;
+  /* margin 只负责「别贴着字」，不再兼职当空格。8px 是它还得替空格出力那阵子定的；现在
+     chipPadMove 会在光标那一侧放一个真空格，两份间距叠起来就成了用户说的「距离那么远」。
+     缩到 2px：光标那侧 = 2px + 一个空格 ≈ 正常词距，另一侧 2px 只保证不贴字。 */
+  padding: 1px 7px 1px 5px; margin: 0 2px;
   vertical-align: baseline;
   font-size: .92em; font-weight: 500; line-height: 1.5;
   color: var(--accent);
