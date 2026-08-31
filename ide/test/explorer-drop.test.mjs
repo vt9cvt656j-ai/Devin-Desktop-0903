@@ -532,6 +532,42 @@ test("选中高亮统一成蓝色，不再用紫色", () => {
     "多选叠加当前文件时没有加深");
 });
 
+test("内联实体片跟随主题，不再写死 Google 蓝", () => {
+  // 输入框里的 @引用片和发出去之后消息里的那枚，原本都是写死的 #1a73e8 / #e8f0fe / #d2e3fc。
+  // 深色主题、以及用户换强调色之后全都对不上，所以统一走 var(--accent) + color-mix。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  for (const sel of [".composer-chip {", ".msg-mention {"]) {
+    const blk = css.slice(css.indexOf(sel), css.indexOf("}", css.indexOf(sel)));
+    assert.ok(blk, `找不到 ${sel}`);
+    assert.doesNotMatch(blk, /#1a73e8|#e8f0fe|#d2e3fc/, `${sel} 还在用写死的 Google 蓝`);
+    assert.match(blk, /color: var\(--accent\)/, `${sel} 没有走强调色令牌`);
+    // 全圆角胶囊读起来是"标签"；这是被引用的**对象**，用小圆角矩形。
+    assert.match(blk, /border-radius: 6px/, `${sel} 还是 999px 的胶囊`);
+  }
+});
+
+test("蓝气泡上的实体片要用实心白底，不能是半透明白", () => {
+  // 用户那条消息的气泡本身就是 accent 渐变。原来在上面铺 22% 的半透明白 —— 蓝上加淡蓝，
+  // 对比很弱，那枚片几乎糊在气泡里（用户实拍）。实心白底 + 强调色字才立得住。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  const i = css.indexOf(".msg.user .msg-mention, .msg__body .msg-mention {");
+  const blk = css.slice(i, css.indexOf("}", i));
+  assert.ok(i > 0, "找不到气泡上的覆盖规则");
+  assert.match(blk, /background: #fff;/, "气泡上的片还是半透明白，糊在气泡里");
+  assert.match(blk, /color: var\(--accent-solid\)/, "白底上的字没有用强调色");
+  assert.doesNotMatch(blk, /rgba\(255, 255, 255, 0\.22\)/, "又回到半透明白了");
+});
+
+test("深色覆盖不许再盖住实体片", () => {
+  // 那条 [data-theme=dark] 覆盖原本把 .composer-chip 和气泡上的 .msg-mention 一起改成
+  // 淡蓝底——前者已经走令牌不需要覆盖，后者盖上去就又糊回蓝上加蓝了。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.doesNotMatch(css, /\[data-theme="dark"\] \.composer-chip/, "深色又硬覆盖 composer-chip 了");
+  assert.doesNotMatch(css, /\[data-theme="dark"\] \.msg__body \.msg-mention/, "深色又硬覆盖气泡上的片了");
+  // 拖拽幽灵是写死的浅色卡片，那条覆盖要留着。
+  assert.match(css, /\[data-theme="dark"\] \.row-drag-ghost/, "拖拽幽灵的深色覆盖被误删了");
+});
+
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
   // 纯逻辑对了但没接上等于没修。钉三件事：文件树是独立落区、树落点走复制而不是
   // openFolder、以及复制真的调了后端。
