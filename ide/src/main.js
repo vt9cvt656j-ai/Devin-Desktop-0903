@@ -124,7 +124,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import {
-  addHidden, chipBeside, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  addHidden, chipBeside, chipSpacers, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
 } from "./agent/explorer-drop.js";
 
@@ -74891,6 +74891,13 @@ function _chipText(chip) {
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
+// 片紧挨着另一个片时垫一个**真空格**：两片之间没有可编辑文本，光标无处停，看着就是粘在
+// 一起（零宽空格宽度为 0，视觉上一样贴着）。序列化本就在片两侧补虚拟空格，多这一个不影响解析。
+function _padChipNeighbours(chip) {
+  const sp = chipSpacers(chip, (x) => x.classList?.contains("composer-chip"));
+  if (sp.before) chip.parentNode.insertBefore(document.createTextNode(" "), chip);
+  if (sp.after) chip.parentNode.insertBefore(document.createTextNode(" "), chip.nextSibling);
+}
 function _makeComposerChip(rel, kind = "file", labelText = "") {
   const name = labelText || rel.split("/").filter(Boolean).pop() || rel;
   const chip = document.createElement("span");
@@ -75255,6 +75262,7 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
   // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
   // layout shift, and stripped back out by _ceSerialize so it never reaches the sent text.
+  _padChipNeighbours(chip);
   let pad = chip.nextSibling;
   if (!pad || pad.nodeType !== 3) {
     pad = document.createTextNode("\u200b");
@@ -75394,6 +75402,32 @@ promptEl.addEventListener("keydown", (e) => {
   to.selectNode(chip);
   to.collapse(left);                    // 左键落到片之前，右键落到片之后
   sel.removeAllRanges(); sel.addRange(to);
+});
+
+// 退格 / 删除也要自己接管：一次只删**一个**片。
+//
+// 片是 contentEditable=false 的原子节点，而片与片之间只隔着零宽空格。WKWebView 在这种结构上
+// 会把一整串原子节点当成一个删除单元 —— 输入框里有 3 个片时按一下退格，3 个一起没了
+//（用户实拍）。和方向键同源，同样不能指望浏览器的默认行为。
+promptEl.addEventListener("keydown", (e) => {
+  if (e.key !== "Backspace" && e.key !== "Delete") return;
+  if (e.altKey || e.metaKey || e.ctrlKey || e.isComposing) return;
+  const sel = window.getSelection();
+  if (!sel?.isCollapsed || !sel.rangeCount) return;   // 有选区时交给浏览器（用户自己框选的）
+  const r = sel.getRangeAt(0);
+  if (!promptEl.contains(r.startContainer)) return;
+  const back = e.key === "Backspace";                 // 退格删左边那个，Delete 删右边那个
+  const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left: back,
+    isChip: (n) => n.classList?.contains("composer-chip") });
+  if (!chip) return;
+  e.preventDefault();
+  // 把光标停在被删片原来的位置上，再只移除它自己。
+  const to = document.createRange();
+  to.setStartBefore(chip);
+  to.collapse(true);
+  chip.remove();
+  sel.removeAllRanges(); sel.addRange(to);
+  try { _cePlaceholder(); } catch {}
 });
 promptEl.addEventListener("keydown", (e) => {
   // Enter 直接发送；Shift+Enter 换行（⌘/Ctrl+Enter 也照发）。但要避开两种情况：
@@ -76045,7 +76079,8 @@ function _insertAtChip({ kind, value, label }) {
     range.deleteContents();
     const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
-    let pad = chip.nextSibling;
+    _padChipNeighbours(chip);
+  let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
       pad = document.createTextNode("​");
       chip.parentNode.insertBefore(pad, chip.nextSibling);
