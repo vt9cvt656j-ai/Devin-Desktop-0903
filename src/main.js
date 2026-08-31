@@ -216,6 +216,7 @@ import { approvalLabel } from "./agent/approval-label.js";
 import { domainKnowledgeBullets as _domainKnowledgeBullets, domainKnowledgeBrief as _domainKnowledgeBrief, DOMAIN_KNOWLEDGE_BRIEF_BUDGET as _DOMAIN_KNOWLEDGE_BRIEF_BUDGET } from "./agent/domain-knowledge-brief.js";
 import { langBadge as _langBadge } from "./agent/language.js";
 import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffView } from "./agent/diff-view.js";
+import { selectionLabel as _selectionLabel, selectionText as _selectionText } from "./agent/selection-drag.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
 // Global shared state store for sub-agent collaboration
@@ -74896,6 +74897,10 @@ async function _voiceStart(btn) {
 function _chipText(chip) {
   const kind = chip?.dataset?.kind || "file";
   const rel = chip?.dataset?.rel || "";
+  // 从编辑器拖进来的那一段代码：片上只显示「文件名:起-止」，发送时展开成带出处的代码块。
+  // 它不是 @ 引用——@ 引用是"去把这个文件读进来"，而这段代码用户已经**指定**了，
+  // 正文直接带着走，不必再让 _atContext 去读一遍整个文件。
+  if (kind === "code") return chip?.dataset?.text || "";
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
@@ -74943,6 +74948,10 @@ function _makeComposerChip(rel, kind = "file", labelText = "") {
       // MCP 不是"品牌"，没有 i-brand-mcp 这个符号；拼出来的名字找不到会静默渲染成空白。
       : kind === "mcp"
         ? iconSvg("i-mcp", "ic--doc")
+      // 拖进来的一段代码。同样不能走 `i-brand-<kind>`：没有 i-brand-code 这个符号，
+      // 找不到会静默渲染成空白（这个仓库为此付过账）。
+      : kind === "code"
+        ? iconSvg("i-code", "ic--doc")
         : iconSvg(`i-brand-${kind}`, "ic--doc");
   }
   const nameEl = document.createElement("span");
@@ -75265,10 +75274,12 @@ async function _dispatchComposerSubmission(draft) {
 // Drop a file/dir chip into the composer at the caret (from a tree drag). The chip is an atomic
 // contentEditable=false card; the @-mention regex the send path needs is satisfied by the VIRTUAL
 // spaces _ceSerialize emits around each chip — so nothing is inserted here but the chip itself.
-function _insertRefAtCursor(rel, kind = "file", labelText = "") {
+function _insertRefAtCursor(rel, kind = "file", labelText = "", dataText = "") {
   if (!rel) return;
   promptEl.focus();
   const chip = _makeComposerChip(rel, kind, labelText);
+  // code 片自己带正文（选中的那段代码），_chipText 发送时读它。
+  if (dataText) chip.dataset.text = dataText;
   const sel = window.getSelection();
   // Insert at the caret if it's inside the composer; else append at the end. Supports MULTIPLE drags
   // (each adds another chip). NO surrounding space so caret navigation past the chip is a single press.
@@ -75401,6 +75412,77 @@ async function _moveIntoDir(paths, destDir) {
     }
   });
 })();
+
+// 编辑器里选中的一段代码，按住往输入框拖 —— 落进去变成一枚片，发送时展开成带出处的代码块。
+//
+// 走鼠标事件，不走 HTML5 拖放：和文件树那条同源（见 _wireTreeDragToComposer 上面的说明）。
+// 没有和它合并，是因为两者能落的地方不一样 —— 树里那条还要画目标目录、还要真的移动文件，
+// 而一段选区只可能落到输入框；合在一起会让树那条的每个判据都多出一支「这次不是文件」。
+//
+// Monaco 自己的「拖动选中文字来移动它」照旧开着，两边不打架，这一点是读它源码确认的：
+// contrib/dnd 的 _onEditorMouseDrop 只在**落点仍在编辑器内容区**时才执行移动命令，落在
+// 输入框上时它只清掉那个落点指示、什么都不改；而且它在 mousedown 之后不会立刻塌掉选区
+// （_dragSelection 把选区记下来），所以拖的全程选区还在，我们照样取得到那段代码。
+(function _wireSelectionDragToComposer() {
+  const box = promptEl.closest(".composer__box") || promptEl.parentElement;
+  if (!box || !editorEl) return;
+  let cand = null, dragging = false, ghost = null;
+  const over = (x, y) => {
+    const r = box.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+  const clear = () => {
+    cand = null; dragging = false;
+    if (ghost) { ghost.remove(); ghost = null; }
+    document.body.classList.remove("tree-dragging");
+    box.classList.remove("drop-target");
+  };
+  // 捕获阶段只是"记一个候选"，不拦 Monaco：按在选区里也可能只是想把光标点进去。
+  // 真正变成拖，要等鼠标走够距离（下面的阈值）。
+  editorEl.addEventListener("mousedown", (e) => {
+    cand = null;
+    if (e.button !== 0) return;
+    try {
+      const sel = monacoEditor.getSelection();
+      const model = monacoEditor.getModel();
+      if (!sel || sel.isEmpty() || !model) return;
+      const t = monacoEditor.getTargetAtClientPoint(e.clientX, e.clientY);
+      if (!t?.position || !sel.containsPosition(t.position)) return;   // 只有按在选区里才可能是拖
+      cand = {
+        sx: e.clientX, sy: e.clientY,
+        rel: _pathToRel(activePath), lang: model.getLanguageId(),
+        a: sel.startLineNumber, b: sel.endLineNumber,
+        code: model.getValueInRange(sel),
+      };
+    } catch { cand = null; }
+  }, true);
+  document.addEventListener("mousemove", (e) => {
+    if (!cand) return;
+    if (!dragging) {
+      if (Math.abs(e.clientX - cand.sx) + Math.abs(e.clientY - cand.sy) < 6) return;
+      dragging = true;
+      document.body.classList.add("tree-dragging");
+      ghost = document.createElement("div");
+      ghost.className = "row-drag-ghost";
+      ghost.textContent = _selectionLabel(cand.rel, cand.a, cand.b);
+      document.body.appendChild(ghost);
+    }
+    ghost.style.left = `${e.clientX + 12}px`;
+    ghost.style.top = `${e.clientY + 10}px`;
+    box.classList.toggle("drop-target", over(e.clientX, e.clientY));
+  });
+  document.addEventListener("mouseup", (e) => {
+    if (!cand) return;
+    const hit = dragging && over(e.clientX, e.clientY);
+    const c = cand;
+    clear();
+    if (!hit) return;
+    try { window.getSelection().removeAllRanges(); } catch {}
+    _insertRefAtCursor(c.rel, "code", _selectionLabel(c.rel, c.a, c.b),
+      _selectionText({ rel: c.rel, lang: c.lang, startLine: c.a, endLine: c.b, code: c.code }));
+  });
+})();
+
 // Swallow the click that follows a drag so the dragged file isn't also opened/selected.
 // 只吞树内的点击：旧版全局吞，拖完文件紧接着点 文件/Git/大纲/测试 页签会被白吞一次。
 document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; if (e.target && e.target.closest && e.target.closest("#tree")) { e.stopPropagation(); e.preventDefault(); } } }, true);
