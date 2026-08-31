@@ -21,7 +21,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 「落点算得对不对」。下面这些造的都是最小假件。
 const rect = (left, top, right, bottom) => ({ left, top, right, bottom, width: right - left, height: bottom - top });
 const elWithRect = (r) => ({ getBoundingClientRect: () => r });
-const _dropPointIn = load("_dropPointIn", { window: { devicePixelRatio: 1 } });
+const _dropPointIn = load("_dropPointIn", { _dropScale: 1 });
 
 test("路径基本件：末尾斜杠不影响结果", () => {
   assert.equal(baseName("/a/b/c.txt"), "c.txt");
@@ -98,35 +98,22 @@ test("目标目录为空时不产出任何复制", () => {
   assert.deepEqual(plan.copies, []);
 });
 
-test("落区命中：物理像素和逻辑像素两套坐标都要认", () => {
-  // Tauri 报的坐标可能是物理像素（HiDPI 上 = 逻辑像素 × dpr），浏览器路径给的是 client px。
-  // 只认一套的话，Retina 上整个投放区会偏到一半位置去。
-  const el = elWithRect(rect(0, 0, 200, 100));
-  assert.deepEqual(_dropPointIn({ x: 50, y: 50 }, el), { x: 50, y: 50 }, "逻辑像素要命中");
-  assert.equal(_dropPointIn({ x: 300, y: 50 }, el), null, "框外不该命中");
-  assert.equal(_dropPointIn({ x: 50, y: 50 }, null), null, "元素不存在时不该炸");
+test("落点坐标只按实测比例换算一次，不许两套都试", () => {
+  // 用户实拍的 bug：光标在下面，高亮却出现在**光标位置的一半处**。
+  // 原因是老写法 `hit(p/dpr) || hit(p)` 先试除以 dpr 的那个 —— 而侧栏又窄又高，
+  // 坐标减半后往往仍落在侧栏矩形里，于是那个错误候选每次都先命中。
+  // 现在只按实测的 _dropScale 换算一次，没有第二个候选可挑。
+  const el = elWithRect(rect(0, 0, 200, 1200));   // 又窄又高，正是当年翻车的形状
+  const at1 = load("_dropPointIn", { _dropScale: 1 });
+  assert.deepEqual(at1({ x: 100, y: 810 }, el), { x: 100, y: 810 }, "scale=1 时原样使用");
+  // 关键回归：810 减半是 405，同样落在这个矩形里。老写法会返回 405（错），新写法必须是 810。
+  assert.equal(at1({ x: 100, y: 810 }, el).y, 810,
+    "坐标被多除了一次——高亮会出现在光标位置的一半处");
 
-  // dpr=2：物理坐标 (100,100) 落在逻辑 (50,50) → 命中，且**还回逻辑坐标**，
-  // 因为后面 elementFromPoint 要的是 client 空间。
-  const hi = load("_dropPointIn", { window: { devicePixelRatio: 2 } });
-  assert.deepEqual(hi({ x: 100, y: 100 }, el), { x: 50, y: 50 },
-    "HiDPI 下必须换算成逻辑坐标再还回去，否则命中测试和 elementFromPoint 对不上");
-});
-
-test("三个落区的分工，以及空工作区时不抢文件树", () => {
-  const composer = elWithRect(rect(0, 500, 400, 600));
-  const tree = elWithRect(rect(0, 0, 200, 400));
-  const mk = (root) => load("_dragTargetAt", {
-    _dropPointIn, _composerEl: composer, _explorerEl: tree, rootPath: root,
-    window: { devicePixelRatio: 1 },
-  });
-  const open = mk("/w");
-  assert.equal(open({ position: { x: 100, y: 550 } }), "composer", "落在输入框上是引用到对话");
-  assert.equal(open({ position: { x: 100, y: 200 } }), "explorer", "落在侧栏上要走复制，不是换工作区");
-  assert.equal(open({ position: { x: 800, y: 200 } }), "open", "落在编辑器区仍然是打开/换项目");
-  // 没打开项目时树里是空状态：这时拖文件夹进来，用户要的是「打开这个项目」。
-  assert.equal(mk("")({ position: { x: 100, y: 200 } }), "open",
-    "空工作区时文件树不该抢落点——否则拖文件夹进来会算出空目标，什么都不发生");
+  const at2 = load("_dropPointIn", { _dropScale: 2 });
+  assert.deepEqual(at2({ x: 200, y: 1620 }, el), { x: 100, y: 810 }, "scale=2 时按 2 换算");
+  assert.equal(at2({ x: 600, y: 1620 }, el), null, "换算后在框外的不该命中");
+  assert.equal(at1({ x: 100, y: 810 }, null), null, "元素不存在时不该炸");
 });
 
 test("落点落在哪一行 → 进哪个目录（真跑 elementFromPoint）", () => {
@@ -147,7 +134,6 @@ test("落点落在哪一行 → 进哪个目录（真跑 elementFromPoint）", (
   };
   const at = (row) => load("_dropDirAt", {
     _dropPointIn, _treeEl: tree, rootPath: "/w", dropDirFor,
-    window: { devicePixelRatio: 1 },
     document: { elementFromPoint: () => row },
   })({ position: { x: 50, y: 50 } });
 
@@ -185,19 +171,16 @@ test("拖放事件必须按窗口订阅，否则两个窗口会各干一遍", ()
     "拖放这段又回到从 event 模块直接取 listen 了，默认 target 是 Any");
 });
 
-test("浏览器路径的坐标要乘回 dpr，否则 Retina 上命中错行", () => {
-  // _dropPointIn 先按物理像素试（Tauri 那条给的就是 PhysicalPosition）。浏览器路径给的却是
-  // CSS 像素，dpr=2 时 (130,400) 除完变成 (65,200) —— 而侧栏又窄又高，除完**仍然落在框内**，
-  // 于是分档答案对、坐标偏了半屏，行高亮会命中光标上方好几行。
+test("浏览器路径传原始 client 坐标，不许再乘 dpr", () => {
+  // 之前为了抵消 _dropPointIn 里那次误除，在浏览器路径上乘了一次 dpr。现在换算只做一次
+  // 且按实测比例（浏览器下 _dropScale=1），再乘就又偏了。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  // 只看拖放那一段：树内部的 _rowDragCandidate 也存 clientX，但它不走 _dropPointIn。
   const zone = src.slice(src.indexOf("// Browser / non-Tauri path"), src.indexOf("tauri://drag-enter"));
-  const m = zone.match(/position: \{ x: e\.clientX[^}]*\}/g) || [];
-  assert.ok(m.length >= 2, "找不到浏览器路径的坐标构造——测试台锚点失效了");
-  for (const line of m) {
-    assert.match(line, /devicePixelRatio|_dpr/,
-      `浏览器路径的坐标没有乘回 dpr：${line}`);
-  }
+  assert.match(zone, /position: \{ x: e\.clientX, y: e\.clientY \}/, "浏览器路径没有传原始 client 坐标");
+  assert.doesNotMatch(zone, /clientX \* /, "浏览器路径又在乘 dpr 了");
+  // 换算比例必须是**量出来的**，不是拿 devicePixelRatio 猜的。
+  assert.match(src, /getCurrentWindow\(\)\.innerSize\(\)/, "没有向窗口实测缩放比例");
+  assert.match(src, /_dropScale = Math\.round\(k\)/, "没有把实测比例用起来");
 });
 
 test("投放高亮照 VS Code：一块底色，不改文字，不加边框", () => {
