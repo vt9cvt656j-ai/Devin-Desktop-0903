@@ -223,6 +223,50 @@ export function fnSource(name, { code = false } = {}) {
   return `const ${name} = ${text.slice(d.init.start, d.init.end)};`;
 }
 
+/**
+ * 取「以某段源码起头的那个语法结构」的完整源码。
+ *
+ * fnSource 按**名字**取声明，够不着三类锚点：调度分支
+ * （`} else if (call.type === "browser") {`）、回调注册（`el.addEventListener("scroll", …)`）、
+ * 函数内部的局部块。这些地方历来写成
+ *     SRC.slice(RAW_SRC.indexOf(锚点), RAW_SRC.indexOf(锚点) + 2000)
+ * 两个毛病：
+ *   · **固定字符数**——被守的那段一变长，窗口尾部就滑出去，断言从此守的是别的东西；
+ *   · **锚点不唯一时 indexOf 闷声挑第一个**——本仓有个锚点在源码里出现 16 次。
+ *
+ * 这里两条都堵掉：区间由 AST 节点边界决定（长多少都盖得住），锚点不唯一就**当场抛错**。
+ * 判据是「锚点最后一个字符落在哪个最小节点里」——`} else if (…) {` 的最后一个字符
+ * 正是该分支块的 `{`，于是取到的就是这个分支的完整块。
+ *
+ * @param {string} anchor 源码里的一段字面文本（含它结尾的 `{` 时最准）
+ * @param {{ code?: boolean, nth?: number }} [opts]
+ *   code:true 从剥了注释的那份切（做正向断言时用，免得匹配到注释里引用的旧代码）；
+ *   nth 只在确实存在多处同形锚点、且你明确要第 n 个时才传（从 0 数）。
+ */
+export function blockFrom(anchor, { code = false, nth = null } = {}) {
+  const hits = [];
+  for (let i = SRC.indexOf(anchor); i >= 0; i = SRC.indexOf(anchor, i + 1)) hits.push(i);
+  if (!hits.length) throw new Error(`源码里找不到锚点：${JSON.stringify(anchor.slice(0, 80))}`);
+  if (hits.length > 1 && nth == null) {
+    throw new Error(
+      `锚点出现 ${hits.length} 次，按下标取就是赌运气：${JSON.stringify(anchor.slice(0, 80))}\n`
+      + `换一段唯一的锚点，或者确实要第 n 个时传 { nth }。`);
+  }
+  const at = hits[nth ?? 0];
+  const pos = at + anchor.length - 1;
+  let best = null;
+  (function walk(node) {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+    if (typeof node.start === "number" && typeof node.end === "number"
+      && node.start <= pos && pos < node.end
+      && (!best || node.end - node.start < best.end - best.start)) best = node;
+    for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
+  })(_ast);
+  if (!best) throw new Error(`锚点落在任何 AST 节点之外：${JSON.stringify(anchor.slice(0, 80))}`);
+  return (code ? CODE : SRC).slice(best.start, best.end);
+}
+
 /** 一条依赖的源码：名字在 OVERRIDES 里就拼字面量，否则回 main.js 抓真源。 */
 function _depSource(name) {
   if (Object.hasOwn(OVERRIDES, name)) return `const ${name} = ${JSON.stringify(OVERRIDES[name])};`;
