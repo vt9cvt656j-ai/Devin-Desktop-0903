@@ -16,7 +16,7 @@ import test from "node:test";
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import assert from "node:assert";
-import { SRC, CODE, fnSource, load } from "./helpers/source.mjs";
+import { SRC, CODE, fnSource, load, blockFrom } from "./helpers/source.mjs";
 
 const loop = fnSource("_runAgenticLoop", { code: true });
 
@@ -58,7 +58,16 @@ test("writeFacts 登记进事实类，且同一处每 run 只说一次（run 级
 
 test("收尾门的记账没有被搬空：三个扫描器在静默轮照旧写 incompleteReason", () => {
   // 搬的是「输出通道」不是「记账」：收尾门那份闭合枚举还是用户结局卡片的来源。
-  const quiet = loop.slice(loop.indexOf("if (!turn.toolCalls.length)"), loop.indexOf("break; // truly done"));
+  // 结束锚点原来写的是 `"break; // truly done"` —— 带 `//` 注释文本，而 loop 来自
+  // fnSource(..., { code: true })，注释已被抹成空格：indexOf 永远返回 **-1**。
+  // 于是 slice(起点, -1) 不是空串，而是「到函数尾少一个字」——实测拿到 189196 字
+  // （整个 _runAgenticLoop 的 67%），而静默分支只有 18609 字。三条断言从此在函数
+  // 大半截里找字符串，谁把记账搬出静默轮都照样绿。
+  // 而且 `slice(a, -1)` 返回非空，所以「切出来是不是空的」这类哨兵结构上抓不到它。
+  // 改成按 AST 取整个 if 块（这个锚点在源码里有两处，另一处不在本函数里，所以传 nth；
+  // 次数一旦变化 blockFrom 会当场抛错，不会静默漂到别处）。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   assert.match(quiet, /removed_unchecked:\$\{_gone\.length\}/);
   assert.match(quiet, /overwrote_unread:\$\{run\._blindOverwrites\.length\}/);
   assert.match(quiet, /stub_delivery:\$\{_stubs\.length\}/);

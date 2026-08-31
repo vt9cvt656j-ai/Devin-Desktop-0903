@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as acorn from "acorn";
-import { SRC, CODE, OVERRIDES, fnSource, load, loadConst } from "./helpers/source.mjs";
+import { SRC, CODE, OVERRIDES, fnSource, blockFrom, load, loadConst, stripComments } from "./helpers/source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TEST_FILES = readdirSync(HERE).filter((f) => f.endsWith(".test.mjs"));
@@ -164,4 +164,115 @@ test("读 src/main.js 的测试不许自己手写按名字抠函数体的提取�
   assert.deepEqual(offenders.filter((o) => !o.startsWith("source-helper.test.mjs")), [],
     "又出现了手抄的函数提取器。改用 test/helpers/source.mjs 的 fnSource——"
     + "手抄那几种要么不认字符串字面量里的括号、要么切掉 async 前缀，会静默抠出错的代码");
+});
+
+// ── blockFrom：fnSource 够不着的锚点（调度分支 / 回调注册 / 局部块）────────────
+// 这些地方历来写成 `SRC.slice(RAW_SRC.indexOf(锚), RAW_SRC.indexOf(锚) + 2000)`。
+// 两个毛病：固定字符数（被守的那段一变长，窗口尾部就滑出去，断言从此守别的东西）、
+// 锚点不唯一时 indexOf 闷声挑第一个（本仓有个锚点出现 16 次）。
+
+test("blockFrom 按 AST 边界取整块，长度不受固定窗口限制", () => {
+  const browser = blockFrom('} else if (call.type === "browser") {', { code: true });
+  assert.ok(browser.startsWith("{"), "取到的应当是这个分支的块本身");
+  assert.ok(browser.length > 30000, `browser 分支有三万多字，取到 ${browser.length} 说明被截了`);
+  // 相邻分支各取各的，不会串到一起。
+  const mcp = blockFrom('} else if (call.type === "mcp") {', { code: true });
+  assert.ok(mcp.length > 5000 && mcp.length < browser.length);
+  assert.ok(!mcp.includes('call.type === "browser"'), "串到隔壁分支去了");
+});
+
+test("锚点不唯一就当场抛错，不许闷声挑第一个", () => {
+  // `card.innerHTML =` 在源码里出现 16 次；indexOf 会挑第一个，而那多半不是你要的。
+  assert.throws(() => blockFrom("card.innerHTML ="), /出现 \d+ 次/,
+    "锚点不唯一却没抛错——这正是「按下标切源码」最会骗人的地方");
+  // 确实要第 n 个时可以显式说。
+  assert.ok(blockFrom("card.innerHTML =", { nth: 0 }).length > 0);
+});
+
+test("锚点找不到要抛错，不能返回一段别人的代码", () => {
+  // indexOf 找不到会返回 -1，slice(-1) 只剩最后一个字符——断言随之变成守空气。
+  assert.throws(() => blockFrom("这段源码里绝对不存在的锚点"), /找不到锚点/);
+});
+
+test("blockFrom 的 code:true 和 SRC 版边界一致（只是注释被抹成空格）", () => {
+  const a = blockFrom('} else if (call.type === "system") {');
+  const b = blockFrom('} else if (call.type === "system") {', { code: true });
+  assert.equal(a.length, b.length, "两份文本逐字节对齐，边界必须一模一样");
+});
+
+// ── 「按下标切源码」的棘轮 ────────────────────────────────────────────────
+// 判据只有一个、不需要判断：**它变多了没有**。
+//
+// 为什么是棘轮而不是白名单：这类写法现在有 167 处，散在 18 个文件。逐条写进白名单
+// 要做 167 次「它到底守得住守不住」的判断，而那张表接下来只会烂掉。棘轮只回答
+// 「有没有新增」，迁移过程中基线跟着往下走，方向是单调的，谁也不用维护理由。
+//
+// 为什么这类写法要往下走（三条实测）：
+//   · 固定字符数：被守的那段一变长，窗口尾部滑出去。wiring 里守 _deliveryFactsLine
+//     的那条就是这么红的——我往函数里加了几行注释，锚点从 1988 挪到 2028，窗口 2000。
+//     **红了算走运**，同一形状悄悄绿着才是常态。
+//   · 锚点不唯一：`card.innerHTML =` 在源码里出现 16 次，indexOf 闷声挑第一个。
+//   · 锚点找不到：indexOf 回 -1，slice(-1) 只剩一个字符，断言从此守空气。
+// 改法：函数用 fnSource(名字)，分支/回调/局部块用 blockFrom(锚点)——两个都按 AST
+// 取边界，且锚点不唯一/找不到会**当场抛错**而不是猜。
+const SLICE_BASELINE = {
+  "ambiguous-failure.test.mjs": 1,
+  "comment-quality.test.mjs": 2,
+  "control-glow.test.mjs": 3,
+  "desktop-automation.test.mjs": 2,
+  "gate-tristate.test.mjs": 1,
+  "interrupt-transcript.test.mjs": 1,
+  "knowledge-preflight-card.test.mjs": 1,
+  "knowledge-routing.test.mjs": 1,
+  "logic.test.mjs": 86,
+  
+  "mcp.test.mjs": 7,
+  "prefix-cache.test.mjs": 14,
+  "runtime-state-cache.test.mjs": 1,
+  "search-tools-routing.test.mjs": 1,
+  "skill-catalog.test.mjs": 7,
+  "skills.test.mjs": 2,
+  "truthfulness.test.mjs": 1,
+  "wiring.test.mjs": 26,
+};
+
+/** 每个测试文件里「SRC.slice(SRC.indexOf(…))」的条数。先剥注释——注释里会**讲**这个
+ *  写法（本文件上面就有），不剥的话删一句注释都算"修好了一处"。 */
+function sliceCensus() {
+  const out = {};
+  for (const f of readdirSync(HERE).filter((n) => n.endsWith(".mjs"))) {
+    const s = stripComments(readFileSync(join(HERE, f), "utf8"));
+    const n = (s.match(/(?:RAW_)?SRC\.slice\(\s*(?:RAW_)?SRC\.indexOf\(/g) || []).length;
+    if (n) out[f] = n;
+  }
+  return out;
+}
+
+test("按下标切源码的写法只许减少，不许增加", () => {
+  const now = sliceCensus();
+  const grew = Object.entries(now)
+    .filter(([f, n]) => n > (SLICE_BASELINE[f] || 0))
+    .map(([f, n]) => `${f}: ${SLICE_BASELINE[f] || 0} → ${n}`);
+  assert.deepEqual(grew, [],
+    `这些文件新增了「按下标切源码」的守卫：\n  ${grew.join("\n  ")}\n`
+    + "函数用 fnSource(名字)，分支/回调/局部块用 blockFrom(锚点)——按 AST 取边界，"
+    + "锚点不唯一或找不到会当场抛错，而不是闷声守错地方。");
+
+  // 反向：修好了就要把基线跟着降下来，否则那一格永远绿着，别人后来又加回两条也不会红。
+  const stale = Object.entries(SLICE_BASELINE)
+    .filter(([f, n]) => (now[f] || 0) < n)
+    .map(([f, n]) => `${f}: 基线 ${n}，实际 ${now[f] || 0}`);
+  assert.deepEqual(stale, [],
+    `基线高于实际，说明这些已经迁过了，把 SLICE_BASELINE 调到实际值锁住成果：\n  ${stale.join("\n  ")}`);
+});
+
+test("这个普查器本身没坏（不许量出 0 条还报通过）", () => {
+  const now = sliceCensus();
+  const total = Object.values(now).reduce((a, b) => a + b, 0);
+  assert.ok(total >= 100,
+    `全仓只量到 ${total} 条——普查器坏了（正则或剥注释），而它坏掉的表现恰好是「一切干净」。`);
+  // 阳性对照：一处**当前确实存在**的写法必须被数到。
+  const wiring = stripComments(readFileSync(join(HERE, "wiring.test.mjs"), "utf8"));
+  assert.match(wiring, /SRC\.slice\(\s*RAW_SRC\.indexOf\(/,
+    "阳性对照不在剥注释后的文本里——普查结果不作数");
 });

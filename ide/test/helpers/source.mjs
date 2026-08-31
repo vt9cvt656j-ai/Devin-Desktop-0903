@@ -223,6 +223,93 @@ export function fnSource(name, { code = false } = {}) {
   return `const ${name} = ${text.slice(d.init.start, d.init.end)};`;
 }
 
+/**
+ * 取「以某段源码起头的那个语法结构」的完整源码。
+ *
+ * fnSource 按**名字**取声明，够不着三类锚点：调度分支
+ * （`} else if (call.type === "browser") {`）、回调注册（`el.addEventListener("scroll", …)`）、
+ * 函数内部的局部块。这些地方历来写成
+ *     SRC.slice(RAW_SRC.indexOf(锚点), RAW_SRC.indexOf(锚点) + 2000)
+ * 两个毛病：
+ *   · **固定字符数**——被守的那段一变长，窗口尾部就滑出去，断言从此守的是别的东西；
+ *   · **锚点不唯一时 indexOf 闷声挑第一个**——本仓有个锚点在源码里出现 16 次。
+ *
+ * 这里两条都堵掉：区间由 AST 节点边界决定（长多少都盖得住），锚点不唯一就**当场抛错**。
+ * 判据是「锚点最后一个字符落在哪个最小节点里」——`} else if (…) {` 的最后一个字符
+ * 正是该分支块的 `{`，于是取到的就是这个分支的完整块。
+ *
+ * @param {string} anchor 源码里的一段字面文本（含它结尾的 `{` 时最准）
+ * @param {{ code?: boolean, nth?: number, enclosing?: boolean }} [opts]
+ *   code:true 从剥了注释的那份切（做正向断言时用，免得匹配到注释里引用的旧代码）；
+ *   nth 只在确实存在多处同形锚点、且你明确要第 n 个时才传（从 0 数）；
+ *   enclosing:true 取**包住锚点的那个函数体**，而不是锚点自己所在的最小节点——
+ *   锚点是一行普通语句（`if (…) return;`）而你想要整个回调时用它。不加的话
+ *   `blockFrom("… return;")` 只会还给你那条 return 语句本身。
+ */
+export function blockFrom(anchor, { code = false, nth = null, enclosing = false } = {}) {
+  const hits = [];
+  for (let i = SRC.indexOf(anchor); i >= 0; i = SRC.indexOf(anchor, i + 1)) hits.push(i);
+  if (!hits.length) throw new Error(`源码里找不到锚点：${JSON.stringify(anchor.slice(0, 80))}`);
+  if (hits.length > 1 && nth == null) {
+    throw new Error(
+      `锚点出现 ${hits.length} 次，按下标取就是赌运气：${JSON.stringify(anchor.slice(0, 80))}\n`
+      + `换一段唯一的锚点，或者确实要第 n 个时传 { nth }。`);
+  }
+  const at = hits[nth ?? 0];
+  const pos = at + anchor.length - 1;
+  let best = null;
+  (function walk(node) {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+    if (typeof node.start === "number" && typeof node.end === "number"
+      && node.start <= pos && pos < node.end
+      && (!best || node.end - node.start < best.end - best.start)) best = node;
+    for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
+  })(_ast);
+  if (!best) throw new Error(`锚点落在任何 AST 节点之外：${JSON.stringify(anchor.slice(0, 80))}`);
+  if (enclosing) {
+    // 往上找包住它的那个函数体。第二遍扫：取「包含锚点、且是函数/块」里最小的那个，
+    // 但要比 best 本身大，否则又退回原地。
+    let fn = null;
+    (function walk(node) {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) { for (const x of node) walk(x); return; }
+      const t = node.type;
+      if ((t === "FunctionDeclaration" || t === "FunctionExpression" || t === "ArrowFunctionExpression")
+        && node.start <= pos && pos < node.end
+        && node.end - node.start > best.end - best.start
+        && (!fn || node.end - node.start < fn.end - fn.start)) fn = node;
+      for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
+    })(_ast);
+    if (!fn) throw new Error(`锚点外面没有函数可取：${JSON.stringify(anchor.slice(0, 80))}`);
+    best = fn.body || fn;
+  }
+  return (code ? CODE : SRC).slice(best.start, best.end);
+}
+
+/**
+ * 找不到就抛错的 indexOf —— 专治「顺序断言恒真」。
+ *
+ * `assert.ok(seg.indexOf(A) < seg.indexOf(B))` 有个哑掉的方向：**A 被删掉时
+ * indexOf 返回 -1，而 `-1 < 任何下标` 恒成立**。于是这条守卫只挡得住「把 A 挪到 B
+ * 后面」，挡不住「把 A 整个删掉」——而后者才是重构时真会发生、后果也一样的那种。
+ * 实测两例：删除锁 `_treeDeleteBusy = true;`（删掉它，连点几下就叠出好几个确认框）、
+ * 大写入的上限判断 `_LIVE_EDITOR_PREVIEW_MAX_CHARS`（删掉它，大文件照旧走编辑器
+ * 预览路径）——两条测试都一声不吭。
+ *
+ * 用法：`assert.ok(at(seg, A) < at(seg, B), "…")`，A 不在了就当场报「找不到」。
+ */
+export function at(text, needle, what = "") {
+  const i = String(text).indexOf(needle);
+  if (i < 0) {
+    throw new Error(
+      `顺序断言的锚点找不到${what ? `（${what}）` : ""}：${JSON.stringify(String(needle).slice(0, 70))}\n`
+      + "它要么被删了、要么改了写法。注意 indexOf 返回 -1 会让 `-1 < 下标` 恒成立，"
+      + "所以这里必须抛错，而不是让比较静默通过。");
+  }
+  return i;
+}
+
 /** 一条依赖的源码：名字在 OVERRIDES 里就拼字面量，否则回 main.js 抓真源。 */
 function _depSource(name) {
   if (Object.hasOwn(OVERRIDES, name)) return `const ${name} = ${JSON.stringify(OVERRIDES[name])};`;

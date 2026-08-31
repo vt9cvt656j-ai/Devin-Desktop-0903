@@ -32,7 +32,6 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
-import { _mergeChatArchives as _mergeChatArchivesReal } from "../src/agent/chat-archive.js";
 import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
 import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
@@ -14191,7 +14190,10 @@ test("browser automation keeps the browser alive and has a semantic autofill act
   const browserBranch = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "browser") {'), RAW_SRC.indexOf('} else if (call.type === "system") {'));
   assert.match(browserBranch, /if \(!call\.force\)[\s\S]{0,260}浏览器会话保持打开复用/,
     "plain browser close should keep the browser session alive");
-  assert.match(browserBranch, /act === "autofill" \|\| act === "fill"/,
+  // 裸子串 `act === "autofill" || act === "fill"` 在这个分支里有**三处**：真路由、
+  // 结果判定、回执文案。删掉真路由那处，另外两处照样把它喂饱。钉到真路由那一处：
+  // 它后面紧跟着语义填表器的调用。
+  assert.match(browserBranch, /act === "autofill" \|\| act === "fill"[\s\S]{0,400}?_browserAutofillJS\(/,
     "browser executor should route autofill/fill to the semantic form filler");
   assert.match(browserBranch, /_browserAutofillJS\(fields, !!call\.submit, call\.submitText \|\| call\.text \|\| ""\)/,
     "autofill should support submit and submitText");
@@ -15723,24 +15725,37 @@ test("已有网站沿用真实技术栈，不为 Michael Design 迁移", () => {
 });
 
 test("Michael Design 默认栈行为矩阵：无栈才默认，现有栈和用户指定优先", () => {
-  const stackRule = SRC.slice(RAW_SRC.indexOf("const _MD_STACK_RULE"), RAW_SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
+  // 两个来源**不能 `+` 起来喂给同一个 assert**。原来写的是
+  //   assert.match(stackRule + "\n" + prompt, row.evidence)
+  // 而 _DESIGN_RESEARCH_PROMPT 自己就把五行矩阵的证据和决策全写全了——实测把
+  // _MD_STACK_RULE 整条替换成 "占位" 也全绿，规则那一侧对判定的贡献是 0。
+  // 拆开各验各的。实测哪一侧真的写着哪一条（十项里规则侧命中 7 项）：
+  //   规则侧没有的三项 —— 「明确重做且没有可沿用」「框架、语言、构建工具、组件库和
+  //   样式方案」「默认栈只适用于这些无栈场景」——今天只在提示词那一侧，如实标成
+  //   prompt-only，而不是拿拼接把它糊过去。
+  const stackRule = loadConst("_MD_STACK_RULE");   // 真值，不是源码文本
   const designPrompt = load("_DESIGN_RESEARCH_PROMPT", {
     _P: (_key, fallback) => fallback,
   });
   const prompt = designPrompt("按需修改网站");
   const matrix = [
-    { scenario: "空项目", evidence: /工作区为空/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "项目没有网站", evidence: /项目没有网站/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "明确重构且无可沿用栈", evidence: /明确重做且没有可沿用/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "现有 Vue\/Svelte\/Django 网站", evidence: /已有可运行网站沿用/, decision: /框架、语言、构建工具、组件库和样式方案/ },
-    { scenario: "用户指定 Astro\/Vue\/Svelte 等栈", evidence: /用户明确指定/, decision: /服从用户/ },
+    { scenario: "空项目", side: "both", evidence: /工作区为空/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "项目没有网站", side: "both", evidence: /项目没有网站/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "明确重构且无可沿用栈", side: "prompt", evidence: /明确重做且没有可沿用/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "现有 Vue/Svelte/Django 网站", side: "prompt", evidence: /已有可运行网站沿用/, decision: /框架、语言、构建工具、组件库和样式方案/ },
+    { scenario: "用户指定 Astro/Vue/Svelte 等栈", side: "both", evidence: /用户明确指定/, decision: /服从用户/ },
   ];
   for (const row of matrix) {
-    assert.match(stackRule + "\n" + prompt, row.evidence, `${row.scenario}: 缺少触发条件`);
-    assert.match(stackRule + "\n" + prompt, row.decision, `${row.scenario}: 缺少技术栈决策`);
+    if (row.side === "both") {
+      assert.match(stackRule, row.evidence, `${row.scenario}: 规则里缺少触发条件`);
+      assert.match(stackRule, row.decision, `${row.scenario}: 规则里缺少技术栈决策`);
+    }
+    assert.match(prompt, row.evidence, `${row.scenario}: 设计提示里缺少触发条件`);
+    assert.match(prompt, row.decision, `${row.scenario}: 设计提示里缺少技术栈决策`);
   }
-  assert.match(stackRule + prompt, /默认栈只适用于这些无栈场景/);
-  assert.match(stackRule + prompt, /不得覆盖已有网站/);
+  assert.match(stackRule, /不得覆盖已有网站/, "规则里那句「不得覆盖已有网站」没了");
+  assert.match(prompt, /默认栈只适用于这些无栈场景/);
+  assert.match(prompt, /不得覆盖已有网站/);
   assert.match(prompt, /knowledge_search\(domain="michael-design"\)/,
     "设计子智能体必须调用真实 Michael Design 知识库，不得只读硬编码栈规则");
 });
@@ -20041,13 +20056,28 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
     "WKWebView 下 beforeunload 不可靠，pagehide 必须注册退出 flush");
   assert.ok(SRC.includes('window.addEventListener("beforeunload", () => { _flushExitStateSync(); saveSession(); })'),
     "beforeunload 必须走同一个退出 flush");
-  const visBlock = SRC.slice(RAW_SRC.indexOf("function _flushExitStateSync"), RAW_SRC.indexOf("currentWindow.onCloseRequested"));
-  assert.ok(visBlock.includes('document.visibilityState !== "hidden"') && visBlock.includes("s?.streaming"),
+  // 原来的区间 1958 字 = _flushExitStateSync 函数体(465) + 后面三个 addEventListener(1493)，
+  // 而 `s?.streaming` 在 _flushExitStateSync **自己的函数体里就有一份**。两个子串各自
+  // includes、不要求出现在同一条条件里，于是 visibilitychange 那个监听器整个删掉照样绿。
+  // 按 AST 取那个监听器回调，并把两个条件绑在同一条表达式上。
+  // 源码里有两个 visibilitychange 监听器（另一个是 gap 探测），锚点必须落在这一个上。
+  const visBlock = blockFrom('if (document.visibilityState !== "hidden") return;', { code: true, enclosing: true });
+  assert.match(visBlock, /document\.visibilityState !== "hidden"[\s\S]{0,200}?s\?\.streaming/,
     "visibilitychange(hidden) 只在存在流式会话时 flush，不打扰平时 5s 防抖节奏");
   // 优雅关闭/更新重启路径：草稿还要镜像进磁盘 store（localStorage 强杀时未必来得及落盘）
   const closeBlock = SRC.slice(RAW_SRC.indexOf("currentWindow.onCloseRequested"), RAW_SRC.indexOf("restoreSession().then"));
-  assert.ok(closeBlock.includes("_streamDraftFlushSync()") && closeBlock.includes("_streamDraftPersistDurable"),
-    "CloseRequested 必须先同步 flush 草稿再等磁盘镜像落完才 destroy");
+  // 失败文案说的是「**先**同步 flush、**再**等磁盘镜像落完、**才** destroy」三步顺序，
+  // 而断言只验两个名字在这段里出现过——既不验顺序、不验 await，连 destroy 都没提。
+  // 用 at() 把三步的先后真验出来（缺任何一步都当场报错，而不是静默通过）。
+  assert.ok(at(closeBlock, "_streamDraftFlushSync()", "同步 flush 草稿")
+    < at(closeBlock, "_streamDraftPersistDurable", "等磁盘镜像落完"),
+    "必须先同步 flush 草稿，再等磁盘镜像");
+  assert.ok(at(closeBlock, "_streamDraftPersistDurable", "等磁盘镜像落完")
+    < at(closeBlock, "destroy", "销毁窗口"),
+    "磁盘镜像还没落完就 destroy，在途回复会丢");
+  // 它是包在 Promise.all 里被 await 的，别按 `await _streamDraftPersistDurable` 字面匹配。
+  assert.match(closeBlock, /await [^\n]*_streamDraftPersistDurable/,
+    "没 await 的话等于没等，destroy 照样先到");
   assert.ok(SRC.includes("await _streamDraftPersistDurable(_streamDraftFlushSync());"),
     "IDE 更新 relaunch 前必须把最新全量草稿落完磁盘");
 });
@@ -20515,7 +20545,11 @@ test("P1：run_subagent 多任务并发——tasks 数组解析 + Promise.allSet
   // 并发实现：Promise.allSettled + 合并报告；只对 run_subagent 多任务生效（worker/wiki 不受影响）
   const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
   assert.match(loopSrc, /!isWorker && it\.tc\.name === "run_subagent" && Array\.isArray\(it\.call\.tasks\)/);
-  assert.match(loopSrc, /Promise\.allSettled/);
+  // 裸的 /Promise\.allSettled/ 太松：同一个函数里「多立场辩论」那条派发也写着
+  // `await Promise.allSettled(stanceList.map(`，把多任务并发整个删掉照样喂饱它
+  // （全仓共 15 处 Promise.allSettled）。钉到 _multiTasks 这条判据后面。
+  assert.match(loopSrc, /_multiTasks[\s\S]{0,1200}?Promise\.allSettled/,
+    "多任务并发那条路没了——单任务串行跑，用户要的并发不生效");
   assert.match(loopSrc, /多子智能体并发报告/);
   assert.match(loopSrc, /⚠️ 失败：/, "失败任务也要出现在合并报告里，不能静默丢失");
   // 单任务/worker/wiki 原路径完整保留（#43 返工前的回归点，钉死）
@@ -20580,21 +20614,30 @@ test("子智能体 schema 公开 tasks/wait，映射层不丢参数", () => {
 });
 
 test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记录；wait/worker/wiki 保持同步", () => {
+  // 这条用例同时覆盖两条派发路（spawn_multiple_agents 和异步 run_subagent），所以宽
+  // 区间要留着。但那两段是**文本近亲**（一个用 _smLive/_smSess，一个用 _jobLive/_jobSess），
+  // 实测 14 条断言里有 7 条在宽区间内命中 ≥2 次——把异步那段整个删掉，它们照样被隔壁
+  // 喂饱。所以再切一个只含异步派发的窄块（3,908 字，实测不含 _smLive），
+  // 属于异步作业台账的那几条钉到窄块上。
   const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
+  const asyncJob = blockFrom(
+    "if (!isWorker && !it.call._wiki && !it.call.wait && _asyncSpawnNames.has(it.tc.name)) {", { code: true });
+  assert.ok(!asyncJob.includes("_smLive"), "窄块混进了 spawn_multiple_agents 那一段");
+  const dispatchFn = extractFn("_runAgenticLoop", { code: true });
   // 异步条件：worker（写盘记账依赖同步）、wiki（存盘）、显式 wait=true 豁免，其余默认后台
-  assert.match(loopSrc, /!isWorker && !it\.call\._wiki && !it\.call\.wait && _asyncSpawnNames\.has\(it\.tc\.name\)/);
-  assert.match(loopSrc, /new Set\(\["run_subagent", "research_project", "design_research"\]\)/);
+  assert.match(dispatchFn, /!isWorker && !it\.call\._wiki && !it\.call\.wait && _asyncSpawnNames\.has\(it\.tc\.name\)/);
+  assert.match(SRC, /new Set\(\["run_subagent", "research_project", "design_research"\]\)/);
   // 作业台账挂 run（不用模块级全局），字段齐全
-  assert.match(loopSrc, /run\._subAgentJobs = new Map\(\)/);
-  assert.match(loopSrc, /run\._subAgentJobSeq = \(run\._subAgentJobSeq \|\| 0\) \+ 1/);
-  assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
+  assert.match(asyncJob, /run\._subAgentJobs = new Map\(\)/);
+  assert.match(asyncJob, /run\._subAgentJobSeq = \(run\._subAgentJobSeq \|\| 0\) \+ 1/);
+  assert.match(asyncJob, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
   // 启动后不 await：promise 挂进作业记录，工具结果立即返回
-  assert.match(loopSrc, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
+  assert.match(asyncJob, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
   // 回执改写过（2026-08-25）：原文同时说「结果就绪后会自动送达」和「不要立即 await」，
   // 两句互相矛盾——结果只在**下一次迭代开头**投递，模型收尾就没有下一次了，
   // 在途作业被取消、几十轮调用白花。现在钉的是新版里那条硬约束。
-  assert.match(loopSrc, /结果会在你\*\*下一步开始时\*\*自动送达/);
-  assert.match(loopSrc, /收尾之前必须汇合/, "收尾前不汇合就会丢结果，这条必须写在回执里");
+  assert.match(asyncJob, /结果会在你\*\*下一步开始时\*\*自动送达/);
+  assert.match(asyncJob, /收尾之前必须汇合/, "收尾前不汇合就会丢结果，这条必须写在回执里");
   // promise.then 落四态：done/failed/timeout/cancelled（cancelled 同时标 consumed 防幽灵拦截）
   assert.match(loopSrc, /job\.status = "done"/);
   assert.match(loopSrc, /job\.status = "failed"/);
@@ -36939,9 +36982,10 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
 // 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
 // ---------------------------------------------------------------------------
 test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
-  // 直接 import 真模块，不再抠源码手工注入：这个函数每加一个内部 helper，手抄的注入表就
-  // 漏一个（漏过 _archiveAt），测试红得跟被测行为毫无关系。
-  const merge = _mergeChatArchivesReal;
+  const merge = load("_mergeChatArchives", {
+    _archiveHasChats: load("_archiveHasChats", {}),
+    _mergeArchiveList: load("_mergeArchiveList", { _archiveMsgCount: load("_archiveMsgCount", {}) }),
+  });
   const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
 
   // 事故形状：退出时同步写的镜像里有一个会话，几分钟前的 SQLite 快照里没有。

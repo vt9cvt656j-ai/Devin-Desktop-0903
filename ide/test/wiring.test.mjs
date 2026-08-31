@@ -578,9 +578,19 @@ test("任务完成通知必须说真实结局，不能写死成功", () => {
   assert.match(SRC, /_notifyTaskDone\(sess, text, sess\?\._lastRunState\?\.outcome \|\| "success"\)/,
     "通知要读真实 outcome；写死 true 等于 harness 自己谎报完成");
   assert.equal(count(SRC, /_notifyTaskDone\(sess, text, true\)/g), 0, "字面量 true 不许回来");
-  const fn = SRC.slice(RAW_SRC.indexOf("async function _notifyTaskDone("), RAW_SRC.indexOf("async function _notifyTaskDone(") + 1200);
+  // 验标题表的**值**，不是键在不在。原来写的是 `match(fn, /partial:\s*\[/)` ——
+  // 只要 partial 后面跟一个方括号就算过，方括号里装什么都行。把三条的文案全改成
+  // 「✅ 任务完成」照样绿，而这条用例存在的全部理由就是不许它们并进「任务完成」。
+  const fn = fnSource("_notifyTaskDone", { code: true });
+  const table = /const _titles = \{([\s\S]*?)\n  \};/.exec(fn)?.[1];
+  assert.ok(table, "_notifyTaskDone 里找不到标题表——这条断言失去落点");
+  const titles = Object.fromEntries([...table.matchAll(/(\w+):\s*\["([^"]*)",\s*"([^"]*)"\]/g)]
+    .map((m) => [m[1], [m[2], m[3]]]));
+  assert.ok(titles.success, "success 那行没解析出来，下面的比对不作数");
   for (const [oc, why] of [["partial", "没做完"], ["failed", "失败"], ["awaiting_user", "在等用户回话"]]) {
-    assert.match(fn, new RegExp(`${oc}:\\s*\\[`), `${why} 要有自己的标题，不能并进"任务完成"`);
+    assert.ok(titles[oc], `${why} 没有自己的标题`);
+    assert.notDeepEqual(titles[oc], titles.success, `${why} 的标题和 success 一模一样——harness 又在写死成功`);
+    assert.doesNotMatch(titles[oc][0], /任务完成/, `${why} 的标题里不许出现「任务完成」`);
   }
 });
 
@@ -1350,11 +1360,27 @@ test("强力版：网关说了没有强力线路，就不该把那个按钮画�
 
   // 同一条闸必须同时管住**渲染**和**发送**。只藏按钮不拦请求头，用户会陷在一个
   // 每轮都报错、又找不到地方关掉的状态里。
-  const send = SRC.slice(RAW_SRC.indexOf("function _powerRouteOn"));
-  assert.match(send.slice(0, 900), /_powerRouteAvailable\(id\) === false/,
+  // 两侧都**真跑一遍**，别用「函数起点 + 固定窗口」验字符串。
+  // _powerRouteOn 只有 264 字，而窗口开到 900——多出来的 636 字正好盖住隔壁
+  // _setPowerRoute 和 _modelPowerToggleHtml 的开头。实测把发送侧这道闸整个删掉
+  // （连注释共 128 字节），后面的文本左移，**渲染侧**那处 `=== false` 就滑进了窗口，
+  // 于是「发送侧有闸」这条断言由渲染侧的代码满足，两侧独立性的证明当场作废、还全绿。
+  const powerOn = load("_powerRouteOn", {
+    _modelSupportsPowerRoute: () => true,
+    _powerRouteAvailable: () => false,
+    _loadPowerRoutes: () => ({ m: true }),
+  });
+  assert.equal(powerOn("m"), false,
     "发送侧没拦——按钮藏了但请求头照发，用户没有关掉它的入口");
-  const render = SRC.slice(RAW_SRC.indexOf("function _modelPowerToggleHtml"));
-  assert.match(render.slice(0, 1200), /_powerRouteAvailable\(id\) === false/,
+  // 三态：null/undefined 是「不知道」，不等于「没有」。当成没有的话离线时开关会集体失灵。
+  const powerUnknown = load("_powerRouteOn", {
+    _modelSupportsPowerRoute: () => true,
+    _powerRouteAvailable: () => null,
+    _loadPowerRoutes: () => ({ m: true }),
+  });
+  assert.equal(powerUnknown("m"), true, "「不知道」被当成了「没有」");
+  // 渲染侧按 AST 取整个函数，不留窗口。
+  assert.match(fnSource("_modelPowerToggleHtml", { code: true }), /_powerRouteAvailable\(id\) === false/,
     "渲染侧没拦——按钮画在了没有强力线路的模型上，点了只会报错");
 });
 
