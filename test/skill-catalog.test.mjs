@@ -335,9 +335,25 @@ test("界面上不再有任何「启用 / 未启用」的说法", () => {
   // （实测：页面上改成「在线 / 离线」、原字符串挪到窗口内的另一个函数），旧写法照样全绿。
   // 按 AST 取整个 renderSkillsTool：区间正好是它自己，它长多少都盖得住，也一个字不越界。
   const skillsPage = topLevelFn("renderSkillsTool", { code: true });
-  for (const stale of ['"未启用"', '"已启用"', '保存并启用', '默认启用到模型请求里']) {
-    assert.ok(!skillsPage.includes(stale), `设置面板的 Skills 页还留着「${stale}」`);
+  // 只把这四个反向检查收进 renderSkillsTool 是**放松**：老窗口是「锚点后 40000 字」，
+  // 覆盖到函数结束之后那 22095 字，而这条用例的标题说的是「界面上」，不是「这个函数里」。
+  // 实测这个变异：在 renderSkillsTool **之后**（`const FEATURE_TABS = [` 前面）加一个
+  // `function _skillEditorButtons() { return \`<button …>保存并启用</button>\`; }`
+  // ——页面本体一个字没动，旧写法红、只钉 renderSkillsTool 的写法绿。
+  //
+  // 所以改成按「这个词在源码里合法出现几次」来钉，不再依赖任何窗口：
+  // 这三个词在整份源码（CODE，注释已置空）里今天是 0 次，直接对全文断言，
+  // 严格强于原来那 40000 字窗口，而且 helper 搬到哪儿都跑不掉。
+  for (const stale of ['"未启用"', '保存并启用', '默认启用到模型请求里']) {
+    assert.ok(!SRC.includes(stale), `界面上又出现了「${stale}」`);
   }
+  // 「已启用」不能对全文断言：MCP 服务器那条分支里真的有开/关这回事，合法地出现 2 次
+  //（实测：mcpconfig 分支 4796 字，两处都在里面，全文也正好 2 处）。钉的是「它只出现在
+  // 那条分支里」——技能这边、或任何别的页面冒出第三处，这条立刻红。
+  const mcpCfgBranch = blockFrom('} else if (call.type === "mcpconfig") {', { code: true });
+  assert.equal(SRC.split('"已启用"').length - 1, mcpCfgBranch.split('"已启用"').length - 1,
+    "「已启用」跑到 MCP 服务器那条分支之外去了——技能从来没有「关着」这个状态");
+  assert.ok(!skillsPage.includes('"已启用"'), "设置面板的 Skills 页还留着「已启用」");
   assert.match(skillsPage, /on \? "常驻" : "按需"/, "状态标签没改成说实话的那个");
   assert.match(skillsPage, /on \? "已常驻" : "设为常驻"/, "切换按钮还在说「启用」");
 });

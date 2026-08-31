@@ -620,16 +620,23 @@ test("复用终端的调用要说清这次什么都没执行", () => {
     "必须明说这次没执行任何命令，否则模型据此认定服务在跑");
   assert.match(branch, /PTY 存活，不等于这条命令本身还在跑/,
     "首次启动那条有的免责声明，真正什么都没做的这条更需要");
-  // 「这一次真的一个字节都没写进 PTY」这个前提**不发生在上面那段里**。写 PTY 的是
-  // 这条分支上面那句 `r = await _runTaskInNewTerminal(...)`，而 backend.termWrite 全部
-  // 在 _runTaskInNewTerminal 内部（偏移 3974377，离这个窗口 76 万字远）。所以原来那条
-  // `assert.doesNotMatch(branch, /termWrite/)` 拦的是一件**结构上不可能出现在这个位置**
-  // 的事——它唯一还会触发的时候是误伤首次启动路径。改成钉住真正能被违反的地方：
-  // _runTaskInNewTerminal 里 `if (_reuse.alreadyRunning)` 那个块（169 字，AST 取整块）。
-  // 实测：往那个块里塞一句 backend.termWrite，改之前这条测试照样绿。
+  // 「这一次真的一个字节都没写进 PTY」这个前提有**两个**能被违反的地方，两个都要钉。
+  //
+  // ① 这条分支自己。它不是「结构上不可能」：往 `if (r.alreadyRunning) {` 里塞一句
+  //    `try { backend.termWrite(r.entry.backendId, "\r"); } catch {}`（「顺手戳一下让
+  //    tab 刷新」这种改动很自然），上面那句「没有执行任何命令」立刻成了假话。旧写法
+  //    （2200 字定长窗口 + doesNotMatch）**抓得住**这一手——实测这个变异：旧写法红、
+  //    只钉 _reuse 那块的写法绿。所以这条不能省，只是区间换成 AST 取的分支块（941 字，
+  //    不再多吃后面 1259 字首次启动路径，那里写 PTY 本来就是对的）。
+  assert.doesNotMatch(branch, /termWrite|\.term\.write/,
+    "复用分支自己往 PTY 写了东西——「本次调用没有执行任何命令」那句话就成了假话");
+  // ② 它依赖的上游 `_runTaskInNewTerminal` 里的 `if (_reuse.alreadyRunning)` 块
+  //    （169 字，AST 取整块）。写 PTY 的语句全在那个函数里，复用路径在那儿多写一个
+  //    字节，同样让上面那句话变成假话，而旧的 2200 字窗口离它 76 万字远、抓不到。
+  //    实测：往那个块里塞一句 backend.termWrite，旧写法绿、这条红。
   const reuseBranch = blockFrom("if (_reuse.alreadyRunning) {", { code: true });
   assert.doesNotMatch(reuseBranch, /termWrite|\.term\.write/,
-    "复用分支真的往 PTY 写了东西——「本次调用没有执行任何命令」那句话就成了假话");
+    "_runTaskInNewTerminal 的复用路径往 PTY 写了东西——同样让「本次调用没有执行任何命令」成为假话");
 });
 
 // 检测到 EADDRINUSE / cannot find module 却仍然判成功、仍然给计划打勾。

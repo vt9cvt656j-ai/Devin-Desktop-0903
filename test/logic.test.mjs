@@ -4057,6 +4057,7 @@ test("theme picker only exposes light and dark with Cursor-style dark tokens", (
   // 于是变量名叫 appearanceSrc、锚在 renderThemePreviewCard 上，实际守的是 renderAppearanceTool
   // ——后者只要被挪到 renderSettingsTool 后面（一次纯排版重构），6 条断言会同时假红。
   // 改成按「谁拥有这条断言」分别取真源码，区间由 AST 定，谁挪到哪儿都不影响。
+  const themeCard = extractFn("renderThemePreviewCard", { code: true });      // 主题缩略卡 1283 字
   const appearanceTool = extractFn("renderAppearanceTool", { code: true });   // 外观页本体 1786 字
   const appIconSettings = extractFn("renderAppIconSettings", { code: true }); // 图标设置控件 2874 字
   const appIconNormalize = extractFn("appIconFromFile", { code: true });      // 上传归一化 1344 字
@@ -4087,11 +4088,19 @@ test("theme picker only exposes light and dark with Cursor-style dark tokens", (
     "saved app icon should be applied globally");
   assert.match(SRC, /document\.querySelectorAll\("[^"]*brandmark[^"]*assistant-logo[^"]*data-app-icon[^"]*"\)/,
     "app icon should update the titlebar and assistant/login logos");
-  // 反向断言收成带引号的形状：主题 id 在源码里全是字符串字面量，而裸的 /system|…/i 太宽——
-  // system 这个词在 systemPreferredLocale / filesystem 里到处都是，迟早假红。加引号之后覆盖面
-  // 反而更大（三个真函数一起盖，比原来那 7861 字的窗口更贴题），实测在干净源码上为 false。
-  assert.doesNotMatch([appearanceTool, appIconSettings, appIconNormalize].join("\n"),
-    /"(system|monokai|github-light|solarized|nord)"/i,
+  // 反向断言：区间必须**四个函数全在**。上一版只 join 了 appearanceTool + appIconSettings
+  // + appIconNormalize（6004 字），把 renderThemePreviewCard（1283 字，也就是这条断言原来
+  // 那个起始锚点、真正画主题卡的那个函数）漏在外面，比原来 7861 字的窗口还小 1857 字——
+  // 反向断言配更小的区间就是纯粹放松。实测这个变异：
+  //   `const isDark = theme === "dark";` → `… || theme === "monokai" || theme === "nord";`
+  // （被删掉的主题从缩略卡这一侧长回来）——旧写法红，只 join 三个函数的写法**绿**。
+  //
+  // 正则也从带引号的 /"(…)"/ 收回裸词：主题 id 不一定以字符串字面量出现（模板里的
+  // `data-theme=nord`、对象键 `{ nord: … }` 都不带引号）。只有 system 这个词确实会撞上
+  // systemPreferredLocale / filesystem，所以单独给它加词边界——`\bsystem\b` 对这两个都
+  // 不命中。实测干净源码上四个函数拼起来对这条正则为 false。
+  assert.doesNotMatch([themeCard, appearanceTool, appIconSettings, appIconNormalize].join("\n"),
+    /monokai|github-light|solarized|nord|\bsystem\b/i,
     "appearance picker must not expose removed themes");
 
   const menus = extractFn("getMenus");
