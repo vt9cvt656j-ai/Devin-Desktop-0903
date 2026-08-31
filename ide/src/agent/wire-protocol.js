@@ -22,6 +22,15 @@ export const CM_PROTOCOL_DEFAULT = "openai";
  * 形状的请求体、端点和鉴权头。而且浏览器直连 api.anthropic.com 还会被 CORS 挡。所以网页上
  * 这两条协议**不可选**，且要说清为什么，而不是让它变成一个看不懂的网络错误。
  */
+// ⚠️ 这份里的 `gaps` 是**兜底副本**，不是权威。权威在 Rust：protocol.rs 的
+// `Wire::unsupported()`，经 `ai_protocols` 命令下发；main.js 打开自定义模型面板时会拉一次
+// 并覆盖这里的 gaps/label（拉不到——比如网页版没有 Tauri——才用这份）。
+//
+// 为什么要这样：手抄必漂，而且已经漂过。这里 anthropic 那条一度把中间整句
+//「3.7/4.x 收 thinking.budget_tokens，4.7 之后只收 adaptive + output_config.effort，
+// 两套互不兼容、发错是硬 400」丢掉，只剩后半截，旁边却还写着「protocol.rs 的 anthropic 臂
+// 逐字如此」——那句话在它被写下之后就不成立了。改这里的 gaps 之前先问：Rust 那边改了吗。
+// ph / hint / desktopOnly 是纯 UI 字段，本来就该住在前端，不跟 Rust 走。
 export const CM_PROTOCOL_UI = {
   openai: {
     label: "OpenAI 兼容",
@@ -39,8 +48,7 @@ export const CM_PROTOCOL_UI = {
       "温度 / top_p 不会发送：新一代 Claude 即使关掉思考也拒收这两个参数，发了整轮 400。",
       "思考开关的形状按你填的模型名猜：名字带版本号（claude-sonnet-4-5）才猜得准；写成 sonnet-latest 这类别名时认不出代次，这条模型上一律不发思考参数。",
       "不报推理 token 数：Anthropic 把思考算进输出 token，结构上就没有这个数，界面只能显示思考字数。",
-      "最深的两档（极限 / xhigh）会被折成「高」：本机没有模型目录，赌错是整轮 400。\n" +
-        "        （protocol.rs 的 anthropic 臂逐字如此，和 xAI 那条同源。）",
+      "最深的两档（极限 / xhigh）会被折成「高」：本机没有模型目录，赌错是整轮 400。",
       "不设提示词缓存断点：长会话每轮全价重算，缓存创建量会显示为 0。",
       "最大输出没填时按 32000 发：模型上限低于这个数的（例如 Haiku 一族）请自己填，否则上游 400。",
       "输入框的「下一句预测」不出现：那条路自己拼 /chat/completions，不经过协议翻译。宁可不预测，也不发一个必然 404 的请求。",
