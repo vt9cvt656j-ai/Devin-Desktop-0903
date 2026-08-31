@@ -116,7 +116,18 @@ export function buildDiffView(oldText, newText, filePath) {
   const isNew = !oldText;
 
   let h = '';
-  h += `<div class="atc-diff" data-lang="${escapeHtml(monoLang)}">`;
+  // 内层这一格不是装饰：它是"每行都铺到最宽那行"的唯一支点。
+  //
+  // 外层 .atc-diff 是横向滚动容器，行的宽度 auto = **可视宽**，于是往右一滚，增/删的底色
+  // 就只剩最长那一两行有，其余全白（用户实拍两次）。第一版想用单列网格
+  // minmax(100%, max-content) 解决——**不成立**：轨道基准是 100%（可视宽），上限是
+  // max-content，而轨道只有在容器里还有剩余空间时才会长向上限；容器正好等于可视宽，剩余
+  // 空间为 0，于是轨道停在 280px，所有行仍然只有可视宽（浏览器里实测 gridTemplateColumns
+  // 就是 "280px"）。
+  //
+  // 内层 width: max-content（长到最宽那行）+ min-width: 100%（内容窄时也不短于可视宽），
+  // 行是块级、宽度 auto，自然铺满内层。实测四种写法只有这一种让每一行都等于 scrollWidth。
+  h += `<div class="atc-diff" data-lang="${escapeHtml(monoLang)}"><div class="atc-diff-inner">`;
 
   const cap = 60;
   let rendered = 0;
@@ -169,7 +180,7 @@ export function buildDiffView(oldText, newText, filePath) {
     const remaining = Math.max(oldL.length, newL.length) - stoppedAt;
     if (remaining > 0) h += `<div class="atc-diff-more">… ${remaining} more lines not shown …</div>`;
   }
-  h += "</div>";
+  h += "</div></div>";   // 关掉 .atc-diff-inner 和 .atc-diff
   return h;
 }
 

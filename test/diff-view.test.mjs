@@ -136,35 +136,56 @@ test("highlightDiffView colorizes through injected Monaco dependencies", async (
 });
 
 test("增删行的底色要铺到最宽那行，横向滚动后右边不能是白的", () => {
-  // 用户实拍：「被删除的和新增的代码那个背景颜色没覆盖全，后面还是白色的，右边那里」。
+  // 用户实拍两次：「被删除的和新增的代码那个背景颜色没覆盖全，右边都是空白」。
   //
-  // 根因不是底色画少了。行是块级 flex，宽度 auto = 滚动容器的**可视宽**；只有最长那行被
-  // min-width: fit-content 顶到自己的内容宽，于是它一个人撑出了滚动宽度，其余每一行都停在
-  // 可视宽的边上。往右一滚，除了最长的那一两行，全是白的。
+  // 行的宽度 auto 在横向滚动容器里等于**可视宽**；只有最长那行会把滚动宽度撑开，其余每行
+  // 都停在可视宽的边上，往右一滚就全是白的。width: 100% 也治不了——100% 就是可视宽。
   //
-  // width: 100% 在滚动容器里等于可视宽，治不了。单列网格才治得了：
-  // 轨道 = minmax(可视宽, 最宽那行)，所有行按轨道拉伸。改前/改后各渲过一版图对照确认。
-  // 先把注释剥掉再切：上面那几段注释里逐字写着 min-width: fit-content、overflow: hidden，
-  // 不剥的话「这些写法不许回来」的断言会匹配到**说明它们的注释**，改回去照样绿。
+  // 第一版用单列网格 minmax(100%, max-content)，**不成立**：轨道基准是 100%（可视宽），
+  // 上限是 max-content，而轨道只有在容器里还有剩余空间时才会长向上限；容器正好等于可视宽，
+  // 剩余为 0，轨道就停在可视宽上。浏览器里实测 gridTemplateColumns = "280px"，每行也都是
+  // 280 —— 和没改一样。（教训：这条只能在真排版引擎里量，不能靠推。）
+  //
+  // 成立的是内层那一格：width: max-content 长到最宽那行，min-width: 100% 保证内容窄时也
+  // 不短于可视宽；行是块级、宽度 auto，自然铺满它。四种写法在浏览器里逐个量过，只有这种
+  // 让每一行都等于 scrollWidth。
   const css = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8")
+    // 先剥注释再断言：注释里逐字写着被废掉的那几种写法，不剥的话改回去照样绿。
     .replace(/\/\*[\s\S]*?\*\//g, "");
   const rule = (sel) => {
     const i = css.indexOf(`\n${sel} {`);
     assert.ok(i > 0, `找不到规则 ${sel}`);
     return css.slice(i, css.indexOf("}", i));
   };
-  const box = rule(".atc-diff");
-  assert.match(box, /display:\s*grid/, "滚动容器不是网格——行宽又只剩可视宽");
-  assert.match(box, /grid-template-columns:\s*minmax\(100%,\s*max-content\)/,
-    "轨道不是 minmax(100%, max-content)：只写 max-content 时内容比容器窄就不铺满，只写 100% 就等于可视宽");
-  const row = rule(".atc-diff-row");
-  assert.doesNotMatch(row, /min-width:\s*fit-content/,
+  const inner = rule(".atc-diff-inner");
+  assert.match(inner, /width:\s*max-content/, "内层没有长到最宽那行，短行的底色还是停在可视宽");
+  assert.match(inner, /min-width:\s*100%/, "内层没有兜住可视宽，内容比容器窄时右边会露白");
+  // 那套不成立的网格不许回来。
+  assert.doesNotMatch(rule(".atc-diff"), /display:\s*grid/,
+    "又用网格撑宽度了——minmax(100%, max-content) 的轨道在没有剩余空间时长不起来，实测等于没改");
+  assert.doesNotMatch(rule(".atc-diff-row"), /min-width:\s*fit-content/,
     "min-width: fit-content 回来了——它只让**这一行**长到自己的内容宽，别的行照旧停在可视宽");
   const code = rule(".atc-diff-code");
   assert.match(code, /flex:\s*1 0 auto/,
-    "代码格被允许压缩了：压窄了这行的 max-content 就变小，网格轨道跟着变窄，最长那行反而被截");
+    "代码格被允许压缩了：压窄了这行的 max-content 就变小，内层跟着变窄，最长那行反而被截");
   assert.doesNotMatch(code, /overflow:\s*hidden/,
-    "overflow: hidden 把这一格的最小宽压成 0，等于把「这行有多宽」抹掉，轨道量不到最宽行");
+    "overflow: hidden 把这一格的最小宽压成 0，等于把「这行有多宽」抹掉，内层量不到最宽行");
   assert.doesNotMatch(code, /text-overflow:\s*ellipsis/,
     "横向能滚的容器里省略号轮不到出场，留着只会让人以为这行被截断了");
+});
+
+test("每一行都在 .atc-diff-inner 里面——漏在外面的那一行就是白的那一行", () => {
+  // 样式只管到内层里的行。页脚那条 @@ 提示也必须在里面：它有自己的底色和上边框，
+  // 漏在外面就是横滚之后突然断掉的那一条。
+  const html = buildDiffView("a\nb\n", "a\nc\nd\n", "x.py");
+  const open = html.indexOf(`<div class="atc-diff-inner">`);
+  assert.ok(open > 0, "没有内层容器——每行又只剩可视宽");
+  assert.ok(open < html.indexOf(`class="atc-diff-row`), "第一行落在了内层外面");
+  assert.ok(html.trimEnd().endsWith("</div></div>"), "内层没有被关掉");
+  // 长文件会带页脚，页脚也要在内层里。
+  const long = buildDiffView("", Array.from({ length: 90 }, (_, i) => `line ${i}`).join("\n"), "x.py");
+  const more = long.indexOf(`class="atc-diff-more"`);
+  assert.ok(more > 0, "没生成页脚——这条断言就守不住东西了");
+  assert.ok(more > long.indexOf(`<div class="atc-diff-inner">`), "页脚漏在了内层外面");
+  assert.ok(more < long.lastIndexOf("</div></div>"), "页脚跑到了内层关闭之后");
 });
