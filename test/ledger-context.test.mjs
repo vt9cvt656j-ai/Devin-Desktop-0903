@@ -581,3 +581,43 @@ test("工具成败台账：只失败没成功的工具不许被截断掉——�
   const clean = toolLedgerStats([{ tool: "read_file", category: "file", ok: true }]);
   assert.ok(!/其余/.test(clean), "没截断却挂了截断尾注");
 });
+
+test("草稿纸的「已改文件」按全路径记——同名文件不许互相覆盖", () => {
+  // _pad.modified 是 Map，原来按 basename 建键：Next.js 那种 3 个 page.tsx + 2 个
+  // layout.tsx 的项目改完 6 个文件，纸上只剩 3 条「page.tsx(编辑)」。历史压缩之后
+  // 这张纸就是模型对「我改过什么」的唯一记忆——它既说不出改的是哪个目录下的，
+  // 也数不对改了几个；同一份还随 _sharedCtxDigest 发给每个子体。
+  const src = stripJsComments(SRC);
+  for (const bad of [/_pad\.modified\.set\([^)]*\.split\("\/"\)\.pop\(\)/,
+                     /run\.ctx\.modified\.set\([^)]*\.split\("\/"\)\.pop\(\)/]) {
+    assert.doesNotMatch(src, bad, "又改回按 basename 建键了——同名文件会互相覆盖");
+  }
+  const fmt = load("_fmtModified");
+  const two = fmt(new Map([["src/app/dashboard/page.tsx", "编辑"], ["src/app/settings/page.tsx", "编辑"]]), ", ");
+  assert.ok(two.includes("dashboard/page.tsx") && two.includes("settings/page.tsx"),
+    "两个同名 page.tsx 必须都在，而且看得出是哪个目录下的");
+  // 全路径会变长，所以要有上界；但截断必须说出来，别读成「这一轮只改了这 40 个」。
+  const many = fmt(new Map(Array.from({ length: 45 }, (_, i) => [`src/f${i}.ts`, "编辑"])), ", ");
+  assert.match(many, /…等共 45 个/, "静默截断——被丢掉的那些无声无息");
+});
+
+test("知识库检索成功了就别判成失败——正文本来就是别人写的文档", () => {
+  // _toolExecutionSucceeded 对多数工具按**全文**匹配 [失败]/[ERROR] 这类标记。knowledge
+  // 的正文就是语料原文，一句普通的 markdown 链接「参见 [Error handling](…)」就会命中。
+  // 代价不是记一笔错账：_domainKnowledgeBrief 拿它当闸门，判失败就把命中的语料整段丢掉，
+  // 还当面告诉模型「本轮检索没有拿到结果（检索链路失败）」。重试也没用——触发条件是
+  // 语料自己的正文，每次都在。
+  const f = load("_toolExecutionSucceeded", {
+    _WORKSPACE_MUTATING_TYPES: new Set(),
+    _toolFailureMatch: load("_toolFailureMatch"),
+    _toolFailureMarkerAtHead: load("_toolFailureMarkerAtHead"),
+  });
+  const hit = "知识库命中 2 条：\n1. 幂等：所有写接口必须支持 Idempotency-Key。"
+    + "\n2. 分页：参见 [Error handling](https://example.com/errors) 一节。";
+  assert.equal(f({ type: "knowledge" }, { content: hit }), true,
+    "命中的语料里有 [Error handling] 就被判失败——两段真事实一个字都进不了上下文");
+  // 真失败必须照旧认得出，否则这条守卫是把闸门整个拆了。
+  for (const bad of ["[失败] michael-design 预取异常: timeout", "[ERROR/UNREADABLE] 语料读不出来",
+                     "〔外部数据〕[失败] 检索链路异常"])
+    assert.equal(f({ type: "knowledge" }, { content: bad }), false, `真失败 ${bad.slice(0, 12)} 漏判了`);
+});
