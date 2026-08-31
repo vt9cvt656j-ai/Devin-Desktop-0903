@@ -32,7 +32,6 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
 import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
-import { _mergeChatArchives as _mergeChatArchivesReal } from "../src/agent/chat-archive.js";
 import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
 import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
@@ -19621,9 +19620,10 @@ test("推断出的外部研究偏好永远不会让静默收尾多补一个回�
   // 研究证据是分类器**预测**的（"这活儿该查查同类实现"）。循环重构后，静默收尾不再基于这个
   // 预测记账——`research_evidence_missing` 的静默收尾腿已删除（AGENT_LOOP_REBUILD.md 阶段 2）。
   // 关键不变量是它从来不 force：绝不存在 researchEvidence 的 _pushNudge 去逼模型再来一轮。
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
   assert.doesNotMatch(quiet, /_missingResearchEvidence/,
     "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
@@ -20686,9 +20686,9 @@ test("P2.1-await_subagent：等待作业落定取回结果；无作业/无运行
 // Both tests now assert that split from their own side.
 test("P2.1-收尾：模型自己派发的子智能体只记账，不制造阻断回合", () => {
   const loop = stripJsComments(extractFn("_runAgenticLoop"));
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  assert.ok(quietStart >= 0, "the quiet-turn accounting branch must exist");
-  const quiet = loop.slice(quietStart, quietStart + 1900);
+  // 定长 1900 窗口盖不住静默分支（实测 18609 字），按 AST 取整块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   assert.match(quiet, /_subAgentJobs/);
   assert.match(quiet, /subagent_results_pending/,
     "unfinished jobs remain a truthful outcome fact");
@@ -25377,9 +25377,10 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
 //   2. agent_core.txt carries the instruction it used to force.
 test("read-it-and-stop is prevented by the prompt, not by a profile-derived harness gate", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
 
   // 1. The profile-derived forcing gate is gone. No classifier guess ("workspace") may drive a
   //    re-entry — that is the exact machinery this rebuild exists to remove.
@@ -25400,10 +25401,11 @@ test("read-it-and-stop is prevented by the prompt, not by a profile-derived harn
 
 test("a quiet turn is the model's completion decision except for real bounded work", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
-  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn branch must be extractable");
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   for (const name of ["planPending", "researchEvidence", "toolFirst", "semanticReview", "effect", "codeVerify", "reconcile", "uiDeliveryAudit", "uiVerify"]) {
     assert.equal(quiet.includes(`_pushNudge("${name}"`), false, `${name} must not force another quiet-turn request`);
   }
@@ -25454,7 +25456,10 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   assert.ok(_planGateAt > 0, "plan 门不见了");
   const _afterPlanGate = quiet.slice(_planGateAt);
   const _reenterAt = _afterPlanGate.indexOf("continue;");
-  const _trulyDoneAt = _afterPlanGate.indexOf("break; // truly done");
+  // `break; // truly done` 带注释文本，在剥了注释的 quiet 里找不到（indexOf 会回 -1，
+  // 而 `-1 > _reenterAt` 恰好是 false，这条断言从此只会误红或误绿）。
+  // 它是静默块的**最后一条语句**，用 lastIndexOf 定位。
+  const _trulyDoneAt = _afterPlanGate.lastIndexOf("break;");
   assert.ok(_reenterAt > 0, "plan 门之后没有 continue——计划没做完时不会有界续跑");
   assert.ok(_trulyDoneAt > _reenterAt,
     "an open plan re-enters, boundedly, and then the run ends honestly");
@@ -25464,17 +25469,18 @@ test("a quiet turn is the model's completion decision except for real bounded wo
 
 test("收尾诚实：最后一个动作轮有工具失败时，安静收尾必须记 last_action_failed（只记账、不补回合）", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
-  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn 分支要能切出来");
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   // 收尾门必须真的读 lastTurnHadFailure，并写进 incompleteReason。
   assert.match(quiet, /if \(lastTurnHadFailure && run\.mode === "agent" && !run\._incompleteReason\) \{[\s\S]{0,200}run\._incompleteReason = `last_action_failed:\$\{lastFailKinds \|\| "tool"\}`/,
     "最后一个动作轮报了失败、模型却收尾 → 必须记 last_action_failed，让'已完成'说真话");
   // 只记账：这一句和 break 之间不许有 _pushNudge / continue（否则就成了强制补回合，
   // 违反'quiet turn 是模型的收尾决定'那条钉死的哲学）。
   const gateAt = quiet.indexOf("lastTurnHadFailure && run.mode");
-  const breakAt = quiet.indexOf("break; // truly done", gateAt);
+  const breakAt = quiet.lastIndexOf("break;");   // 静默块的最后一条语句（注释在 CODE 里已被抹掉）
   assert.ok(gateAt >= 0 && breakAt > gateAt, "last_action_failed 门必须在 truly-done break 之前");
   const tail = quiet.slice(gateAt, breakAt);
   assert.doesNotMatch(tail, /_pushNudge\(|continue;/,
@@ -25604,8 +25610,11 @@ test("dynamic tool admission uses the real registry, not the current intent prof
 
   const dispatchAt = loop.indexOf("const items = turn.toolCalls");
   const editBoundary = loop.indexOf("// Keep edit_file calls exactly as emitted", dispatchAt);
-  const searchAt = loop.indexOf("if (call && call.type === \"search_tools\")", editBoundary);
-  const searchTools = loop.slice(searchAt, loop.indexOf("// Same-batch EXACT-duplicate read", searchAt));
+  // 结束锚点 "// Same-batch EXACT-duplicate read" 在源码里**根本不存在**（那段注释后来
+  // 改写过），indexOf 回 -1，slice(起点, -1) 于是拿到 160,152 字——从 search_tools 分支
+  // 一路切到函数尾。下面那条 doesNotMatch 和 windowAt 都在这一大片里找，等于没界。
+  // 按 AST 取这个分支块本身（源码里同形分支有两处，另一处不在本函数，故传 nth）。
+  const searchTools = blockFrom('if (call && call.type === "search_tools") {', { code: true, nth: 1 });
   const windowAt = searchTools.indexOf("_applyToolPayloadWindow(toolSchemas, adds");
   assert.ok(windowAt >= 0, "search_tools additions reach the bounded payload window");
   assert.doesNotMatch(searchTools, /_agentToolNameAllowedByProfile/);
@@ -36911,9 +36920,10 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
 // 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
 // ---------------------------------------------------------------------------
 test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
-  // 直接 import 真模块，不再抠源码手工注入依赖：这个函数每加一个内部 helper，
-  // 手抄的注入表就漏一个（这次漏的是 _archiveAt），测试红得跟被测行为毫无关系。
-  const merge = _mergeChatArchivesReal;
+  const merge = load("_mergeChatArchives", {
+    _archiveHasChats: load("_archiveHasChats", {}),
+    _mergeArchiveList: load("_mergeArchiveList", { _archiveMsgCount: load("_archiveMsgCount", {}) }),
+  });
   const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
 
   // 事故形状：退出时同步写的镜像里有一个会话，几分钟前的 SQLite 快照里没有。
