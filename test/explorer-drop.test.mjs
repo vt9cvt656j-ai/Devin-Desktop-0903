@@ -13,7 +13,7 @@ import {
   dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside, chipPadMove,
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
-import { load, fnSource } from "./helpers/source.mjs";
+import { load, fnSource, loadConst } from "./helpers/source.mjs";
 import { _mergeChatArchives as _mca } from "../src/agent/chat-archive.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -561,8 +561,7 @@ test("发出去之后 @github:owner/repo 仍然是 GitHub 图标和全名", () =
   // 用户实拍：输入框里那枚是对的（GitHub 图标 + owner/repo），发出去之后变成**文件夹图标**、
   // 名字还被截成 `ThesisX`。根因是消息端只按"有没有扩展名"猜文件/文件夹——发送后消息里
   // 只剩纯文本 `@github:owner/repo`，带前缀的引用根本不是本地路径。
-  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  const fn = src.slice(src.indexOf("function _renderMentionsToHtml"), src.indexOf("function _renderMentionsToHtml") + 2200);
+  const fn = fnSource("_renderMentionsToHtml");
   assert.match(fn, /\^\(github\|gitlab\|mcp\):/, "消息端没有识别带前缀的引用");
   assert.match(fn, /iconSvg\(`i-brand-\$\{kind\}`/, "没有用品牌图标");
   // 只显示仓库名，owner 收进 tooltip：组织名常常比仓库名还长，摆在气泡里挤掉正文。
@@ -576,6 +575,51 @@ test("发出去之后 @github:owner/repo 仍然是 GitHub 图标和全名", () =
   for (const id of ["i-brand-github", "i-brand-gitlab"]) {
     assert.ok(html.includes(`id="${id}"`), `图标符号 ${id} 不存在——<use> 会静默渲染成空白`);
   }
+});
+
+test("每一种片都走同一条规则：只显示最后一段名字", () => {
+  // 用户：「其他的这种组件囊卡片也要和这个一样的规则 不然的话 不咋地」。
+  // 输入框那边 _makeComposerChip 一直是 rel.split("/").pop()——每种片都只显示最后一段。
+  // 气泡这边早先只给 github/gitlab 截，mcp 摊出整条 server/uri：同一枚片，在输入框里是
+  // 资源名、发出去变成一长条路径。现在两边同一条规则，完整值都收在 title 里。
+  const fn = fnSource("_renderMentionsToHtml");
+  assert.match(fn, /const shown = pfx\[2\]\.split\("\/"\)\.filter\(Boolean\)\.pop\(\)/,
+    "带前缀的片没有统一取最后一段");
+  assert.doesNotMatch(fn, /kind === "mcp" \? pfx\[2\]/, "mcp 又被单独放行、在气泡里摊出整条路径了");
+  assert.match(fn, /title="\$\{relAttr\}"/, "完整值要留在 tooltip 里");
+});
+
+test("「是不是片」按结构判，不按类名——两个键盘处理器共用一份", () => {
+  // 方向键一下跨过去、退格一次只删一个、那一格空格跟着光标走：这三条讲的是"原子节点挡住了
+  // 光标"，跟片是文件、仓库还是 MCP 资源无关。写死 composer-chip 就等于又开了一份手工名单，
+  // 以后加一种片得记得回来改两处——本仓在别处已经被这种名单坑过。
+  const isAtom = loadConst("_isComposerAtom");
+  const el = (attrs) => ({ nodeType: 1, getAttribute: (k) => attrs[k] ?? null });
+  assert.equal(isAtom(el({ contenteditable: "false" })), true, "认不出原子片");
+  assert.equal(isAtom(el({ contenteditable: "true" })), false, "把可编辑元素也当成片了");
+  assert.equal(isAtom(el({})), false, "没有 contenteditable 的普通元素也被当成片了");
+  assert.equal(isAtom({ nodeType: 3, nodeValue: "hi" }), false, "文本节点被当成片了");
+  assert.equal(isAtom(null), false);
+  // 两个处理器都得用这一份，且不许再按类名判。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.equal((src.match(/isChip: _isComposerAtom/g) || []).length, 2,
+    "方向键和退格没有共用同一份判据");
+  assert.doesNotMatch(src, /isChip: \(n\) => n\.classList\?\.contains\("composer-chip"\)/,
+    "又按类名判了——新增别的片时这两处会静默失灵");
+});
+
+test("气泡里那枚片和输入框里那枚间距一致", () => {
+  // 同一条规则要在两处都成立，否则同一枚片发出去之后疏密就变了。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  const mg = (sel) => {
+    const i = css.indexOf(sel);
+    assert.ok(i > 0, `找不到 ${sel}`);
+    const m = css.slice(i, css.indexOf("}", i)).match(/margin:\s*0\s+(\d+)px/);
+    assert.ok(m, `${sel} 没有横向 margin`);
+    return Number(m[1]);
+  };
+  assert.equal(mg(".msg-mention {"), mg(".composer-chip {"),
+    "输入框里和气泡里那枚片的左右间距不一样了");
 });
 
 test("蓝气泡上的片不能是纯白块", () => {
