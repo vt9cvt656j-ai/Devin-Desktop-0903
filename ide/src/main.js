@@ -762,8 +762,9 @@ async function tauriBackend() {
     marketplaceList: () => core.invoke("marketplace_list"),
     marketplaceSearch: (query) => core.invoke("marketplace_search", { query }),
     marketplaceInstall: (entry) => core.invoke("marketplace_install", { entry }),
-    dbMarketplaceList: () => core.invoke("db_marketplace_list"),
-    dbMarketplaceUpsert: (ext) => core.invoke("db_marketplace_upsert", { ext }),
+    // dbMarketplaceList / dbMarketplaceUpsert 已删：这两个包装自己零调用点，
+    // 而它们指向的 Rust 命令也随本机 auth.db 那套一起摘掉了（扩展列表现在走
+    // ext_available_builtin，读的是真实内置扩展）。
     tasksList: (root) => core.invoke("tasks_list", { root }),
     // `sandbox` defaults to ON in Rust. Pass false ONLY for a user-approved escape after a
     // confined attempt was refused; IDE-internal probes (version checks, git plumbing) pass

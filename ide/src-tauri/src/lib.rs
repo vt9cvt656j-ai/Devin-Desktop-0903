@@ -245,11 +245,13 @@ pub fn run() {
             // gateway TCP+TLS handshake, then retain it across idle agent/tool work.
             ai::start_gateway_transport_warmup();
 
-            tauri::async_runtime::spawn(async {
-                if let Err(e) = auth::init_db().await {
-                    tracing::warn!("Auth DB init skipped: {e}");
-                }
-            });
+            // 这里原来 spawn 一个 auth::init_db()，在每台机器的 ~/.michael_ide/auth.db 里建
+            // users（bcrypt 密码库）和 marketplace_extensions 两张表。两张都没人读：
+            // 真正的登录走网关 HTTP（前端 fetch /api/auth/*），扩展列表走 ext_available_builtin。
+            // 实测本机 auth.db 的 users 表 0 行——它从建出来那天起就是空的。
+            // 连同上面那 8 条只在注释里被提过的 auth_* / db_marketplace_* 命令一起摘掉：
+            // 一个能在本机被任意调用、会做密码哈希的命令面，不该为了一条没人走的路留着。
+            // 已存在的 auth.db 不删（不动用户机器上的文件），只是不再创建、不再暴露。
 
             Ok(())
         })
@@ -454,15 +456,7 @@ pub fn run() {
             tasks::task_run_capture,
             watcher::fs_watch,
             watcher::fs_unwatch,
-            auth::auth_login_or_register,
-            auth::auth_login,
-            auth::auth_register,
-            auth::auth_check_email,
-            auth::auth_send_code,
-            auth::auth_verify_code,
             handoff::handoff_set_session,
-            auth::db_marketplace_list,
-            auth::db_marketplace_upsert,
             accessibility::read_screen,
             accessibility::probe_screen,
             accessibility::ui_click,
