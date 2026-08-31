@@ -21,7 +21,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 「落点算得对不对」。下面这些造的都是最小假件。
 const rect = (left, top, right, bottom) => ({ left, top, right, bottom, width: right - left, height: bottom - top });
 const elWithRect = (r) => ({ getBoundingClientRect: () => r });
-const _dropPointIn = load("_dropPointIn", { _dropScale: 1 });
+const _dropPointIn = load("_dropPointIn", {
+  _dropCssPoint: load("_dropCssPoint", { _dropScale: 1, window: { devicePixelRatio: 1 }, viewportW: () => 4000, viewportH: () => 4000 }),
+});
 
 test("路径基本件：末尾斜杠不影响结果", () => {
   assert.equal(baseName("/a/b/c.txt"), "c.txt");
@@ -98,22 +100,35 @@ test("目标目录为空时不产出任何复制", () => {
   assert.deepEqual(plan.copies, []);
 });
 
-test("落点坐标只按实测比例换算一次，不许两套都试", () => {
-  // 用户实拍的 bug：光标在下面，高亮却出现在**光标位置的一半处**。
-  // 原因是老写法 `hit(p/dpr) || hit(p)` 先试除以 dpr 的那个 —— 而侧栏又窄又高，
-  // 坐标减半后往往仍落在侧栏矩形里，于是那个错误候选每次都先命中。
-  // 现在只按实测的 _dropScale 换算一次，没有第二个候选可挑。
+test("落点坐标：默认当 CSS 用，越出视口才认定是物理像素", () => {
+  // 这块踩过两次，两次都表现为「放在下面，亮的是上面」：
+  //  ① 「两套都试、先试除以 dpr」——侧栏又窄又高，减半后仍落在侧栏里，错的那个每次先命中。
+  //  ② 「向窗口要 innerSize 除以 CSS 宽算比例」——界面缩放会改 clientWidth，比例又量歪。
+  // 所以现在既不试两套也不测量：先当 CSS，观察到越出视口才锁定成 dpr。
   const el = elWithRect(rect(0, 0, 200, 1200));   // 又窄又高，正是当年翻车的形状
-  const at1 = load("_dropPointIn", { _dropScale: 1 });
-  assert.deepEqual(at1({ x: 100, y: 810 }, el), { x: 100, y: 810 }, "scale=1 时原样使用");
-  // 关键回归：810 减半是 405，同样落在这个矩形里。老写法会返回 405（错），新写法必须是 810。
-  assert.equal(at1({ x: 100, y: 810 }, el).y, 810,
+
+  // 逻辑点（wry 在 macOS 上报的就是这种）：一次都不许除。
+  // 关键回归：810 减半是 405，同样落在这个矩形里——老写法会返回 405。
+  const at = load("_dropPointIn", {
+    _dropCssPoint: load("_dropCssPoint", { _dropScale: 1, window: { devicePixelRatio: 2 },
+      viewportW: () => 1000, viewportH: () => 1200 }),
+  });
+  assert.equal(at({ x: 100, y: 810 }, el).y, 810,
     "坐标被多除了一次——高亮会出现在光标位置的一半处");
 
-  const at2 = load("_dropPointIn", { _dropScale: 2 });
-  assert.deepEqual(at2({ x: 200, y: 1620 }, el), { x: 100, y: 810 }, "scale=2 时按 2 换算");
-  assert.equal(at2({ x: 600, y: 1620 }, el), null, "换算后在框外的不该命中");
-  assert.equal(at1({ x: 100, y: 810 }, null), null, "元素不存在时不该炸");
+  // 物理像素：越出 CSS 视口 → 锁定 dpr 换算。
+  const phys = load("_dropCssPoint", { _dropScale: 1, window: { devicePixelRatio: 2 },
+    viewportW: () => 1000, viewportH: () => 1200 });
+  assert.deepEqual(phys({ x: 200, y: 1620 }), { x: 100, y: 810 }, "越界后要按 dpr 换算");
+  // 锁定之后对后续坐标一直有效（同一次拖动里不能一帧一个结论）。
+  assert.deepEqual(phys({ x: 100, y: 200 }), { x: 50, y: 100 }, "锁定后要持续按 dpr 换算");
+
+  // dpr=1 时没有歧义，任何坐标都原样使用。
+  const one = load("_dropCssPoint", { _dropScale: 1, window: { devicePixelRatio: 1 },
+    viewportW: () => 1000, viewportH: () => 1200 });
+  assert.deepEqual(one({ x: 100, y: 1900 }), { x: 100, y: 1900 });
+
+  assert.equal(at({ x: 100, y: 810 }, null), null, "元素不存在时不该炸");
 });
 
 test("落点落在哪一行 → 进哪个目录（真跑 elementFromPoint）", () => {
@@ -179,8 +194,10 @@ test("浏览器路径传原始 client 坐标，不许再乘 dpr", () => {
   assert.match(zone, /position: \{ x: e\.clientX, y: e\.clientY \}/, "浏览器路径没有传原始 client 坐标");
   assert.doesNotMatch(zone, /clientX \* /, "浏览器路径又在乘 dpr 了");
   // 换算比例必须是**量出来的**，不是拿 devicePixelRatio 猜的。
-  assert.match(src, /getCurrentWindow\(\)\.innerSize\(\)/, "没有向窗口实测缩放比例");
-  assert.match(src, /_dropScale = Math\.round\(k\)/, "没有把实测比例用起来");
+  // 换算比例既不猜也不靠会被界面缩放污染的测量：默认当 CSS，越界才锁 dpr。
+  assert.match(src, /if \(dpr > 1 && \(p\.x > viewportW\(\) \|\| p\.y > viewportH\(\)\)\) _dropScale = dpr;/,
+    "坐标换算不是自校正的——界面缩放会把测量出来的比例带歪");
+  assert.doesNotMatch(src, /innerSize\(\)/, "又回到靠 innerSize 测量比例了，缩放不为 1 时会量歪");
 });
 
 test("投放高亮照 VS Code：一块底色，不改文字，不加边框", () => {
