@@ -33,6 +33,17 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_760（2026-08-31 第七次）：实测 81,696 行。买到的是「在编辑器里选中一段代码，
+ *   按住拖进对话框」（用户原话：「我鼠标选中的内容 要能够直接拖拽到对话框那里 使用」）。
+ *   落下去是一枚片，发送时展开成带出处的代码块——出处不是装饰，模型得知道是哪个文件的
+ *   哪几行才能改它。
+ *   纯的那一半进了 src/agent/selection-drag.js（标签怎么写、正文怎么围栏、超长怎么明说
+ *   截断，全部从参数进，真跑）。留在 main.js 的是鼠标那一半：要 getBoundingClientRect
+ *   判落点、要 Monaco 的 getTargetAtClientPoint 判「按下的地方在不在选区里」、要往
+ *   document.body 上挂那个跟手的幽灵——三样都是 DOM 和编辑器实例，搬出去只会变成把它们
+ *   再传回来的假模块。和文件树那条拖拽没有合并也是有意的：树里那条还要画目标目录、还要
+ *   真的移动文件，合在一起会让它的每个判据都多出一支「这次不是文件」。
+ *
  * · 81_640（2026-08-30 第六次）：实测 81,584 行。买到的是输入框里那些内联「片」
  *   （@文件 / @github:owner/repo）真正能用：方向键跨过去、退格一次只删一个、相邻两片之间
  *   垫真空格。这三件都不是锦上添花——片是 contentEditable=false 的原子节点，WKWebView 在
@@ -148,7 +159,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_640;
+const MAIN_JS_MAX_LINES = 81_760;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");
