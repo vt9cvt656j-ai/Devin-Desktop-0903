@@ -24,7 +24,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn, blockFrom, load} from "./helpers/source.mjs";
 
 // _skillCatalogBlock 读的是模块级的 _fileSkills / _loadSkillsLocal / _isSkillActive，
 // 全部注入成桩，这样测的就是真实那段代码本身。
@@ -156,23 +156,93 @@ test("技能：正文不被腰斩、描述不被提前砍死、allowed-tools 真
   // ③ allowed-tools 必须是真约束。原来它唯一的消费点是工具卡片上一枚灰色标签：
   //    一个写着 Read, Grep 的只读技能，启用后模型照样能 write_file、删文件。
   assert.match(SRC, /function _skillAllowedTools\(\)/, "allowed-tools 的收窄逻辑没了");
-  const gate = SRC.slice(RAW_SRC.indexOf("async function _approveToolCall"));
+  // 区间原来是 `SRC.slice(RAW_SRC.indexOf("async function _approveToolCall"))` 再手工
+  // `.slice(0, 1400)` / `.slice(0, 3200)`。两头都不成立：
+  //   · 1400 / 3200 跟代码结构没有任何关系。_approveToolCall 实测 5053 字，两个目标分别
+  //     落在偏移 318 和 1303；谁在它们前面补上千把字（代码或**注释**都算——CODE 把注释
+  //     换成等长空格，长度照旧）就把目标顶出窗口；反过来函数一旦变短，窗口会溢出右花括号
+  //     去看后面那个 _userDeniedToolResult，于是断言匹配到的可能根本不是这道闸。
+  //   · 更要命的是这两条只验「这行字还在吗」。实测把 `.some(` 换成 `.every(`
+  //     （同一次调用的几个名字要**全部**在白名单里才放行，run_cmd 立刻被自己声明它的
+  //     技能拒掉），这两行字一个都没动，两条断言全绿。
+  // 所以：源码断言只留「接线还在」这一层、区间按 AST 取整函数；判断本身改成真跑一遍。
+  const gate = topLevelFn("_approveToolCall", { code: true });
   // 钉住**白名单的来源**，不只是那行条件文本：把 skillGate 直接改成 null，条件那行还在，
   // 只钉文本的话照样绿。
-  assert.match(gate.slice(0, 1400), /const skillGate = typeof _skillAllowedTools === "function" \? _skillAllowedTools\(\) : null;/,
+  assert.match(gate, /const skillGate = typeof _skillAllowedTools === "function" \? _skillAllowedTools\(\) : null;/,
     "审批闸没接技能白名单，allowed-tools 又变回纯装饰");
   // 形状变了（改成把这次调用的几个名字都试一遍，见本文件末尾那条行为测试），但意思不变：
-  // 闸必须真的去查白名单。切片放宽是因为那处补了一大段说明为什么不能按单一字段比对。
-  assert.match(gate.slice(0, 3200), /_skillToolAllowed\(skillGate\.allow, n\)/, "闸没真的去查白名单");
+  // 闸必须真的去查白名单。
+  assert.match(gate, /_skillToolAllowed\(skillGate\.allow, n\)/, "闸没真的去查白名单");
+  // 真跑这道闸。技能白名单排在权限规则**之前**，判定发生在任何 await 之前，所以
+  // _noteRefusal 是同步被调到的——拿它当出口，这条用例就不用改成 async。
+  // 闸后面的路径与本条无关：_permissionRuleVerdict 短路成 "allow"，于是 true/false
+  // 唯一的分歧点就是技能白名单这一关。
+  const _skillToolAllowedReal = load("_skillToolAllowed", ["_SKILL_TOOL_ALIASES", "_skillToolAllowed"]);
+  const gateRefusals = (allowNames, call) => {
+    const seen = [];
+    const approve = load("_approveToolCall", {
+      _callIsDestructive: () => false,
+      _skillAllowedTools: () => (allowNames ? { allow: new Set(allowNames), names: ["只读技能"] } : null),
+      _skillToolAllowed: _skillToolAllowedReal,
+      showToast: () => {},
+      _noteRefusal: (...a) => seen.push(a),
+      _loadPermissionRules: async () => [],
+      _permissionRuleVerdict: () => "allow",
+      _permRuleSource: () => "",
+    });
+    approve(call, {}).catch(() => {}); // 闸之后是异步的，与本条无关，丢掉
+    return seen;
+  };
+  assert.deepEqual(
+    gateRefusals(["read"], { _toolName: "write_file", type: "write" }),
+    [["skill", "只读技能", ["read"]]],
+    "只声明了 read 的技能常驻着，write_file 却照样放行——allowed-tools 又变回纯装饰；"
+    + "或者拒绝回执没把「这个技能到底允许什么」带给模型（它只能换个名字一轮轮试）");
+  assert.deepEqual(
+    gateRefusals(["run_cmd"], { _toolName: "run_cmd", type: "cmd", name: "某技能名" }),
+    [],
+    "技能自己声明的 run_cmd 被这道闸拒了——注册名/内部类型/call.name 三个名字里比对错了字段");
+  assert.deepEqual(
+    gateRefusals(["read", "read_skill"], { _toolName: "read_skill", type: "skill", name: "deploy-gateway" }),
+    [],
+    "read_skill 被拒——技能把自己锁死，模型连正文都读不到");
+  assert.deepEqual(
+    gateRefusals(null, { _toolName: "write_file", type: "write" }),
+    [],
+    "一个技能都没声明 allowed-tools 时这道闸也在拦——它只该在有人声明时收窄");
   // 取并集不取交集：启用两个技能时两边的工具都该可用，交集会让"启用越多能干越少"。
-  const allow = SRC.slice(RAW_SRC.indexOf("function _skillAllowedTools"));
-  assert.match(allow.slice(0, 900), /for \(const s of declaring\) for \(const t of s\.tools\)/,
-    "白名单不是并集");
-  assert.match(allow.slice(0, 900), /allow\.add\("read_skill"\)/,
-    "read_skill 没被永久放行——提示词要求模型用它读正文，挡掉等于技能自锁");
+  //
+  // 这三条原来是 `SRC.slice(RAW_SRC.indexOf("function _skillAllowedTools")).slice(0, 900)`
+  // 上的文本匹配，两头都不成立：
+  //   · 900 是拍脑袋的数，而 _skillAllowedTools 真身只有 765 字（fnSource 实测）——窗口
+  //     比函数长 135 字，多出来的部分越过右花括号落到下一个声明上；另一头也没余量：
+  //     `allow.add("read_skill")` 落在偏移 625，谁在它前面补 275 字（注释也算）就顶出去。
+  //   · 更要命的是三条全是「这行字还在吗」。实测把筛选条件里的 `_activeSkillIds.has(s.id)`
+  //     删掉（没常驻的技能也来贡献工具，白名单凭空变大、别人的技能反过来收窄了这一次调用），
+  //     三行字一个都没动，三条断言全绿。
+  // 这个函数的外部依赖只有三个模块级变量，能直接在 Node 里跑，所以整段换成真往返。
+  const skillAllowed = (activeIds, skills) => load("_skillAllowedTools", {
+    _activeSkillIds: new Set(activeIds),
+    _loadSkillsLocal: () => [],
+    _fileSkills: skills,
+  })();
+  const union = skillAllowed(["a", "b"], [
+    { id: "a", name: "A", tools: ["Read"] },
+    { id: "b", name: "B", tools: ["Bash"] },
+    { id: "c", name: "C", tools: ["Write"] }, // 没常驻：一个字都不该进来
+    { id: "d", name: "D" },                   // 常驻了但没声明：不表态
+  ]);
+  assert.deepEqual([...union.allow].sort(), ["bash", "read", "read_skill"],
+    "白名单不是并集（交集会让「启用越多能干越少」）、或 read_skill 没被永久放行"
+    + "（提示词要求模型用它读正文，挡掉等于技能自锁）、或没常驻的技能也进来收窄了");
+  assert.deepEqual(union.names, ["A", "B"],
+    "回执里的技能名不对——模型收到的拒绝理由会指错技能");
   // 没声明 allowed-tools 的技能不表态，不该缩小任何范围。
-  assert.match(allow.slice(0, 900), /if \(!declaring\.length\) return null;/,
+  assert.equal(skillAllowed(["d"], [{ id: "d", name: "D" }]), null,
     "没有声明的技能也参与收窄了");
+  assert.equal(skillAllowed([], [{ id: "a", name: "A", tools: ["Read"] }]), null,
+    "一个技能都没常驻时也去收窄了");
 
   // ④ 只扫**家目录技能库**这一处。这一条改过两次：最早断言"要扫到 Claude Code 的插件
   //    市场"，2026-08-18 按用户要求改成"只扫自己的目录（工作区 + 家目录）"，
@@ -257,7 +327,14 @@ test("界面上不再有任何「启用 / 未启用」的说法", () => {
   // 技能从来没被"关"过：清单里的名称和描述始终在上下文里，模型随时能 read_skill 读它。
   // 「未启用」尤其糟——它是常驻显示在卡片上的**状态标签**，用户读到的是"这个技能是
   // 关着的"，于是他以为点一下就能停掉某个技能，实际什么都没停。
-  const skillsPage = SRC.slice(RAW_SRC.indexOf('<h3>Skills 技能</h3>'), RAW_SRC.indexOf('<h3>Skills 技能</h3>') + 40000);
+  // 区间原来是 `SRC.slice(indexOf('<h3>Skills 技能</h3>'), … + 40000)`。40000 是个跟代码
+  // 结构毫无关系的数：Skills 页那个单元 renderSkillsTool 实测只有 18271 字、锚点落在它
+  // 内部偏移 366，于是窗口末尾还多盖了 22095 字、十几个跟 Skills 页毫不相干的函数。
+  // 两个方向都坏：反向的 !includes 会被隔壁函数的字眼打成假红；正向的两条 assert.match
+  // 只要那串字在窗口内**任何地方**出现就绿——把状态标签从 Skills 页整个搬到后面某个函数里
+  // （实测：页面上改成「在线 / 离线」、原字符串挪到窗口内的另一个函数），旧写法照样全绿。
+  // 按 AST 取整个 renderSkillsTool：区间正好是它自己，它长多少都盖得住，也一个字不越界。
+  const skillsPage = topLevelFn("renderSkillsTool", { code: true });
   for (const stale of ['"未启用"', '"已启用"', '保存并启用', '默认启用到模型请求里']) {
     assert.ok(!skillsPage.includes(stale), `设置面板的 Skills 页还留着「${stale}」`);
   }
@@ -305,7 +382,15 @@ test("allowed-tools 比对的必须是工具注册名，不是映射后的内部
 // 文件照样写成功、模型照样跟用户说「已经存好了」，而下一轮它在清单里是一条没有描述、
 // 甚至根本解析不出来的废条目。所以这条把两头接起来跑一遍。
 test("save_skill 写出的 SKILL.md 能被真正的技能解析器读回来", () => {
-  const exec = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "saveskill") {'));
+  // 区间原来是开放式的 `SRC.slice(RAW_SRC.indexOf('} else if (call.type === "saveskill") {'))`
+  // ——一路切到拼接源码的结尾（约 467 万字），下面那条正则于是只是「从 saveskill 分支的
+  // 起点往后找第一个 const _doc = [」。锚点除了给一个起始偏移之外没有任何约束力：把拼装
+  // 代码从 save_skill 分支里搬走、换成调用别处的辅助函数（实测：辅助函数追加在 main.js
+  // 末尾，分支里只剩一句调用），正则照样在文件后半截捞到那份拼装，连 assert.ok(docSrc)
+  // 这道兜底也照样绿——于是这条验的是「文件某处有一份拼得对的代码」，不是「save_skill
+  // 写出来的那份」。blockFrom 按 AST 把区间闭合在这个分支的块上（实测 2468 字），
+  // 锚点在全文出现 1 次、不唯一时它当场抛错；拼装一旦搬出这个分支就立刻红。
+  const exec = blockFrom('} else if (call.type === "saveskill") {', { code: true });
   const docSrc = /const _doc = \[[\s\S]*?\.join\("\\n"\);/.exec(exec);
   assert.ok(docSrc, "SKILL.md 的拼装代码改形状了，这条断言失去落点");
   const build = new Function("_name", "_desc", "_fmTools", "_body", `${docSrc[0]}\nreturn _doc;`);

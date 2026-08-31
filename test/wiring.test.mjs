@@ -39,7 +39,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, load, fnSource } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, load, fnSource, blockFrom} from "./helpers/source.mjs";
 
 // Deliberately NOT comment-stripped. A naive stripper is unsafe here: this file contains
 // regex literals holding `/*` and `//`, and a stripper that mis-parses one silently deletes a
@@ -608,13 +608,28 @@ test("子智能体轮次用尽不能标成完成", () => {
 
 // 一个字节都没写进 PTY 的调用，此前回「已在运行中」并判成功、还给计划打勾。
 test("复用终端的调用要说清这次什么都没执行", () => {
-  const branch = SRC.slice(RAW_SRC.indexOf("if (r.alreadyRunning) {"), RAW_SRC.indexOf("if (r.alreadyRunning) {") + 2200);
-  assert.ok(branch.length > 100, "复用分支还在");
-  assert.doesNotMatch(branch, /termWrite/, "这条分支确实没有向 PTY 写任何东西——前提没变");
+  // 区间按 AST 取。原来是 `indexOf(锚点) + 2200` 的定长窗口，而这条分支自己只有 941 字：
+  // 多出来的约 1259 字盖住了**紧随其后的首次启动路径**，在那里写 PTY 本来就是正确行为。
+  // 实测：在 `setTimeout(res2, 3500)` 后面加一句 backend.termWrite（完全合法的改动），
+  // 这条测试当场假红。blockFrom 按 AST 节点边界切，分支写多长都盖得住、也一个字都不多吃。
+  // 锚点全文出现 1 次；它不唯一或消失时 blockFrom 会当场抛错，所以原来那句
+  // `assert.ok(branch.length > 100, "复用分支还在")`（定长窗口上几乎恒真，只有 indexOf
+  // 返回 -1 才失败）已经被 blockFrom 自己覆盖，删掉。
+  const branch = blockFrom("if (r.alreadyRunning) {", { code: true });
   assert.match(branch, /本次调用\*\*没有执行任何命令\*\*/,
     "必须明说这次没执行任何命令，否则模型据此认定服务在跑");
   assert.match(branch, /PTY 存活，不等于这条命令本身还在跑/,
     "首次启动那条有的免责声明，真正什么都没做的这条更需要");
+  // 「这一次真的一个字节都没写进 PTY」这个前提**不发生在上面那段里**。写 PTY 的是
+  // 这条分支上面那句 `r = await _runTaskInNewTerminal(...)`，而 backend.termWrite 全部
+  // 在 _runTaskInNewTerminal 内部（偏移 3974377，离这个窗口 76 万字远）。所以原来那条
+  // `assert.doesNotMatch(branch, /termWrite/)` 拦的是一件**结构上不可能出现在这个位置**
+  // 的事——它唯一还会触发的时候是误伤首次启动路径。改成钉住真正能被违反的地方：
+  // _runTaskInNewTerminal 里 `if (_reuse.alreadyRunning)` 那个块（169 字，AST 取整块）。
+  // 实测：往那个块里塞一句 backend.termWrite，改之前这条测试照样绿。
+  const reuseBranch = blockFrom("if (_reuse.alreadyRunning) {", { code: true });
+  assert.doesNotMatch(reuseBranch, /termWrite|\.term\.write/,
+    "复用分支真的往 PTY 写了东西——「本次调用没有执行任何命令」那句话就成了假话");
 });
 
 // 检测到 EADDRINUSE / cannot find module 却仍然判成功、仍然给计划打勾。
@@ -1289,13 +1304,30 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
   // 1) 按钮渲染进卡片头部（不是定义了一个没人调的函数）
   // 断言的是**调用点在卡片模板里**，不是"源码里出现过这个名字"——函数定义本身
   // 就含有这个名字，照着名字找等于自己喂饱自己。
-  const tpl = SRC.slice(RAW_SRC.indexOf("card.innerHTML ="));
-  assert.match(tpl.slice(0, 700), /_modelPowerToggleHtml\(/,
+  //
+  // 两层收窄。原来那句 `SRC.slice(RAW_SRC.indexOf("card.innerHTML =")).slice(0, 700)`
+  // 两头都不对：① 锚点 `card.innerHTML =` 全文出现 **16 次**（偏移 754652、820558、
+  // 1574671、2333742…），命中对的那张卡纯粹因为它排在最前——谁在 754652 之前新写一处
+  // 卡片渲染，这条守卫就默默改去守别人了；② 模板这条赋值语句实测只有 541 字，700 的
+  // 窗口越过分号多吃 159 字，盖到 `card.querySelector(".mic-name").textContent = …`
+  // 那些**模板之外**的语句——「调用点在模板里」这句话区间上根本没兑现（实测：把调用
+  // 从模板挪到分号后面、改成 insertAdjacentHTML，改之前这条断言照样绿）。
+  // 先按 AST 取真正拼卡片的那个函数，再收到这条赋值语句自己的分号为止。
+  const cardFn = fnSource("showModelInfoCard", { code: true });
+  const tplAt = cardFn.indexOf("card.innerHTML =");
+  assert.notEqual(tplAt, -1, "卡片不再由 showModelInfoCard 拼装了，这条守卫要换锚点");
+  const tpl = cardFn.slice(tplAt, cardFn.indexOf(";", tplAt) + 1);
+  assert.match(tpl, /_modelPowerToggleHtml\(/,
     "卡片模板没调强力版按钮，那个函数成了死代码");
 
   // 2) 点击真的落盘，而不是只切了个 class
-  const clickBlock = SRC.slice(RAW_SRC.indexOf('.closest?.(".mic-power")'));
-  assert.match(clickBlock.slice(0, 600), /_setPowerRoute\(/,
+  // 区间按 AST 取「包住锚点的那个回调」（实测 406 字，正是这个点击监听器）。原来是
+  // 锚点起算 600 字的定长窗口，而监听器从锚点算起只有 378 字：多出来的 222 字越过
+  // `});` 盖住外层的 `return el;`、右花括号，一直伸进下一节的注释——于是
+  //「点击处理里有落盘」实际写成了「这 600 个字符里有落盘」。实测：把 _setPowerRoute
+  // 挪到监听器外面（改成 mouseleave 时才补写），改之前这条断言照样绿，而按钮点了就是不存。
+  const clickBlock = blockFrom('.closest?.(".mic-power")', { code: true, enclosing: true });
+  assert.match(clickBlock, /_setPowerRoute\(/,
     "点了按钮没写进持久化状态，刷新/重开卡片就丢");
 
   // 3) 意图盖到了**所有**去后端的入口。轮次组装点有好几处，漏一处就会出现
@@ -1329,9 +1361,20 @@ test("强力版开关必须真的改变请求去向，而不只是一个会亮�
     assert.equal(supports(no), false,
       `${no} 不是 Claude，却冒出了强力版按钮——用户明确要求过只有 Claude 有`);
   }
-  const render = SRC.slice(RAW_SRC.indexOf("function _modelPowerToggleHtml"));
-  assert.match(render.slice(0, 900), /if \(!_modelSupportsPowerRoute\(id\)\) return ""/,
-    "渲染时没挡住非 Claude 模型");
+  // 渲染侧也**真跑一遍**。原来是 `函数起点 + 900 字窗口` 上的一条源码文本断言，两头都松：
+  // _modelPowerToggleHtml 实测只有 817 字，窗口多吃 83 字（滑进隔壁 _micSliderHtml 的
+  // 声明区）；更要命的是它只问「源码里有没有这行字」——把这一行原封不动挪到 return
+  // 后面变成死代码，闸就没了而断言照样绿（实测：改之前绿，跑起来 gpt-5.2 也画出按钮）。
+  // 这正是「断言真实却守错了东西」那种恒真：源码断言只该用来守调用点，能跑的一律跑一次。
+  const toggleHtml = load("_modelPowerToggleHtml", {
+    _modelSupportsPowerRoute: (id) => id === "claude-x",
+    _powerRouteAvailable: () => true,
+    _powerRouteOn: () => false,
+    _escAttr: (s) => String(s),
+  });
+  assert.equal(toggleHtml({ id: "gpt-5.2" }), "", "渲染时没挡住非 Claude 模型");
+  assert.match(toggleHtml({ id: "claude-x" }), /class="mic-power"/,
+    "Claude 模型上也不画按钮了——这条限定把该画的一起挡掉了");
 });
 
 test("强力版：网关说了没有强力线路，就不该把那个按钮画出来", () => {
@@ -1414,8 +1457,16 @@ test("档位滑块：拖动要真的落到档位上，且拖出卡片边界不�
 
   // 3) 拖动中不得重画整张卡片。重画会把正在被拖的那个 input 换成新节点，
   //    指针立刻丢掉目标，拖到一半就断——这正是分段按钮时代 showModelInfoCard() 的做法。
-  const binder = SRC.slice(RAW_SRC.indexOf("function _bindMicSlider"));
-  const binderBody = binder.slice(0, binder.indexOf("\n}\n") + 3);
+  // 按 AST 取整函数（实测 _bindMicSlider = 1531 字）。原来是 `indexOf("function
+  // _bindMicSlider")` 起算、切到第一个 `\n}\n` 为止——**反向断言最怕的两种「区间悄悄
+  // 变短/变歪」全占了**，而区间没了 = doesNotMatch 恒真 = 静默绿：
+  //   ① 锚点是**前缀**匹配。谁在它前面写一个 `_bindMicSliderA11y` 之类的小助手，
+  //      indexOf 就改去切那个助手，真正的 _bindMicSlider 从此没人看。实测：加一个这样的
+  //      助手 + 在真函数里调一次 showModelInfoCard，改之前这条测试是绿的。
+  //   ② `\n}\n` 挑的是**排版**不是语法。函数里出现一段带顶格 `}` 的模板字面量就被截短，
+  //      整份 main.js 里这个切法现在已经对 53/2197 个顶层函数给出了错误边界。
+  // fnSource 按名字精确匹配、按 AST 节点边界切，两个缝一起没了。
+  const binderBody = fnSource("_bindMicSlider", { code: true });
   assert.doesNotMatch(binderBody, /showModelInfoCard\(/,
     "拖动处理里重画了整张卡片，拖动会断在半路");
 
@@ -1481,10 +1532,17 @@ test("AI 助手开关：按钮、面板、分隔条、落盘、开机还原，�
     "按钮状态不是从布局真值读的，会和实际显示对不上");
 
   // 4) 状态落盘 + 开机还原。少了任何一半，用户收起来的面板重启后又弹回来。
-  // 只切 togglePane 的**函数体**。往后多读几行就会读到紧邻的 function _savePaneState()
-  // 定义，那样即便 togglePane 里根本没调它，按名字找的断言照样能通过。
-  const tpAll = SRC.slice(RAW_SRC.indexOf("function togglePane"));
-  const tp = tpAll.slice(0, tpAll.indexOf("\n}\n") + 3);
+  // 只看 togglePane 的**函数体**。往后多读几行就会读到紧邻的 function _savePaneState()
+  // 定义（源码里它就贴在 togglePane 后面），那样即便 togglePane 里根本没调它，
+  // 按名字找的断言照样能通过。
+  //
+  // 原来的防御是「切到第一个 `\n}\n` 为止」，而那挑的是**排版**不是语法：只要 togglePane
+  // 的收尾大括号不再顶格独占一行（`buildMenubar(); }` 这种常见写法就够），第一个 `\n}\n`
+  // 顺延到 _savePaneState 的收尾，区间里于是含着 `function _savePaneState() {` 这行**定义**，
+  // 断言被定义喂饱、调用早就没了——上面这段注释一字不差地预言了这个后果，只是它选的
+  // 防御手段挡不住。实测：删掉调用 + 把收尾大括号并到上一行，改之前这条测试是绿的。
+  // fnSource 按 AST 节点边界切（实测 togglePane = 165 字，正是真长度），排版怎么改都不影响。
+  const tp = fnSource("togglePane", { code: true });
   assert.match(tp, /_savePaneState\(\)/, "开关状态没存，重开 IDE 就丢");
   assert.match(SRC, /_restorePaneState\(\);/, "启动时没还原，存了也等于没存");
 
@@ -1522,22 +1580,116 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
 
   // 2) 两处入口都走同一个组件——否则同一个面板里两种下拉各弹各的。
   assert.match(SRC, /function buildSelectControl\(/, "自绘下拉组件没了");
-  const bc = SRC.slice(RAW_SRC.indexOf("function buildSettingControl"));
-  assert.match(bc.slice(0, 700), /buildSelectControl\(/, "通用设置行没用自绘下拉");
+  // 通用设置行**真跑一遍**，拿桩函数当探针。原来是 `函数起点 + 700 字窗口` 上的
+  // 一条源码文本断言，两头都不成立：buildSettingControl 实测 1401 字，700 的窗口只盖住
+  // 50%（select 分支排第一才侥幸在内，一旦排到 toggle 后面就会变成**假红**）；而它只问
+  //「这 700 字里有没有出现 buildSelectControl(」，不问它长在哪个分支上——实测把分支判据
+  // 从 `item.type === "select"` 改成 `"combo"`（select 类型的设置项从此什么控件都拿不到），
+  // 改之前这条测试照样绿。跑一次就同时把「哪个分支」和「传了什么」都钉住了。
+  const _mkCtl = () => ({
+    className: "", type: "", value: "", innerHTML: "", kids: [],
+    classList: { add() {}, toggle() {}, contains: () => false },
+    setAttribute() {}, addEventListener() {}, appendChild(c) { this.kids.push(c); },
+  });
+  const made = [];
+  const buildSettingControl = load("buildSettingControl", {
+    document: { createElement: _mkCtl },
+    buildSelectControl: (...a) => (made.push(["select", a]), _mkCtl()),
+    buildNumberControl: (...a) => (made.push(["number", a]), _mkCtl()),
+  });
+  buildSettingControl({ type: "select", key: "theme", options: [["a", "A"], ["b", "B"]] }, "a", () => {});
+  assert.deepEqual(made.map((m) => m[0]), ["select"],
+    "通用设置行没用自绘下拉——type:\"select\" 的设置项没走到 buildSelectControl");
+  assert.deepEqual(made[0][1][0], [["a", "A"], ["b", "B"]], "自绘下拉没拿到选项表");
+  assert.equal(made[0][1][1], "a", "自绘下拉没拿到当前值，打开时高亮会落在错的项上");
   const mk = SRC.slice(RAW_SRC.indexOf("const makeSelect = "));
   assert.match(mk.slice(0, 400), /buildSelectControl\(/, "自适应页没用自绘下拉");
 
-  // 3) 菜单必须与控件同宽、贴在正下方。这三行是"对齐"这件事的全部实现。
-  const open = SRC.slice(RAW_SRC.indexOf("const r = btn.getBoundingClientRect();"));
-  assert.match(open.slice(0, 600), /menu\.style\.width = `\$\{r\.width\}px`/, "菜单没跟控件同宽");
-  assert.match(open.slice(0, 600), /menu\.style\.left = `\$\{r\.left\}px`/, "菜单左缘没和控件对齐");
-  assert.match(open.slice(0, 600), /r\.bottom \+ 4/, "菜单没贴在控件下方");
+  // 3) 菜单必须与控件同宽、左缘对齐、贴在控件正下方。
+  //
+  // 原来这三条写成 `SRC.slice(RAW_SRC.indexOf("const r = btn.getBoundingClientRect();"))`
+  // 的前 600 字里有没有那三行源码文本。两头都不对：
+  //   · 锚点 `const r = btn.getBoundingClientRect();` 是一句**通用表达式**，不是这个组件的
+  //     特征。今天全文只有 1 处纯属运气——main.js 里有 20 处 getBoundingClientRect、
+  //     好几个同构的浮层定位块（它们本来就写着 menu.style.*），其中任何一处把变量叫成 btn
+  //     且排在前面，indexOf 就整体前移，三条断言在**别人家**里被一起喂饱。
+  //   · 更根本的是它只问「这 600 个字符里有没有这行字」，不问这三行算出来的值最后有没有
+  //     落在菜单上。实测：三行原封不动留着、后面再补一句 `menu.style.width = "auto";`
+  //     覆盖掉（"让菜单按内容自适应"这种改动很常见），改之前这条测试是绿的。
+  // 所以改成在假 DOM 上**真建一个下拉、真点开**，看最终落在 style 上的值。
+  // 这个假 DOM 下面第 4 节的键盘断言还要再用一次。
+  const RECT = { width: 220, left: 40, top: 300, bottom: 332 };
+  const mkSelect = (options, cur) => {
+    const mkEl = () => {
+      const el = {
+        className: "", textContent: "", style: {}, kids: [], parent: null,
+        offsetHeight: 120, listeners: {}, cls: new Set(),
+        classList: {
+          add: (c) => el.cls.add(c), remove: (c) => el.cls.delete(c),
+          contains: (c) => el.cls.has(c),
+          toggle: (c, on) => (on ? el.cls.add(c) : el.cls.delete(c)),
+        },
+        setAttribute(k, v) { (el.attrs ||= {})[k] = v; },
+        appendChild(c) { el.kids.push(c); c.parent = el; return c; },
+        addEventListener(t, fn) { (el.listeners[t] ||= []).push(fn); },
+        removeEventListener(t, fn) { el.listeners[t] = (el.listeners[t] || []).filter((f) => f !== fn); },
+        remove() { if (el.parent) el.parent.kids = el.parent.kids.filter((k) => k !== el); el.parent = null; },
+        contains(n) { for (let p = n; p; p = p.parent) if (p === el) return true; return false; },
+        focus() {}, scrollIntoView() { el.scrolled = true; },
+        getBoundingClientRect: () => RECT,
+        fire(t, ev = {}) {
+          for (const fn of [...(el.listeners[t] || [])]) {
+            fn({ target: el, preventDefault() {}, stopPropagation() {}, ...ev });
+          }
+        },
+      };
+      return el;
+    };
+    const body = mkEl();
+    const noop = { addEventListener() {}, removeEventListener() {} };
+    const picked = [];
+    const build = load("buildSelectControl", {
+      document: { body, createElement: mkEl, ...noop },
+      window: noop,
+      viewportH: () => 800,
+    });
+    const btn = build(options, cur, (v) => picked.push(v)).kids[0];
+    return { btn, picked, menu: () => body.kids.find((c) => c.className === "mselect__menu") };
+  };
+
+  const aligned = mkSelect([["a", "A"], ["b", "B"], ["c", "C"]], "a");
+  aligned.btn.fire("click");
+  assert.ok(aligned.menu(), "点了按钮没弹出菜单");
+  assert.equal(aligned.menu().style.width, `${RECT.width}px`, "菜单没跟控件同宽");
+  assert.equal(aligned.menu().style.left, `${RECT.left}px`, "菜单左缘没和控件对齐");
+  assert.equal(aligned.menu().style.top, `${RECT.bottom + 4}px`, "菜单没贴在控件正下方");
 
   // 4) 键盘要能用。原生 select 白送的东西，自绘就得自己补——少一样键盘用户就用不了。
-  const kd = SRC.slice(RAW_SRC.indexOf('btn.addEventListener("keydown"'));
-  for (const key of ["Escape", "ArrowDown", "ArrowUp", "Enter"]) {
-    assert.match(kd.slice(0, 1200), new RegExp(key), `键盘少了 ${key}`);
-  }
+  //
+  // 原来是 `btn.addEventListener("keydown"` 起算 1200 字窗口 + `new RegExp(键名)` 裸词，
+  // 而这条守卫**四个键里已经死了三个**：把 ArrowUp / ArrowDown / Enter 的整条导航分支
+  // 各自整段删掉，测试都照样绿——因为同样的键名还写在上面那句「菜单没开时按这些键就
+  // 打开它」里（`ev.key === "ArrowDown" || ev.key === "ArrowUp" || ev.key === "Enter" …`）。
+  // 只有 Escape 还活着（实测：删掉 Escape 那一支会红）。窗口本身也多吃：处理器实测 783 字、
+  // 窗口 1200，越过 `return wrap; }` 伸进 buildNumberControl 154 字——那正是个会处理 ↑/↓
+  // 的步进器，谁在它开头加个 keydown 处理器，剩下那个 Escape 也会跟着哑掉。
+  // 改成**真按一遍**：既不问键名写在哪，也验它按下去到底干了什么。
+  const kb = mkSelect([["a", "A"], ["b", "B"], ["c", "C"]], "a");
+  const actives = () => kb.menu().kids.map((o) => o.cls.has("is-active"));
+  kb.btn.fire("keydown", { key: "ArrowDown" });
+  assert.ok(kb.menu(), "菜单没开时按 ↓ 应该把它打开");
+  assert.deepEqual(actives(), [true, false, false], "刚打开时高亮没落在当前值上");
+  kb.btn.fire("keydown", { key: "ArrowDown" });
+  assert.deepEqual(actives(), [false, true, false], "↓ 没把高亮往下移");
+  kb.btn.fire("keydown", { key: "ArrowUp" });
+  assert.deepEqual(actives(), [true, false, false], "↑ 没把高亮往上移");
+  kb.btn.fire("keydown", { key: "Enter" });
+  assert.deepEqual(kb.picked, ["a"], "Enter 没选中高亮那一项");
+  assert.equal(kb.menu(), undefined, "Enter 选完没关掉菜单");
+  kb.btn.fire("keydown", { key: "ArrowDown" });
+  assert.ok(kb.menu(), "菜单关掉之后就再也打不开了");
+  kb.btn.fire("keydown", { key: "Escape" });
+  assert.equal(kb.menu(), undefined, "Escape 没关掉菜单");
 
   // 4a) 高亮必须由 JS 自己挂类名，**不能**靠 :focus-visible。键盘移动时是程序化
   //     focus，而 focus-visible 由浏览器按"这次焦点是不是键盘引起的"启发式判定，
@@ -1566,9 +1718,65 @@ test("设置面板的下拉必须是自绘组件：菜单在控件正下方、�
 
   // 4b) 只有菜单**外面**的滚动才关菜单。直接把 close 挂在 window 捕获阶段的话，
   //     在菜单里滚滚轮同样会被捕获到，表现就是"菜单根本滚不动"。
-  const sc = SRC.slice(RAW_SRC.indexOf("const onScroll ="));
-  assert.match(sc.slice(0, 200), /menu\.contains\(ev\.target\)/,
-    "菜单内部的滚动也会关掉菜单——菜单会滚不动");
+  //
+  // 原来这里是 `SRC.slice(RAW_SRC.indexOf("const onScroll =")).slice(0, 200)` 上的一条
+  // 源码断言，两头都脆：
+  //   · 锚点 `const onScroll =` 是个再普通不过的变量名，indexOf 只取第一处。main.js 里
+  //     到处是弹层，随手再写一个 onScroll（那种代码天生就带 menu.contains(...)）就把锚点
+  //     抢走，断言从此守的是**别人**那条，这条坏掉也没人知道。实测这个变异：在
+  //     buildSelectControl **上面**加一个提示气泡组件（自带同名的 onScroll、也自带
+  //     menu.contains(...)），同时把真的这条改成无条件 close() —— 旧写法 63/63 全绿。
+  //   · 200 字窗口比这条单行箭头函数（实测 84 字）长一倍多，多出来的 116 字吃进了 pick()；
+  //     紧邻的 onDocDown 写的是 `menu?.contains(ev.target)`，只差一个 `?.`。
+  //
+  // 换成**真跑**：把 buildSelectControl 抠出来，喂一份最小 DOM，打开菜单后在菜单里滚一下、
+  // 在菜单外滚一下，直接看菜单还在不在。这样既不依赖那个名字，也不依赖任何窗口长度——
+  // 换等价写法（`ev.target.closest(".mselect__menu")`）照样能过，真弄丢闸门必红。
+  const dom = (() => {
+    const winL = [], docL = [];
+    const mk = (tag) => {
+      const n = {
+        tagName: tag, children: [], parent: null, style: {}, textContent: "",
+        className: "", attrs: {}, _on: {}, offsetHeight: 100,
+        classList: { _s: new Set(), add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); }, contains(c) { return this._s.has(c); } },
+        setAttribute(k, v) { n.attrs[k] = String(v); },
+        getAttribute: (k) => n.attrs[k],
+        appendChild(c) { c.parent = n; n.children.push(c); return c; },
+        remove() { if (n.parent) { n.parent.children = n.parent.children.filter((x) => x !== n); n.parent = null; } },
+        contains(el) { for (let p = el; p; p = p.parent) if (p === n) return true; return false; },
+        closest(sel) { for (let p = n; p; p = p.parent) if (sel === "." + p.className) return p; return null; },
+        addEventListener(t, f) { (n._on[t] ||= []).push(f); },
+        removeEventListener(t, f) { n._on[t] = (n._on[t] || []).filter((g) => g !== f); },
+        dispatch(t, ev) { for (const f of [...(n._on[t] || [])]) f({ target: n, preventDefault() {}, stopPropagation() {}, ...ev }); },
+        getBoundingClientRect: () => ({ width: 120, left: 10, top: 40, bottom: 60 }),
+        scrollIntoView() {}, focus() {},
+      };
+      return n;
+    };
+    const body = mk("BODY");
+    const off = (list) => (t, f) => { const i = list.findIndex(([a, b]) => a === t && b === f); if (i >= 0) list.splice(i, 1); };
+    return {
+      body,
+      document: { body, createElement: mk, addEventListener: (t, f) => docL.push([t, f]), removeEventListener: off(docL) },
+      window: {
+        addEventListener: (t, f) => winL.push([t, f]),
+        removeEventListener: off(winL),
+        fire(t, ev) { for (const [a, f] of [...winL]) if (a === t) f({ preventDefault() {}, ...ev }); },
+      },
+    };
+  })();
+  const buildSelect = load("buildSelectControl", {
+    document: dom.document, window: dom.window, viewportH: () => 800,
+  });
+  const selWrap = buildSelect([["a", "A"], ["b", "B"]], "a", () => {});
+  const selBtn = selWrap.children[0];
+  const menuOf = () => dom.body.children.find((c) => c.className === "mselect__menu");
+  selBtn.dispatch("click");
+  assert.ok(menuOf(), "点了控件却没开出菜单——下面两条滚动断言会退化成恒真");
+  dom.window.fire("scroll", { target: menuOf().children[0] });
+  assert.ok(menuOf(), "在菜单里滚了一下菜单就关了——用户看到的是「菜单根本滚不动」");
+  dom.window.fire("scroll", { target: selBtn });
+  assert.equal(menuOf(), undefined, "菜单外面滚动没有关掉菜单");
   assert.doesNotMatch(SRC, /window\.addEventListener\("scroll", close/,
     "又把 close 直接挂到 scroll 上了");
 
@@ -1590,8 +1798,29 @@ test("数字设置项要有自绘步进器，而不是一个裸文本框", () =>
   // 连带把"这个值可以加减"的提示也一起拿掉了，剩一个看不出能干嘛的文本框。
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8");
   assert.match(SRC, /function buildNumberControl\(/, "步进器组件没了");
-  const bc = SRC.slice(RAW_SRC.indexOf("function buildSettingControl"));
-  assert.match(bc.slice(0, 900), /buildNumberControl\(/, "数字设置项没用步进器");
+  // 和上一条测试同一个毛病、同一套修法：原来是 `函数起点 + 900 字窗口` 的源码文本断言。
+  // buildSettingControl 实测 1401 字，900 的窗口只盖住 64%——number 分支现在排第二才侥幸
+  // 在内，一旦排到 toggle 后面就会变成**假红**；而断言只问「这 900 字里有没有出现
+  // buildNumberControl(」，不问它长在哪个分支上，任何别的分支调一次步进器，number 分支
+  // 就可以随便烂。实测：把分支判据从 `item.type === "number"` 改成 `"int"`（数字设置项
+  // 从此什么控件都拿不到），改之前这条测试照样绿。改成拿桩函数当探针真跑一遍。
+  const _mkCtl = () => ({
+    className: "", type: "", value: "", innerHTML: "", kids: [],
+    classList: { add() {}, toggle() {}, contains: () => false },
+    setAttribute() {}, addEventListener() {}, appendChild(c) { this.kids.push(c); },
+  });
+  const made = [];
+  const buildSettingControl = load("buildSettingControl", {
+    document: { createElement: _mkCtl },
+    buildSelectControl: (...a) => (made.push(["select", a]), _mkCtl()),
+    buildNumberControl: (...a) => (made.push(["number", a]), _mkCtl()),
+  });
+  buildSettingControl({ type: "number", key: "fontSize", min: 8, max: 40 }, 14, () => {});
+  assert.deepEqual(made.map((m) => m[0]), ["number"],
+    "数字设置项没用步进器——type:\"number\" 的设置项没走到 buildNumberControl");
+  assert.equal(made[0][1][0], 14, "步进器没拿到当前值");
+  assert.equal(made[0][1][1]?.key, "fontSize",
+    "步进器没拿到设置项本身——min/max 是从它上面读的，拿不到就没有钳位也没有置灰");
 
   // 中间必须还是真的 number 输入框：键入、↑/↓、读屏器的数值语义都靠它。
   const nc = SRC.slice(RAW_SRC.indexOf("function buildNumberControl"));
@@ -1690,8 +1919,18 @@ test("快捷键表要覆盖真正生效的键，且每个动作都得有实现",
   // 否则在聊天框里按退格会删掉磁盘上的文件。守卫必须在动作函数**自己**身上。
   // 这里**跑**这个函数，不是看它源码里有没有那几个字符串——把条件 `&& false` 掉，
   // 按名字找的断言照样通过，而守卫已经形同虚设。
-  const del = SRC.slice(RAW_SRC.indexOf("function _deleteSelectedTreeItem"));
-  const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
+  // 取函数体按 AST，不靠排版收口。
+  //
+  // 原来两行：`SRC.slice(RAW_SRC.indexOf("function _deleteSelectedTreeItem"))` 再
+  // `del.slice(0, del.indexOf("\n}\n") + 3)`。收口找的是「顶格右花括号」这个**排版**特征：
+  // 函数里出现任何一段带顶格 `}` 的模板字面量（main.js 里 CSS/HTML 模板遍地），窗口就
+  // 从那儿断掉。实测这个变异：在 `if (_treeSel.size === 0) return;` 之后插一段 4 行行内
+  // CSS 模板（顶格 `}` 收尾，共 114 字），这条用例立刻报
+  // `SyntaxError: Unexpected end of input` —— 守卫本身一个字没动。
+  // 这条的失败方向是响的（不像 _deleteSkillRecord 那条会静默假绿），但它把「守卫坏了」
+  // 和「取源码坏了」说成同一句话，下一个人会往错的方向查。fnSource 按 AST 边界切，
+  // 函数里写什么都盖得住，实测取到 314 字（旧写法 315 字，多的是收口那个 "\n"）。
+  const delBody = fnSource("_deleteSelectedTreeItem", { code: true });
   const runDelete = (activeElement) => {
     let deleted = false;
     new Function(
@@ -1759,8 +1998,21 @@ test("Skills：外部技能可删，但删之前必须把磁盘路径摆出来",
   assert.match(canBody, /return !!String\(skill\.baseDir \|\| ""\)\.trim\(\)/,
     "外部技能又不能删了");
 
-  const del = SRC.slice(RAW_SRC.indexOf("async function _deleteSkillRecord"));
-  const delBody = del.slice(0, del.indexOf("\n}\n") + 3);
+  // 区间按 AST 取整个函数，不再靠**排版**收口。
+  //
+  // 原来两行：`SRC.slice(RAW_SRC.indexOf("async function _deleteSkillRecord"))` 再
+  // `del.slice(0, del.indexOf("\n}\n") + 3)`。收口找的是「顶格右花括号 + 换行」——那是排版
+  // 不是语法：函数里出现任何一段带顶格 `}` 的模板字面量（main.js 里 CSS/HTML 模板遍地），
+  // 窗口就从那儿断掉。而三条正向断言（confirm( / ${dir} / if (!ok) return;）都落在函数
+  // 前半段（实测这个函数 1360 字，三条全在前 700 字内），截断之后照样全绿，于是整条用例
+  // 看起来完全健康，唯一那条 doesNotMatch 已经形同虚设。
+  //
+  // 实测这个变异：在 `if (!ok) return;` 之后插一段 6 行的行内 CSS 模板（顶格 `}` 收尾），
+  // 再在下面的 else 分支里把 `_skillIsWorkspaceInstalled` 分流写回去 —— 旧写法 63/63 全绿。
+  //
+  // `{ code: true }` 同时保住「注释里那句不算数」这个既有性质：`_skillIsWorkspaceInstalled`
+  // 这个名字今天还写在 main.js:34764 的注释里（“这里以前叫……”），用 RAW 会立刻假红。
+  const delBody = fnSource("_deleteSkillRecord", { code: true });
   assert.match(delBody, /confirm\(/, "删磁盘上的技能目录居然不确认");
   assert.match(delBody, /\$\{dir\}/, "确认框里没写清楚要删哪个目录");
   assert.match(delBody, /if \(!ok\) return;/, "用户点了取消还照删");

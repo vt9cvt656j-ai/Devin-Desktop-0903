@@ -580,7 +580,17 @@ test("assistant markdown blockquotes use a refined quote-card style", () => {
 });
 
 test("new project dialog renders as a centered Google-light picker with SVG template icons", () => {
-  const templatesBlock = SRC.slice(RAW_SRC.indexOf("const PROJECT_TEMPLATES"), RAW_SRC.indexOf("async function showNewProjectDialog"));
+  // 区间按 AST 取声明本身。原来是 SRC.slice(RAW_SRC.indexOf("const PROJECT_TEMPLATES"),
+  // RAW_SRC.indexOf("async function showNewProjectDialog")) —— 实测 15692 字，而
+  // PROJECT_TEMPLATES 声明本身只有 6006 字：多出来的 9686 字整个是 projectTemplateIcon
+  // （下一行已经用 extractFn 单独取过它，里面是一大堆内联 SVG）。两个方向都坏：
+  //   · 下面那条反向的 emoji 断言在管着这 9.7KB SVG —— 谁在 SVG 里写一个非 ASCII 字符就假红；
+  //   · 正向的 /icon:\s*"react"/ 和 /desc:\s*"/ 也能被那段无关代码喂绿。实测：把模板表里
+  //     两处 icon: "react" 改名成 "reactjs"（真回归：projectTemplateIcon 的 case "react"
+  //     不再命中，React 模板没图标），同时在 PROJECT_TEMPLATES 和 projectTemplateIcon 之间
+  //     加一个带 icon: "react" 的示例常量，旧写法照样全绿。
+  // 换成 extractFn 之后区间正好 6006 字，就是这三条断言的主人，别人的代码进不来也顶不掉。
+  const templatesBlock = extractFn("PROJECT_TEMPLATES", { code: true });
   const dialogFn = extractFn("showNewProjectDialog");
   const iconFn = extractFn("projectTemplateIcon");
 
@@ -842,7 +852,15 @@ test("reasoning cards render in stream order instead of staying fixed at the top
   assert.match(send, /else if \(ev\.kind === "toolCall"\) \{[\s\S]{0,220}_inlineThinkState\.answerStarted = true;/,
     "an accepted plain-chat tool call must close the current reasoning phase");
 
-  const agentTurn = SRC.slice(RAW_SRC.indexOf("async function _agentModelTurn"), RAW_SRC.indexOf("function _boundRunFilePath"));
+  // 区间按 AST 取函数本体。原来是 SRC.slice(RAW_SRC.indexOf("async function _agentModelTurn"),
+  // RAW_SRC.indexOf("function _boundRunFilePath")) —— 实测 61731 字，而 _agentModelTurn 本体
+  // 只有 49429 字：多出来的 12302 字是函数结束**之后**那批 worker 子智能体的顶层辅助函数
+  // （切片尾巴实测以 "// --- Worker sub-agents …" 开头）。八条断言今天恰好都只在函数体内各命中
+  // 1 次，但任何一条只要在那 12k 尾巴里也出现一次就变成恒真。实测：把函数体内那两句的
+  // visibleAnswer 闸去掉（真回归：任何增量都会折叠思考卡，不再只由可见正文触发），同时在
+  // 尾巴里加一个 worker 侧的 _workerFlushReasoning 复制同样两行，这条测试照样全绿。
+  // 换成 extractFn 之后区间正好是函数本体，也和本文件另外三处 extractFn("_agentModelTurn") 统一。
+  const agentTurn = extractFn("_agentModelTurn", { code: true });
   // 原来这里钉的是复述那个 bug 的注释（「一个大思考卡永远压在正文上面」）——把渲染改回置顶、
   // 注释留着，断言照样绿。钉真代码：思考卡在到达处追加，且从不插到最前面。
   assert.match(agentTurn, /body\.appendChild\(reasoningEl\)/,
@@ -4031,12 +4049,22 @@ test("theme picker only exposes light and dark with Cursor-style dark tokens", (
   assert.match(featureTabs, /id:\s*"appearance"/,
     "advanced tools should expose Appearance directly below Settings");
 
-  const appearanceSrc = SRC.slice(RAW_SRC.indexOf("function renderThemePreviewCard"), RAW_SRC.indexOf("async function renderSettingsTool"));
-  assert.match(appearanceSrc, /renderThemePreviewCard\("light"/,
+  // 原来是 SRC.slice(RAW_SRC.indexOf("function renderThemePreviewCard"),
+  // RAW_SRC.indexOf("async function renderSettingsTool")) —— 7861 字，横跨四个函数
+  // （renderThemePreviewCard 1283 / appIconFromFile 1344 / renderAppIconSettings 2874 /
+  // renderAppearanceTool 1786）。逐条量过：**这 6 条正向断言没有一条落在起始锚点那个函数里**，
+  // 全部由锚点之后的尾巴满足（renderThemePreviewCard 里连 updateEditorPreference 都没有）。
+  // 于是变量名叫 appearanceSrc、锚在 renderThemePreviewCard 上，实际守的是 renderAppearanceTool
+  // ——后者只要被挪到 renderSettingsTool 后面（一次纯排版重构），6 条断言会同时假红。
+  // 改成按「谁拥有这条断言」分别取真源码，区间由 AST 定，谁挪到哪儿都不影响。
+  const appearanceTool = extractFn("renderAppearanceTool", { code: true });   // 外观页本体 1786 字
+  const appIconSettings = extractFn("renderAppIconSettings", { code: true }); // 图标设置控件 2874 字
+  const appIconNormalize = extractFn("appIconFromFile", { code: true });      // 上传归一化 1344 字
+  assert.match(appearanceTool, /renderThemePreviewCard\("light"/,
     "appearance page should render a light preview card");
-  assert.match(appearanceSrc, /renderThemePreviewCard\("dark"/,
+  assert.match(appearanceTool, /renderThemePreviewCard\("dark"/,
     "appearance page should render a dark preview card");
-  assert.match(appearanceSrc, /updateEditorPreference\("theme", theme\)/,
+  assert.match(appearanceTool, /updateEditorPreference\("theme", theme\)/,
     "theme preview cards must switch the real persisted IDE theme");
   assert.match(SRC, /const FONT_FAMILY_OPTIONS = Object\.freeze\(/,
     "appearance settings should expose a curated font dropdown instead of free typing");
@@ -4045,17 +4073,25 @@ test("theme picker only exposes light and dark with Cursor-style dark tokens", (
     "settings tab should also expose font family as the same dropdown");
   assert.match(SRC, /\{ key: "fontFamily", labelKey: "feature\.settings\.fontFamily\.label", type: "select", options: \(cur\) => buildFontFamilyOptions\(cur\) \}/,
     "font family should be rendered as a dropdown select");
-  assert.match(appearanceSrc, /renderAppIconSettings\(body, p\)/,
+  // 这条守的是**接线**，所以只能钉在外观页本体上：原来那个区间把
+  // "function renderAppIconSettings(body, p) {" 这行**声明**也盖了进去，于是断言被自己的声明
+  // 喂绿。实测：把外观页里的调用改成 renderAppIconPresets(body, p)（真回归：外观页不再挂图标
+  // 上传控件，旧函数留成死代码），旧写法照样绿；钉 renderAppearanceTool 之后当场红。
+  assert.match(appearanceTool, /renderAppIconSettings\(body, p\)/,
     "appearance page should expose app icon settings");
-  assert.match(appearanceSrc, /input\.accept = "image\/\*"/,
+  assert.match(appIconSettings, /input\.accept = "image\/\*"/,
     "app icon control should use an image upload picker");
-  assert.match(appearanceSrc, /canvas\.width = size;[\s\S]{0,80}canvas\.height = size;/,
+  assert.match(appIconNormalize, /canvas\.width = size;[\s\S]{0,80}canvas\.height = size;/,
     "uploaded app icons should be normalized through a square canvas");
   assert.match(SRC, /function applyAppIcon\(value = effectivePrefs\(\)\.appIcon\)/,
     "saved app icon should be applied globally");
   assert.match(SRC, /document\.querySelectorAll\("[^"]*brandmark[^"]*assistant-logo[^"]*data-app-icon[^"]*"\)/,
     "app icon should update the titlebar and assistant/login logos");
-  assert.doesNotMatch(appearanceSrc, /system|monokai|github-light|solarized|nord/i,
+  // 反向断言收成带引号的形状：主题 id 在源码里全是字符串字面量，而裸的 /system|…/i 太宽——
+  // system 这个词在 systemPreferredLocale / filesystem 里到处都是，迟早假红。加引号之后覆盖面
+  // 反而更大（三个真函数一起盖，比原来那 7861 字的窗口更贴题），实测在干净源码上为 false。
+  assert.doesNotMatch([appearanceTool, appIconSettings, appIconNormalize].join("\n"),
+    /"(system|monokai|github-light|solarized|nord)"/i,
     "appearance picker must not expose removed themes");
 
   const menus = extractFn("getMenus");
@@ -6896,10 +6932,15 @@ test("读屏/点击能指定应用——而且这条链一路到得了后端", (
   // 执行分支要真的把它们发给后端（这一步漏了，前两步全对也等于没做）
   // 用执行分支自己的锚（`} else if (…)`）：光用 `call.type === "readscreen"` 会先命中
   // _approvalKey 里那一处，切出来的是空片段，于是这条断言恒真——正是它要防的那种假绿。
-  const _execAt = SRC.indexOf('} else if (call.type === "readscreen") {');
-  assert.ok(_execAt > 0, '找不到 readscreen 的执行分支');
-  const exec = SRC.slice(_execAt, SRC.indexOf('} else if (call.type === "uiclick") {', _execAt));
-  assert.ok(exec.length > 300, 'readscreen 执行分支切空了');
+  // 区间改由 AST 决定：blockFrom 取「锚点最后那个 { 所在的最小节点」，也就是这条分支的整块。
+  // 原来的收尾锚是**下一条分支**的源码文本 '} else if (call.type === "uiclick") {'：它一变形
+  // indexOf 就返回 -1，SRC.slice(_execAt, -1) 从 1958 字静默膨胀到 1563522 字（798 倍），
+  // 而 exec.length > 300 那道守卫只挡得住切空、挡不住膨胀。实测：把那条分支写成
+  // call.type === "uiclick" || call.type === "ui_click"（加个别名的无害改动），同时把本分支里
+  // 的 app: call.app / pid: call.pid 换成 null（真回归），再让后面 ui_extract 那处 read_screen
+  // 顺手带上 app/pid —— 这条断言照样全绿，因为它抓到的是膨胀出来的尾巴里那一处。
+  // blockFrom 取到 1920 字，锚点不唯一或找不到会当场抛错，两条路都堵死。
+  const exec = blockFrom('} else if (call.type === "readscreen") {', { code: true });
   assert.match(exec, /backend\.invoke\("read_screen", \{[\s\S]{0,200}app: call\.app[\s\S]{0,120}pid: call\.pid/,
     "读屏没有把 app/pid 发给后端——schema 加了也是死参数");
 
@@ -7986,8 +8027,15 @@ test("快捷键文案只有一个写者——i18n 词条里不带组合键", () 
   assert.match(extractFn("setShortcutTitle"), /t\(labelKey\)/, "标题没走 i18n 取名字");
   assert.match(SRC, /setShortcutTitle\("terminalBtn", "terminal\.toggle"/, "标题栏终端按钮没被平台化");
   // 语言切换后要重跑，否则新词条铺上去平台化结果就没了。
-  const onLocale = SRC.slice(RAW_SRC.indexOf("onLocaleChange(() => {"));
-  assert.match(onLocale.slice(0, 900), /applyPlatformShortcutLabels\(\);/, "切换语言后没重跑平台化");
+  // 这里要守的语义是「在回调**体内**」。原来写成 SRC.slice(indexOf("onLocaleChange(() => {"))
+  // 再 .slice(0, 900)：回调体实测只有 465 字，多出来的约 435 字盖到了回调**外面**的顶层代码
+  // （一路延伸到 "// ---- status bar core items ----" 那一段）。于是「在回调里」根本没被守住——
+  // 实测把 applyPlatformShortcutLabels(); 从回调里挪到 }); 后面的顶层（行为彻底坏掉：只在启动
+  // 时跑一次，切语言不再重跑），这条断言照样绿。反方向同样脆：465 字离 900 只剩一半余量，而这个
+  // 回调正是「每加一个要重刷的 UI 就往里塞一行」的地方，塞满就假红。
+  // 改成 blockFrom：区间由 AST 的块边界决定，长多少都盖得住，锚点没了当场抛错。
+  const onLocale = blockFrom("onLocaleChange(() => {", { code: true });
+  assert.match(onLocale, /applyPlatformShortcutLabels\(\);/, "切换语言后没重跑平台化");
 });
 
 test("项目模板不再用 shell 写种子文件，命令按平台展开", () => {
@@ -8862,7 +8910,16 @@ test("MCP full discovery is connected to the Agent registry and execution path",
   assert.match(SRC, /mcpResourceCache|resourceTemplates/);
   assert.match(SRC, /_mcpCapabilitySchema\(serverName, "resource"/);
   assert.match(SRC, /_mcpCapabilitySchema\(serverName, "prompt"/);
-  const dispatch = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "mcp")'), RAW_SRC.indexOf('} else if (call.type === "demostart")'));
+  // 区间由 AST 决定。原来两头都是**排版文本**：起点连缩进和 else-if 写法都钉死了，收尾锚
+  // '} else if (call.type === "demostart")' 更是**别的分支**的源码——它一变形 indexOf 返回 -1，
+  // SRC.slice(ai, -1) 于是从 7648 字静默膨胀到 1381755 字（180 倍）。膨胀之后
+  // doesNotMatch(dispatch, /"mcp_call"/) 管的是后半份 main.js（那里 "mcp_call" 出现 0 次，
+  // 继续恒绿），几条 assert.match 也退化成「后 1.38MB 里某处有这个串」。实测：把 demostart 那条
+  // 写成 call.type === "demostart" || call.type === "demo_start"（加别名，无害），同时把本分支的
+  // mcp_get_prompt 改成 mcp_call_full（真回归：prompt 适配器被当成普通工具调用发出去），
+  // 这条测试照样全绿——因为 main.js 里另有一处 mcp_get_prompt 落在膨胀出来的尾巴里。
+  // blockFrom 取到 7617 字，锚点不唯一或找不到当场抛错。
+  const dispatch = blockFrom('} else if (call.type === "mcp") {', { code: true });
   assert.match(dispatch, /mcp_call_full/);
   assert.match(dispatch, /mcp_read_resource/);
   assert.match(dispatch, /mcp_get_prompt/);
@@ -12340,9 +12397,18 @@ test("the ghost is rendered from an attribute i18n does not own, and Tab is guar
   // contentEditable 的删除不会把节点删净：全选删掉之后浏览器留下一个 <br>，
   // Tab 补全过再删更是如此。序列化是空串（.is-empty 成立、灰字照常显示），可光标
   // 停在那个 <br> **后面**——灰字在第一行、光标在第二行。必须清干净并把光标放回第 0 位。
-  const inputListener = SRC.slice(RAW_SRC.indexOf('promptEl.addEventListener("input", () => {'));
-  const inputBody = stripJsComments(inputListener.slice(0, inputListener.indexOf("});")));
-  assert.match(inputBody, /_normalizeEmptyComposer\(\)/,
+  // 这条守的是**接线**（归一化真的挂在 input 上），函数本身由下面 extractFn("_normalizeEmptyComposer")
+  // 那几条守。匿名箭头没名字可取，所以钉的是相邻语句对。
+  //
+  // 原来写成 SRC.slice(RAW_SRC.indexOf('promptEl.addEventListener("input", () => {'))：这个锚点在
+  // 源码里出现 **2 次**（main.js:74948 和 74990，同一个 promptEl 上挂了两个 input 监听器），
+  // indexOf 取第一个纯属运气；收尾用 indexOf("});") 挑的是排版不是语法，监听器里将来出现一个
+  // setTimeout(() => {…}); （隔壁那个监听器里就有两处）就会在那儿截断。实测：在它们之前再注册
+  // 一个也调用 _normalizeEmptyComposer 的 input 监听器，同时把真监听器里那一句删掉（真回归），
+  // 旧断言照样绿——它去检查了错的那段代码。
+  // 现在钉「_clearComposerGhost(); 紧跟 _normalizeEmptyComposer();」这一对相邻语句：全文断言，
+  // 非贪婪 + 400 字上限，谁先注册都不影响判定，把任何一句挪走都红。
+  assert.match(SRC, /promptEl\.addEventListener\("input", \(\) => \{[\s\S]{0,400}?_clearComposerGhost\(\);\s*_normalizeEmptyComposer\(\);/,
     "输入框删空后必须归一化，否则 Tab 过再删光标会留在残留 <br> 之后");
   const normalize = stripJsComments(extractFn("_normalizeEmptyComposer"));
   assert.match(normalize, /promptEl\.textContent = ""/, "要把残留节点真的清掉");
@@ -15490,7 +15556,14 @@ test("前缀续传的校验必须认得网关真正签发的 token", () => {
   const realToken = "mcp_" + "a1b2c3d4e5f60718".repeat(2);
   assert.ok(/^mcp_[a-f0-9]{16,80}$/i.test(realToken), "真实 token 必须通过");
   assert.ok(!/^[a-f0-9]+$/i.test(realToken), "旧正则确实会拒绝真实 token（这就是当初的 bug）");
-  const gate = SRC.slice(RAW_SRC.indexOf("x-michael-compression-covered"), RAW_SRC.indexOf("x-michael-compression-covered") + 1200);
+  // 区间改成整个 _realAiFetch（按 AST 取，实测 18647 字）。原来是「响应头名 + 写死 1200 字」的
+  // 固定窗口：被守的 try/catch 块到窗口相对位置约 1030 结束，只剩约 170 字余量，而窗口前 672 字里
+  // 有 528 字是紧贴那行 if 的注释散文（已经 5 行，还在解释历史 bug）——再补两三行注释，窗口尾部
+  // 就滑出 try/catch。正向断言滑出去会红（吵闹、能发现），反向断言只会**悄悄变短**：旧的纯 hex
+  // 正则只要回归在窗口之外就再也抓不到。实测：把 /^[a-f0-9]+$/i.test(trimmedPrefix) 以「兼容老
+  // 网关」的名义插到同一个函数里靠后的位置（真回归：它会拒掉每一个真 token），旧断言照样绿。
+  // 钉整条 fetch 路径之后，旧正则挪到函数里任何位置都抓得住，覆盖面反而更大。
+  const gate = extractFn("_realAiFetch", { code: true });
   assert.match(gate, /\^mcp_\[a-f0-9\]\{16,80\}\$/, "校验点必须用真实 token 的格式");
   assert.doesNotMatch(gate, /\/\^\[a-f0-9\]\+\$\/i\.test\(trimmedPrefix\)/, "旧的纯 hex 正则必须消失");
 });
@@ -17700,8 +17773,14 @@ test("background LLM chores are bounded to at most one call per run", () => {
     "deciding whether a success recurs needs no model");
   assert.match(SRC, /function _saveInducedWorkflow\(obj, cluster, currentEp, root\)/,
     "persisting an induced workflow needs no model");
-  const recordEpisode = SRC.slice(RAW_SRC.indexOf("async function _recordEpisode"));
-  const recordBody = recordEpisode.slice(0, recordEpisode.indexOf("\n}\n"));
+  // 两个坏形状叠在一起：外层开放式切到文件尾（2189156 字），内层靠 indexOf("\n}\n") 猜函数尾
+  // ——挑的是排版不是语法（test/helpers/source.mjs 自己的注释就把这条列为本仓四种坏语义之一）。
+  // 眼下 recordBody 7459 字 vs fnSource 7461 恰好对上，但 _recordEpisode 正是那种会往提示词里贴
+  // JSON 形状的函数：模板字面量里一旦出现顶格的 }，它后面的代码整段不再被计数，而 === 1 这种
+  // 计数型不变量在这种截断下是**往安全方向说谎**的。实测：在它里面加一段带顶格 } 的 JSON 形状
+  // 模板，再补第二次 _billableAiComplete（真回归：一轮跑完发两次后台请求），旧写法数出来仍然
+  // 是 1，测试全绿。换成 extractFn 之后区间由 AST 定，数到 2、当场红。
+  const recordBody = extractFn("_recordEpisode", { code: true });
   const runEndCalls = recordBody.match(/_billableAiComplete\(/g) || [];
   assert.equal(runEndCalls.length, 1,
     `a finished run must make exactly one background model call (found ${runEndCalls.length})`);
@@ -32239,10 +32318,29 @@ test("上下文溢出要压缩后重试，而不是拿同一份超长负载连�
 
   // 压缩本身的两条不变量：最近几条交换必须留原文（模型要靠它接续），压无可压要回 false
   // （否则十次重试全花在空转上）。
-  const sq = SRC.slice(RAW_SRC.indexOf("function _squeezeMessagesForContext"));
-  const body = sq.slice(0, sq.indexOf("\n  return changed;\n}") + 22);
+  // 区间按 AST 取，不再靠**排版串**收口。
+  //
+  // 原来两行：`SRC.slice(RAW_SRC.indexOf("function _squeezeMessagesForContext"))` 开放式切到
+  // 文件尾（实测 2,641,809 字），再用 `sq.indexOf("\n  return changed;\n}") + 22` 重新收口。
+  // 收口靠的是**缩进和换行**而不是语法：那一行末尾加个注释（CODE 里注释被置空成等量空格，
+  // 于是那 20 个字符的排版串再也拼不出来）indexOf 就变 -1，body 塌成 21 个字符，下面第一条
+  // 断言以「最后一组 assistant+tool 配对被压了」的形式假红——实测只往 `return changed;`
+  // 后面缀一句注释、一个字节的行为都没改，报的就是这句。反过来，哪天别的函数也长出同样
+  // 排版的收尾，body 会静默吞掉中间几万字。
+  const body = extractFn("_squeezeMessagesForContext", { code: true });
   assert.match(body, /i !== lastToolsIdx/, "最后一组 assistant+tool 配对被压了，模型没法接续");
-  assert.match(body, /return changed;/, "压缩没有回报「有没有压掉东西」");
+  // 「压无可压要回 false」这条原来写成 `assert.match(body, /return changed;/)`，**由构造方式
+  // 决定恒真**：body 的结尾就是 `\n  return changed;\n}`（那 +22 正是这个子串的长度），
+  // 切成功时它必然命中，切失败时上一条会先红——它永远不可能独立失败。改成真跑一次。
+  const squeezeNoop = load("_squeezeMessagesForContext");
+  assert.equal(squeezeNoop([]), false,
+    "空对话也报「压掉了东西」——重试循环会拿着一模一样的负载再爆一次，十次重试全花在空转上");
+  assert.equal(squeezeNoop([
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", function: { name: "read_file", arguments: '{"path":"a.js"}' } }] },
+    { role: "tool", tool_call_id: "c1", content: "short" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c2", function: { name: "read_file", arguments: '{"path":"b.js"}' } }] },
+    { role: "tool", tool_call_id: "c2", content: "short" },
+  ]), false, "没有任何东西够得着阈值时仍然报 true —— 同样会把十次重试空转掉");
 });
 
 test("能驱动键鼠的那三条通道也必须带〔外部数据〕框，截图同理", () => {
@@ -32252,9 +32350,21 @@ test("能驱动键鼠的那三条通道也必须带〔外部数据〕框，截�
   //   system      窗口标题、菜单项、frontmost 应用名
   // 而这一层能合成真实键鼠（开终端敲任意命令），默认 auto 模式下不逐次确认。
   // 链路是「网页/剪贴板里的一句指令 → 模型当命令执行 → 键鼠 → 终端」。
-  const set = SRC.slice(RAW_SRC.indexOf("const _EXTERNAL_DATA_TYPES = new Set(["), RAW_SRC.indexOf("function _isExternalDataToolResult"));
+  // 直接验**真值**，不再在源文本上开窗口。
+  //
+  // 原来是 `SRC.slice(indexOf("const _EXTERNAL_DATA_TYPES = new Set(["), indexOf("function
+  // _isExternalDataToolResult"))`。窗口今天正好等于声明（实测 1951 字 vs 声明 1950 字），
+  // 所以它当时确实有效；但撑住它的唯一东西是那个**终点锚**——一个函数名（全仓只出现 2 次：
+  // 声明 + 一处调用）。改名或者把它挪到常量前面，`indexOf` 就返回 -1，而 `slice(a, -1)`
+  // 在 JS 里是「切到倒数第一个字符」，于是窗口变成 2,626,420 字的整条文件尾巴。那条尾巴里
+  // `"automation"` 出现 19 次、`"uiclick"` 15 次、`"system"` 43 次——三个词从 Set 里全删光，
+  // 三条断言照样绿。实测过这个变异：把函数改名成 `_isExternalDataResult`（连调用点一起）
+  // 并把三条从 Set 里删掉，旧写法一声不吭。
+  //
+  // loadConst 把这条常量在空作用域里求值，拿到的是真 Set（实测 46 项），既不认名字也不认位置。
+  const set = loadConst("_EXTERNAL_DATA_TYPES");
   for (const t of ["automation", "uiclick", "system"]) {
-    assert.match(set, new RegExp('"' + t + '"'), `${t} 结果没有〔外部数据〕标记`);
+    assert.ok(set.has(t), `${t} 结果没有〔外部数据〕标记`);
   }
 
   // 截图里的字同样是别人写的。边界必须和图片在**同一条消息**里。
@@ -34964,10 +35074,28 @@ test("五种「存在但读不了」不许被说成文件不存在", () => {
   // 别的返回点，窗口对不上，变成假红）。
   assert.equal((SRC.match(/!_isMissingFileError\(_msg\)/g) || []).length, 2,
     "multi_edit / format 没有都按判据分流 —— 漏一个，读不了就仍然会被说成文件不存在");
-  // read_file 的「读不了」判据要认得非 UTF-8 和没权限。
-  const readSrc = SRC.slice(RAW_SRC.indexOf("const unreadableMatches = []"));
-  assert.match(readSrc.slice(0, 2000), /not valid UTF-8\|没有读取权限/,
-    "read_file 仍然把非 UTF-8 / 没权限当成「找不到」");
+  // read_file 的「读不了」判据要认得非 UTF-8 和没权限 —— 把判据抠出来**真跑**。
+  //
+  // 原来是 `SRC.slice(RAW_SRC.indexOf("const unreadableMatches = []")).slice(0, 2000)` 上的
+  // 一条 assert.match，两头都脆：
+  //   · 断言里那个 `|` 是**转义**的（/not valid UTF-8\|没有读取权限/），匹配的不是「两者
+  //     之一」而是一整段字面子串——等于把 main.js 那条正则里两个候选项的**书写顺序和相邻
+  //     关系**钉死了。实测：把这两项调个个儿（行为完全等价）立刻假红。
+  //   · 锚点离真正要守的那行 1,250 字，2000 字窗口只剩 750 字余量，而这中间已经躺着
+  //     400 多字注释；再补两句说明，断言就会以「这段代码不见了」的形式假红。
+  //     （开放式 readSrc 本体 1,698,195 字。）
+  // 现在按一段**唯一**的结构锚（`unreadableMatches.push` 全仓只出现 1 次）把那条正则整个
+  // 取出来，在 Node 里对真实错误信息各跑一遍：换写法、调顺序、加注释都不影响，真丢掉一类
+  // 「存在但读不了」必红。
+  const unreadableM = /if \((\/[^\n]*?\/i)\.test\(msg\)\) \{ unreadableMatches\.push/.exec(SRC);
+  assert.ok(unreadableM, "read_file 的「读不了」判据不见了 —— 读不了会重新被说成「文件不存在」");
+  const UNREADABLE_RE = new Function(`return ${unreadableM[1]};`)();
+  for (const msg of ["file is not valid UTF-8: assets/legacy.c", "没有读取权限: /etc/shadow",
+    "file too large (> 5 MB): dist/app.asar", "binary file, refusing to read as text"]) {
+    assert.ok(UNREADABLE_RE.test(msg), `read_file 仍然把「${msg}」当成找不到`);
+  }
+  assert.ok(!UNREADABLE_RE.test("No such file or directory (os error 2)"),
+    "真的不存在被当成「读不了」了 —— 模型会去修一个不存在的读权限问题");
   // 三处新分支都必须明确否掉 write_file 这条死路。
   assert.ok((SRC.match(/别改用 write_file|别再 find_files/g) || []).length >= 2,
     "没告诉模型别走那两条死路");

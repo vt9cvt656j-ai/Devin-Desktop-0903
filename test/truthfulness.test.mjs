@@ -194,11 +194,23 @@ test("「改了代码没验证」只记账不补回合——这是刻意的，�
   // 我一度把它改成推提醒并续跑，被两条测试拦下，而它们是对的：红构建是**观测到失败**，
   // 是「已完成」为假的直接证据；「没验证」观测到的是**缺席**，缺席不等于工作是坏的。
   // 拿缺席去覆盖模型的收尾判断，就是用 harness 的偏好压过它的判断。
-  const loop = SRC.slice(RAW_SRC.indexOf("function _runAgenticLoop"));
+  // 区间按 AST 取整个函数，不再是 `SRC.slice(RAW_SRC.indexOf("function _runAgenticLoop"))`。
+  //
+  // 那个写法后面没有任何收口，是**真开放式**：实测切出 2,129,215 字，而 _runAgenticLoop
+  // 真身只有 281,537 字——多出来的 1,847,678 字（一直到拼接源码的末尾）全被当成「这个函数」。
+  // 于是两条断言都在守别的东西：
+  //   · 正向那条变成「文件后半截任何地方有这句就算数」。实测变异：把记账搬进一个写在
+  //     _runAgenticLoop **之外**的小函数 `_settleUnverifiedCode(run)`，函数里再也没有这句，
+  //     这条断言照样绿（33/33 全过）——正是它该拦的那种搬家。
+  //   · 反向那条变成「文件后半截任何地方都不许出现」，别人的代码能把它打成假红。
+  const loop = fnSource("_runAgenticLoop", { code: true });
   // 记账搬到了收尾（中途记会让「红了又修好」粘成假 partial），性质不变：缺席仍然要记。
   assert.match(loop, /run\._incompleteReason \|\|= "code_delivered_unverified"/,
     "缺席必须记账，否则这一轮看起来就像验证过了");
-  assert.ok(!/_pushNudge\("codeVerify"/.test(loop),
+  // 反向这条改成对**整份源码**断言，比切片更稳也更严：_pushNudge 是 _runAgenticLoop 内部的
+  // 闭包（实测全仓唯一一处声明，41 个调用点全在函数内、函数外 0 个），所以「整份源码里
+  // 没有这句」和「这个函数里没有这句」等价，却不会跟着区间一起漂。
+  assert.doesNotMatch(SRC, /_pushNudge\("codeVerify"/,
     "又把它改成强制补回合了——见 logic.test.mjs 里那两条守卫");
   // 记了账就必须到得了用户：outcome 变 partial，然后作为一枚建议按钮出现。
   assert.match(SRC, /code_delivered_unverified: "跑一遍验证刚才的改动"/,
