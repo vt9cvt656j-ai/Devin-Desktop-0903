@@ -124,7 +124,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import {
-  addHidden, chipBeside, chipSpacers, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  addHidden, chipBeside, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
 } from "./agent/explorer-drop.js";
 
@@ -74891,12 +74891,18 @@ function _chipText(chip) {
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
-// 片紧挨着另一个片时垫一个**真空格**：两片之间没有可编辑文本，光标无处停，看着就是粘在
-// 一起（零宽空格宽度为 0，视觉上一样贴着）。序列化本就在片两侧补虚拟空格，多这一个不影响解析。
-function _padChipNeighbours(chip) {
-  const sp = chipSpacers(chip, (x) => x.classList?.contains("composer-chip"));
-  if (sp.before) chip.parentNode.insertBefore(document.createTextNode(" "), chip);
-  if (sp.after) chip.parentNode.insertBefore(document.createTextNode(" "), chip.nextSibling);
+// 光标用方向键跨到片旁边之后，在**光标和片之间**留一个真空格。
+//
+// 不是插入片的时候就加（用户明确否掉了那个：「不是直接空格，而是我光标 我左键往左时候，
+// 才会开始 光标右边空格」）—— 只有光标真的停到片边上时才需要那点余地，否则光标紧贴片沿，
+// 看不出自己停在哪一侧。已经有空格就不再加，来回按不会越积越多。
+function _spaceBesideChip(chip, left) {
+  const at = left ? chip.previousSibling : chip.nextSibling;
+  const txt = at && at.nodeType === 3 ? (at.nodeValue || "") : "";
+  const has = left ? / $/.test(txt) : /^ /.test(txt);
+  if (has) return;
+  const sp = document.createTextNode(" ");
+  chip.parentNode.insertBefore(sp, left ? chip : chip.nextSibling);
 }
 function _makeComposerChip(rel, kind = "file", labelText = "") {
   const name = labelText || rel.split("/").filter(Boolean).pop() || rel;
@@ -75262,7 +75268,6 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
   // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
   // layout shift, and stripped back out by _ceSerialize so it never reaches the sent text.
-  _padChipNeighbours(chip);
   let pad = chip.nextSibling;
   if (!pad || pad.nodeType !== 3) {
     pad = document.createTextNode("\u200b");
@@ -75398,9 +75403,13 @@ promptEl.addEventListener("keydown", (e) => {
     isChip: (n) => n.classList?.contains("composer-chip") });
   if (!chip) return;
   e.preventDefault();
+  // 落位之前先保证光标和片之间有一个真空格，光标停到空格的**外**侧。
+  _spaceBesideChip(chip, left);
   const to = document.createRange();
-  to.selectNode(chip);
-  to.collapse(left);                    // 左键落到片之前，右键落到片之后
+  const gap = left ? chip.previousSibling : chip.nextSibling;
+  if (gap && gap.nodeType === 3) to.setStart(gap, left ? Math.max(0, (gap.nodeValue || "").length - 1) : 1);
+  else { to.selectNode(chip); to.collapse(left); }
+  to.collapse(true);
   sel.removeAllRanges(); sel.addRange(to);
 });
 
@@ -76079,8 +76088,7 @@ function _insertAtChip({ kind, value, label }) {
     range.deleteContents();
     const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
-    _padChipNeighbours(chip);
-  let pad = chip.nextSibling;
+    let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
       pad = document.createTextNode("​");
       chip.parentNode.insertBefore(pad, chip.nextSibling);
