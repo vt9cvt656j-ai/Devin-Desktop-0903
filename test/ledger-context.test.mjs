@@ -671,3 +671,36 @@ test("调度器留下的空洞不算失败——否则「重新发起」和「�
   assert.match(loop, /!it\._skipped && !it\._notAttempted && _toolExecutionAttempted\(it\.rawResult\)/,
     "台账那处的排除被改掉了");
 });
+
+test("附件压缩后要留下文件名和路径，不能只剩「1 item(s): image」", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  // 用户把构建报错截图拖进来、一个字没打。压缩之后他问「刚才那个报错是哪个文件报的」，
+  // 摘要里只写着「1 item(s): image」——模型既没有文件名也没有磁盘路径，连重新看一眼
+  // 都做不到，只能反问「你说的是哪个报错」，而用户觉得自己十分钟前才给过。
+  m.push({ role: "user", content: "看下这张截图里的报错",
+    attachments: [{ kind: "image", name: "checkout-500.png", path: "/Users/m/Desktop/checkout-500.png" }] });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  // 断言写成 `image:checkout-500.png`，不是光找 "checkout-500.png"——后者会被下面
+  // 那半句括号里的路径顺带满足，于是「标签退回只剩 kind」这种回归照样绿着。
+  assert.match(sum, /image:checkout-500\.png/, "文件名没了——模型说不出用户给的是哪张图");
+  assert.ok(sum.includes("/Users/m/Desktop/checkout-500.png"), "磁盘路径没了——重新看一眼都做不到");
+});
+
+test("摘要要标出它覆盖了第几轮到第几轮", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  m.push({ role: "user", content: "端口是 5433 不是 5432" });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  // range 从两个写入点、一个合并点一路维护下来，却在唯一通往模型的出口被丢掉：
+  // 摘要里的话和 recent 里的话谁先谁后，模型判断不了；而 searchArchive 的条目带 turn。
+  assert.ok(m.summaries[0]?.range, "range 本来就没存下来，先修存的那一头");
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  assert.ok(sum.includes(m.summaries[0].range),
+    `摘要里没有轮次区间（${m.summaries[0].range}）——先后顺序对不上号`);
+});

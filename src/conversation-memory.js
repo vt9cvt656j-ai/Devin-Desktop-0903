@@ -750,7 +750,11 @@ export class ConversationMemory {
       });
     }
     if (this.summaries.length > 0) {
-      const merged = this.summaries.map(s => s.text).join('\n\n');
+      // range 从两个写入点、一个合并点一路维护下来，却在**唯一**通往模型的出口被丢掉。
+      // 后果是先后顺序没了：摘要里写着「[user] 端口是 5433 不是 5432」，recent 里用户说
+      // 「改回默认端口」，模型无法判断哪句在前——而 searchArchive 返回的条目是带 turn 的，
+      // 两边对不上号。摘要被折叠合并之后跨度可能有几十轮，歧义只会更大。
+      const merged = this.summaries.map((s) => (s.range ? `【${s.range}】\n${s.text}` : s.text)).join('\n\n');
       const recallHint = this.archive.length
         ? '\n\n（以上是早期对话的压缩摘要；需要某段早期对话的原文细节时，用 recall_conversation 工具按关键词检索归档）'
         : '';
@@ -955,8 +959,21 @@ export class ConversationMemory {
       }
       const attachments = Array.isArray(msg?.attachments) ? msg.attachments : [];
       if (attachments.length) {
-        const kinds = attachments.map((a) => a?.kind || "media").slice(0, 4).join(", ");
-        lines.push(`[attachments] ${attachments.length} item(s): ${kinds}`);
+        // 只写 kind 等于没写。用户把构建报错截图拖进来、一个字没打，压缩之后摘要里
+        // 是「1 item(s): image」——之后他问「刚才那个报错是哪个文件报的」，模型既没有
+        // 文件名也没有磁盘路径，连重新看一眼都做不到，只能反问「你说的是哪个报错」，
+        // 而用户觉得自己十分钟前才给过。附件对象上 name / path 一直都在。
+        const label = (x) => {
+          const kind = x?.kind || "media";
+          const name = x?.name || (x?.path ? String(x.path).split(/[\\/]/).pop() : "");
+          return name ? `${kind}:${name}` : kind;
+        };
+        const shown = attachments.slice(0, 4).map(label).join(", ");
+        const more = attachments.length > 4 ? ` 等 ${attachments.length} 个` : "";
+        // 路径单独留一份：重新打开它要的是全路径，不是文件名。
+        const paths = attachments.map((x) => x?.path).filter(Boolean).slice(0, 4);
+        lines.push(`[attachments] ${attachments.length} item(s): ${shown}${more}`
+          + (paths.length ? `（${paths.join("、")}）` : ""));
       }
     }
     const p = [];
