@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside,
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
@@ -634,20 +634,53 @@ test("没有 id 的会话保留，不能被当成「不在打开列表里」删�
   assert.equal(_mca(primary, mirror).sessions.length, 2, "没有 id 的会话被误删了");
 });
 
-test("片的左右两边都要有光标落脚点", () => {
-  // 用户：「我点击 往左 他往左边走不了」。片是 contentEditable=false 的原子节点，
-  // 它前面若没有文本节点（比如它就是输入框第一个元素），光标按左键无处可去。
-  // 右边早就补了零宽空格，左边一直没有。两处插入（@菜单选中 / 从树里拖进来）都要补。
-  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  const n = (src.match(/insertBefore\(document\.createTextNode\("\\u200b"\), chip\)/g) || []).length;
-  assert.equal(n, 2, `两处插入都要在片左边补落脚点（当前 ${n} 处）`);
-});
-
 test("输入框里的 GitHub 片也只显示仓库名", () => {
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
   assert.match(src, /label: r\.full_name\.split\("\/"\)\.pop\(\)/, "输入框里的片还在显示 owner/repo");
   // value 仍然是全名——发送出去的文本要能唯一定位仓库。
   assert.match(src, /value: r\.full_name, label:/, "片的值不能跟着截短，否则定位不到仓库");
+});
+
+test("光标紧挨着片时，左右键能跨过去（直接跑模块函数）", () => {
+  // 用户实拍两次：片是输入框里第一个元素时，按左键**没反应**。片是 contentEditable=false
+  // 的原子节点，WKWebView 不总能在它两侧摆放光标；两侧垫零宽空格试过——不够，浏览器有时
+  // 压根不把空文本节点当成可落脚位置。所以自己接管方向键，判据就是这个函数。
+  const TXT = (v) => ({ nodeType: 3, nodeValue: v, previousSibling: null, nextSibling: null, parentNode: null });
+  const CHIP = () => ({ nodeType: 1, _chip: true, previousSibling: null, nextSibling: null, parentNode: null, childNodes: [] });
+  const link = (nodes, parent) => {
+    nodes.forEach((n, k) => { n.parentNode = parent; n.previousSibling = nodes[k - 1] || null; n.nextSibling = nodes[k + 1] || null; });
+    parent.childNodes = nodes; return parent;
+  };
+  const isChip = (n) => !!n._chip;
+
+  // [片][零宽空格] —— 片就是第一个元素，光标在那个零宽空格的开头。
+  const chip = CHIP(), pad = TXT("\u200b");
+  const box = { nodeType: 1, childNodes: [] };
+  link([chip, pad], box);
+  assert.equal(chipBeside({ container: box, node: pad, offset: 0, left: true, isChip }), chip,
+    "左边就是片，却没认出来——按左键会走不动");
+
+  // 反向：片右边有片，按右键要越过去。
+  const chip2 = CHIP(), lead = TXT("hi");
+  const box2 = { nodeType: 1, childNodes: [] };
+  link([lead, chip2], box2);
+  assert.equal(chipBeside({ container: box2, node: lead, offset: 2, left: false, isChip }), chip2);
+
+  // 这一侧还有真字符可走时**不许**接管，否则逐字移动会被吞掉。
+  assert.equal(chipBeside({ container: box2, node: lead, offset: 1, left: false, isChip }), null,
+    "文本中间也接管了——逐字移动会失灵");
+  assert.equal(chipBeside({ container: box2, node: lead, offset: 1, left: true, isChip }), null);
+  // 旁边不是片就放行。
+  const plain = TXT("x"), box3 = { nodeType: 1, childNodes: [] };
+  link([plain, TXT("y")], box3);
+  assert.equal(chipBeside({ container: box3, node: box3.childNodes[1], offset: 0, left: true, isChip }), null);
+
+  // 接线：处理器真的用了它，并且阻止了默认行为（否则浏览器那套走不动的行为仍然生效）。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const h = src.slice(src.indexOf("// 左右方向键跨过内联的片"), src.indexOf("// Enter 直接发送"));
+  assert.match(h, /chipBeside\(\{ container: promptEl/, "方向键处理器没有接上判据");
+  assert.match(h, /e\.preventDefault\(\)/, "没有阻止默认行为");
+  assert.match(h, /to\.collapse\(left\)/, "左键要落到片之前、右键落到片之后");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

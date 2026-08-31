@@ -124,7 +124,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import {
-  addHidden, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  addHidden, chipBeside, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
 } from "./agent/explorer-drop.js";
 
@@ -11883,8 +11883,12 @@ function _treeSelectClick(e, path) {
     _applyTreeSel();
     return true;
   }
-  // plain click → single-select + set range anchor; caller proceeds to open/expand
-  _treeSel = new Set([path]);
+  // 普通点击**不留持久的选中标记**。
+  //
+  // 以前会把这一行塞进 _treeSel，于是点一下文件夹就留一块底色；而"当前打开的文件"另有一块
+  // 底色 —— 屏幕上同时两处高亮，分不清哪个才是"我选中的"。选区只服务于多选（⇧ 连选 /
+  // ⌘ 点选，给批量删除和整组拖动用），所以普通点击清空它，只留 anchor 供 ⇧ 连选起头。
+  _treeSel.clear();
   _treeAnchor = path;
   _applyTreeSel();
   return false;
@@ -12243,6 +12247,7 @@ function closeContextMenu() {
     ctxMenuEl.remove();
     ctxMenuEl = null;
   }
+  if (_ctxTargetPath) _paintCtxTarget("");
   // Flush any tree reloads that were deferred while the menu was open.
   if (_pendingReloadDirs.size) {
     const dirs = [..._pendingReloadDirs];
@@ -12257,9 +12262,19 @@ function closeContextMenu() {
     }, 150);
   }
 }
+// 右键的那一行要看得出来：菜单浮在旁边而行上毫无标记，用户不知道自己在操作哪一项，
+// 而菜单里就有不可逆的「删除」。存路径不存节点——菜单开着时 fs-watcher 仍可能重建树。
+let _ctxTargetPath = "";
+function _paintCtxTarget(path) {
+  for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
+  _ctxTargetPath = path || "";
+  if (!_ctxTargetPath) return;
+  treeEl?.querySelector(`.row[data-path="${cssEscape(_ctxTargetPath)}"]`)?.classList.add("is-ctx-target");
+}
 function openContextMenu(x, y, entry) {
   _suppressNativeSelection();
   closeContextMenu();
+  _paintCtxTarget(entry?.path || "");
   const isDir = !!entry.is_dir;
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isWorkspaceRoot = workspaceRoots.includes(entry.path);
@@ -22215,9 +22230,22 @@ function _renderMentionsToHtml(text) {
   while ((m = re.exec(text))) {
     out += _escHtmlLite(text.slice(last, m.index + m[1].length));
     const rel = m[2];
+    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    // 带前缀的引用（@github:owner/repo 等）不是本地路径。发送后消息里只剩纯文本，而下面
+    // 那条判据只按"有没有扩展名"猜文件/文件夹 —— 仓库会被画成文件夹图标、名字还被截尾。
+    const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
+    if (pfx) {
+      const kind = pfx[1];
+      // 只显示仓库名，owner 收进 tooltip（title 已是完整的 github:owner/repo）。
+      const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
+      const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
+      out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
+        + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
+      last = re.lastIndex;
+      continue;
+    }
     const name = rel.split("/").filter(Boolean).pop() || rel;
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name); // heuristic: no extension → folder
-    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
     out += `<span class="msg-mention" data-rel="${relAttr}" data-dir="${isDir ? 1 : 0}" title="${relAttr}">`
       + `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(name)}</span></span>`;
     last = re.lastIndex;
@@ -75347,6 +75375,26 @@ async function _moveIntoDir(paths, destDir) {
 // Swallow the click that follows a drag so the dragged file isn't also opened/selected.
 // 只吞树内的点击：旧版全局吞，拖完文件紧接着点 文件/Git/大纲/测试 页签会被白吞一次。
 document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; if (e.target && e.target.closest && e.target.closest("#tree")) { e.stopPropagation(); e.preventDefault(); } } }, true);
+// 左右方向键跨过内联的片。片是 contentEditable=false 的原子节点，WKWebView 不总能在它两侧
+// 摆放光标——片若是输入框第一个元素，按左键"没反应"（两侧垫零宽空格试过，不够）。所以自己
+// 接管：只在"光标紧挨着片"时越过它，其余一律放行，不影响逐字移动和选区。判断在模块里。
+promptEl.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey || e.isComposing) return;
+  const sel = window.getSelection();
+  if (!sel?.isCollapsed || !sel.rangeCount) return;
+  const r = sel.getRangeAt(0);
+  if (!promptEl.contains(r.startContainer)) return;
+  const left = e.key === "ArrowLeft";
+  const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left,
+    isChip: (n) => n.classList?.contains("composer-chip") });
+  if (!chip) return;
+  e.preventDefault();
+  const to = document.createRange();
+  to.selectNode(chip);
+  to.collapse(left);                    // 左键落到片之前，右键落到片之后
+  sel.removeAllRanges(); sel.addRange(to);
+});
 promptEl.addEventListener("keydown", (e) => {
   // Enter 直接发送；Shift+Enter 换行（⌘/Ctrl+Enter 也照发）。但要避开两种情况：
   //  ① @文件 / 斜杠菜单打开时，Enter 是「选中菜单项」——交给各自的处理器；
@@ -75664,7 +75712,9 @@ function _atRepoRows(kind, query) {
       icon: `i-brand-${kind}`,
       name: r.full_name,
       detail: r.private ? "Private" : "Public",
-      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
+      // 片上只显示仓库名，owner 收进 tooltip：组织名常常比仓库名长，摆在输入框里挤掉正文。
+      // value 仍是完整的 owner/repo —— 发出去的文本要能唯一定位仓库，只有显示层收短。
+      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name.split("/").pop() || r.full_name }),
     }));
   if (rows.length) return rows;
   // 三种"没有行"要说三句不同的话。以前只分了两种：缓存空就一律说「Loading…」，于是一个
