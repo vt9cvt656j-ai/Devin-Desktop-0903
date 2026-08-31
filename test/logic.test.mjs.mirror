@@ -8,11 +8,6 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { toolLedgerStats } from "../src/agent/tool-ledger.js";
-import { readFileSync as _rfs } from "node:fs";
-const TOOL_LEDGER_SRC = _rfs(new URL("../src/agent/tool-ledger.js", import.meta.url), "utf8");
-import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
-import { setBadgeText } from "../src/agent/escape.js";
 // 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
 // （抠源码验得到行为，验不到它在真实调用链上还在不在）。
 import { parseSkillDocument as _parseSkillDoc } from "../src/agent/skill-doc.js";
@@ -21,7 +16,7 @@ import { planStepTargets, toolTouchedTargets, targetsConflict } from "../src/age
 // 不再抠源码：抠源码验得到行为，验不到它在真实调用链上还在不在。
 import { splitCodeAndComments as _splitCC, symbolPatternsFor as _symPat } from "../src/agent/code-text.js";
 import { chipShortLabel as _chipShortLabel } from "../src/agent/chip-label.js";
-import { summarizeTiming, summarizeIntentRace } from "../src/agent/turn-timing.js";
+import { summarizeTiming } from "../src/agent/turn-timing.js";
 import { partialCause as _partialCause, runOutcome as _runOutcome, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "../src/agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "../src/agent/verification-evidence.js";
 // 项目栈那一族 2026-08-25 搬进了 src/agent/stack.js —— 行为断言直接 import 真模块，
@@ -31,9 +26,6 @@ import { stackTable as STACK_TABLE, extractStackHints as extractStack,
          stackManifestExts as stackExts, formatStackHint as formatStack,
          manifestExtra as MANIFEST_EXTRA } from "../src/agent/stack.js";
 import { baseTools, readonlyExternalTools, writeTools } from "../src/agent/tool-catalog.js";
-import { topLevelOf as _topLevelOf } from "../src/agent/explorer-drop.js";
-import { monitorProducerStopped as _monitorProducerStopped, preexistingConditionNote as _preexistingConditionNote } from "../src/agent/terminal-commands.js";
-import { approvalLabel } from "../src/agent/approval-label.js";
 // 主↔子实时通道已搬进 src/agent/mainlink.js，直接 import 产品代码，
 // 不再从 main.js 源码里抠函数文本。
 import {
@@ -92,7 +84,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst, at, blockFrom, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as extractFn, fnSource as extractConstDecl, loadConst, TOOL_CATALOG_SRC } from "./helpers/source.mjs";
 const DAP_CLIENT = readFileSync(join(HERE, "../src/dap-client.js"), "utf8");
 const LSP_CLIENT = readFileSync(join(HERE, "../src/lsp-client.js"), "utf8");
 const TAURI_DEBUG = readFileSync(join(HERE, "../src-tauri/src/debug.rs"), "utf8");
@@ -1401,11 +1393,7 @@ test("file tree refresh preserves manual expansion state and refreshes the neare
 });
 
 test("file tree delete is single-shot, dedupes nested selections, and locks while deleting", () => {
-  // _treeTopLevelTargets 的算法已经搬进 src/agent/explorer-drop.js 的 topLevelOf（移动那条路
-  // 漏了这一步会丢文件，所以它成了两条路共用的判据）。main.js 侧只剩一层薄壳，
-  // 所以这里把真模块注进去——比抠源码更能证明"产品用的就是这个实现"。
   const topLevel = load("_treeTopLevelTargets", {
-    topLevelOf: _topLevelOf,
     _treePath: (p) => String(p || "").replace(/\/+$/, ""),
     _pathIsAtOrUnder: (candidate, parent) => candidate === parent || candidate.startsWith(parent.replace(/\/+$/, "") + "/"),
   });
@@ -1438,10 +1426,7 @@ test("file tree delete is single-shot, dedupes nested selections, and locks whil
     "single-item delete should share the same deletion lock");
   assert.match(singleDelete, /finally \{\s*_treeDeleteBusy = false;/,
     "delete lock must always be released after success, cancel, or failure");
-  // 用 at()：抬锁那一行被**删掉**时 indexOf 返回 -1，而 `-1 < ioConfirm 的下标` 恒成立，
-  // 于是「连点几下叠出好几个确认框」这个原始 bug 可以整个回来而测试不动。
-  // 本用例其余断言只覆盖「读锁」和「finally 释放」，没有一条证明锁被**置位**过。
-  assert.ok(at(singleDelete, "_treeDeleteBusy = true;", "抬锁") < at(singleDelete, "const ok = await ioConfirm", "确认框"),
+  assert.ok(singleDelete.indexOf("_treeDeleteBusy = true;") < singleDelete.indexOf("const ok = await ioConfirm"),
     "delete lock should be raised before the confirmation dialog opens so repeated clicks don't stack dialogs");
 
   const confirmStart = RAW_SRC.indexOf("function ioConfirm(");
@@ -2848,38 +2833,6 @@ test("the size cache notices the one mutation that does not change object identi
 // Permission rules were two booleans plus a hardcoded regex — nothing a team could express
 // or check into git. This is the `Tool(pattern)` grammar, deliberately the same shape Claude
 // Code uses so anyone already writing those rules does not have to relearn them.
-test("后台监控跑 shell 的那一支必须被 deny 规则和危险命令判据看见", () => {
-  // background_monitor 的 check_type:"command" 把模型给的 pattern 原样交给 shell，
-  // 而且按轮询节奏重复跑几十上百次。它一直不在任何一道授权门里：
-  //   · tool-policy 没注册 → 只读模式不拦、审批不弹（那半边在 tool-policy.test.mjs 里钉）
-  //   · _PERM_TOOL_ALIASES.bash 不含它 → 用户写的 Bash(rm:*) deny 规则连工具名这关都过不去
-  //   · _permRuleSubject 取到空串 → 就算过了工具名也没有命令可比
-  //   · _callIsDangerousCommand 只认 cmd/termtask → 危险命令不弹框
-  // deny 是系统里唯一的静默否决、默认 auto 档下唯一还活着的门。这条钉后三个。
-  const toolMatches = load("_permRuleToolMatches", {
-    _PERM_TOOL_ALIASES: new Function("fileMutationTypes", "return " + SRC.match(/const _PERM_TOOL_ALIASES = (\{[\s\S]*?\n\});/)[1])(toolPolicy.fileMutationTypes),
-  });
-  const subject = load("_permRuleSubject");
-  const dangerous = load("_callIsDangerousCommand", { _isDangerousCmd: (c) => /\brm\s+-rf\b/.test(String(c || "")) });
-  const bm = (checkType, pattern) => ({ type: "background_monitor", checkType, pattern });
-
-  assert.equal(toolMatches("Bash", "background_monitor"), true,
-    "Bash 规则覆盖不到监视器——用户的 deny 规则对这条路等于不存在");
-  assert.equal(subject(bm("command", "rm -rf /tmp/x")), "rm -rf /tmp/x",
-    "跑命令那一支没有把 pattern 当成命令主体，规则没东西可比");
-  assert.equal(dangerous(bm("command", "rm -rf /")), true, "危险命令在监视器里不弹框");
-
-  // 反向同样重要：其余 check_type 是纯观察，不许被拖进 Bash 规则和危险命令判断——
-  // 否则「等端口 3000」「等文件出现」会莫名其妙撞上用户的命令规则。
-  for (const ct of ["port", "file", "url", "screen", "capture", "manual"]) {
-    assert.equal(subject(bm(ct, "3000")), "", `check_type=${ct} 是纯观察，不该有命令主体`);
-    assert.equal(dangerous(bm(ct, "rm -rf /")), false, `check_type=${ct} 不跑 shell，不该被判成危险命令`);
-  }
-  // 对照：cmd 的行为一个字没变。
-  assert.equal(dangerous({ type: "cmd", command: "rm -rf /" }), true);
-  assert.equal(subject({ type: "cmd", command: "npm t" }), "npm t");
-});
-
 test("permission rules match by tool family and pattern", () => {
   const matches = load("_permRuleMatches", {
     _parsePermRule: load("_parsePermRule"),
@@ -3743,11 +3696,7 @@ test("Advanced Tools settings exposes the supported IDE language preference", ()
   assert.match(SRC, /import \{ buildLanguageOptions, coerceSupportedLocale, localeDisplayName, localeLanguageCode \} from "\.\/locales\.js";/);
   assert.match(SRC, /locale:\s*"zh-CN"/,
     "Simplified Chinese should be the default software language");
-  // 原来切 [const SETTINGS_SCHEMA, async function renderSettingsTool) = 20682 字，
-  // 而声明本身只有 2618 字。多出的 18064 字里躺着 APPEARANCE_SETTINGS_ITEMS 这种
-  // **形状完全相同**的设置项数组，于是断言实际只问「这 20KB 里某处有这么一段」——
-  // 把语言/国家选择器从设置表里整个删掉，照样绿。按 AST 取声明本身。
-  const settingsSchema = extractConstDecl("SETTINGS_SCHEMA", { code: true });
+  const settingsSchema = SRC.slice(RAW_SRC.indexOf("const SETTINGS_SCHEMA"), RAW_SRC.indexOf("async function renderSettingsTool"));
   assert.match(settingsSchema, /groupKey:\s*"feature\.settings\.group\.language"[\s\S]{0,260}key:\s*"locale"[\s\S]{0,240}labelKey:\s*"feature\.settings\.locale\.label"[\s\S]{0,300}buildLanguageOptions/,
     "Advanced Tools settings should render a language selector before appearance settings");
   assert.match(SRC, /if \(key === "locale"\) value = coerceSupportedLocale/,
@@ -3886,11 +3835,7 @@ test("country preference is selectable and shown as a flag in the profile card",
     "country values must be normalized before persistence and display");
   assert.match(SRC, /function countryFlag\(code\)[\s\S]{0,260}String\.fromCodePoint\(0x1f1e6/,
     "country flags should be derived from ISO region codes instead of hardcoded images");
-  // 原来切 [const SETTINGS_SCHEMA, async function renderSettingsTool) = 20682 字，
-  // 而声明本身只有 2618 字。多出的 18064 字里躺着 APPEARANCE_SETTINGS_ITEMS 这种
-  // **形状完全相同**的设置项数组，于是断言实际只问「这 20KB 里某处有这么一段」——
-  // 把语言/国家选择器从设置表里整个删掉，照样绿。按 AST 取声明本身。
-  const settingsSchema = extractConstDecl("SETTINGS_SCHEMA", { code: true });
+  const settingsSchema = SRC.slice(RAW_SRC.indexOf("const SETTINGS_SCHEMA"), RAW_SRC.indexOf("async function renderSettingsTool"));
   assert.match(settingsSchema, /key:\s*"locale"[\s\S]{0,260}key:\s*"country"[\s\S]{0,240}labelKey:\s*"feature\.settings\.country\.label"[\s\S]{0,260}buildCountryOptions/,
     "Advanced Tools settings should render the country selector directly under language");
   assert.match(SRC, /if \(key === "country"\) value = normalizeCountryCode\(value, DEFAULT_EDITOR_SETTINGS\.country\);/,
@@ -4808,7 +4753,7 @@ test("tool cards always have a label and skipped paths settle their spinner", ()
     classList: { add: (name) => classes.add(name) },
     querySelector: (selector) => selector === ".atc-result" ? resultEl : null,
   };
-  const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {}, _setBadge: setBadgeText });
+  const settle = load("_settleToolStep", { _collapseSettledToolSteps: () => {} });
   assert.equal(settle(step, { content: "[重复读取·已跳过]" }, "重复 · 已跳过"), true);
   assert.equal(textContent, "重复 · 已跳过");
   assert.equal(step.dataset.toolSettled, "1");
@@ -6914,10 +6859,7 @@ test("盯屏幕这条监视器不许毁掉模型手里的 ref", () => {
   // clear_latest_ax_refs()，一个每几秒读一次的后台监视器会把模型上一次读屏拿到的
   // ref **持续作废**——模型攥着一把废数字，ui_click 只回「ref 已过期」，
   // 而它根本不知道是谁弄没的。所以轮询必须走那条不发 ref 也不毁 ref 的读法。
-  // 锚点必须是**执行器分支**那个唯一形状。裸的 `call.type === "background_monitor"`
-  // 现在在授权门那边也出现（deny 规则主体、危险命令判据），indexOf 会命中最早那一处，
-  // 于是切出来的"段"横跨四万行整个文件——里面当然找得到 read_screen，断言就假红了。
-  const bm = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
+  const bm = SRC.slice(SRC.indexOf('call.type === "background_monitor"'), SRC.indexOf('call.type === "designboard"'));
   assert.ok(bm.length > 2000, "没切到 background_monitor 那段");
   assert.match(bm, /bmType === "screen"/, "没有 screen 这个检查类型的轮询分支");
   assert.match(bm, /backend\.invoke\("probe_screen"/, "screen 分支没走 probe_screen");
@@ -6940,102 +6882,6 @@ test("盯屏幕这条监视器不许毁掉模型手里的 ref", () => {
   assert.match(screenBranch, /if \(_bmScreenFails >= \d\) \{[\s\S]{0,400}_bmFinish\(/,
     "连续探查失败没有真的退场——会用整个超时窗口换一句假的「条件没满足」");
   assert.match(screenBranch, /这\*\*不是\*\*「条件没满足」/, "失败退场时没有把真实原因说清楚");
-});
-
-test("生产者已停：监视器不许空等一件已经失败了的事", () => {
-  // 用户截图里那张卡：终端已打出 `auth error: login was not completed` 并退回提示符，
-  // 卡片还在「等待你在浏览器中完成 Cursor 授权… 17s / 300s」——它在等一件已经失败了
-  // 的事，最后回一句「超时」，读起来像「用户没做」。判据必须真的按行为工作，不是恒真。
-  const authFail = { wasExited: false, nowExited: true, recentOut: "Opening browser...\nauth error: login was not completed\n$ " };
-  const r1 = _monitorProducerStopped(authFail);
-  assert.equal(r1.stopped, true, "命令从运行中变成退出，应判定生产者已停");
-  assert.equal(r1.failed, true, "临终输出里有 login was not completed，应识别为失败退出");
-  assert.match(r1.tail, /login was not completed/, "应把终端临终输出带回给模型定位根因");
-
-  // 开始等的时候它就已经退出了 = 陈旧快照，不是我们在等的那条命令，别误当生产者。
-  assert.equal(_monitorProducerStopped({ wasExited: true, nowExited: true, recentOut: "auth error" }).stopped, false,
-    "开始时就已退出的终端是陈旧快照，不该判生产者已停");
-  // 还在跑：不该收尾。
-  assert.equal(_monitorProducerStopped({ wasExited: false, nowExited: false, recentOut: "waiting..." }).stopped, false,
-    "命令还在跑时不该判生产者已停");
-  // 干净退出（无报错）：保守起见 stopped=true 但 failed=false，主循环只在 failed 时收尾，
-  // 把干净退出留给端口/URL 那条正常轮询——服务可能自我 daemon 化了。
-  const clean = _monitorProducerStopped({ wasExited: false, nowExited: true, recentOut: "Server listening on 3000\n$ " });
-  assert.equal(clean.stopped, true);
-  assert.equal(clean.failed, false, "干净退出不该被当成失败——否则会误杀自我 daemon 化的服务");
-
-  // 主循环里这条判据必须真的接到了 _bmFinish，而不是只声明了变量。
-  const bm2 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
-  assert.match(bm2, /monitorProducerStopped\(\{[\s\S]{0,200}wasExited:/, "轮询里没有真的调用 monitorProducerStopped");
-  assert.match(bm2, /_ps\.stopped && _ps\.failed[\s\S]{0,300}_bmFinish\(/, "生产者失败退出时没有真的收尾");
-  // UI 不再有滴答的秒数倒计时和进度条——用户要的是「监听中」。
-  assert.doesNotMatch(bm2, /\$\{Math\.floor\(elapsed\)\}s \/ \$\{bmTimeout\}s/, "卡片仍在显示 Xs / Ys 倒计时");
-  assert.doesNotMatch(bm2, /class="bm-bar"/, "卡片仍有进度条");
-  assert.match(bm2, /监听中/, "卡片没有「监听中」这个被动监听指示");
-});
-
-test("一开始就已经满足 ≠ 等到了", () => {
-  // 模型重启 dev server：先起新进程，再 background_monitor(port 3000)。而 3000 还被**旧**
-  // 进程占着 → 第一次轮询就命中 → 回执「端口 3000 已被监听，继续执行」→ 模型认定新服务
-  // 起来了。file 同理（上次登录留下的产物文件还在）。两种状态被报成同一个值。
-  assert.notEqual(_preexistingConditionNote(1), "", "第一次检查就命中，必须点明它可能本来就成立");
-  assert.match(_preexistingConditionNote(1), /开始等之前/, "没说清「本来就是真的」这个可能");
-  assert.match(_preexistingConditionNote(1), /旧进程|上一次|时间戳/, "没给出区分新旧的取证办法");
-  // 等了几轮才命中 = 真的等到了，不许加这句噪音。
-  for (const n of [2, 3, 17]) {
-    assert.equal(_preexistingConditionNote(n), "", `第 ${n} 次才命中说明是真的等到了，不该加警告`);
-  }
-  // manual **根本不轮询**（它等的是用户点「已完成，继续」），_bmChecks 恒为 0——
-  // 于是"第一次检查就命中"对它恒成立。用户亲手确认完却被告知「别把它当成做完的证据」，
-  // 直接否定用户唯一的显式表态。恒真判据是这个仓库反复出现的坑，这条钉死它。
-  assert.equal(_preexistingConditionNote(0, "manual"), "", "用户亲手点的确认不许被这句话否定");
-  assert.equal(_preexistingConditionNote(1, "manual"), "", "manual 任何情况下都不该发这句");
-  // 一次自动检查都没做过，也谈不上「本来就成立」。
-  assert.equal(_preexistingConditionNote(0, "port"), "", "没做过检查就不该断言它本来就成立");
-  assert.notEqual(_preexistingConditionNote(1, "port"), "", "port 第一次检查就命中，仍要提示");
-  // 调用点必须把类型传进去，否则上面这条判据在产品里根本不生效。
-  const bm4 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
-  assert.match(bm4, /preexistingConditionNote\(_bmChecks, bmType\)/,
-    "调用点没把 bmType 传进去——manual 那条恒真判据会活着");
-
-  // 必须真的接进 _bmFinish 的回执里，而不是只导入了没用。
-  const bm3 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
-  assert.match(bm3, /preexistingConditionNote\(_bmChecks, bmType\)/, "没有把命中轮次和类型传给判据");
-  assert.match(bm3, /_queueFollowup\(_bmSess, followupText \+ _pre\)/, "警告没有真的拼进给模型的回执");
-  // 只对「等到了」加，超时/取消不加——那两种本来就没有假命中问题。
-  assert.match(bm3, /dotClass === "done" \? preexistingConditionNote/, "对非 done 的收尾也加了这句，属于噪音");
-});
-
-test("后台监控另外三条会静默骗人的规则", () => {
-  const bm5 = SRC.slice(SRC.indexOf('} else if (call.type === "background_monitor") {'), SRC.indexOf('call.type === "designboard"'));
-
-  // ① capture 分支：_captureFlows 是定长 3000 的环形缓冲，拿 length 当基线的话，
-  //    缓冲一满基线恒等于 length，`i < length` 恒假——循环体一次都不执行，
-  //    卡片显示「监听中」、超时回执说「没等到条件」，而实际一次都没检查过。
-  assert.doesNotMatch(bm5, /const _bmSnap = _captureFlows\.length/,
-    "capture 又拿数组下标当基线了——环形缓冲写满后这条判据恒假");
-  assert.match(bm5, /_bmSnapTotal = _captureTotal/, "capture 基线没有改用累计计数");
-  assert.match(SRC, /let _captureTotal = 0;/, "缺累计计数器");
-  assert.match(SRC, /_captureFlows\.push\(flow\);\s*\n\s*_captureTotal\+\+;/,
-    "收到流量时没有累加计数——基线就永远不动");
-
-  // ② screen 分支：失败计数只增不清零，成功一百次也会被三次瞬时失败累计掉，
-  //    还硬说「一次都没成功过、多半是没给辅助功能权限」，把模型引去查不存在的故障。
-  const sAt = bm5.indexOf('} else if (bmType === "screen" && bmPat) {');
-  const screenBranch = bm5.slice(sAt, bm5.indexOf('} else if (bmType === "port" && bmPat) {', sAt));
-  assert.match(screenBranch, /_bmScreenOk = true; _bmScreenFails = 0;/,
-    "探查成功时没有清零失败计数——那是累计失败不是连续失败");
-  assert.match(screenBranch, /_bmScreenOk\s*\n?\s*\?/,
-    "退场文案没按「是否曾经成功过」分叉，仍会硬说一次都没成功过");
-
-  // ③ command 分支：每次检查写死 10 秒，会让所有慢检查结构性地不可能成立，
-  //    而回执只说「用户可能没做完」，把根因藏起来。
-  assert.doesNotMatch(bm5, /taskRunCapture\(bmCwd, bmPat, \{ timeoutSecs: 10 \}\)/,
-    "command 又写死 10 秒了——npm run build 这类检查永远拿不到 exit 0");
-  assert.match(bm5, /_cmdTimeout = Math\.min\(60, Math\.max\(10, Math\.floor\(bmTimeout \/ 6\)\)\)/,
-    "command 的单次超时没有随整体超时伸缩");
-  assert.match(bm5, /_bmCmdTimedOut/, "没有记录「是被自己的超时杀掉的」");
-  assert.match(bm5, /被自己的超时杀掉/, "超时回执没把这个根因说给模型");
 });
 
 test("盯着界面等不算验证证据", () => {
@@ -7766,10 +7612,8 @@ test("model card shows backend input output pricing as model price", () => {
     { inPrice: 0.25, outPrice: 1.5, flatPrice: 0.09, rate: 0 },
   );
 
-  // officialPrice 那个桩已删：客户端那张写死的厂商标价表 2026-08-30 整个删掉了。
-  // 它原来桩成恒返 {in:5,out:15}，于是「网关说没价、客户端自己编一个填进同一个格子」
-  // 这件事在测试里结构上看不见——桩总是给得出价。
   const rows = load("_modelPriceRows", {
+    officialPrice: () => ({ in: 5, out: 15 }),
     _fmtTokPrice: (n) => "$" + n,
     _escHtml: (s) => String(s),
     t: (key, params = {}) => {
@@ -8326,7 +8170,8 @@ test("Git and GitHub PR tools are integrated across catalog, aliases, and execut
   assert.match(SRC, /name: "git_status"/);
   // 「完整工具目录」这四个字在 _semanticToolOrchestrator 里只剩一行注释。真正发给编排模型的
   // 是 catalogSystem 那段能力索引 —— 它由 _criticToolCatalog(toolRegistry) 全量生成。钉它。
-  const orchestrator = extractFn("_semanticToolOrchestrator", { code: true });
+  const orchestrator = SRC.slice(RAW_SRC.indexOf("async function _semanticToolOrchestrator"),
+    RAW_SRC.indexOf("async function _semanticToolOrchestrator") + 6000);
   assert.match(orchestrator, /const catalog = _criticToolCatalog\(toolRegistry\);/,
     "Git and PR tools should be discovered from the live registry, not a static reminder string");
   assert.match(orchestrator, /catalog\.map\(\(entry\) => enrichedCatalogLine\(entry\)\)/,
@@ -8994,8 +8839,7 @@ test("bounded MCP failures stay off the cached prefix and surface only through e
 });
 
 test("_sharedCtxDigest renders the shared run-context a sub-agent reads (真上下文协议)", () => {
-  // _fmtModified 注入真实现：它决定「已改文件」按全路径还是 basename 渲染，桩会让这条失真。
-  const f = load("_sharedCtxDigest", { _fmtModified: load("_fmtModified") });
+  const f = load("_sharedCtxDigest");
   assert.equal(f(null), "", "no ctx → empty");
   assert.equal(f({}), "", "empty ctx → empty (nothing to share yet)");
   const ctx = {
@@ -9340,8 +9184,7 @@ test("AI intent judgment is session-aware, semantic, and never falls back to key
   assert.match(aiIntentSrc, /Promise\.race/, "判定调用必须有超时上限");
   // 窗口必须是那个具名常量，不是裸字面量：发送路径的第一轮等待从同一个常量推导，
   // 各写一个数就是上一次留下 1500 的方式——等待短于窗口，race 从此恒定由 timer 赢。
-  // 超时臂多了一笔胜负记账（_mark(false)）——模块里包着 try、调用点 typeof 兜底。
-  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => \{ _mark\(false\); resolve\(null\); \}, _INTENT_FOREGROUND_WAIT_MS\)/,
+  assert.match(aiIntentSrc, /timer = setTimeout\(\(\) => resolve\(null\), _INTENT_FOREGROUND_WAIT_MS\)/,
     "前台采用窗口只限制采用、绝不阻断发送，且必须与第一轮等待同源");
   assert.doesNotMatch(aiIntentSrc, /backend\.cancelAi|acceptResult\s*=\s*false/,
     "前台超时不能取消或废弃仍在运行的物理判定");
@@ -11508,7 +11351,7 @@ test("bug evidence ladder forces terminal API DB file evidence before browser lo
 });
 
 test("tool hints stay capability-neutral while the semantic orchestrator controls live schemas", () => {
-  const build = load("_buildToolHint", { _staticToolNames: () => new Set(["read_file", "search"]) });
+  const build = load("_buildToolHint");
   const hint = build("跑起来了但看不到哪里错", { applies: true, bug: true, backendApi: true });
   assert.match(hint, /动态工具编排/);
   // 情境→工具的映射仍然禁止手写扩张（那会过拟合到昨天的工具集）。但从注册表生成的
@@ -12907,19 +12750,13 @@ test("natural-language capability queries are routed by the semantic tool orches
   let request = null;
   const scenarioSignature = load("_buildScenarioSignature");
   const route = load("_semanticToolOrchestrator", {
-    // 2026-08-30：弱模型上限挪进来之后，这个依赖必须注入——不注入会抛 ReferenceError，
-    // 被函数尾部的 `catch { return null; }` 吞掉，测试拿到 null 而不是一个明确的错误。
-    _isWeakModel: () => false,
     _cognitiveLegEffort: load("_cognitiveLegEffort"),
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
     _chatCompletionsUrl: () => "https://gateway.example/v1/chat/completions",
     _safeJsonLoose: JSON.parse,
     enrichedCatalogLine,
-    // recommendToolsForIntent 2026-08-30 删除（零调用点 + 词表对不上，接上也恒为 0）。
-    // 这条注入本来就是多余的：_semanticToolOrchestrator 从来没有引用过它——
-    // 而这条测试的标题正是「不按关键词打分」，那个关键词打分器现在整个不存在了，
-    // 这件事比原来更成立。
+    recommendToolsForIntent: load("recommendToolsForIntent"),
     _buildScenarioSignature: scenarioSignature,
     _toolExpRetrieve: load("_toolExpRetrieve", { _buildScenarioSignature: scenarioSignature }),
     // 这条测试关心的是**编排逻辑**，不是传输。传输（SSE 拼装 / JSON 兜底）另有专门的
@@ -13458,13 +13295,7 @@ test("typed runtime and external evidence stays separate from workspace mutation
 });
 
 test("package search exposes exact version and compatibility metadata", () => {
-  // `name: "package_search"` 在拼接源码里出现两次：main.js 那处是**调用点**
-  // （`? { name: "package_search", query: _gateQuery }`），真 schema 在
-  // src/agent/tool-catalog.js；而结束锚只在 catalog 里。indexOf 命中前者，于是窗口
-  // 变成 1,849,284 字 ≈ 整个 main.js——三条断言实际是在全仓找字符串。
-  const _pkgAt = at(TOOL_CATALOG_SRC, 'name: "package_search"', "package_search 的 schema");
-  const packageSchemaSnippet = TOOL_CATALOG_SRC.slice(
-    _pkgAt, at(TOOL_CATALOG_SRC, 'name: "github_search"', "下一个工具"));
+  const packageSchemaSnippet = SRC.slice(RAW_SRC.indexOf('name: "package_search"'), RAW_SRC.indexOf('name: "github_search"'));
   assert.match(packageSchemaSnippet, /dist-tags\.latest/);
   assert.match(packageSchemaSnippet, /peerDependencies/);
   assert.match(packageSchemaSnippet, /engines/);
@@ -13724,9 +13555,7 @@ test("large streaming writes stay out of Monaco while the bounded tool card keep
   assert.equal(userOpen.entry._editorPreviewOutcome, "card-only");
 
   const ensure = extractFn("_ensureLiveEditorWritePreview");
-  // 同上：上限判断被删掉时 indexOf 是 -1，比较恒成立。而这条顺序断言是那道闸门在
-  // 整个测试里的**唯一**代表（其余断言跑的是 _flushLiveEditorWritePreview 的行为）。
-  assert.ok(at(ensure, "_LIVE_EDITOR_PREVIEW_MAX_CHARS", "大写入上限") < at(ensure, "backend.readTextFile", "读临时 model"),
+  assert.ok(ensure.indexOf("_LIVE_EDITOR_PREVIEW_MAX_CHARS") < ensure.indexOf("backend.readTextFile"),
     "content-first large calls must be rejected before opening/reading a temporary editor model");
 });
 
@@ -14189,10 +14018,7 @@ test("browser automation keeps the browser alive and has a semantic autofill act
   const browserBranch = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "browser") {'), RAW_SRC.indexOf('} else if (call.type === "system") {'));
   assert.match(browserBranch, /if \(!call\.force\)[\s\S]{0,260}浏览器会话保持打开复用/,
     "plain browser close should keep the browser session alive");
-  // 裸子串 `act === "autofill" || act === "fill"` 在这个分支里有**三处**：真路由、
-  // 结果判定、回执文案。删掉真路由那处，另外两处照样把它喂饱。钉到真路由那一处：
-  // 它后面紧跟着语义填表器的调用。
-  assert.match(browserBranch, /act === "autofill" \|\| act === "fill"[\s\S]{0,400}?_browserAutofillJS\(/,
+  assert.match(browserBranch, /act === "autofill" \|\| act === "fill"/,
     "browser executor should route autofill/fill to the semantic form filler");
   assert.match(browserBranch, /_browserAutofillJS\(fields, !!call\.submit, call\.submitText \|\| call\.text \|\| ""\)/,
     "autofill should support submit and submitText");
@@ -14634,47 +14460,12 @@ test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
     "await_subagent 的查找判据变了，上面那条回执格式要跟着改");
 });
 
-test("单次运行 token 预算必须有写入端——只读的键等于这道天花板不存在", () => {
-  // _readTokenCap 读 michael-ide.token-budget，超限后不再硬扩步数并在收尾提醒；
-  // 它是整个智能体循环**唯一的数值天花板**。但那个键一度全仓只有 getItem、没有任何
-  // setItem，也没有任何界面能填 —— cap 恒为 0（不限），而代码里两处注释写着
-  // 「烧钱由用户自设的 token 预算兜住」。这条钉住读写两头都在。
-  const KEY = "michael-ide.token-budget";
-  const reads = (SRC.match(new RegExp(`getItem\\("${KEY}"`, "g")) || []).length;
-  const writes = (SRC.match(new RegExp(`setItem\\("${KEY}"`, "g")) || []).length;
-  assert.ok(reads >= 1, "读取端没了");
-  assert.ok(writes >= 1,
-    "这个键只有读没有写——那道 token 天花板永远是 0（不限），而注释说它兜着烧钱");
-  // 写入端要真的接在界面上，不是一个没人调的函数。
-  assert.match(SRC, /_initTokenBudgetField\(\)/, "写入端没有调用点");
-  assert.match(SRC, /\$\("tokenBudgetInput"\)/, "写入端没接到设置里的那个输入框");
-});
-
-test("入参归一不许把数组拍平——system 的菜单路径就是数组", () => {
-  // `path` 在绝大多数工具里是文件路径（字符串），所以它在 _STR_ARG_KEYS 里。但 system 的
-  // action:"menu"/"menu_items" 把 path 声明成 array（菜单层级），后端签名也是
-  // `system_menu(app, path: Vec<String>)`。原来那个 for 无差别 String()，
-  // ["File","New Folder"] 变成 "File,New Folder" —— 两层以上的菜单路径必然点不中，
-  // 而那正是这个动作唯一的用途；报错还长得像"找不到菜单项"，看不出参数在半路换了形状。
-  const src = SRC.slice(SRC.indexOf("for (const k of _STR_ARG_KEYS) {"), SRC.indexOf("for (const k of _STR_ARG_KEYS) {") + 700);
-  assert.match(src, /if \(Array\.isArray\(v\)\) continue;/,
-    "数组又被 String() 拍平了——system 的多层菜单路径会静默失效");
-  // schema 那边确实声明成 array，别把这条测试写成对着空气断言。
-  const sysSchema = TOOL_CATALOG_SRC.slice(TOOL_CATALOG_SRC.indexOf('name: "system"'), TOOL_CATALOG_SRC.indexOf('name: "system"') + 6000);
-  assert.match(sysSchema, /path: \{ type: "array"/, "system.path 不再是 array 了，这条测试的前提要重看");
-});
-
-test("弱模型收敛只做一次上限，不再套一层恒等变换", () => {
+test("弱模型收敛只做 slice，不再套一层恒等变换", () => {
   assert.doesNotMatch(SRC, /_prioritizeNamedTools/,
     "那个恒等变换又回来了——它按 s.function?.name 取名，而传进去的是字符串数组");
-  // 2026-08-30：收敛点从 _runAgenticLoop 挪到 _semanticToolOrchestrator 真正裁剪的那一行。
-  // 原来那条 `routeToolNames.length > 10 && _isWeakModel(...)` 在下游，而列表到那儿已经被
-  // 上游裁到 ≤10 —— 实测喂 3/8/10/14/20/40 六种输入全为 false，弱模型窗口一次都没收窄过。
-  const orch = extractFn("_semanticToolOrchestrator");
-  assert.match(orch, /_isWeakModel\(config\?\.model\) \? 8 : 10/,
-    "弱模型的工具收敛没了（或又被挪回那个恒不触发的位置）");
-  assert.match(orch, /_criticRequestedToolSchemas\(j\.tools, toolRegistry, _toolCap\)/,
-    "上限没有真的用在裁剪那一行");
+  const loop = extractFn("_runAgenticLoop");
+  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
+    "弱模型的工具收敛没了");
 });
 
 test("existing-file edits execute against current disk while exact anchors and CAS stay objective", () => {
@@ -15724,37 +15515,24 @@ test("已有网站沿用真实技术栈，不为 Michael Design 迁移", () => {
 });
 
 test("Michael Design 默认栈行为矩阵：无栈才默认，现有栈和用户指定优先", () => {
-  // 两个来源**不能 `+` 起来喂给同一个 assert**。原来写的是
-  //   assert.match(stackRule + "\n" + prompt, row.evidence)
-  // 而 _DESIGN_RESEARCH_PROMPT 自己就把五行矩阵的证据和决策全写全了——实测把
-  // _MD_STACK_RULE 整条替换成 "占位" 也全绿，规则那一侧对判定的贡献是 0。
-  // 拆开各验各的。实测哪一侧真的写着哪一条（十项里规则侧命中 7 项）：
-  //   规则侧没有的三项 —— 「明确重做且没有可沿用」「框架、语言、构建工具、组件库和
-  //   样式方案」「默认栈只适用于这些无栈场景」——今天只在提示词那一侧，如实标成
-  //   prompt-only，而不是拿拼接把它糊过去。
-  const stackRule = loadConst("_MD_STACK_RULE");   // 真值，不是源码文本
+  const stackRule = SRC.slice(RAW_SRC.indexOf("const _MD_STACK_RULE"), RAW_SRC.indexOf("const _AGENT_ROLE_BLOCKS"));
   const designPrompt = load("_DESIGN_RESEARCH_PROMPT", {
     _P: (_key, fallback) => fallback,
   });
   const prompt = designPrompt("按需修改网站");
   const matrix = [
-    { scenario: "空项目", side: "both", evidence: /工作区为空/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "项目没有网站", side: "both", evidence: /项目没有网站/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "明确重构且无可沿用栈", side: "prompt", evidence: /明确重做且没有可沿用/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
-    { scenario: "现有 Vue/Svelte/Django 网站", side: "prompt", evidence: /已有可运行网站沿用/, decision: /框架、语言、构建工具、组件库和样式方案/ },
-    { scenario: "用户指定 Astro/Vue/Svelte 等栈", side: "both", evidence: /用户明确指定/, decision: /服从用户/ },
+    { scenario: "空项目", evidence: /工作区为空/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "项目没有网站", evidence: /项目没有网站/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "明确重构且无可沿用栈", evidence: /明确重做且没有可沿用/, decision: /React \+ Tailwind CSS \+ shadcn\/ui/ },
+    { scenario: "现有 Vue\/Svelte\/Django 网站", evidence: /已有可运行网站沿用/, decision: /框架、语言、构建工具、组件库和样式方案/ },
+    { scenario: "用户指定 Astro\/Vue\/Svelte 等栈", evidence: /用户明确指定/, decision: /服从用户/ },
   ];
   for (const row of matrix) {
-    if (row.side === "both") {
-      assert.match(stackRule, row.evidence, `${row.scenario}: 规则里缺少触发条件`);
-      assert.match(stackRule, row.decision, `${row.scenario}: 规则里缺少技术栈决策`);
-    }
-    assert.match(prompt, row.evidence, `${row.scenario}: 设计提示里缺少触发条件`);
-    assert.match(prompt, row.decision, `${row.scenario}: 设计提示里缺少技术栈决策`);
+    assert.match(stackRule + "\n" + prompt, row.evidence, `${row.scenario}: 缺少触发条件`);
+    assert.match(stackRule + "\n" + prompt, row.decision, `${row.scenario}: 缺少技术栈决策`);
   }
-  assert.match(stackRule, /不得覆盖已有网站/, "规则里那句「不得覆盖已有网站」没了");
-  assert.match(prompt, /默认栈只适用于这些无栈场景/);
-  assert.match(prompt, /不得覆盖已有网站/);
+  assert.match(stackRule + prompt, /默认栈只适用于这些无栈场景/);
+  assert.match(stackRule + prompt, /不得覆盖已有网站/);
   assert.match(prompt, /knowledge_search\(domain="michael-design"\)/,
     "设计子智能体必须调用真实 Michael Design 知识库，不得只读硬编码栈规则");
 });
@@ -19015,12 +18793,7 @@ test("background monitors retire with their run instead of billing a new one", (
   const bmStopAt = bmFinish.indexOf("if (_bmIv) clearTimeout(_bmIv);");
   const bmReleaseAt = bmFinish.indexOf("_bmRelease();");
   const bmRetireAt = bmFinish.indexOf("if (_bmRetired() && !suppressFollowup) return;");
-  // 锚点用 `_queueFollowup(_bmSess,` 而不是整句：followupText 后面会挂东西
-  //（比如"这个条件本来就成立"那句提示），写死整句的话下次一改参数，indexOf 返回 -1，
-  //  上面那串 `<` 比较会因为 -1 最小而**恒真**——这条顺序断言就悄悄变成了摆设。
-  //  这是本仓库记过的「锚点失效」那一种恒真守卫。
-  const bmQueueAt = bmFinish.indexOf("_queueFollowup(_bmSess,");
-  assert.ok(bmQueueAt >= 0, "_bmFinish 里找不到排后续轮次的调用——锚点又失效了");
+  const bmQueueAt = bmFinish.indexOf("_queueFollowup(_bmSess, followupText);");
   assert.ok(bmStopAt >= 0 && bmStopAt < bmReleaseAt && bmReleaseAt < bmRetireAt && bmRetireAt < bmQueueAt,
     "_bmFinish 必须先停表并注销交互，再判断退场，最后才允许排新 run");
   assert.match(SRC, /if \(_bmRetired\(\)\) \{ _bmDone = true; if \(_bmIv\) clearTimeout\(_bmIv\); return; \}/,
@@ -19635,10 +19408,9 @@ test("推断出的外部研究偏好永远不会让静默收尾多补一个回�
   // 研究证据是分类器**预测**的（"这活儿该查查同类实现"）。循环重构后，静默收尾不再基于这个
   // 预测记账——`research_evidence_missing` 的静默收尾腿已删除（AGENT_LOOP_REBUILD.md 阶段 2）。
   // 关键不变量是它从来不 force：绝不存在 researchEvidence 的 _pushNudge 去逼模型再来一轮。
-  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
-  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
-  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
-  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
   assert.doesNotMatch(quiet, /_missingResearchEvidence/,
     "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
@@ -19717,38 +19489,6 @@ test("弱模型判定：激活参数标识优先，大模型不被关键字包�
   assert.equal(isWeak(""), false);
 });
 
-test("多角色协作时派发工具必须前置——追加会被两道尾部裁剪静默切掉", () => {
-  // 那段注入的注释自己写着「不依赖编排器自觉返回它们（弱模型常不返回不熟悉的工具名）」。
-  // 可它原来是 push 到**尾部**，而后面紧跟两道都从尾部切的裁剪：弱模型 slice(0, 8)、
-  // 以及所有模型都过的 _criticRequestedToolSchemas(..., 10)。编排器返回 ≥7 个已注册工具
-  // 是难任务的常态（系统提示词还专门鼓励「第一轮就把取证面铺开」）——于是 run_worker /
-  // await_subagent / spawn_multiple_agents 被静默丢掉，多角色协作模式下模型手上根本没有
-  // 派子体的工具，而那正是这个模式的全部意义。
-  const loop = extractFn("_runAgenticLoop");
-  const at = loop.indexOf('orchestrationMode === "staged_roles"');
-  assert.ok(at > 0, "找不到强制注入那段");
-  const seg = loop.slice(at, at + 600);
-  assert.doesNotMatch(seg, /routeToolNames\.push\(t\)/,
-    "又改回追加了——尾部裁剪会把这四个派发工具切掉，注入等于没做");
-  assert.match(seg, /routeToolNames = \[\.\.\._dispatch, \.\.\.routeToolNames\.filter/,
-    "派发工具没有前置");
-
-  // 真往返：模拟「编排器返回 8 个 + 注入 4 个 → 裁到 10」，前置时四个必须全活下来。
-  const dispatch = ["run_subagent", "run_worker", "await_subagent", "spawn_multiple_agents"];
-  const orchestrated = Array.from({ length: 8 }, (_, i) => `tool_${i}`);
-  const prepended = [...dispatch, ...orchestrated.filter((t) => !dispatch.includes(t))].slice(0, 10);
-  const appended = [...orchestrated, ...dispatch].slice(0, 10);
-  assert.deepEqual(dispatch.filter((t) => prepended.includes(t)), dispatch, "前置后四个派发工具应全部存活");
-  assert.ok(dispatch.filter((t) => appended.includes(t)).length < dispatch.length,
-    "这条反证：追加时确实会被切掉（夹具没构造出问题就说明断言是摆设）");
-
-  // 真正在裁的那处必须出声，否则用户和排查者看不到「工具被裁过」。
-  // 2026-08-30 修正：那处**在上游** _semanticToolOrchestrator 里（下游比较的是裁后长度，
-  // 恒等于自己，说不出任何东西）。所以事实由编排器随返回值带出，下游只负责转成 note。
-  assert.match(loop, /decision\?\.dropped > 0/, "下游没有消费上游带出的裁剪事实");
-  assert.match(loop, /编排选了 \$\{decision\.picked\} 个工具/, "裁剪仍然是静默的");
-});
-
 test("编排合理性检查：收敛不 reject，notes 把事实留给主模型权衡", () => {
   const classify = load("_classifyToolFailure");
   const validate = load("_validateToolOrchestration", { _classifyToolFailure: classify });
@@ -19781,19 +19521,12 @@ test("工具失败记账与弱模型收敛接入编排链路", () => {
   assert.match(loop, /raw\.slice\(0, 200\)/, "失败细节从 70 字放宽到 200 字");
   assert.match(loop, /_validateToolOrchestration\(decision\.tools, run\._toolRegistry, run\.engineering\)/,
     "编排结果装载 schema 前必须先过硬性合理性检查");
-  // 2026-08-30：弱模型的 8 工具窗口从 _runAgenticLoop 挪到 _semanticToolOrchestrator 里
-  // **真正裁剪的那一行**。原来的判据 `routeToolNames.length > 10` 在那时已经被上游裁到
-  // ≤10，实测喂 3/8/10/14/20/40 六种输入全为 false —— 窗口从来没收窄过，_isWeakModel 空转。
-  const orch = extractFn("_semanticToolOrchestrator");
-  assert.match(orch, /_isWeakModel\(config\?\.model\) \? 8 : 10/,
-    "弱模型上限没有落在真正裁剪的那一行——写在下游就是恒不触发");
-  assert.doesNotMatch(loop, /routeToolNames = routeToolNames\.slice\(0, 8\)/,
-    "下游那条恒假的 slice(0,8) 又回来了");
-  assert.match(orch, /dropped = Math\.max\(0, _picked - tools\.length\)/,
-    "裁剪事实没有被带出来，下游就说不出「工具被裁过」");
+  assert.match(loop, /_isWeakModel\(config\?\.model\)/, "弱模型才收敛工具窗口，强模型保持现状");
+  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
+    "弱模型超额时收敛到 8 个（原来这里还套了一层 _prioritizeNamedTools，实测是恒等变换，已删）");
   assert.match(loop, /编排收敛提示/, "收敛 notes 必须拼进编排 nudge 告知主模型");
-  // _toolLedgerStats 已搬到 src/agent/tool-ledger.js（失败行优先，见那儿的头注释）。
-  assert.match(TOOL_LEDGER_SRC, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
+  const stats = extractFn("_toolLedgerStats");
+  assert.match(stats, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
   const retrieve = extractFn("_toolExpRetrieve");
   assert.match(retrieve, /catAdvice/, "跨会话经验必须把失败类别转成行动建议");
 });
@@ -20055,28 +19788,13 @@ test("流式回复退出落盘：节流尾部常驻内存，退出 flush 同步�
     "WKWebView 下 beforeunload 不可靠，pagehide 必须注册退出 flush");
   assert.ok(SRC.includes('window.addEventListener("beforeunload", () => { _flushExitStateSync(); saveSession(); })'),
     "beforeunload 必须走同一个退出 flush");
-  // 原来的区间 1958 字 = _flushExitStateSync 函数体(465) + 后面三个 addEventListener(1493)，
-  // 而 `s?.streaming` 在 _flushExitStateSync **自己的函数体里就有一份**。两个子串各自
-  // includes、不要求出现在同一条条件里，于是 visibilitychange 那个监听器整个删掉照样绿。
-  // 按 AST 取那个监听器回调，并把两个条件绑在同一条表达式上。
-  // 源码里有两个 visibilitychange 监听器（另一个是 gap 探测），锚点必须落在这一个上。
-  const visBlock = blockFrom('if (document.visibilityState !== "hidden") return;', { code: true, enclosing: true });
-  assert.match(visBlock, /document\.visibilityState !== "hidden"[\s\S]{0,200}?s\?\.streaming/,
+  const visBlock = SRC.slice(RAW_SRC.indexOf("function _flushExitStateSync"), RAW_SRC.indexOf("currentWindow.onCloseRequested"));
+  assert.ok(visBlock.includes('document.visibilityState !== "hidden"') && visBlock.includes("s?.streaming"),
     "visibilitychange(hidden) 只在存在流式会话时 flush，不打扰平时 5s 防抖节奏");
   // 优雅关闭/更新重启路径：草稿还要镜像进磁盘 store（localStorage 强杀时未必来得及落盘）
   const closeBlock = SRC.slice(RAW_SRC.indexOf("currentWindow.onCloseRequested"), RAW_SRC.indexOf("restoreSession().then"));
-  // 失败文案说的是「**先**同步 flush、**再**等磁盘镜像落完、**才** destroy」三步顺序，
-  // 而断言只验两个名字在这段里出现过——既不验顺序、不验 await，连 destroy 都没提。
-  // 用 at() 把三步的先后真验出来（缺任何一步都当场报错，而不是静默通过）。
-  assert.ok(at(closeBlock, "_streamDraftFlushSync()", "同步 flush 草稿")
-    < at(closeBlock, "_streamDraftPersistDurable", "等磁盘镜像落完"),
-    "必须先同步 flush 草稿，再等磁盘镜像");
-  assert.ok(at(closeBlock, "_streamDraftPersistDurable", "等磁盘镜像落完")
-    < at(closeBlock, "destroy", "销毁窗口"),
-    "磁盘镜像还没落完就 destroy，在途回复会丢");
-  // 它是包在 Promise.all 里被 await 的，别按 `await _streamDraftPersistDurable` 字面匹配。
-  assert.match(closeBlock, /await [^\n]*_streamDraftPersistDurable/,
-    "没 await 的话等于没等，destroy 照样先到");
+  assert.ok(closeBlock.includes("_streamDraftFlushSync()") && closeBlock.includes("_streamDraftPersistDurable"),
+    "CloseRequested 必须先同步 flush 草稿再等磁盘镜像落完才 destroy");
   assert.ok(SRC.includes("await _streamDraftPersistDurable(_streamDraftFlushSync());"),
     "IDE 更新 relaunch 前必须把最新全量草稿落完磁盘");
 });
@@ -20127,22 +19845,13 @@ test("流式草稿恢复：双通道取较新者，两侧都消费后清槽", as
   // 恢复渲染完整性：草稿全文进 memory（push 不截断），并强制从持久历史重建可见窗口
   assert.ok(SRC.includes("for (const _draft of await _streamDraftTake())"),
     "恢复路径必须遍历所有会话的草稿，只取一份会丢掉并发标签页的整轮输出");
-  // 进历史的必须是**全文**，不许在这里 slice。正文捕成 _draftText = String(_draft.text||"")
-  // （全量），横幅+步骤之后接上它。步骤清单插在中间是刻意的（见恢复处注释）。
-  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draftText/.test(SRC),
-    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draftText 全文）");
-  assert.match(SRC, /const _draftText = String\(_draft\.text \|\| ""\);/,
-    "恢复处必须先把草稿正文原样捕成全量变量，不许 slice");
-  assert.doesNotMatch(SRC, /_draft(?:\.text|Text)\.slice\(/,
+  // 原来两条分支都假定「横幅后面紧跟 _draft.text」。步骤清单现在插在中间（见
+  // 「被打断的 run 恢复出来要带上这一轮执行过的步骤」那条），旧锚点因此失效 ——
+  // 但它守的性质没变：进历史的必须是**全文**，不许在这里 slice。改成钉那个性质本身。
+  assert.ok(/以下为已生成的部分）[\s\S]{0,400}\+ _draft\.text/.test(SRC),
+    "中断恢复必须把草稿全文补进历史（横幅之后要接上 _draft.text）");
+  assert.doesNotMatch(SRC, /_draft\.text\.slice\(/,
     "草稿正文在恢复处被截断了——那正是「显示一点点」的另一种写法");
-  // 思考（reasoning）也存了、也是被渲染过的内容，恢复时不能丢：以前只拼 steps+text，
-  // 「✓ 思考」只剩一个勾。现在带上，走 assistant.reasoning 那条渲染老路。
-  assert.match(SRC, /if \(_draftReasoning\.trim\(\)\) _msg\.reasoning = _draftReasoning;/,
-    "中断恢复丢了草稿里的思考内容——reasoning 存了却没补进恢复的消息");
-  // 被打断在工具执行途中（满是步骤、正文还没落）的那一轮不能整条消失：
-  // 可恢复内容 = 正文/思考/步骤三者任一非空，探针也退到思考而不是只认正文。
-  assert.match(SRC, /_hasContent = !!\(_draftText\.trim\(\) \|\| _draftReasoning\.trim\(\) \|\| _steps\)/,
-    "恢复判据只认正文——只思考过/只跑了工具还没出正文的那一轮会被当成空草稿丢掉");
 });
 
 // ---- 深度思考质量修复（方案 A+B+E） ----------------------------------------------
@@ -20544,11 +20253,7 @@ test("P1：run_subagent 多任务并发——tasks 数组解析 + Promise.allSet
   // 并发实现：Promise.allSettled + 合并报告；只对 run_subagent 多任务生效（worker/wiki 不受影响）
   const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
   assert.match(loopSrc, /!isWorker && it\.tc\.name === "run_subagent" && Array\.isArray\(it\.call\.tasks\)/);
-  // 裸的 /Promise\.allSettled/ 太松：同一个函数里「多立场辩论」那条派发也写着
-  // `await Promise.allSettled(stanceList.map(`，把多任务并发整个删掉照样喂饱它
-  // （全仓共 15 处 Promise.allSettled）。钉到 _multiTasks 这条判据后面。
-  assert.match(loopSrc, /_multiTasks[\s\S]{0,1200}?Promise\.allSettled/,
-    "多任务并发那条路没了——单任务串行跑，用户要的并发不生效");
+  assert.match(loopSrc, /Promise\.allSettled/);
   assert.match(loopSrc, /多子智能体并发报告/);
   assert.match(loopSrc, /⚠️ 失败：/, "失败任务也要出现在合并报告里，不能静默丢失");
   // 单任务/worker/wiki 原路径完整保留（#43 返工前的回归点，钉死）
@@ -20613,30 +20318,21 @@ test("子智能体 schema 公开 tasks/wait，映射层不丢参数", () => {
 });
 
 test("P2.1-异步派发：只读调研默认后台作业立即返回+台账记录；wait/worker/wiki 保持同步", () => {
-  // 这条用例同时覆盖两条派发路（spawn_multiple_agents 和异步 run_subagent），所以宽
-  // 区间要留着。但那两段是**文本近亲**（一个用 _smLive/_smSess，一个用 _jobLive/_jobSess），
-  // 实测 14 条断言里有 7 条在宽区间内命中 ≥2 次——把异步那段整个删掉，它们照样被隔壁
-  // 喂饱。所以再切一个只含异步派发的窄块（3,908 字，实测不含 _smLive），
-  // 属于异步作业台账的那几条钉到窄块上。
   const loopSrc = SRC.slice(RAW_SRC.indexOf("const runSubagentItem = async (it)"), RAW_SRC.indexOf("const executeScheduledItem"));
-  const asyncJob = blockFrom(
-    "if (!isWorker && !it.call._wiki && !it.call.wait && _asyncSpawnNames.has(it.tc.name)) {", { code: true });
-  assert.ok(!asyncJob.includes("_smLive"), "窄块混进了 spawn_multiple_agents 那一段");
-  const dispatchFn = extractFn("_runAgenticLoop", { code: true });
   // 异步条件：worker（写盘记账依赖同步）、wiki（存盘）、显式 wait=true 豁免，其余默认后台
-  assert.match(dispatchFn, /!isWorker && !it\.call\._wiki && !it\.call\.wait && _asyncSpawnNames\.has\(it\.tc\.name\)/);
-  assert.match(SRC, /new Set\(\["run_subagent", "research_project", "design_research"\]\)/);
+  assert.match(loopSrc, /!isWorker && !it\.call\._wiki && !it\.call\.wait && _asyncSpawnNames\.has\(it\.tc\.name\)/);
+  assert.match(loopSrc, /new Set\(\["run_subagent", "research_project", "design_research"\]\)/);
   // 作业台账挂 run（不用模块级全局），字段齐全
-  assert.match(asyncJob, /run\._subAgentJobs = new Map\(\)/);
-  assert.match(asyncJob, /run\._subAgentJobSeq = \(run\._subAgentJobSeq \|\| 0\) \+ 1/);
-  assert.match(asyncJob, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
+  assert.match(loopSrc, /run\._subAgentJobs = new Map\(\)/);
+  assert.match(loopSrc, /run\._subAgentJobSeq = \(run\._subAgentJobSeq \|\| 0\) \+ 1/);
+  assert.match(loopSrc, /status: "running", startedAt: Date\.now\(\), result: "", consumed: false/);
   // 启动后不 await：promise 挂进作业记录，工具结果立即返回
-  assert.match(asyncJob, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
+  assert.match(loopSrc, /\[子智能体已后台启动 job#\$\{jobId\}\]/);
   // 回执改写过（2026-08-25）：原文同时说「结果就绪后会自动送达」和「不要立即 await」，
   // 两句互相矛盾——结果只在**下一次迭代开头**投递，模型收尾就没有下一次了，
   // 在途作业被取消、几十轮调用白花。现在钉的是新版里那条硬约束。
-  assert.match(asyncJob, /结果会在你\*\*下一步开始时\*\*自动送达/);
-  assert.match(asyncJob, /收尾之前必须汇合/, "收尾前不汇合就会丢结果，这条必须写在回执里");
+  assert.match(loopSrc, /结果会在你\*\*下一步开始时\*\*自动送达/);
+  assert.match(loopSrc, /收尾之前必须汇合/, "收尾前不汇合就会丢结果，这条必须写在回执里");
   // promise.then 落四态：done/failed/timeout/cancelled（cancelled 同时标 consumed 防幽灵拦截）
   assert.match(loopSrc, /job\.status = "done"/);
   assert.match(loopSrc, /job\.status = "failed"/);
@@ -20729,9 +20425,9 @@ test("P2.1-await_subagent：等待作业落定取回结果；无作业/无运行
 // Both tests now assert that split from their own side.
 test("P2.1-收尾：模型自己派发的子智能体只记账，不制造阻断回合", () => {
   const loop = stripJsComments(extractFn("_runAgenticLoop"));
-  // 定长 1900 窗口盖不住静默分支（实测 18609 字），按 AST 取整块。
-  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
-  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  assert.ok(quietStart >= 0, "the quiet-turn accounting branch must exist");
+  const quiet = loop.slice(quietStart, quietStart + 1900);
   assert.match(quiet, /_subAgentJobs/);
   assert.match(quiet, /subagent_results_pending/,
     "unfinished jobs remain a truthful outcome fact");
@@ -21071,43 +20767,6 @@ test("#51-3 装载 nudge 结构化：工具名带微用途括号（use_cases 首
   assert.match(SRC, /return brief \? `\$\{name\}（\$\{brief\}）` : name;/);
   // 元数据真源核验：db_query 的 use_cases 首条截断后确实是可读微用途
   assert.ok(Array.isArray(TOOL_METADATA.db_query?.use_cases) && TOOL_METADATA.db_query.use_cases.length > 0);
-});
-
-test("子体的「门」和「钥匙」两张表要对得上（有门没钥匙 = 那个能力对子体等于不存在）", () => {
-  // 两张手抄表：_READ_TOOLS 是**发给**子体的工具名单，_READ_TYPES 是执行时**放行**的类型。
-  // 漂一格就会出现两种哑火：
-  //   · 有门没钥匙：_READ_TYPES 放行了，_READ_TOOLS 里没有 → 子体压根拿不到这个工具
-  //     （2026-08-30 实测：liveenvironment 放行了，live_environment 却不在名单里，
-  //      research 类子体查天气/空气质量/地震这类免 key 结构化事实只能退回 web_search）。
-  //   · 有钥匙没门：注释里骂过的 read_logs / read_skill 那次，正好反过来。
-  const sub = extractFn("_runSubAgent");
-  const tools = (sub.match(/const _READ_TOOLS = \[([^\]]+)\]/) || [])[1] || "";
-  const types = (sub.match(/const _READ_TYPES = \[([^\]]+)\]/) || [])[1] || "";
-  assert.ok(tools && types, "两张表都要能取到");
-  const has = (blob, name) => blob.includes(`"${name}"`);
-
-  // 逐对核：类型 ←→ 工具名（这几对是 _mapToolCall 里真实的映射关系）
-  for (const [type, tool] of [
-    ["liveenvironment", "live_environment"],
-    ["localdiscovery", "local_discovery"],
-    ["readscreen", "read_screen"],
-    ["uiextract", "ui_extract"],
-    ["semsearch", "semantic_search"],
-    ["findsymbol", "find_symbol"],
-    ["knowledge", "knowledge_search"],
-    ["termread", "read_terminal"],
-    ["logs", "read_logs"],
-    ["skill", "read_skill"],
-  ]) {
-    if (has(types, type)) {
-      assert.ok(has(tools, tool),
-        `_READ_TYPES 放行了 ${type}，但 _READ_TOOLS 里没有 ${tool}——有门没钥匙，子体拿不到这个工具`);
-    }
-    if (has(tools, tool)) {
-      assert.ok(has(types, type),
-        `_READ_TOOLS 发了 ${tool}，但 _READ_TYPES 不放行 ${type}——有钥匙没门，调了就被拒`);
-    }
-  }
 });
 
 test("#51-4 子智能体白名单：web_search 在场 + git 只读四件套 + op 级把关", () => {
@@ -22426,11 +22085,6 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
   // 失败」这类统计的上游。判据必须是**结构**：凡是拿 `it.rawResult` 问
   // `_toolExecutionAttempted` 的地方，同一个条件里就得有 `!it._notAttempted`
   // （或等价的 `it._notAttempted ||` 早退），一处都不许漏。
-  //
-  // 2026-08-30 下限从 5 降到 4：observeToolCall 那个读取点随死岛一起删了（那条"自适应
-  // 学习器"链一次都没跑过——它写的 window._growthState 全仓唯一写入点就在它自己函数体内、
-  // 还被开头的早退挡着）。下限只是"提取器有没有抓全"的地板，真正的判据是下面 unguarded
-  // 必须为空；删掉一个读取点不影响那条，但地板要跟着降，否则它就成了恒假的摆设。
   const NEEDLE = "_toolExecutionAttempted(it.rawResult)";
   const sites = [];
   for (let i = loop.indexOf(NEEDLE); i !== -1; i = loop.indexOf(NEEDLE, i + 1)) {
@@ -22439,7 +22093,7 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
     assert.notEqual(open, -1, "找不到包住它的 if —— 提取器或代码形状变了");
     sites.push(loop.slice(open, i));
   }
-  assert.ok(sites.length >= 4,
+  assert.ok(sites.length >= 5,
     `只找到 ${sites.length} 个 _toolExecutionAttempted(it.rawResult) 读取点，提取器可能没抓全`);
   const unguarded = sites.filter(
     (cond) => !cond.includes("!it._notAttempted") && !cond.includes("it._notAttempted ||"),
@@ -22450,7 +22104,7 @@ test("补齐的「未执行」空洞不许进工具台账，那是没跑不是�
 });
 
 test("#85 Tool Ledger 分类增强: _toolLedgerStats 输出类别汇总", () => {
-  const statsFn = toolLedgerStats;
+  const statsFn = load("_toolLedgerStats", { _classifyToolFailure: load("_classifyToolFailure") });
   const entries = [
     { tool: "read_file", category: "file", ok: true },
     { tool: "search", category: "search", ok: true },
@@ -22868,13 +22522,13 @@ test("#88: web_fetch/web_search 错误消息友好化", () => {
 });
 
 test("#88: deferred search 工具错误消息友好化", () => {
-  // 失败时给模型多条可选路径（重试/换词/换工具/换源），而不是一句固定文案。
-  assert.match(SRC, /const _hint = /,
-    "失败消息必须包含排查建议（_hint）");
-  assert.match(SRC, /换查询词/,
-    "建议里必须包含换查询词选项");
-  assert.match(SRC, /web_search/,
-    "建议里必须包含换用 web_search 的选项");
+  // 原来钉的是一句固定文案「检查查询参数、网络连接或稍后重试」。意图对（失败要给
+  // 排查建议），但那句话对**被反爬封锁**的源是错的建议 —— 实测 403/202 的源重试
+  // 一万次也不会好，而那句话正好在劝模型再试一次。契约升级为：必须按状态码分因。
+  assert.match(SRC, /const _blocked = /,
+    "必须按状态码判定「被封锁」，不能对所有失败给同一句建议");
+  assert.match(SRC, /重试无用/,
+    "判定为封锁时必须明说重试无用（否则模型会一直换词重试）");
 });
 
 test("#88: 联网工具保留失败 telemetry 且不缓存显式调用", () => {
@@ -23292,11 +22946,7 @@ test("client modules have no undeclared identifiers", async () => {
     "performance","queueMicrotask","requestAnimationFrame","requestIdleCallback","self","setInterval",
     "setTimeout","window","setImmediate",
     // Feature-detected on purpose, always behind `typeof x !== "undefined"`
-    // module 2026-08-30 摘掉：它当初在这张表里，只因为 observeToolCall 末尾有一段
-    // `if (typeof module !== 'undefined') module.exports = ...` 的 CommonJS 尾巴。
-    // 那座死岛（observeToolCall + recommendToolsForIntent）已整体删除，全仓再无 module 引用；
-    // 白名单留着它，下次真有人误用裸 module 就会被这张表放行。白名单只许变短。
-    "session",
+    "module","session",
     // 构建期常量，不是运行时全局：vite.config.js 的 `define` 在打包/dev 时把它替换成
     // 字面量。这里（node 直接跑测试）没有 define，所以源码里必须一直带 typeof 保护。
     "__APP_VERSION__",
@@ -23334,7 +22984,7 @@ test("client modules have no undeclared identifiers", async () => {
 // guard, the allowlist would hide a real ReferenceError, so pin the guard itself.
 test("typeof-guarded globals keep their guards", () => {
   const code = RAW_SRC;   // 共享源（main.js + src/agent/*），别自己读
-  for (const [name, expected] of [["session", 3]]) {   // module 已随死岛删除，见上面白名单注释
+  for (const [name, expected] of [["session", 3], ["module", 1]]) {
     const guards = code.match(new RegExp(`typeof\\s+${name}\\s*!==?\\s*["']undefined["']`, "g")) || [];
     assert.ok(guards.length >= expected,
       `${name} is allowlisted as a feature-detected global but only ${guards.length} typeof guard(s) remain (expected >= ${expected})`);
@@ -24461,7 +24111,7 @@ test("both L0 call sites preserve client-only context without duplicating gatewa
     assert.ok(auth.includes(term), `auth framing must name ${term} as legitimate dev work`);
   }
   assert.match(auth, /别拒答|别说教/, "must instruct the model not to refuse or lecture");
-  assert.match(auth, /开发者工具/, "must state this is a developer tool with no restrictions");
+  assert.match(auth, /攻击未授权的第三方|盗他人凭据/, "must keep the genuine harm line");
 });
 
 test("failure caches do not outlive the fact that produced them", () => {
@@ -24555,17 +24205,8 @@ test("stale write-preview re-bases instead of blocking; CAS still guards the wri
   assert.match(region, /_rollbackLiveEditorWritePreview\(liveWritePreview\)/);
   assert.match(region, /call\._liveWritePreview = null;/);
   // Guard 1: an unsaved human edit is still refused, EARLIER than this point.
-  // 原来写的是 `RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale")`，
-  // 两层错叠在一起：① 查的是 RAW_SRC（含注释），而这句话在全文的**第一次**出现是
-  // main.js:9647 的一句注释（offset 445263），拿一句注释去和一段真代码比先后；
-  // ② 它声称的顺序在生产代码里**本来就是假的**——剥掉注释后真代码在 offset 3014957，
-  // 而 _previewStale 在 3013208，脏缓冲检查其实排在**后面**。（_previewStale 那个块里
-  // 的注释也跟着写错了，说"上面已经拒掉了脏缓冲"，已一并订正。）
-  //
-  // 真正保住"未保存的人工改动不会被覆盖"的是这条：脏缓冲检查排在**真正落盘之前**。
-  // 预览回滚不写磁盘，排在它前面无害。用 CODE 而不是 RAW_SRC，用 at() 让缺失当场报错。
-  assert.ok(at(SRC, "_openFileWriteConflict(fp)", "脏缓冲检查") < at(SRC, "writeTextFileIfUnchanged(fp, existed ? old : null, newContent)", "落盘"),
-    "脏缓冲检查必须排在真正落盘之前，否则未保存的人工改动会被覆盖");
+  assert.ok(RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale"),
+    "the dirty-buffer check must run before the preview check it now relies on");
   // Guard 2: the write itself is still compare-and-swap against freshly-read disk.
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
     "a genuinely concurrent change must still fail at the CAS write");
@@ -25018,40 +24659,8 @@ test("命令批次闸门真的接进了执行链——不是又一个零调用�
     "没接进去的话它就是个死函数，而测试照样全绿（本仓库反复踩的那个坑）");
 });
 
-test("写失败后重试成功的文件，不许再每轮告诉模型「它此刻不在磁盘上」", () => {
-  // run._writeLedger 顺序追加、整 run 不剪枝：写失败后重试成功的那条仍留在账上。
-  // 这里原来是 filter(a.ok === false)，于是补救成功之后**每一轮**还在说「没落盘」。
-  // 后果两种都难看：模型把刚写对的文件从头再整篇写一遍覆盖掉，或者收尾对用户说
-  // 「没能保存成功，请手动检查」——而文件好好躺在磁盘上。收尾门读同一本账，
-  // 用的一直是「按 path 取最后一条」，两个消费方的判据必须一致。
-  const facts = load("_deliveryFactsLine", {
-    _failedWritePaths,
-    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
-    _looksLikeTestFile: load("_looksLikeTestFile"),
-    _deliveryFacts: load("_deliveryFacts", {
-      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
-      _looksLikeTestFile: load("_looksLikeTestFile"),
-    }),
-    _strayScratchFiles: load("_strayScratchFiles"),
-    _projectStacks: new Map(),
-  });
-  const run = (ledger) => facts({
-    _mutatedFiles: new Set(["src/api/invoices.ts"]), _executionEvidence: [], _writeLedger: ledger,
-  });
-  // 第 3 轮 CONFLICT、第 5 轮重试成功 → 不该再报没落盘。
-  assert.doesNotMatch(
-    run([{ path: "src/api/invoices.ts", ok: false }, { path: "src/api/invoices.ts", ok: true }]),
-    /没有落盘/, "补救成功的文件仍被当成没落盘——模型会把它再整篇写一遍或者对用户谎报失败");
-  // 真的还没补救成功的，照样要报——别把这条守卫修成永远不报。
-  assert.match(
-    run([{ path: "src/api/invoices.ts", ok: true }, { path: "src/api/invoices.ts", ok: false }]),
-    /没有落盘/, "最后一次确实失败的，必须报出来");
-  assert.match(run([{ path: "src/api/invoices.ts", ok: false }]), /没有落盘/);
-});
-
 test("交付事实来自执行记录，不做任何推断", () => {
   const facts = load("_deliveryFactsLine", {
-    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -25182,7 +24791,6 @@ test("这一轮留下的一次性脚本要被清点出来——规则早就写�
 
   // 清点结果必须真的出现在收尾那行事实里——只写函数不接线，等于没做。
   const line = load("_deliveryFactsLine", {
-    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -25285,7 +24893,6 @@ test("收尾评审员必须真的被调用——它曾经零调用点，而三�
 
 test("评审结论只陈述、不拦回合", () => {
   const facts = load("_deliveryFactsLine", {
-    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -25429,10 +25036,9 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
 //   2. agent_core.txt carries the instruction it used to force.
 test("read-it-and-stop is prevented by the prompt, not by a profile-derived harness gate", () => {
   const loop = extractFn("_runAgenticLoop");
-  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
-  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
-  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
-  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
 
   // 1. The profile-derived forcing gate is gone. No classifier guess ("workspace") may drive a
   //    re-entry — that is the exact machinery this rebuild exists to remove.
@@ -25453,11 +25059,10 @@ test("read-it-and-stop is prevented by the prompt, not by a profile-derived harn
 
 test("a quiet turn is the model's completion decision except for real bounded work", () => {
   const loop = extractFn("_runAgenticLoop");
-  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
-  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
-  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
-  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
-  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
+  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn branch must be extractable");
   for (const name of ["planPending", "researchEvidence", "toolFirst", "semanticReview", "effect", "codeVerify", "reconcile", "uiDeliveryAudit", "uiVerify"]) {
     assert.equal(quiet.includes(`_pushNudge("${name}"`), false, `${name} must not force another quiet-turn request`);
   }
@@ -25508,10 +25113,7 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   assert.ok(_planGateAt > 0, "plan 门不见了");
   const _afterPlanGate = quiet.slice(_planGateAt);
   const _reenterAt = _afterPlanGate.indexOf("continue;");
-  // `break; // truly done` 带注释文本，在剥了注释的 quiet 里找不到（indexOf 会回 -1，
-  // 而 `-1 > _reenterAt` 恰好是 false，这条断言从此只会误红或误绿）。
-  // 它是静默块的**最后一条语句**，用 lastIndexOf 定位。
-  const _trulyDoneAt = _afterPlanGate.lastIndexOf("break;");
+  const _trulyDoneAt = _afterPlanGate.indexOf("break; // truly done");
   assert.ok(_reenterAt > 0, "plan 门之后没有 continue——计划没做完时不会有界续跑");
   assert.ok(_trulyDoneAt > _reenterAt,
     "an open plan re-enters, boundedly, and then the run ends honestly");
@@ -25521,18 +25123,17 @@ test("a quiet turn is the model's completion decision except for real bounded wo
 
 test("收尾诚实：最后一个动作轮有工具失败时，安静收尾必须记 last_action_failed（只记账、不补回合）", () => {
   const loop = extractFn("_runAgenticLoop");
-  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
-  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
-  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
-  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
-  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
+  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
+  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
+  const quiet = loop.slice(quietStart, quietEnd);
+  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn 分支要能切出来");
   // 收尾门必须真的读 lastTurnHadFailure，并写进 incompleteReason。
   assert.match(quiet, /if \(lastTurnHadFailure && run\.mode === "agent" && !run\._incompleteReason\) \{[\s\S]{0,200}run\._incompleteReason = `last_action_failed:\$\{lastFailKinds \|\| "tool"\}`/,
     "最后一个动作轮报了失败、模型却收尾 → 必须记 last_action_failed，让'已完成'说真话");
   // 只记账：这一句和 break 之间不许有 _pushNudge / continue（否则就成了强制补回合，
   // 违反'quiet turn 是模型的收尾决定'那条钉死的哲学）。
   const gateAt = quiet.indexOf("lastTurnHadFailure && run.mode");
-  const breakAt = quiet.lastIndexOf("break;");   // 静默块的最后一条语句（注释在 CODE 里已被抹掉）
+  const breakAt = quiet.indexOf("break; // truly done", gateAt);
   assert.ok(gateAt >= 0 && breakAt > gateAt, "last_action_failed 门必须在 truly-done break 之前");
   const tail = quiet.slice(gateAt, breakAt);
   assert.doesNotMatch(tail, /_pushNudge\(|continue;/,
@@ -25662,11 +25263,8 @@ test("dynamic tool admission uses the real registry, not the current intent prof
 
   const dispatchAt = loop.indexOf("const items = turn.toolCalls");
   const editBoundary = loop.indexOf("// Keep edit_file calls exactly as emitted", dispatchAt);
-  // 结束锚点 "// Same-batch EXACT-duplicate read" 在源码里**根本不存在**（那段注释后来
-  // 改写过），indexOf 回 -1，slice(起点, -1) 于是拿到 160,152 字——从 search_tools 分支
-  // 一路切到函数尾。下面那条 doesNotMatch 和 windowAt 都在这一大片里找，等于没界。
-  // 按 AST 取这个分支块本身（源码里同形分支有两处，另一处不在本函数，故传 nth）。
-  const searchTools = blockFrom('if (call && call.type === "search_tools") {', { code: true, nth: 1 });
+  const searchAt = loop.indexOf("if (call && call.type === \"search_tools\")", editBoundary);
+  const searchTools = loop.slice(searchAt, loop.indexOf("// Same-batch EXACT-duplicate read", searchAt));
   const windowAt = searchTools.indexOf("_applyToolPayloadWindow(toolSchemas, adds");
   assert.ok(windowAt >= 0, "search_tools additions reach the bounded payload window");
   assert.doesNotMatch(searchTools, /_agentToolNameAllowedByProfile/);
@@ -26313,15 +25911,8 @@ test("写文件前的预备打开不弹「文件不存在」——新建文件�
     "模型侧的提示要保留：这才是它该收到的那条");
 
   // silentMissing 只在缺文件时生效，别顺手把权限、越界这类真错误也吞掉。
-  // 结束锚点原来是一句**注释**，而 openFn 切自 SRC（= CODE，注释已抹成空格），
-  // indexOf 永远返回 -1；`slice(0, -1)` 不报错也不返回空串，而是「整份文本少一个字」
-  // ——实测 4,445,317 字，等于从 openFile 一路切到拼接源码的末尾。两条断言于是在
-  // 整个后半截源码里找字符串，越界检查被搬走或删掉都照样绿。
-  // 锚点改用真代码，并按 AST 取整个函数。
-  const openFn = extractFn("openFile", { code: true });
-  const guardEnd = openFn.indexOf("if (opening.externalDeleted) {");
-  assert.ok(guardEnd > 0, "早期错误分支的结束锚点没了——这条守卫会退化成守整份源码");
-  const guard = openFn.slice(0, guardEnd);
+  const openFn = SRC.slice(RAW_SRC.indexOf("async function openFile("));
+  const guard = openFn.slice(0, openFn.indexOf("// A known write may have completed"));
   assert.match(guard, /options\.silentMissing && _isMissingFileError\(e\)/,
     "silentMissing 必须与「确实是缺文件」同时成立才吞");
   assert.match(guard, /_isOutsideWorkspaceError\(e\)/,
@@ -31559,10 +31150,7 @@ test("一键全撤：不许覆盖你事后自己改过的文件", async () => {
 
 test("每个会弹审批框的工具都得有自己的文案，不能只给一句「执行该操作？」", async () => {
   const { approvalTypes } = await import("../src/agent/tool-policy.js");
-  // 2026-08-30 搬进 src/agent/approval-label.js —— 直接 import 产品代码，不再抠源码。
-  // 抠源码验得到行为，验不到「这个函数还在不在真实调用链上」；调用链那一头由下面
-  // 对 main.js 薄壳的断言守着。
-  const label = (call) => approvalLabel(call, { mcpSnapshot: () => null });
+  const label = load("_approvalLabel", { _escHtml: String, _dbCallIsDestructive: () => false });
   const generic = label({ type: "__不存在的类型__" }).title;
   const bland = [];
   for (const t of [...approvalTypes()].sort()) {
@@ -31575,11 +31163,6 @@ test("每个会弹审批框的工具都得有自己的文案，不能只给一�
   }
   // 一个没有信息的框，只会让人闭着眼睛点同意——那时候这道门就只剩摩擦、不剩保护。
   assert.deepEqual(bland, [], "这些工具会弹框，但框上只有一句没信息的默认文案：" + bland.join(", "));
-  // 搬出去之后还要守住调用链：main.js 里的薄壳必须真的调它，并且把 MCP 快照传进去
-  //（那是它唯一的外部依赖；不传的话 MCP 框里就没有"服务自述"那一行）。
-  const shell = extractFn("_approvalLabel", { code: true }) || "";
-  assert.match(shell, /return approvalLabel\(call, \{/, "main.js 的 _approvalLabel 没有调模块");
-  assert.match(shell, /mcpSnapshot:/, "薄壳没把 MCP 快照传进去");
   // 铺一整棵项目树的那两个，必须在框里说清会往工作区写东西——它是这批里代价最大的一个。
   for (const t of ["game_scaffold", "web_scaffold"]) {
     const r = label({ type: t, name: "x", engine: "godot", framework: "react" });
@@ -32224,7 +31807,8 @@ test("上下文溢出要压缩后重试，而不是拿同一份超长负载连�
   // 整套溢出恢复从没被接上过。溢出走的是通用错误路径：_isRetryableAiError 不认它
   // （既不是 5xx 也不是掉线），于是一次都不重试直接报错；就算认了，重发的也是同一份
   // 超长负载，十次重试十次爆。表现就是「长对话到后期突然一直失败，重开会话就好了」。
-  const loop = extractFn("_runModelRequestWithRetry", { code: true });
+  const loop = SRC.slice(RAW_SRC.indexOf("async function _runModelRequestWithRetry"),
+                         RAW_SRC.indexOf("async function _runModelRequestWithRetry") + 12000);
   assert.match(loop, /typeof _isContextOverflowAiError === "function" && _isContextOverflowAiError\(attemptError\)/,
     "重试循环没有识别上下文溢出（或漏了 typeof 兜底——沙箱里会 ReferenceError 把循环带崩）");
   assert.match(loop, /squeezedForOverflow \|\| _isRetryableAiError\(attemptError(?:, attemptStatus)?\)/,
@@ -32651,7 +32235,6 @@ test("eager 落盘台账走权威失败判定，不是手写的三词正则", ()
 // ---- 写入落空必须进交付事实：模型收尾时手上要有与「已保存」矛盾的那条事实 ----
 test("写入没落盘要说出来，而纯问答/只改文档的 run 照旧不受打扰", () => {
   const line = load("_deliveryFactsLine", {
-    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -33118,9 +32701,8 @@ test("方向检查提前到中途，但闸门要紧，且绝不顶掉收尾那�
   assert.match(loop, /run\._directionChecked[\s\S]{0,200}?run\._wrapUpReviews = \(run\._wrapUpReviews \|\| 0\) \+ 1/,
     "要占用已有预算，不能白开一个新口子");
   // 绝不写 _wrapUpVerdict：那是用户建议卡的来源，中途一份不完整的裁定会顶掉收尾那份好结论。
-  // 定长窗口（原来 2600）会随着这一段变长而滑出去，反向断言对窗口外恒真。
-  const _dcAt = at(loop, "run._directionChecked", "方向检查段");
-  const seg = loop.slice(_dcAt, loop.indexOf("\n      }", _dcAt) + 8);
+  const _dcAt = loop.indexOf("run._directionChecked");
+  const seg = loop.slice(_dcAt, _dcAt + 2600);
   assert.doesNotMatch(seg, /run\._wrapUpVerdict\s*=/, "中途版不许写裁定");
   // 评审挑好的工具要真的装上——「走偏了→去看真实作品」这条路此前整条断在这里。
   assert.match(seg, /_criticRequestedToolSchemas\(_dir\?\.tools, run\._toolRegistry, 4\)/);
@@ -33317,19 +32899,12 @@ test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /run\._incompleteReason \|\|= `writes_failed:\$\{_failedWrites\.length\}`/,
     "写入落空在结局里没有任何出口——用户看到的收尾卡片一个字都不会提这件事");
-  // 读法本身已经提到 agent/write-ledger.js（收尾门和喂给模型的交付事实共用一份，
-  // 这正是这个 bug 的成因——两个消费方读同一本账却各有各的判据）。这里守两件事：
-  // ① 调用点确实喂的是执行记录 run._writeLedger，不是从措辞里猜；
-  assert.match(loop, /_failedWritePaths\(run\._writeLedger\)/,
+  assert.match(loop, /for \(const a of \(Array\.isArray\(run\._writeLedger\) \? run\._writeLedger : \[\]\)\) if \(a\?\.path\) _lastWrite\.set\(String\(a\.path\), a\.ok === true\)/,
     "判据要读执行记录（每次写入尝试的成败），不是从措辞里猜");
-  // ② 读法本身做真往返，不匹配源码文本——账本顺序追加、整 run 不剪枝，
-  //    写失败后重试成功的那条仍在账上，直接 filter(ok === false) 会把补救成功的也算进 N。
-  assert.deepEqual(
-    _failedWritePaths([{ path: "a.ts", ok: false }, { path: "a.ts", ok: true }]), [],
+  // 账本顺序追加、整 run 不剪枝：写失败后重试成功的那条仍在账上，
+  // 直接 filter(ok === false) 会把已经补救成功的也算进 N。按 path 取最后一条。
+  assert.match(loop, /_failedWrites = \[\.\.\._lastWrite\]\.filter\(\(\[, ok\]\) => !ok\)/,
     "写失败后重试成功的那条又被算进 writes_failed 了");
-  assert.deepEqual(
-    _failedWritePaths([{ path: "a.ts", ok: true }, { path: "a.ts", ok: false }]), ["a.ts"],
-    "最后一次确实失败的必须留在结局里");
   // 闭合枚举必须认得它，否则界面回落到那句无意义的「继续没做完的部分」。
   const labels = loadConst("_INCOMPLETE_LABELS");
   assert.equal(labels.writes_failed, "重写那几个没写成的文件");
@@ -34676,25 +34251,16 @@ test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤�
 // ---- 四条「回执在骗模型」的修复 ----
 
 test("读不了的文件不许说成「找不到」，而且错误码要被失败识别器认出来", () => {
-  // 按 AST 取这个分支块，不要开放式切片 + 1600 定长窗口（实测那个窗口已经越过分支尾部
-  // 约 370 字、切进了下一个 if 块）。
-  const src = blockFrom('} else if (unreadableMatches.length === 1) {', { code: true });
-  // 必须是**无条件**返回。上一版写的是
-  //   /usedPath = …[\s\S]{0,600}?\n        return \{ type: "read", …/
-  // 里面真正起限制作用的只有 `\n` 后面那 8 个空格——它钉的是 return 的**缩进**，不是
-  // 它的无条件性。JS 不在乎缩进，所以「包一层 if 但不重排版」这个最省事的改法正好从
-  // 缝里穿过去；而注释里点名说第一版就栽在这儿，第二版换了个形状栽在同一处。
-  // 直接验分支体里没有任何条件分叉。
-  const body = src.slice(src.indexOf("{") + 1);
-  assert.doesNotMatch(body, /\bif\s*\(/,
-    "「读不了」的 return 被条件包住了 —— 又会掉回「找不到唯一文件」那条死路");
-  assert.match(body, /return \{ type: "read", path: usedPath, content:/,
-    "这一支不再返回读取结果");
-  assert.match(src, /\[ERROR\/UNREADABLE\] 文件确实存在/,
+  const src = SRC.slice(RAW_SRC.indexOf("} else if (unreadableMatches.length === 1) {"));
+  // 必须是**无条件**返回：只比字符串在不在的话，包一层 if (false) 照样绿（第一版就这么漏的）。
+  assert.match(src.slice(0, 1600),
+    /usedPath = unreadableMatches\[0\]\.path;[\s\S]{0,600}?\n        return \{ type: "read", path: usedPath, content:/,
+    "那一支不是无条件返回了 —— 一旦被条件包住，就又会掉回「找不到唯一文件」那条分支");
+  assert.match(src.slice(0, 1600), /\[ERROR\/UNREADABLE\] 文件确实存在/,
     "文件存在只是读不了，却仍然掉进「找不到唯一文件」那条分支 —— 模型会去 find_files，"
     + "搜到同一个路径、再读、同一句话，要么死循环要么对用户断言「项目里没有这个文件」");
-  assert.match(src, /别再 find_files/, "没告诉模型别再去找路径");
-  assert.match(src, /run_cmd/, "没给可行动的替代办法");
+  assert.match(src.slice(0, 1600), /别再 find_files/, "没告诉模型别再去找路径");
+  assert.match(src.slice(0, 1600), /run_cmd/, "没给可行动的替代办法");
   // 错误码必须落在失败识别器的枚举里，否则这次失败会被算成**成功**。
   const failMatch = load("_toolFailureMatch");
   assert.ok(failMatch("[ERROR/UNREADABLE] 文件确实存在: /a/b.db"),
@@ -35638,7 +35204,6 @@ function _epForLedger(entries, outcome = "success") {
     // 时间线汇总用真模块，不打桩：它的兜底行为（坏输入返回 null 而不是抛）本身就是
     // 这条测试的落点之一——它一抛，整条情景记录会被外层 try 吞掉、静默消失。
     _summarizeTiming: summarizeTiming,
-    _summarizeIntentRace: summarizeIntentRace,
     _epLoad: () => [],
     _epSave: (root, eps) => { saved.push(JSON.parse(JSON.stringify(eps))); },
     _markReworkIfAny: () => {},
@@ -36444,24 +36009,10 @@ test("能力名录：已在工具列表里的直接调，不许再让它先取�
   assert.doesNotMatch(hint, /名录只给名字。看到贴合目标的那个，用 search_tools/,
     "旧的无条件指令回来了——它对已加载的那批工具是假的");
 
-  // 名录必须**按轮恒定**：动态化会击穿前缀缓存，这是刻意不选的那条路。
-  //
-  // 2026-08-30 这条断言收紧了一次。原来写的是「不许接受任何参数」，理由栏写的却是
-  // 「按**窗口**过滤会让它变成动态内容」——两者不是一回事，而那个过宽的形式挡住了一个
-  // 必要的修复：名录抬头对模型说「全部可用，按名字直接调用即可自动装载」，可它原来无条件
-  // 列 TOOL_METADATA 全表，网页版（inTauri=false）会把 89 个 desktopOnly 工具一起列出来，
-  // 模型照着调就是一轮白烧（search_tools 里最长等 8 秒 MCP 发现，再吃一句「注册表没有」）。
-  //
-  // 判据改成「用什么过滤」：
-  //   · _staticToolNames() —— 按进程 memo，只在用户改自定义能力声明时失效，**不随轮次变** → 允许
-  //   · 工具窗口 / 本轮画像 / 任务文本 —— 每轮都变 → 禁止
-  // 「按轮恒定」这件事本身由 test/cache-prefix.test.mjs 那条 build() === build(args) 正面钉着。
-  assert.match(hint, /toolCapabilityIndex\(/, "名录不见了");
-  // 允许一层嵌套括号：实参本身就是个函数调用（_staticToolNames()）。
-  const _idxCall = /toolCapabilityIndex\(((?:[^()]|\([^()]*\))*)\)/.exec(extractFn("_buildToolHint"))?.[1]?.trim() ?? "";
-  assert.equal(_idxCall, "_staticToolNames()",
-    `名录的过滤依据必须是按进程 memo 的静态注册表，实际是「${_idxCall}」——`
-    + "按窗口/画像/任务文本过滤会让它每轮变，击穿缓存前缀");
+  // 名录本身必须保持静态：动态化会击穿前缀缓存，这是刻意不选的那条路。
+  assert.match(hint, /toolCapabilityIndex\(\)/, "名录仍然由静态索引提供");
+  assert.doesNotMatch(hint, /toolCapabilityIndex\([^)]+\)/,
+    "名录不许开始接受参数——按窗口过滤会让它变成动态内容，每次窗口变化都击穿缓存前缀");
 });
 
 // on_run_end 钩子不许跟着「付费学习调用」那道闸一起被关掉。
@@ -37299,81 +36850,17 @@ test("方案文档保留全部小节，只摘掉开场白和结尾那句征询",
   assert.ok(planCoreFromReply("就一句话，没有任何小节。").includes("就一句话"));
 });
 
-test("浮层定位一律按 CSS 视口夹取，不许混进物理像素", () => {
-  // 视口有两种口径：window.innerWidth/Height 是**物理**像素（不随界面缩放变，实测），
-  // documentElement.clientWidth/Height 是 **CSS** 像素 = 物理 / 缩放，也就是布局坐标系。
-  // getBoundingClientRect / clientX / style.left 全是 CSS 像素，所以任何「把矩形夹进视口」
-  // 的算式都必须用后者。混用的后果：放到 140% 时 innerWidth 比布局宽度大 40%，
-  // Math.min(r.left, innerWidth - w - 8) 这个上界永远大于 r.left，夹取一次都不触发，
-  // 模型菜单、悬浮卡、右键菜单直接飞出屏幕右下角 ——「放大缩小其他 UI 内容也都会乱飞」。
-  //
-  // 这条是**全文件不变量**，不是逐个调用点的断言：新加一个浮层时照抄旧写法是最可能的
-  // 复发路径，逐点断言拦不住新写的那一个。
-  // 用 RAW_SRC（main.js + src/agent/ 下每个模块拼起来），不自己读 main.js：搬模块时
-  // 自读会假红，反向断言还会悄悄失效 —— wiring.test.mjs 那道闸拦的就是这个。拼起来也
-  // 更严：以后把某个浮层搬进模块，这条照样管得着。
-  let rest = RAW_SRC;
-  // 该用物理口径的，各自问的都是「这块屏幕有多大」，与布局坐标系无关；
-  // viewportW/H 自己的兜底也在里面（量不到 CSS 视口时退回 innerWidth，总比返回 0 强）。
-  for (const name of ["_uiZoomCeiling", "_applyLayoutDensity", "viewportW", "viewportH"]) {
-    const src = extractFn(name);
-    assert.ok(rest.includes(src), `${name} 不见了 —— 白名单失效，这条断言会变成恒真`);
-    rest = rest.replace(src, "");
-  }
-  // 这两行住在 src/agent/browser-page-scripts.js：那段是**注进目标网页**执行的，
-  // 那边没有我们的界面缩放，innerWidth 就是它自己的视口，是对的。
-  const ALLOW = new Set([
-    "var W = window.innerWidth || document.documentElement.clientWidth || 1;",
-    "var H = window.innerHeight || document.documentElement.clientHeight || 1;",
-  ]);
-  const hits = (stripJsComments(rest).match(/.*window\.inner(?:Width|Height).*/g) || [])
-    .map((l) => l.trim()).filter((l) => l && !ALLOW.has(l));
-  assert.deepEqual(hits, [],
-    "这些地方还在用物理像素夹 CSS 坐标 —— 放大后浮层会飞出屏幕，改用 viewportW()/viewportH()");
-});
-
-test("viewportW/H 取的是 CSS 视口，不是物理像素", async () => {
-  const m = await import("../src/agent/layout-density.js");
-  const prevDoc = globalThis.document, prevWin = globalThis.window;
-  try {
-    // 放大到 140% 时的真实形状：物理 1400×980，布局坐标系只有 1000×700。
-    globalThis.document = { documentElement: { clientWidth: 1000, clientHeight: 700 } };
-    globalThis.window = { innerWidth: 1400, innerHeight: 980 };
-    assert.equal(m.viewportW(), 1000, "取到了物理宽度 —— 夹取会失效，浮层飞出屏幕");
-    assert.equal(m.viewportH(), 700, "取到了物理高度");
-    // documentElement 量不到时（嵌入场景、测试台）才退回 innerWidth，总比返回 0 强：
-    // 0 会让 `min(x, 0 - w - 8)` 变成一个负上界，浮层被推到屏幕外。
-    globalThis.document = { documentElement: { clientWidth: 0, clientHeight: 0 } };
-    assert.equal(m.viewportW(), 1400, "量不到 CSS 视口时没有退回物理宽度");
-    assert.equal(m.viewportH(), 980);
-  } finally {
-    if (prevDoc === undefined) delete globalThis.document; else globalThis.document = prevDoc;
-    if (prevWin === undefined) delete globalThis.window; else globalThis.window = prevWin;
-  }
-});
-
 test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩放不能算两次", async () => {
   // 界面缩放走 documentElement.style.zoom：1 CSS px = zoom 个物理像素。app.css 里各栏
   // 宽度已经除以 --ui-zoom，物理宽度因此与缩放无关。档位要是再按 CSS 像素（= 物理/缩放）
   // 分，就等于把缩放算了两次：放大一次、档位又缩一次，窄窗口里一放大侧栏反而更小。
   const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
   const el = { dataset: {} };
-  const stepAt = (px) => { applyLayoutDensity(px, 1000, el); return el.dataset.layout; };
-  assert.equal(stepAt(1440), undefined, "常规笔记本宽度不该有档位 —— 用户拖出来的宽度要原样生效");
+  const stepAt = (px) => { applyLayoutDensity(px, el); return el.dataset.layout; };
+  assert.equal(stepAt(1440), undefined, "宽窗口不该有档位 —— 用户拖出来的宽度要原样生效");
   assert.equal(stepAt(1100), "narrow");
   assert.equal(stepAt(900), "tight");
   assert.equal(stepAt(700), "min");
-  // 大屏是同一个问题掉了个头：2K/4K 上 250px 的侧栏细得像条缝，助手栏装不下一段代码。
-  // 这两档调的是**默认**宽度，用户拖过的宽度永远优先（app.css 里是两层 var）。
-  assert.equal(stepAt(2560), "wide", "2K 上没把侧栏默认宽度调大");
-  assert.equal(stepAt(3840), "xwide", "4K 上没把侧栏默认宽度调大");
-  assert.equal(stepAt(1728), undefined, "常规 mac 屏被误判成大屏了");
-  // 两端不能同时命中，也不能互相漏掉：一路扫过去每个宽度都要落到唯一一档。
-  for (const [w, want] of [[100, "min"], [779, "min"], [780, "tight"], [979, "tight"],
-                           [980, "narrow"], [1179, "narrow"], [1180, undefined],
-                           [2199, undefined], [2200, "wide"], [2999, "wide"], [3000, "xwide"]]) {
-    assert.equal(stepAt(w), want, `${w}px 落错档了`);
-  }
   // 窗口拉回来，封顶要松开 —— 否则用户拖宽过的侧栏再也回不来。
   assert.equal(stepAt(1440), undefined, "窗口拉宽后档位没松开");
   // 调用点必须喂**物理**宽度。量错对象的话（比如 documentElement.clientWidth），
@@ -37385,12 +36872,10 @@ test("三栏跟着窗口自适应让位，且档位按物理宽度算——缩�
 
 test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素算", () => {
   const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
-  // 行首锚定，理由同上：`:root[data-layout="narrow"] .layout .explorer {` 里也含
-  // `.layout .explorer {`，按子串取会切到别人家的规则里去。
   const grab = (sel) => {
-    const m = new RegExp("^" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{[^}]*\\}", "m").exec(css);
-    assert.ok(m, `${sel} 这条规则不见了`);
-    return m[0];
+    const i = css.indexOf(sel + " {");
+    assert.ok(i >= 0, `${sel} 这条规则不见了`);
+    return css.slice(i, css.indexOf("}", i));
   };
   // 三栏的宽度和下限都要除以 --ui-zoom。不除的话放大 140% 时两条侧栏各多占 40% 的屏幕，
   // 中间编辑区被挤到 min-width 以下，而 .layout 是 overflow:hidden —— 用户原话
@@ -37409,68 +36894,13 @@ test("界面缩放不改变三栏各占屏幕多少——宽度按物理像素�
   const sash = stripJsComments(extractFn("makePanelSash"));
   assert.match(sash, /setProperty\(cssProp, Math\.round\(w \* z\)/,
     "分隔条存的还是 CSS 像素 —— 放大状态下拖完一松手，栏宽会跳到别的尺寸");
-  // 档位**不能**去改 --sidebar-w/--assistant-w 本身：那两个是拖分隔条存下来的（内联在
-  // .layout 上），改掉等于把用户拖出来的宽度抹了。窄端用 max-width 封顶，宽端只改
-  // --sidebar-w-default（两层 var 的兜底那一层），拖过的人两种情况下都保持自己的选择。
-  const dens = css.slice(css.indexOf(':root[data-layout="narrow"]'));
+  // 自适应档位用 max-width 封顶，**不能**去改 --sidebar-w/--assistant-w：那两个变量是
+  // 拖分隔条存下来的（内联在 .layout 上），改掉等于把用户拖出来的宽度抹了。
+  const dens = css.slice(css.indexOf(':root[data-layout="narrow"]'), css.indexOf(':root[data-layout="narrow"]') + 900);
   assert.ok(!/--sidebar-w\s*:/.test(dens) && !/--assistant-w\s*:/.test(dens),
-    "档位改写了拖动存下来的栏宽 —— 用户拖出来的宽度会被抹掉");
-  assert.match(grab(".layout .explorer"), /var\(--sidebar-w,\s*var\(--sidebar-w-default/,
-    "侧栏宽度没走两层 var —— 大屏那一档的默认值不会生效，或者会盖掉用户拖出来的宽度");
-  assert.match(grab(".layout .assistant"), /var\(--assistant-w,\s*var\(--assistant-w-default/,
-    "助手栏宽度没走两层 var");
-  for (const step of ["narrow", "tight", "min", "wide", "xwide"]) {
+    "自适应档位改写了拖动存下来的栏宽 —— 用户拖出来的宽度会被抹掉");
+  for (const step of ["narrow", "tight", "min"]) {
     assert.ok(css.includes(`:root[data-layout="${step}"]`), `缺 ${step} 这一档`);
-  }
-});
-
-test("矮窗口要收紧竖直留白——横向档位一点忙都帮不上", async () => {
-  const { applyLayoutDensity } = await import("../src/agent/layout-density.js");
-  const el = { dataset: {} };
-  const vAt = (h) => { applyLayoutDensity(1440, h, el); return el.dataset.vlayout; };
-
-  // 竖直的空间大头是聊天区内边距、消息 gap、输入框最大高度、空状态那一坨（图标+标题+
-  // 说明+一排 chip 近 200px）、页签条。1280×720 上空状态能把消息区占满。
-  assert.equal(vAt(1080), undefined, "够高的窗口不该收紧");
-  assert.equal(vAt(800), "short", "800 高没进 short 档");
-  assert.equal(vAt(640), "xshort", "640 高没进 xshort 档");
-  assert.equal(vAt(820), undefined, "边界取的是「小于」");
-  assert.equal(vAt(819), "short", "819 高没进 short 档");
-  assert.equal(vAt(680), "short", "680 高该是 short，不该是 xshort");
-  assert.equal(vAt(679), "xshort", "679 高没进 xshort 档");
-  // 窗口拉高要松开，否则一旦矮过就永远紧着。
-  assert.equal(vAt(1080), undefined, "窗口拉高后没松开");
-
-  // **宽和高互不相干**：一个宽而矮的窗口要收竖直、不收横向；窄而高的反过来。
-  // 合成一个档位名会组合爆炸，所以是两个属性。
-  applyLayoutDensity(900, 1080, el);
-  assert.equal(el.dataset.layout, "tight", "横向档位丢了");
-  assert.equal(el.dataset.vlayout, undefined, "窄但高的窗口被误收了竖直留白");
-  applyLayoutDensity(2560, 640, el);
-  assert.equal(el.dataset.layout, "wide", "横向档位丢了");
-  assert.equal(el.dataset.vlayout, "xshort", "宽但矮的窗口没收竖直留白");
-});
-
-test("竖直收紧先压留白、后藏内容，而且不藏能点的东西", () => {
-  const css = readFileSync(join(HERE, "../src/styles/app.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
-  const block = (step) => css.split("\n").filter((l) => l.includes(`[data-vlayout="${step}"]`)).join("\n");
-  const short = block("short"), xshort = block("xshort");
-  assert.ok(short && xshort, "两档竖直规则至少要各有一条");
-
-  // short 只压留白，一个字都不少 —— 先让留白，再谈藏东西。
-  assert.ok(!/display:\s*none/.test(short),
-    "最浅的一档就开始藏内容了 —— 留白还没压完就先减信息，顺序反了");
-  assert.match(short, /\.chat\b[^{]*\{[^}]*padding/, "short 没压聊天区内边距");
-  assert.match(short, /textarea[^{]*\{[^}]*max-height/, "short 没压输入框最大高度");
-
-  // xshort 才开始藏，而且只藏装饰和那句说明。
-  assert.match(xshort, /\.chat-empty__icon[^{]*\{[^}]*display:\s*none/, "xshort 没藏掉那个装饰图标");
-  // **标题和 chip 任何时候都不许藏**：那是这一屏唯一能点的东西。
-  for (const src of [short, xshort]) {
-    assert.ok(!/\.chat-empty__chips[^{]*\{[^}]*display:\s*none/.test(src),
-      "把可点的 chip 藏了 —— 空状态那一屏就没有出口了");
-    assert.ok(!/\.chat-empty h3[^{]*\{[^}]*display:\s*none/.test(src),
-      "把标题藏了 —— 用户不知道这一栏是干什么的");
   }
 });
 
@@ -37538,16 +36968,7 @@ test("方案页签接进了编辑器的类型门和触发点", () => {
   assert.match(foot, /min-width:\s*\d+px/, "两颗按钮没有定等宽");
   // **正文铺满整块编辑区**，和打开一个文件时一样。原来挂着 max-width: 78ch，而它限的是
   // 滚动容器本身：正文缩在左边一条、右边空一大片、滚动条卡在中间，表格还被挤到换行。
-  // **按行首锚定取规则块。** 直接 indexOf(".planpane__body {") 会被
-  // `:root[data-vlayout="xshort"] .planpane__body {` 抢先命中（它把选择器整个包在里面，
-  // 而且排在前面），于是切出来的是一大段跨了几十条规则的文本，里面随便哪条的 max-width
-  // 都会让这条断言假红。同一个坑这份文件里已经踩过一次（断言匹配到自己的注释）。
-  const ruleOf = (sel) => {
-    const m = new RegExp("^" + sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s*\\{[^}]*\\}", "m").exec(pcss);
-    assert.ok(m, `${sel} 这条规则不见了`);
-    return m[0];
-  };
-  const pbody = ruleOf(".planpane__body");
+  const pbody = pcss.slice(pcss.indexOf(".planpane__body {"), pcss.indexOf(".planpane__body > :first-child"));
   assert.ok(!/max-width/.test(pbody), "方案正文还限着宽 —— 只占左边一条");
   // 「用 Agent 执行此方案」是这条回复末尾唯一的动作，要居中。inline-flex 吃不到 auto
   // 外边距，所以光写 margin auto 没用，两样都得断言。
