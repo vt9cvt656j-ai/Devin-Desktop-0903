@@ -124,7 +124,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import {
-  addHidden, chipBeside, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  addHidden, chipBeside, chipPadMove, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
 } from "./agent/explorer-drop.js";
 
@@ -74891,18 +74891,26 @@ function _chipText(chip) {
   return " @" + (kind === "file" ? "" : `${kind}:`) + rel + " ";
 }
 
-// 光标用方向键跨到片旁边之后，在**光标和片之间**留一个真空格。
+// 光标用方向键跨到片旁边之后，在**光标和片之间**留一个真空格；同时把光标**离开**那一侧上次
+// 垫的那一格收回 —— 这一格是跟着光标走的，同一时刻只存在一个。
 //
-// 不是插入片的时候就加（用户明确否掉了那个：「不是直接空格，而是我光标 我左键往左时候，
-// 才会开始 光标右边空格」）—— 只有光标真的停到片边上时才需要那点余地，否则光标紧贴片沿，
-// 看不出自己停在哪一侧。已经有空格就不再加，来回按不会越积越多。
+// 两步都是用户改出来的。先是否掉了「插入片的时候就加空格」那版（「不是直接空格，而是我光标
+// 我左键往左时候，才会开始 光标右边空格」）：只有光标真的停到片边上时才需要那点余地，否则
+// 光标紧贴片沿，看不出自己停在哪一侧。接着是「往左走就把右边那格减掉，往右走把左边那格减
+// 掉」：只加不减的话，来回按会在片两侧各留一格，两个片之间攒成两格，越按越宽。
+//
+// 收回只认自己垫的那个节点（_chipPad 按身份比对，且必须仍正好是一格），用户自己敲的空格不动。
+// 决策在模块里（chipPadMove），这里只负责照着改 DOM。
+let _chipPad = null;
 function _spaceBesideChip(chip, left) {
-  const at = left ? chip.previousSibling : chip.nextSibling;
-  const txt = at && at.nodeType === 3 ? (at.nodeValue || "") : "";
-  const has = left ? / $/.test(txt) : /^ /.test(txt);
-  if (has) return;
+  const { drop, add } = chipPadMove({ prev: chip.previousSibling, next: chip.nextSibling, left, pad: _chipPad });
+  if (drop) drop.parentNode.removeChild(drop);
+  _chipPad = null;
+  if (!add) return;
+  // drop 和 add 永远在片的两侧，所以这里读到的 nextSibling 不会是刚删掉的那个。
   const sp = document.createTextNode(" ");
-  chip.parentNode.insertBefore(sp, left ? chip : chip.nextSibling);
+  chip.parentNode.insertBefore(sp, add === "left" ? chip : chip.nextSibling);
+  _chipPad = sp;
 }
 function _makeComposerChip(rel, kind = "file", labelText = "") {
   const name = labelText || rel.split("/").filter(Boolean).pop() || rel;
