@@ -390,6 +390,27 @@ const CN_EN: &[(&str, &str)] = &[
     ("主页", "homepage landing"),
     ("首页", "homepage landing hero"),
     ("门户", "portal"),
+    // 页面/屏幕类型 —— 上面那批覆盖的是**行业**（咖啡/餐厅/医疗），而人说「帮我做个后台」
+    // 「做个落地页」时用的是**页面类型**，这一类原来一个都没有。语料是英文的，中文词没有
+    // 英文别名就只能匹配到随机的通用蓝图，等于强制调用的那次检索白跑一趟。
+    // 实测 20 个常见页面类型词里 17 个没有别名。
+    ("后台", "admin dashboard backend"),
+    ("管理后台", "admin panel dashboard backend"),
+    ("控制台", "console dashboard admin"),
+    ("登录页", "login signin"),
+    ("注册页", "signup onboarding"),
+    ("落地页", "landing hero conversion"),
+    ("个人主页", "homepage profile portfolio"),
+    ("商城", "shop store ecommerce storefront"),
+    ("定价页", "pricing tiers"),
+    ("设置页", "settings preferences"),
+    ("文档站", "docs documentation"),
+    ("知识库", "helpcenter documentation"),
+    ("招聘", "jobs careers hiring recruitment"),
+    ("问卷", "survey form questionnaire"),
+    ("预约", "booking appointment scheduling"),
+    ("看板", "kanban board task"),
+    ("日历", "calendar schedule"),
     ("动效", "motion animation scroll interactive"),
     ("交互", "interactive interaction"),
     ("咖啡", "coffee cafe"),
@@ -1607,5 +1628,32 @@ mod design_share_guard {
             call_site.contains("let hits = if domain.is_some() {"),
             "排除没有限定在无域那一支 —— 明确要设计知识的请求会被一起挡掉",
         );
+    }
+
+    /// 人说「帮我做个后台 / 落地页」时用的是**页面类型**词，那一类原来一个别名都没有。
+    ///
+    /// michael-design 语料是英文的（knowledge.rs:383 那段注释写着「a Chinese business word
+    /// MUST map to English category terms」），而 design_core.txt 又**强制**每次做界面都要
+    /// 调一次 knowledge_search(domain="michael-design")。中文词没有英文别名 → 那次强制调用
+    /// 只能匹配到随机的通用蓝图，等于白跑一趟，还占着回合和上下文。
+    ///
+    /// 原有的 431 个词覆盖的是**行业**（咖啡/餐厅/医疗/律所），实测 20 个常见**页面类型**
+    /// 词里 17 个没有别名。这条把它们钉住。
+    #[test]
+    fn page_type_words_have_english_aliases() {
+        let table: std::collections::HashMap<&str, &str> = super::CN_EN.iter().copied().collect();
+        for word in [
+            "后台", "管理后台", "控制台", "登录页", "注册页", "落地页", "个人主页",
+            "商城", "定价页", "设置页", "文档站", "知识库", "招聘", "问卷", "预约",
+            "看板", "日历",
+        ] {
+            let en = table.get(word).unwrap_or_else(|| {
+                panic!("页面类型词「{word}」没有英文别名——强制的设计检索会匹配到随机蓝图")
+            });
+            assert!(
+                en.is_ascii() && !en.trim().is_empty(),
+                "「{word}」的别名不是英文：{en}"
+            );
+        }
     }
 }
