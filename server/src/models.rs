@@ -6753,6 +6753,49 @@ async fn try_spend_free_points(state: &AppState, uid: uuid::Uuid, points: i64) -
     }
 }
 
+/// 抽干式扣点：能扣多少扣多少，返回**真正扣掉的**毫点（可能小于 points，可能是 0）。
+///
+/// 只给**按量计费**的免费模型用（`free_micro_usd == 0`）。为什么这一类不能用
+/// `try_spend_free_points` 的「全额扣或一点不扣」：那一类的成本要等上游回话才知道，
+/// 准入门只能退到 `free_points_needed(0) == 1`，即「池里还剩 1 毫点」就放行、**且不看钱包**。
+/// 结算再全额扣不到就整笔落到钱包，而池子**一分不动**（旧 SQL 的 `ELSE cur.avail`）——
+/// 于是那点余数永远卡在那儿，门永远说「免费池能付」，钱包被无限透支。
+/// 抽干让余数必然归 0，下一次 `free_pool_covers_call(0, 0)` 为假，402 重新可达。
+///
+/// 和 `spend_free_points` 的区别只在入参口径（毫点 vs micro-USD）；同样是 `FOR UPDATE`
+/// 下的单条语句，读和写之间插不进第二个请求。
+async fn spend_free_points_draining(state: &AppState, uid: uuid::Uuid, points: i64) -> i64 {
+    if points <= 0 {
+        return 0;
+    }
+    let (member_grant, base_grant) = crate::auth::daily_grant_binds();
+    let row: Result<Option<(i64,)>, _> = sqlx::query_as(&format!(
+        "WITH cur AS ( \
+             SELECT id, \
+                    CASE WHEN free_points_date IS DISTINCT FROM CURRENT_DATE \
+                         THEN {grant} ELSE free_points END AS avail \
+             FROM users WHERE id = $1 FOR UPDATE \
+         ) \
+         UPDATE users u \
+            SET free_points = GREATEST(0, cur.avail - $2), \
+                free_points_date = CURRENT_DATE \
+           FROM cur \
+          WHERE u.id = cur.id \
+         RETURNING LEAST(cur.avail, $2)::bigint",
+        grant = crate::auth::daily_grant_sql("$3", "$4"),
+    ))
+    .bind(uid)
+    .bind(points)
+    .bind(member_grant)
+    .bind(base_grant)
+    .fetch_optional(&state.db)
+    .await;
+    match row.ok().flatten() {
+        Some((spent,)) => spent.max(0),
+        None => 0,
+    }
+}
+
 /// 一次调用要从免费池扣多少毫点。地板是 1：`free + 不配费用` 若扣 0，这个模型就不是
 /// 免费而是**无限**——每日额度永远不动，也就永远没有"用完"这回事。
 pub fn free_points_needed(micro_usd: i64) -> i64 {
@@ -7087,6 +7130,11 @@ async fn bill_inner(
     let cost = crate::settings::usd_cents_to_wallet_cents(cost);
 
     let requested_cost = cost.max(0);
+    /// 一整分等于多少毫点：MICRO_USD_PER_CENT / MICRO_USD_PER_MILLI_POINT = 10000 / 50。
+    /// 和 `free_points_needed` 走同一套换算，改一处两边一起动。
+    const MILLI_POINTS_PER_CENT: i64 = MICRO_USD_PER_CENT / MICRO_USD_PER_MILLI_POINT;
+    // 免费池对这一次**部分覆盖**掉的毫点。0 = 没走免费分支，或池子全额付了/一点没付。
+    let mut pool_paid_milli = 0i64;
     // Free models bill against the daily points pool, never quota or wallet. Done here rather
     // than at each call site so no biller can forget it: every path that charges a free model
     // lands in this one branch, and the model_usage row below is still written (so usage
@@ -7114,16 +7162,47 @@ async fn bill_inner(
         // 见底那一刻起，免费模型既扣不到钱也不再拒绝——用量记着 0 点，钱包和会员额度一分
         // 不动。现在它会真的改用付费余额/会员额度继续，与准入门那条规则对上。
         let want = free_points_needed(micro);
-        let spent = try_spend_free_points(state, uid, want).await;
-        if spent > 0 {
+        // 按量计费的免费模型（free_micro_usd == 0）**必须把池子抽干**，按次计价的不动。
+        //
+        // 判据是「准入门算不算得准」，不是「哪种更好看」：
+        //   · 按次计价（free_micro_usd > 0）：门拿到的就是这一次的真实单价，
+        //     `free_pool_covers_call(balance, micro)` 是**确定**的答案 —— 池子盖不住时
+        //     用户在门口就已经被挡下并落到付费路径了，全额扣或一点不扣没有任何副作用。
+        //   · 按量计费（micro == 0）：成本要等上游回话才知道，门只能退到
+        //     `free_points_needed(0) == 1`，也就是「池里还剩 1 毫点」就放行，而且**不看钱包**
+        //     （admit_billing 的 `if free_here && free_pool_has_room { return Ok(true) }`）。
+        //     结算这边全额扣不到就整笔落到钱包 —— 于是池子停在那点余数上**再也不动**
+        //     （旧 SQL：`ELSE cur.avail`），门于是永远说「免费池能付」，钱包被无限透支。
+        //
+        // 生产实测 2026-08-22，zhangminghua221@gmail.com：池子从 100000 毫点一路正常支付到
+        // 余 1398，随后 00:45:46 起**每一次**调用都 want > 1398 → 扣 0、余数不动 →
+        // 445 次调用、6637 分全部记进钱包，余额从 0 变成 -6637。中位间隔 21 秒、
+        // 1 秒内最多 2 笔 —— 这不是并发，MAX_INFLIGHT_PER_USER=8 一次都没拦到。
+        //
+        // 抽干之后：第一笔盖不住的调用由池子出 1398、钱包出剩下的零头，池子归 0，
+        // **下一次** `free_pool_covers_call(0, 0)` 为假 → 落回 admit_billing → 402。
+        // 超支被限制在**一次**调用，而且用户拿满了当天 100% 的免费额度（不是靠预留一截
+        // 猜出来的 72%）—— 不需要预测成本，也就没有估高误杀正常用户的风险。
+        let spent = if free_micro_usd > 0 {
+            try_spend_free_points(state, uid, want).await
+        } else {
+            spend_free_points_draining(state, uid, want).await
+        };
+        if spent >= want {
             // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
             // free_points_spent carries what the user actually paid, in 点.
             record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
             return BillOutcome::Settled;
         }
+        // 部分覆盖：池子出了 `spent` 毫点，剩下的零头往下走付费路径。
+        // 记账两边都要说实话 —— model_usage 同时有 free_milli_points_spent 和 cost_cents，
+        // 一次调用由两个池子分摊是能如实表达的（线上本来就有 2801 行两列同时非零）。
+        pool_paid_milli = spent;
         if !free_fallback_to_paid() {
             // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
-            record_usage_row(state, uid, conn_id, requested_cost, 0, tokens).await;
+            // 记的是**真扣掉的**那部分（抽干模式下可能是部分覆盖），不再写死 0 ——
+            // 否则用量历史会说「一点没花」，而池子确实少了那么多。
+            record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
             return BillOutcome::Settled;
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
@@ -7231,7 +7310,11 @@ async fn bill_inner(
             tracing::error!(%error, %uid, carry_cents = rest, "failed to persist sub-cent carry");
         }
     }
-    let requested_cost = requested_cost + carried_cents;
+    // 免费池已经付掉的那部分不能再向钱包收一次。抽干模式下 `pool_paid_milli` 是这一次
+    // 池子真正扣走的毫点，换算回整分后从待收金额里减掉；不足一分的零头留给池子（对用户
+    // 有利的方向，且和 carry_to_cents 的「宁可少收不多收」同一条纪律）。
+    let pool_paid_cents = pool_paid_milli / MILLI_POINTS_PER_CENT;
+    let requested_cost = (requested_cost + carried_cents - pool_paid_cents).max(0);
     let charge = if requested_cost == 0 {
         FusedCharge::default()
     } else {
@@ -7313,12 +7396,16 @@ async fn bill_inner(
     // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
     // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(uid)
     .bind(conn_id)
-    .bind(actual_cost)
+    // cost_cents 记的是**这次调用的真实上游成本**，不是钱包被扣走的那一份 —— 免费分支
+    // 早退那一路（record_usage_row(.., requested_cost, spent, ..)）一直是这个口径。
+    // 部分覆盖时钱包只收了零头，把零头写进来的话，同一条免费线路上「池子全额付」的行
+    // 记全价、「池子付一半」的行记半价，对账的成本侧会凭空少掉池子出的那一块。
+    .bind(actual_cost + pool_paid_cents)
     .bind(tokens.prompt)
     .bind(tokens.completion)
     .bind(tokens.cached)
@@ -7331,6 +7418,9 @@ async fn bill_inner(
     .bind(tokens.emitted_tool.as_deref())
     .bind(settlement_id)
     .bind(tokens.prompt_includes_cached)
+    // 部分覆盖时池子出的那一份也要落在这一行上，否则「谁付的钱」只剩现金那一半，
+    // 而池子确实少了这么多毫点 —— 对账两侧就此对不上。
+    .bind(pool_paid_milli)
     .execute(&mut *tx)
     .await
     {
@@ -15049,10 +15139,19 @@ mod billing_tests {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
             .expect("read models.rs");
         let at = src.find("async fn bill(").expect("bill 改名了");
-        let body: String = src[at..].chars().take(12_000).collect();
+        // 窗口跟着函数走，不写死字数：原来是 `take(12_000)`，而 bill_inner 每加一段说明
+        // 就把被守的那一行往外推一点，推出去之后这条断言**恒真且仍然是绿的**——
+        // 守卫悄悄失效，正是它要防的 bug 可以大摇大摆回来的时候。
+        let end = src[at..]
+            .find("\n/// 一笔结算的结局")
+            .or_else(|| src[at..].find("\nmod billing_tests"))
+            .map(|e| e + at)
+            .unwrap_or(src.len());
+        let body = &src[at..end];
         assert!(
-            body.contains("let requested_cost = requested_cost + carried_cents;"),
-            "零头算出来了却没加进这次的扣费——免费池空了之后仍然一分不扣",
+            body.contains("let requested_cost = (requested_cost + carried_cents - pool_paid_cents).max(0);"),
+            "零头算出来了却没加进这次的扣费——免费池空了之后仍然一分不扣；\
+             或者池子已付的那部分没被减掉——同一次调用会被两个池子各收一遍",
         );
         assert!(
             body.contains("if free_pool && free_micro_usd > 0 && free_fallback_to_paid()"),
@@ -15080,9 +15179,15 @@ mod billing_tests {
         let mut checked = 0;
         let mut rest = production;
         while let Some(at) = rest.find("INSERT INTO model_usage") {
-            let stmt = &rest[at..(at + 700).min(rest.len())];
+            // 按**字符**切，不按字节：语句后面就是中文注释，`at + 700` 落在多字节字符
+            // 中间时 &str 直接 panic —— 一条和它要防的 bug 毫无关系的崩溃。
+            let stmt: String = rest[at..].chars().take(700).collect();
+            let stmt = stmt.as_str();
+            // 守的是**子查询**那一段，不是整串占位符：两条路径的列数本来就不一样
+            // （付费那条多一列 free_milli_points_spent），把尾巴一起写死只会让
+            // 「加一列」这种无关改动来撞这条断言，而它要防的根本不是列数。
             assert!(
-                stmt.contains("VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"),
+                stmt.contains("VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,"),
                 "第 {} 条 model_usage 插入没走子查询：线路一删，这条路径上的钱就永远补不回来",
                 checked + 1,
             );
@@ -15178,7 +15283,7 @@ mod billing_tests {
 
         // 记账行要带 settlement_id，端到端可追。
         assert!(
-            body.contains("emitted_tool, settlement_id, prompt_includes_cached)"),
+            body.contains("emitted_tool, settlement_id, prompt_includes_cached"),
             "model_usage 插入必须带 settlement_id 列",
         );
         assert!(
@@ -15267,9 +15372,13 @@ mod billing_tests {
         // 加它是因为「prompt_tokens 含不含缓存读取」两家不一样，而这件事**只有收回执
         // 那一刻知道**——事后从数字反推不出来（cached < prompt 时两种形状完全同形）。
         // 下游算缓存命中率的分母全靠这一位；不落库的话 Claude 会被结构性顶到 100%。
-        assert_eq!(cols, 15, "model_usage 列数变了");
-        assert_eq!(max_ph, 15, "占位符和列数对不上");
-        assert_eq!(binds, 15, ".bind() 和列数对不上——结算会运行时报错");
+        // 16 = 上面 15 列 + free_milli_points_spent。
+        // 加它是因为按量计费的免费模型现在会**部分覆盖**：池子出一部分、钱包出零头。
+        // 不落这一列的话，这一行只剩现金那一半，而池子确实少了那么多毫点——
+        // 「谁付的钱」在对账两侧就永远对不上。
+        assert_eq!(cols, 16, "model_usage 列数变了");
+        assert_eq!(max_ph, 16, "占位符和列数对不上");
+        assert_eq!(binds, 16, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
@@ -15388,6 +15497,105 @@ mod billing_tests {
 
     /// 免费池按「全额扣或一点不扣」结算：剩 2 点时来一次 50 点的调用，不能把 2 点扣光
     /// 还记 0 —— 那正是"扣不到钱也不拒绝"的旧行为。地板仍然是 1 毫点。
+    /// 线上 2026-08-22 那 445 次透支的形状，钉在这里。
+    ///
+    /// zhangminghua221@gmail.com：plan=none、从未充值、credits 起点 0。免费池 100000 毫点
+    /// 正常支付到余 1398，随后每一次调用 want > 1398 → 全额扣不到 → 扣 0、**余数不动** →
+    /// 445 次全部记进钱包，余额 0 → -6637。中位间隔 21 秒、1 秒内最多 2 笔，
+    /// MAX_INFLIGHT_PER_USER=8 一次都没碰到，所以「并发上限兜底」在这条路上是空话。
+    ///
+    /// 断的是**机制**，不是措辞：只要「池子扣不到时余数原样留着」这件事回来，
+    /// 门就会永远说「免费池能付」，这条就红。
+    #[test]
+    /// 抽干这件事**发生在 SQL 里**，单测跑不到——所以守调用点和 SQL 本身的形状。
+    ///
+    /// 上一条只证明了「假如池子被抽干，门就会拦」，它对「池子到底会不会被抽干」一无所知：
+    /// 把 `GREATEST(0, …)` 改回 `CASE WHEN avail >= $2 … ELSE avail END`，那一条照样全绿
+    /// （我实测过）。而那一行正是这个 bug 的本体——余数原样写回 → 门永远看到 >0 →
+    /// 每一次都免检放行 → 欠款无上限。真库上验过两种写法的差别：
+    ///     旧：池子 1398 → 仍是 1398，实扣 0
+    ///     新：池子 1398 → 0，        实扣 1398
+    ///     够付时两者完全一致（398 / 1000），正常路径零行为变化。
+    #[test]
+    fn the_draining_spend_actually_drains_and_is_the_one_used_for_usage_billing() {
+        let src = include_str!("models.rs");
+        // ① 抽干函数必须真的抽干：GREATEST 下限 0 + RETURNING 实扣量。
+        let at = src
+            .find("async fn spend_free_points_draining(")
+            .expect("抽干函数没了——按量计费的免费池会退回「全额扣或一点不扣」，欠款重新无上限");
+        // 按**字符**切，不能按字节——src 里全是中文注释，字节切片会落在多字节字符中间直接 panic。
+        // 切到**这个函数结束**（下一个顶层 fn 之前），不要拍一个字符数——SQL 很长，
+        // 窗口小了够不到 RETURNING 那一行，断言就会误红；窗口的毛病本仓踩过很多次。
+        let rest = &src[at + "async fn spend_free_points_draining(".len()..];
+        let end = rest.find("\nasync fn ").or_else(|| rest.find("\nfn ")).unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("SET free_points = GREATEST(0, cur.avail - $2)"),
+            "抽干函数不再抽干了（余数会被原样写回，池子永远不归零）"
+        );
+        assert!(
+            body.contains("RETURNING LEAST(cur.avail, $2)"),
+            "没有如实回报「这次实际扣了多少」，钱包那边就会重复收费或漏收"
+        );
+        assert!(
+            !body.contains("ELSE cur.avail END"),
+            "全额扣或一点不扣的写法回来了——那正是 bug 本体"
+        );
+        // ② 按量计费（free_micro_usd == 0）必须走抽干，按次计价必须保持原样。
+        let call = src
+            .find("let spent = if free_micro_usd > 0 {")
+            .expect("两类免费模型的分流没了——判据是「准入门算不算得准」");
+        let branch: String = src[call..].chars().take(200).collect();
+        let branch = branch.as_str();
+        assert!(
+            branch.contains("try_spend_free_points(state, uid, want)"),
+            "按次计价那一支被改了——它的门是准确的，行为必须逐字不变"
+        );
+        assert!(
+            branch.contains("spend_free_points_draining(state, uid, want)"),
+            "按量计费没走抽干，池子还是不会归零"
+        );
+    }
+
+    fn drained_pool_makes_the_gate_reachable_again() {
+        // 按量计费的免费模型：门只能退到地板 1。
+        assert_eq!(super::free_points_needed(0), 1);
+        // 余 1398 时门仍然放行，而且 admit_billing 在这一支**根本不读钱包** ——
+        // 这两件事叠加就是那 445 次的全部原因。
+        assert!(super::free_pool_covers_call(1_398, 0), "余数 > 0 时门必然放行");
+        assert_eq!(
+            super::admit_billing(true, true, true, false, 0, false, 0, 0, 0, 0).ok(),
+            Some(true),
+            "零余额、零套餐，却因为「免费池有余数」被放行——这一步不看钱包",
+        );
+
+        // 抽干之后：余数归 0，同一道门立刻变成 402。
+        assert!(!super::free_pool_covers_call(0, 0), "抽干后门必须说付不起");
+        assert!(
+            super::admit_billing(true, true, false, false, 0, false, 0, 0, 0, 0).is_err(),
+            "池子归零 + 没余额没套餐 = 必须当场 402，而不是继续记债",
+        );
+
+        // 一分 = 200 毫点，两边换算必须同源，否则「池子已付」减错会变成双收或漏收。
+        assert_eq!(super::MICRO_USD_PER_CENT / super::MICRO_USD_PER_MILLI_POINT, 200);
+        assert_eq!(super::free_points_needed(80 * super::MICRO_USD_PER_CENT), 16_000,
+            "线上那笔 80 分的调用要 16000 毫点——池里只剩 1398，正是它把用户推进负债");
+
+        // 抽干模式接进去了没有：纯函数对了不等于 bill_inner 用了它。
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/models.rs"))
+            .expect("read models.rs");
+        let at = src.find("async fn bill_inner(").expect("bill_inner 改名了");
+        let body: String = src[at..].chars().take(9_000).collect();
+        assert!(
+            body.contains("spend_free_points_draining(state, uid, want).await"),
+            "按量计费的免费模型又回到「全额扣或一点不扣」了——余数会再次永远卡住",
+        );
+        assert!(
+            body.contains("if free_micro_usd > 0 {"),
+            "按次计价那一支必须保持原样：它的门是准确的，抽干只针对按量计费",
+        );
+    }
+
     #[test]
     fn free_points_needed_keeps_the_floor() {
         assert_eq!(super::free_points_needed(0), 1, "免费且不配费用也必须消耗一点，否则就是无限");
@@ -15406,17 +15614,31 @@ mod billing_tests {
             src.contains("milli_points_for_micro_usd(micro_usd).max(1)"),
             "a free-flagged call must always consume at least one milli-点",
         );
+        // 「全额扣或一点不扣」按**计价方式**分成两条，判据是「准入门算不算得准」：
+        //   · 按次计价（free_micro_usd > 0）：门拿到的就是真实单价，答案确定 →
+        //     仍然全额扣或一点不扣（try_spend_free_points），行为一个字节不变。
+        //   · 按量计费（micro == 0）：成本要等上游回话，门只能退到地板 1、且不看钱包。
+        //     全额扣不到就**余数原样留着**，于是门永远说「免费池能付」、钱包被无限透支
+        //     （线上 2026-08-22 实测：445 次、6637 分、余额 0 → -6637）。这一支必须抽干。
+        //
+        // 原来那句「部分覆盖会让用量记录说不清是谁付的钱」的顾虑，由 model_usage 同时
+        // 落 free_milli_points_spent 和 cost_cents 解决（线上本来就有 2801 行两列同时非零）。
         assert!(
             src.contains("let want = free_points_needed(micro);")
-                && src.contains("let spent = try_spend_free_points(state, uid, want).await;"),
-            "免费池必须走「全额扣或一点不扣」，部分覆盖会让用量记录说不清是谁付的钱",
+                && src.contains("try_spend_free_points(state, uid, want).await")
+                && src.contains("spend_free_points_draining(state, uid, want).await"),
+            "按次计价那一支必须保持全额扣或一点不扣；按量计费那一支必须抽干，\
+             否则余数永远卡住、准入门永远说「免费池能付」",
         );
         // 池子盖不住时必须**落下去**按付费结算，而不是照旧早退。写成 `if true` 之类
         // 无条件早退，免费额度见底那一刻起就既扣不到钱也不再拒绝——钱包和会员额度一分不动。
+        // `spent >= want` 比原来的 `spent > 0` **更严**：不仅要真的扣到，还必须扣满这一次
+        // 的量。抽干模式下 `spent > 0` 会把「只付得起一部分」当成全额付讫早退，那正好是
+        // 免费额度见底之后白送的老毛病换个形状回来。
         assert!(
-            src.contains("if spent > 0 {"),
-            "免费池的早退必须以「真的扣到了」为条件；无条件早退＝免费额度见底那一刻起，\
-             免费模型既扣不到钱也不再拒绝，钱包和会员额度一分不动",
+            src.contains("if spent >= want {"),
+            "免费池的早退必须以「这一次真的扣满了」为条件；写成 `spent > 0` 或无条件早退＝\
+             免费额度见底那一刻起，免费模型既扣不到钱也不再拒绝，钱包和会员额度一分不动",
         );
         assert!(
             src.contains("if !free_fallback_to_paid() {"),

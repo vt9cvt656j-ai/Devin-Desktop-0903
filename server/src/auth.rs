@@ -1613,10 +1613,12 @@ mod customers_page_tests {
         // 四条语句形状还不一样（一条在 SET 里、一条在外层 CASE 的 THEN 里、两条在 CTE 里），
         // 最容易漏。这条断言扫的是 models.rs，而它自己写在 auth.rs 里，不会匹配到自身。
         let models = include_str!("models.rs");
+        // 四个：free_points_balance / spend_free_points / try_spend_free_points /
+        // spend_free_points_draining（按量计费免费模型的抽干扣点）。
         assert_eq!(
             models.matches("crate::auth::daily_grant_sql(").count(),
-            3,
-            "models.rs 里的三个发放点没有全部共用同一条会员判据",
+            4,
+            "models.rs 里的四个发放点没有全部共用同一条会员判据",
         );
         assert!(
             !models.contains("plan_expires_at > now()"),
