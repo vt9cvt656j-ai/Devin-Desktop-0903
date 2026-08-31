@@ -1352,6 +1352,48 @@ fn route_header_ewma(route_id: uuid::Uuid) -> Option<Duration> {
 /// 两个自适应机制（EWMA 收紧、卡死后的短探测）因此对出口**全部静默失效**，
 /// 每个出口都拿满 30 秒；主力线路每条挂 3~6 个出口，也就是绝大多数候选。
 /// 单测抓不到这种错——错的是**调用点传了哪个键**，不是函数本身。所以把键收进来。
+/// 只留一条线路的出口 —— 跨线路兜底到此为止。
+///
+/// 用户要的是「多路由」不是「跨路由」：一条线路挂多个出口、出口之间互相兜底，
+/// 而不是一个请求在多条线路之间找哪条能用。
+///
+/// 入参是 `expand()` 之后的扁平表（每项 = 线路 × 某个门，已按线路顺序排好、
+/// 线路内按「能用 → 不慢 → 便宜」排好）。选哪条线路沿用这个顺序
+/// （x-ide-route → 会话粘性 → sort），**但跳过「试过、从来没成过」的线路**。
+///
+/// 那道跳过不是锦上添花，是防一次确定的停机：线上 glm-5.3-flash 的候选里，
+/// 智普(sort=50) 对这个模型只有一个当天新建的出口（0 成 2 败），而 670 成 62 败的
+/// 那个挂在 sort=110 那条上。今天靠跨线路兜底才落到好的那条；直接按 sort 收窄
+/// 会把每一发都钉死在 0 成 2 败上。
+///
+/// 判据刻意取得很窄 —— **有失败、且一次都没成过**。全新没样本的线路（0 成 0 败）
+/// 不受影响，照旧按顺序拿流量，不会被饿死；这和 `is_reliable` 对 total=0 返回 true
+/// 是同一条规矩：没有证据不构成降级理由。
+fn narrow_to_one_route(
+    candidates: Vec<Model>,
+    rate_of: impl Fn(&Model) -> (i64, i64),
+) -> Vec<Model> {
+    let never_worked = |m: &Model| {
+        let (ok, bad) = rate_of(m);
+        ok == 0 && bad > 0
+    };
+    let mut order: Vec<uuid::Uuid> = Vec::new();
+    for c in &candidates {
+        if !order.contains(&c.id) {
+            order.push(c.id);
+        }
+    }
+    let chosen = order
+        .iter()
+        .find(|rid| candidates.iter().any(|c| c.id == **rid && !never_worked(c)))
+        .copied()
+        .or_else(|| order.first().copied());
+    match chosen {
+        Some(rid) => candidates.into_iter().filter(|c| c.id == rid).collect(),
+        None => candidates,
+    }
+}
+
 fn header_wait_for_candidate(base: Duration, candidate: &Model, now: Instant) -> Duration {
     header_wait_for_route(base, candidate.health_id(), now)
 }
@@ -10115,7 +10157,7 @@ pub async fn chat_completions(
     // 没配多路由的线路展开成一份、就是它自己，所以这一行对现有配置是恒等变换。
     //
     // 位置在免费池收窄**之后**：先决定用哪些线路，再决定每条线路走哪个门。
-    if !endpoint_map.is_empty() {
+    {
         // 自带地址的成败单独取一次：它在 route_endpoints 表里没有行，
         // 不取的话它永远「没有样本」＝永远算靠谱，而最初暴露这个问题的就是它。
         let own_rates = crate::route_endpoints::load_own_rates(
@@ -10123,8 +10165,51 @@ pub async fn chat_completions(
             &candidates.iter().map(|m| m.id).collect::<Vec<_>>(),
         )
         .await;
+        // 原来这里外面套着 `if !endpoint_map.is_empty()`，而 endpoint_map 是**全站**的：
+        // 一旦全站一个出口都没配，整段被跳过、candidates 保持多线路，收窄就漏了。
+        // 去掉那道 if —— 没有出口的线路 expand 出来就是它自己（route_endpoints 那边有
+        // `expanding_a_route_without_endpoints_changes_nothing` 正面钉着）。
         candidates =
             crate::route_endpoints::expand(&candidates, &endpoint_map, &own_rates, &model_id);
+
+        // ── 只走一条线路：跨线路兜底到此为止 ──────────────────────────
+        //
+        // 用户要的是「多路由」而不是「跨路由」：一条线路挂多个出口、出口之间互相兜底，
+        // 而不是一个请求在多条线路之间找哪条能用。拆在这里最省事——`expand()` 之后
+        // 每个候选都已经是「线路 × 某个门」，按线路 id 收成一组即可，下游每一处判据
+        // 用的都是 `health_id()`（出口粒度），语义自动从「跨线路」变成「线路内」：
+        // route_goes_to_the_back 的 route_count、429 让位的替补池、失败文案、日志，
+        // 全部不用动。计费（cid = conn.id）、粘性键、AVOID 头也都不受影响。
+        //
+        // 选哪条：沿用上面已经排好的顺序（x-ide-route → 会话粘性 → sort），
+        // **但跳过「试过、从来没成过」的线路**。
+        //
+        // 这一条不是锦上添花，是防一次确定的停机：线上 glm-5.3-flash 的候选里，
+        // 智普(sort=50) 对这个模型只有一个今天新建的出口（0 成 2 败），而 670 成 62 败
+        // 的那个挂在 sort=110 那条上。今天靠跨线路兜底才落到好的那条；直接按 sort 收窄
+        // 会把每一发都钉死在 0 成 2 败上。判据刻意取得很窄——**有失败、且一次都没成过**
+        // 才跳过，全新没样本的线路（0 成 0 败）不受影响，不会被饿死。
+        let rate_of = |m: &Model| -> (i64, i64) {
+            match m.endpoint_id {
+                Some(eid) => endpoint_map
+                    .get(&m.id)
+                    .and_then(|v| v.iter().find(|e| e.id == eid))
+                    .map(|e| (e.real_ok.unwrap_or(0), e.real_bad.unwrap_or(0)))
+                    .unwrap_or((0, 0)),
+                None => own_rates.get(&m.id).copied().unwrap_or((0, 0)),
+            }
+        };
+        let before = candidates.len();
+        candidates = narrow_to_one_route(candidates, rate_of);
+        if before != candidates.len() {
+            tracing::info!(
+                model = %model_id,
+                route_id = %candidates.first().map(|c| c.id).unwrap_or_default(),
+                targets = candidates.len(),
+                dropped = before - candidates.len(),
+                "只在这条线路的出口之间切换（跨线路兜底已按运维要求关闭）"
+            );
+        }
     }
 
     // 续写时明确避开刚死掉的那个出口。
@@ -20394,6 +20479,110 @@ mod route_cooldown_tests {
             wait < Duration::from_millis(13_300),
             "本该被拖到 13.3 秒以下（那样慢成功必被截断），实际 {wait:?}"
         );
+    }
+
+    /// 收窄必须真的接在派单路径上 —— 函数写对了但没人调，等于没关跨线路。
+    ///
+    /// 这条守的是**调用点**：`narrow_to_one_route` 的单测只证明函数本身对，把那一行
+    /// 从主循环里删掉，那些单测照样全绿（我实测过）。所以在源码上钉住它被调用、
+    /// 且位置在 `expand()` 之后（收窄的输入必须是展开后的扁平表）。
+    #[test]
+    fn the_dispatch_path_actually_narrows_to_one_route() {
+        let src = include_str!("models.rs");
+        const CALL: &str = "\n        candidates = narrow_to_one_route(candidates, rate_of);";
+        let at = src.find(CALL).expect(
+            "派单路径上没有调用 narrow_to_one_route —— 跨线路兜底其实没关掉，\
+             或者调用形状变了（那就更新这条断言的锚点）",
+        );
+        let expand_at = src
+            .find("crate::route_endpoints::expand(&candidates, &endpoint_map, &own_rates, &model_id);")
+            .expect("expand 的调用点没了，这条断言失去落点");
+        assert!(
+            expand_at < at,
+            "收窄跑到 expand 前面去了——那样它吃到的还不是「线路 × 门」的扁平表"
+        );
+        assert_eq!(src.matches(CALL).count(), 1, "出现了第二个收窄点，逐一确认后再改这条");
+    }
+
+    /// 只留一条线路：跨线路兜底关掉之后，一个请求只在这条线路的出口之间切换。
+    #[test]
+    fn only_one_route_survives_narrowing() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let mk = |rid: uuid::Uuid, eid: Option<uuid::Uuid>| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m.endpoint_id = eid;
+            m
+        };
+        // A 线路 3 个门（自带地址 + 2 个出口），B 线路 2 个。
+        let cands = vec![
+            mk(a, None),
+            mk(a, Some(uuid::Uuid::new_v4())),
+            mk(a, Some(uuid::Uuid::new_v4())),
+            mk(b, None),
+            mk(b, Some(uuid::Uuid::new_v4())),
+        ];
+        // 都有成功记录 → 按顺序取第一条线路 A，且 A 的三个门**全部保留**（这就是多路由）。
+        let out = narrow_to_one_route(cands, |_| (10, 1));
+        assert_eq!(out.len(), 3, "线路内的多个出口被砍掉了，多路由就没了");
+        assert!(out.iter().all(|m| m.id == a), "混进了别的线路");
+    }
+
+    /// 「试过、从来没成过」的线路要跳过——这条防的是一次确定的停机。
+    ///
+    /// 线上 glm-5.3-flash：智普(sort 靠前) 对这个模型只有一个当天新建的出口
+    /// （0 成 2 败），而 670 成 62 败的那个在排后面那条线路上。今天靠跨线路兜底
+    /// 才没出事；按 sort 直接收窄会把每一发都钉死在 0 成 2 败上。
+    #[test]
+    fn a_route_that_never_worked_is_skipped() {
+        let dead = uuid::Uuid::new_v4();
+        let good = uuid::Uuid::new_v4();
+        let dead_ep = uuid::Uuid::new_v4();
+        let mk = |rid, eid| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m.endpoint_id = eid;
+            m
+        };
+        // 排在前面的是那条只有一个 0 成 2 败出口的线路。
+        let cands = vec![mk(dead, Some(dead_ep)), mk(good, None)];
+        let out = narrow_to_one_route(cands, |m| {
+            if m.endpoint_id == Some(dead_ep) { (0, 2) } else { (670, 62) }
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, good, "被钉死在那条从来没成过的线路上了");
+    }
+
+    /// 全新、还没有任何样本的线路不许被饿死：0 成 0 败照旧按顺序拿流量。
+    #[test]
+    fn a_brand_new_route_is_not_starved() {
+        let fresh = uuid::Uuid::new_v4();
+        let old = uuid::Uuid::new_v4();
+        let mk = |rid| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m
+        };
+        let out = narrow_to_one_route(vec![mk(fresh), mk(old)], |m| {
+            if m.id == fresh { (0, 0) } else { (999, 1) }
+        });
+        assert_eq!(out[0].id, fresh, "没有证据不构成降级理由——新线路被误跳过了");
+    }
+
+    /// 全都从来没成过时照样发第一个：宁可试一发，也不把请求直接打死。
+    #[test]
+    fn all_dead_still_sends_the_first_one() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let mk = |rid| {
+            let mut m = Model::blank();
+            m.id = rid;
+            m
+        };
+        let out = narrow_to_one_route(vec![mk(a), mk(b)], |_| (0, 5));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, a);
     }
 
     /// 出口候选也必须吃到自适应收紧 —— 这条守的是一次真实的键错事故。
