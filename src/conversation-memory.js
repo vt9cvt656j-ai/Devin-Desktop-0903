@@ -857,6 +857,22 @@ export class ConversationMemory {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, max);
+    // 工具结果**掐头去尾都不行，要掐中间**。
+    //
+    // 报错的价值分布在两头：第一行说"是什么错"，最后几行说"根因/结论"，中间那一坨
+    // stack frame 是噪音。而 slice(0, 320) 砍的正是末尾——实测一条真实的 pg 连接失败
+    // （491 字符）过完这个函数，模型看到 "Error: connect ECONNREFUSED …" 加五行
+    // node_modules 里的栈，而最后那句「根因：DATABASE_URL 指向 5432，而 compose 里映射的是
+    // 5433」被截掉了。于是压缩之后模型知道"连不上库"，却不知道自己上一轮已经查出为什么，
+    // 只能从头再查一遍——这正是「跑久了变蠢」。
+    // 预算不变（还是 max），只是改成头 55% + 尾 45%，中间用 … 标出来。
+    const cleanEnds = (value, max) => {
+      const one = String(value || "").replace(/\s+/g, " ").trim();
+      if (one.length <= max) return one;
+      const head = Math.max(1, Math.floor(max * 0.55));
+      const tail = Math.max(1, max - head - 3);
+      return `${one.slice(0, head)}…${one.slice(-tail)}`;
+    };
     for (const msg of batch) {
       if (msg.tool_calls) for (const tc of msg.tool_calls) {
         const n = tc.function?.name;
@@ -868,10 +884,15 @@ export class ConversationMemory {
           // 而 multi_edit 改过的文件从 Files: 里静默消失——只剩一句「做过 multi_edit」。
           // 越是按建议用它做大改，压缩后越想不起来自己动过哪些文件。这是「跑久了变笨」
           // 的一种具体机制。format_file / create_dir / delete_path 同理，一并补上。
-          if (['write_file', 'edit_file', 'multi_edit', 'read_file', 'format_file', 'create_dir', 'delete_path'].includes(n)) {
+          // 参数名不止 path：move_path / copy_path 用的是 from + to，所以它们既不在这张
+          // 名单里、就算加进来 `a.path` 也取不到——实测「Actions: move_path」在，而
+          // Files: 里 src/old.ts → src/new.ts 两个都没有。摘要于是变成「做过一次移动，
+          // 但不知道移的是什么」，比不记还误导。三个键都收。
+          if (['write_file', 'edit_file', 'multi_edit', 'read_file', 'format_file',
+               'create_dir', 'delete_path', 'move_path', 'copy_path'].includes(n)) {
             try {
               const a = JSON.parse(tc.function.arguments || '{}');
-              if (a.path) files.add(String(a.path));
+              for (const k of ['path', 'from', 'to']) if (a[k]) files.add(String(a[k]));
             } catch {}
           }
         }
@@ -880,7 +901,10 @@ export class ConversationMemory {
         : msg?.role === 'user' ? 'user'
         : msg?.role === 'tool' ? 'tool'
         : 'system';
-      const text = clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
+      // 工具结果走 cleanEnds（保住末尾的根因）；用户/助手的正文是连贯叙述，从头读就行。
+      const text = role === 'tool'
+        ? cleanEnds(msg?.content, 320)
+        : clean(msg?.content, role === 'user' ? 700 : role === 'assistant' ? 520 : 320);
       if (text) lines.push(`[${role}] ${text}`);
       // 思考结论优先保留：助手消息尾部的〔推理摘要〕段被上面的 520 字截断裁掉时，
       // 补一条独立结论行（≤400 字），跨压缩边界仍能"接着想"而不是重新推导
