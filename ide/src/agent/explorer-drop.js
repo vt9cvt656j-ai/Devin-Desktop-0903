@@ -209,3 +209,37 @@ export function loadHidden(storage, key) {
 export function saveHidden(storage, key, store) {
   try { storage?.setItem?.(key, JSON.stringify(store || {})); } catch { /* 存不了就算了 */ }
 }
+
+/**
+ * 光标紧邻的那一侧是不是一个「片」（composer-chip）。
+ *
+ * 片是 contentEditable=false 的原子节点，WKWebView 不总能在它两侧摆放光标 —— 片若是输入框
+ * 里第一个元素，按左键就"没反应"。两侧垫零宽空格不够（浏览器有时不把空文本节点当落脚点），
+ * 所以要自己接管方向键，而"该不该接管"就是这个函数回答的。
+ *
+ * 纯 DOM 遍历，节点全部从参数进；isChip 也由调用方给，模块里不认 class 名。
+ */
+export function chipBeside({ container, node, offset = 0, left = true, isChip } = {}) {
+  const bare = (t) => String(t || "").replace(/\u200b/g, "");
+  if (!container || !node) return null;
+  let cur = node;
+  if (cur.nodeType === 3) {
+    const txt = cur.nodeValue || "";
+    // 这一侧还有真字符可走 → 交给浏览器，别抢。
+    if (bare(left ? txt.slice(0, offset) : txt.slice(offset))) return null;
+  } else if (cur.childNodes && cur.childNodes.length) {
+    const i = Math.max(0, Math.min(offset, cur.childNodes.length - 1));
+    cur = cur.childNodes[i] || cur;
+  }
+  let probe = cur;
+  while (probe && probe !== container) {
+    const sib = left ? probe.previousSibling : probe.nextSibling;
+    if (sib) { probe = sib; break; }
+    probe = probe.parentNode;
+  }
+  // 跳过垫在中间的零宽空格，再看过去是不是片。
+  while (probe && probe.nodeType === 3 && !bare(probe.nodeValue)) {
+    probe = left ? probe.previousSibling : probe.nextSibling;
+  }
+  return probe && probe.nodeType === 1 && isChip?.(probe) ? probe : null;
+}

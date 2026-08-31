@@ -124,7 +124,7 @@ import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPers
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
 import {
-  addHidden, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  addHidden, chipBeside, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
   planExplorerDrop, planMove, topLevelOf,
 } from "./agent/explorer-drop.js";
 
@@ -11885,12 +11885,9 @@ function _treeSelectClick(e, path) {
   }
   // 普通点击**不留持久的选中标记**。
   //
-  // 以前这里会把这一行塞进 _treeSel，于是点一下文件夹就留一块底色；而"当前打开的文件"
-  // 另有一块底色 —— 屏幕上同时有两处高亮，用户分不清哪个才是"我选中的"（用户原话：
-  // 「应该被选中的内容只能有一个才对」）。
-  // 选区只服务于**多选**（⇧ 连选 / ⌘ 点选，给批量删除和整组拖动用），所以普通点击把它清空，
-  // 只留下 anchor 供后续 ⇧ 连选起头。点文件 → 它成为当前打开的文件（蓝底）；点文件夹 →
-  // 展开/收起，不留标记。
+  // 以前会把这一行塞进 _treeSel，于是点一下文件夹就留一块底色；而"当前打开的文件"另有一块
+  // 底色 —— 屏幕上同时两处高亮，分不清哪个才是"我选中的"。选区只服务于多选（⇧ 连选 /
+  // ⌘ 点选，给批量删除和整组拖动用），所以普通点击清空它，只留 anchor 供 ⇧ 连选起头。
   _treeSel.clear();
   _treeAnchor = path;
   _applyTreeSel();
@@ -12265,8 +12262,8 @@ function closeContextMenu() {
     }, 150);
   }
 }
-// 右键的那一行要看得出来。普通文件/目录右键之后菜单浮在旁边、行上毫无标记，而菜单里
-// 就有不可逆的「删除」。存路径不存节点：菜单开着时 fs-watcher 仍可能重建树。
+// 右键的那一行要看得出来：菜单浮在旁边而行上毫无标记，用户不知道自己在操作哪一项，
+// 而菜单里就有不可逆的「删除」。存路径不存节点——菜单开着时 fs-watcher 仍可能重建树。
 let _ctxTargetPath = "";
 function _paintCtxTarget(path) {
   for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
@@ -22234,14 +22231,12 @@ function _renderMentionsToHtml(text) {
     out += _escHtmlLite(text.slice(last, m.index + m[1].length));
     const rel = m[2];
     const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-    // 带前缀的引用（@github:owner/repo、@gitlab:…、@mcp:…）不是本地路径：
-    // 发送之后消息里只剩纯文本，而这里原本只按"有没有扩展名"猜文件/文件夹，于是一个 GitHub
-    // 仓库被画成文件夹图标、名字还被截成最后一段（用户实拍：`ThesisX` 配一个文件夹图标）。
+    // 带前缀的引用（@github:owner/repo 等）不是本地路径。发送后消息里只剩纯文本，而下面
+    // 那条判据只按"有没有扩展名"猜文件/文件夹 —— 仓库会被画成文件夹图标、名字还被截尾。
     const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
-      // 只显示仓库名，owner 收进 tooltip（title 已经是完整的 github:owner/repo）。
-      // 组织名往往比仓库名还长，摆在气泡里挤掉正文，而用户真正要认的是"哪个项目"。
+      // 只显示仓库名，owner 收进 tooltip（title 已是完整的 github:owner/repo）。
       const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
       const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
       out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
@@ -60442,8 +60437,10 @@ async function _executeToolStepInner(step, call, root, run) {
       if (_previewStale) {
         // The PREVIEW's baseline is stale — not the write. This used to hard-block with
         // "被其他编辑器或程序修改", but by this point two stronger facts already hold:
-        //   • a dirty editor buffer was rejected by the unsaved-changes check above, so
-        //     no unsaved human edit is at risk here;
+        //   • a dirty editor buffer is rejected by the unsaved-changes check a few lines
+        //     BELOW (_openFileWriteConflict), which still gates the actual write — this
+        //     block only drops a stale preview and never touches disk, so no unsaved
+        //     human edit is at risk here. (This used to say "above"; it never was.)
         //   • this is a whole-file write whose content is self-contained, and it lands
         //     through writeTextFileIfUnchanged(fp, existed ? old : null, newContent) with
         //     the `old` read moments ago — a genuinely concurrent change still fails CAS.
@@ -75254,10 +75251,6 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   }
   if (!range.collapsed) range.deleteContents();
   range.insertNode(chip);
-  // 同上：片前面没有文本节点时，光标按左键过不去（片是原子节点）。
-  if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
-    chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
-  }
   // Give the caret a text node to land in: WKWebView renders NO visible caret directly after a
   // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
   // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
@@ -75382,6 +75375,26 @@ async function _moveIntoDir(paths, destDir) {
 // Swallow the click that follows a drag so the dragged file isn't also opened/selected.
 // 只吞树内的点击：旧版全局吞，拖完文件紧接着点 文件/Git/大纲/测试 页签会被白吞一次。
 document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressTreeClick = false; if (e.target && e.target.closest && e.target.closest("#tree")) { e.stopPropagation(); e.preventDefault(); } } }, true);
+// 左右方向键跨过内联的片。片是 contentEditable=false 的原子节点，WKWebView 不总能在它两侧
+// 摆放光标——片若是输入框第一个元素，按左键"没反应"（两侧垫零宽空格试过，不够）。所以自己
+// 接管：只在"光标紧挨着片"时越过它，其余一律放行，不影响逐字移动和选区。判断在模块里。
+promptEl.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey || e.isComposing) return;
+  const sel = window.getSelection();
+  if (!sel?.isCollapsed || !sel.rangeCount) return;
+  const r = sel.getRangeAt(0);
+  if (!promptEl.contains(r.startContainer)) return;
+  const left = e.key === "ArrowLeft";
+  const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left,
+    isChip: (n) => n.classList?.contains("composer-chip") });
+  if (!chip) return;
+  e.preventDefault();
+  const to = document.createRange();
+  to.selectNode(chip);
+  to.collapse(left);                    // 左键落到片之前，右键落到片之后
+  sel.removeAllRanges(); sel.addRange(to);
+});
 promptEl.addEventListener("keydown", (e) => {
   // Enter 直接发送；Shift+Enter 换行（⌘/Ctrl+Enter 也照发）。但要避开两种情况：
   //  ① @文件 / 斜杠菜单打开时，Enter 是「选中菜单项」——交给各自的处理器；
@@ -75700,6 +75713,7 @@ function _atRepoRows(kind, query) {
       name: r.full_name,
       detail: r.private ? "Private" : "Public",
       // 片上只显示仓库名，owner 收进 tooltip：组织名常常比仓库名长，摆在输入框里挤掉正文。
+      // value 仍是完整的 owner/repo —— 发出去的文本要能唯一定位仓库，只有显示层收短。
       onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name.split("/").pop() || r.full_name }),
     }));
   if (rows.length) return rows;
@@ -76031,12 +76045,6 @@ function _insertAtChip({ kind, value, label }) {
     range.deleteContents();
     const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
-    // 片左边也要有落脚点。片是 contentEditable=false 的原子节点，它**前面**若没有文本节点
-    // （比如它就是输入框里的第一个元素），光标按左键无处可去 —— 表现就是"往左走不动"。
-    // 右边早就补了一个零宽空格，左边一直没有。_ceSerialize 会把零宽空格剥掉，不进发送文本。
-    if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
-      chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
-    }
     let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
       pad = document.createTextNode("​");

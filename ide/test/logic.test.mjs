@@ -19621,9 +19621,10 @@ test("推断出的外部研究偏好永远不会让静默收尾多补一个回�
   // 研究证据是分类器**预测**的（"这活儿该查查同类实现"）。循环重构后，静默收尾不再基于这个
   // 预测记账——`research_evidence_missing` 的静默收尾腿已删除（AGENT_LOOP_REBUILD.md 阶段 2）。
   // 关键不变量是它从来不 force：绝不存在 researchEvidence 的 _pushNudge 去逼模型再来一轮。
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
   assert.doesNotMatch(quiet, /_missingResearchEvidence/,
     "静默收尾不能再基于分类器预测的研究要求记账");
   assert.doesNotMatch(loop, /_pushNudge\("researchEvidence"/,
@@ -20686,9 +20687,9 @@ test("P2.1-await_subagent：等待作业落定取回结果；无作业/无运行
 // Both tests now assert that split from their own side.
 test("P2.1-收尾：模型自己派发的子智能体只记账，不制造阻断回合", () => {
   const loop = stripJsComments(extractFn("_runAgenticLoop"));
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  assert.ok(quietStart >= 0, "the quiet-turn accounting branch must exist");
-  const quiet = loop.slice(quietStart, quietStart + 1900);
+  // 定长 1900 窗口盖不住静默分支（实测 18609 字），按 AST 取整块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   assert.match(quiet, /_subAgentJobs/);
   assert.match(quiet, /subagent_results_pending/,
     "unfinished jobs remain a truthful outcome fact");
@@ -24512,8 +24513,17 @@ test("stale write-preview re-bases instead of blocking; CAS still guards the wri
   assert.match(region, /_rollbackLiveEditorWritePreview\(liveWritePreview\)/);
   assert.match(region, /call\._liveWritePreview = null;/);
   // Guard 1: an unsaved human edit is still refused, EARLIER than this point.
-  assert.ok(RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale"),
-    "the dirty-buffer check must run before the preview check it now relies on");
+  // 原来写的是 `RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale")`，
+  // 两层错叠在一起：① 查的是 RAW_SRC（含注释），而这句话在全文的**第一次**出现是
+  // main.js:9647 的一句注释（offset 445263），拿一句注释去和一段真代码比先后；
+  // ② 它声称的顺序在生产代码里**本来就是假的**——剥掉注释后真代码在 offset 3014957，
+  // 而 _previewStale 在 3013208，脏缓冲检查其实排在**后面**。（_previewStale 那个块里
+  // 的注释也跟着写错了，说"上面已经拒掉了脏缓冲"，已一并订正。）
+  //
+  // 真正保住"未保存的人工改动不会被覆盖"的是这条：脏缓冲检查排在**真正落盘之前**。
+  // 预览回滚不写磁盘，排在它前面无害。用 CODE 而不是 RAW_SRC，用 at() 让缺失当场报错。
+  assert.ok(at(SRC, "_openFileWriteConflict(fp)", "脏缓冲检查") < at(SRC, "writeTextFileIfUnchanged(fp, existed ? old : null, newContent)", "落盘"),
+    "脏缓冲检查必须排在真正落盘之前，否则未保存的人工改动会被覆盖");
   // Guard 2: the write itself is still compare-and-swap against freshly-read disk.
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
     "a genuinely concurrent change must still fail at the CAS write");
@@ -25377,9 +25387,10 @@ test("the agent loop keeps fixing a red build, bounded, then finishes honestly",
 //   2. agent_core.txt carries the instruction it used to force.
 test("read-it-and-stop is prevented by the prompt, not by a profile-derived harness gate", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
 
   // 1. The profile-derived forcing gate is gone. No classifier guess ("workspace") may drive a
   //    re-entry — that is the exact machinery this rebuild exists to remove.
@@ -25400,10 +25411,11 @@ test("read-it-and-stop is prevented by the prompt, not by a profile-derived harn
 
 test("a quiet turn is the model's completion decision except for real bounded work", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
-  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn branch must be extractable");
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   for (const name of ["planPending", "researchEvidence", "toolFirst", "semanticReview", "effect", "codeVerify", "reconcile", "uiDeliveryAudit", "uiVerify"]) {
     assert.equal(quiet.includes(`_pushNudge("${name}"`), false, `${name} must not force another quiet-turn request`);
   }
@@ -25454,7 +25466,10 @@ test("a quiet turn is the model's completion decision except for real bounded wo
   assert.ok(_planGateAt > 0, "plan 门不见了");
   const _afterPlanGate = quiet.slice(_planGateAt);
   const _reenterAt = _afterPlanGate.indexOf("continue;");
-  const _trulyDoneAt = _afterPlanGate.indexOf("break; // truly done");
+  // `break; // truly done` 带注释文本，在剥了注释的 quiet 里找不到（indexOf 会回 -1，
+  // 而 `-1 > _reenterAt` 恰好是 false，这条断言从此只会误红或误绿）。
+  // 它是静默块的**最后一条语句**，用 lastIndexOf 定位。
+  const _trulyDoneAt = _afterPlanGate.lastIndexOf("break;");
   assert.ok(_reenterAt > 0, "plan 门之后没有 continue——计划没做完时不会有界续跑");
   assert.ok(_trulyDoneAt > _reenterAt,
     "an open plan re-enters, boundedly, and then the run ends honestly");
@@ -25464,17 +25479,18 @@ test("a quiet turn is the model's completion decision except for real bounded wo
 
 test("收尾诚实：最后一个动作轮有工具失败时，安静收尾必须记 last_action_failed（只记账、不补回合）", () => {
   const loop = extractFn("_runAgenticLoop");
-  const quietStart = loop.indexOf("if (!turn.toolCalls.length)");
-  const quietEnd = loop.indexOf("// Render every tool step up front", quietStart);
-  const quiet = loop.slice(quietStart, quietEnd);
-  assert.ok(quietStart >= 0 && quietEnd > quietStart, "quiet-turn 分支要能切出来");
+  // 结束锚点原来是一句**注释**，而 loop 来自 fnSource(..., { code: true })（注释已抹成
+  // 空格），indexOf 永远返回 -1；slice(起点, -1) 不是空串而是「到函数尾少一个字」，
+  // 于是这段实际横跨大半个 _runAgenticLoop。按 AST 取静默轮那个块。
+  const quiet = blockFrom("if (!turn.toolCalls.length) {", { code: true, nth: 1 });
+  assert.match(quiet, /quietTurns\+\+/, "切到的不是静默轮分支");
   // 收尾门必须真的读 lastTurnHadFailure，并写进 incompleteReason。
   assert.match(quiet, /if \(lastTurnHadFailure && run\.mode === "agent" && !run\._incompleteReason\) \{[\s\S]{0,200}run\._incompleteReason = `last_action_failed:\$\{lastFailKinds \|\| "tool"\}`/,
     "最后一个动作轮报了失败、模型却收尾 → 必须记 last_action_failed，让'已完成'说真话");
   // 只记账：这一句和 break 之间不许有 _pushNudge / continue（否则就成了强制补回合，
   // 违反'quiet turn 是模型的收尾决定'那条钉死的哲学）。
   const gateAt = quiet.indexOf("lastTurnHadFailure && run.mode");
-  const breakAt = quiet.indexOf("break; // truly done", gateAt);
+  const breakAt = quiet.lastIndexOf("break;");   // 静默块的最后一条语句（注释在 CODE 里已被抹掉）
   assert.ok(gateAt >= 0 && breakAt > gateAt, "last_action_failed 门必须在 truly-done break 之前");
   const tail = quiet.slice(gateAt, breakAt);
   assert.doesNotMatch(tail, /_pushNudge\(|continue;/,
@@ -25604,8 +25620,11 @@ test("dynamic tool admission uses the real registry, not the current intent prof
 
   const dispatchAt = loop.indexOf("const items = turn.toolCalls");
   const editBoundary = loop.indexOf("// Keep edit_file calls exactly as emitted", dispatchAt);
-  const searchAt = loop.indexOf("if (call && call.type === \"search_tools\")", editBoundary);
-  const searchTools = loop.slice(searchAt, loop.indexOf("// Same-batch EXACT-duplicate read", searchAt));
+  // 结束锚点 "// Same-batch EXACT-duplicate read" 在源码里**根本不存在**（那段注释后来
+  // 改写过），indexOf 回 -1，slice(起点, -1) 于是拿到 160,152 字——从 search_tools 分支
+  // 一路切到函数尾。下面那条 doesNotMatch 和 windowAt 都在这一大片里找，等于没界。
+  // 按 AST 取这个分支块本身（源码里同形分支有两处，另一处不在本函数，故传 nth）。
+  const searchTools = blockFrom('if (call && call.type === "search_tools") {', { code: true, nth: 1 });
   const windowAt = searchTools.indexOf("_applyToolPayloadWindow(toolSchemas, adds");
   assert.ok(windowAt >= 0, "search_tools additions reach the bounded payload window");
   assert.doesNotMatch(searchTools, /_agentToolNameAllowedByProfile/);
@@ -34616,16 +34635,25 @@ test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤�
 // ---- 四条「回执在骗模型」的修复 ----
 
 test("读不了的文件不许说成「找不到」，而且错误码要被失败识别器认出来", () => {
-  const src = SRC.slice(RAW_SRC.indexOf("} else if (unreadableMatches.length === 1) {"));
-  // 必须是**无条件**返回：只比字符串在不在的话，包一层 if (false) 照样绿（第一版就这么漏的）。
-  assert.match(src.slice(0, 1600),
-    /usedPath = unreadableMatches\[0\]\.path;[\s\S]{0,600}?\n        return \{ type: "read", path: usedPath, content:/,
-    "那一支不是无条件返回了 —— 一旦被条件包住，就又会掉回「找不到唯一文件」那条分支");
-  assert.match(src.slice(0, 1600), /\[ERROR\/UNREADABLE\] 文件确实存在/,
+  // 按 AST 取这个分支块，不要开放式切片 + 1600 定长窗口（实测那个窗口已经越过分支尾部
+  // 约 370 字、切进了下一个 if 块）。
+  const src = blockFrom('} else if (unreadableMatches.length === 1) {', { code: true });
+  // 必须是**无条件**返回。上一版写的是
+  //   /usedPath = …[\s\S]{0,600}?\n        return \{ type: "read", …/
+  // 里面真正起限制作用的只有 `\n` 后面那 8 个空格——它钉的是 return 的**缩进**，不是
+  // 它的无条件性。JS 不在乎缩进，所以「包一层 if 但不重排版」这个最省事的改法正好从
+  // 缝里穿过去；而注释里点名说第一版就栽在这儿，第二版换了个形状栽在同一处。
+  // 直接验分支体里没有任何条件分叉。
+  const body = src.slice(src.indexOf("{") + 1);
+  assert.doesNotMatch(body, /\bif\s*\(/,
+    "「读不了」的 return 被条件包住了 —— 又会掉回「找不到唯一文件」那条死路");
+  assert.match(body, /return \{ type: "read", path: usedPath, content:/,
+    "这一支不再返回读取结果");
+  assert.match(src, /\[ERROR\/UNREADABLE\] 文件确实存在/,
     "文件存在只是读不了，却仍然掉进「找不到唯一文件」那条分支 —— 模型会去 find_files，"
     + "搜到同一个路径、再读、同一句话，要么死循环要么对用户断言「项目里没有这个文件」");
-  assert.match(src.slice(0, 1600), /别再 find_files/, "没告诉模型别再去找路径");
-  assert.match(src.slice(0, 1600), /run_cmd/, "没给可行动的替代办法");
+  assert.match(src, /别再 find_files/, "没告诉模型别再去找路径");
+  assert.match(src, /run_cmd/, "没给可行动的替代办法");
   // 错误码必须落在失败识别器的枚举里，否则这次失败会被算成**成功**。
   const failMatch = load("_toolFailureMatch");
   assert.ok(failMatch("[ERROR/UNREADABLE] 文件确实存在: /a/b.db"),
@@ -36911,8 +36939,8 @@ test("接下来卡片显示短标签：按语义切，不定宽截断", () => {
 // 退出后重开丢会话：主存档比 localStorage 镜像旧时，两份必须合并而不是二选一
 // ---------------------------------------------------------------------------
 test("恢复会话时合并两份存档，旧的主存档不许盖掉新的镜像", () => {
-  // 直接 import 真模块，不再抠源码手工注入依赖：这个函数每加一个内部 helper，
-  // 手抄的注入表就漏一个（这次漏的是 _archiveAt），测试红得跟被测行为毫无关系。
+  // 直接 import 真模块，不再抠源码手工注入：这个函数每加一个内部 helper，手抄的注入表就
+  // 漏一个（漏过 _archiveAt），测试红得跟被测行为毫无关系。
   const merge = _mergeChatArchivesReal;
   const sess = (id, n) => ({ id, memory: { recent: Array.from({ length: n }, (_, i) => ({ i })) } });
 
