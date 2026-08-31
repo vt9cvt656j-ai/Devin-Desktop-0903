@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
   baseName, parentOf, joinPath, isInsideOrSame, splitExt, uniqueName,
-  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside, chipSpacers,
+  dropDirFor, planExplorerDrop, moveRejection, planMove, topLevelOf, chipBeside,
   addHidden, clearHidden, hiddenFor, isHidden,
 } from "../src/agent/explorer-drop.js";
 import { load } from "./helpers/source.mjs";
@@ -722,28 +722,22 @@ test("退格一次只删一个片，不能把整串都删了", () => {
   assert.match(h, /if \(!sel\?\.isCollapsed/, "有选区时不该接管");
 });
 
-test("两个片相邻时要垫真空格", () => {
-  // 用户：「左边和右边卡片就挨在一起了」。CSS margin 不够——两片之间没有可编辑的文本节点，
-  // 光标无处停；零宽空格宽度为 0，视觉上一样贴着。
-  const TXT = (v) => ({ nodeType: 3, nodeValue: v, previousSibling: null, nextSibling: null });
-  const CHIP = () => ({ nodeType: 1, _chip: true, previousSibling: null, nextSibling: null });
-  const link = (ns) => { ns.forEach((n, k) => { n.previousSibling = ns[k - 1] || null; n.nextSibling = ns[k + 1] || null; }); return ns; };
-  const isChip = (n) => !!n._chip;
-
-  const a = CHIP(), b = CHIP();
-  link([a, TXT("\u200b"), b]);
-  assert.deepEqual(chipSpacers(b, isChip), { before: true, after: false },
-    "紧邻另一个片（中间只有零宽空格）没被认出来");
-  assert.deepEqual(chipSpacers(a, isChip), { before: false, after: true });
-  // 两侧是普通文本就不用垫。
-  const c = CHIP();
-  link([TXT("hi"), c, TXT(" x")]);
-  assert.deepEqual(chipSpacers(c, isChip), { before: false, after: false });
-
+test("光标用方向键跨到片旁边时，才在光标和片之间留一个空格", () => {
+  // 用户否掉了「插入片时就直接加空格」那版：「不是直接空格，而是我光标 我左键往左时候，
+  // 才会开始 光标右边空格」。只有光标真的停到片边上时才需要那点余地。
   const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
-  assert.match(src, /function _padChipNeighbours\(chip\)/, "没有把垫空格接进插入路径");
-  assert.ok((src.match(/_padChipNeighbours\(chip\)/g) || []).length >= 3,
-    "两处插入点（@菜单 / 从树里拖进来）都要垫");
+  assert.doesNotMatch(src, /_padChipNeighbours/, "插入时就垫空格那版应该已经撤掉了");
+  const fn = src.slice(src.indexOf("function _spaceBesideChip"), src.indexOf("function _makeComposerChip"));
+  assert.ok(fn, "找不到 _spaceBesideChip");
+  // 已经有空格就别再加，来回按不能越积越多。
+  assert.match(fn, /if \(has\) return;/, "重复按方向键会不断累积空格");
+  assert.match(fn, /left \? \/ \$\/\.test\(txt\) : \/\^ \/\.test\(txt\)/, "两个方向的判据要分开");
+  // 只在方向键处理器里调用——不是插入路径。
+  const arrow = src.slice(src.indexOf("// 左右方向键跨过内联的片"), src.indexOf("// 退格 / 删除也要自己接管"));
+  assert.match(arrow, /_spaceBesideChip\(chip, left\)/, "方向键落位时没有留空格");
+  // 光标要停在空格的**外**侧，否则它又贴回片上了。
+  assert.match(arrow, /to\.setStart\(gap, left \? Math\.max\(0, \(gap\.nodeValue \|\| ""\)\.length - 1\) : 1\)/,
+    "光标没有停在空格外侧");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {

@@ -250,25 +250,3 @@ export function chipBeside({ container, node, offset = 0, left = true, isChip } 
   return probe && probe.nodeType === 1 && isChip?.(probe) ? probe : null;
 }
 
-/**
- * 片插进来之后，两侧若紧挨着**另一个片**，要垫一个真空格。
- *
- * 光靠 CSS margin 不够：两个片之间没有可编辑的文本节点，光标无处停，看着就是"粘在一起"。
- * 零宽空格也不行——它宽度为 0，视觉上仍然贴着。
- * 返回要在哪一侧插入真空格：{ before, after }。纯判断，插入由调用方做。
- */
-export function chipSpacers(chip, isChip) {
-  const bare = (t) => String(t || "").replace(/​/g, "");
-  const hop = (from, left) => {
-    let n = left ? from.previousSibling : from.nextSibling;
-    while (n && n.nodeType === 3 && !bare(n.nodeValue)) n = left ? n.previousSibling : n.nextSibling;
-    return n;
-  };
-  if (!chip) return { before: false, after: false };
-  const l = hop(chip, true);
-  const r = hop(chip, false);
-  return {
-    before: !!(l && l.nodeType === 1 && isChip?.(l)),
-    after: !!(r && r.nodeType === 1 && isChip?.(r)),
-  };
-}
