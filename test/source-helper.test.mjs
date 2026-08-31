@@ -218,7 +218,6 @@ test("blockFrom 的 code:true 和 SRC 版边界一致（只是注释被抹成空
 const SLICE_BASELINE = {
   "ambiguous-failure.test.mjs": 1,
   "comment-quality.test.mjs": 2,
-  "control-glow.test.mjs": 3,
   "desktop-automation.test.mjs": 2,
   "gate-tristate.test.mjs": 1,
   "interrupt-transcript.test.mjs": 1,

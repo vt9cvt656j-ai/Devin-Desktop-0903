@@ -19,7 +19,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource, fnSource as extractFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource, fnSource as extractFn, blockFrom } from "./helpers/source.mjs";
 
 function decl(name) {
   const i = RAW_SRC.indexOf(`const ${name} = `);
@@ -100,16 +100,20 @@ test("大小写不影响判定", () => {
 test("三个真驱动的执行分支都接上了红光", () => {
   // 光有判据没用，得真的在执行点调。以前只有 automation 那一条接了，而且判据是写死的
   // 正则 ^(mouse|keyboard)\.，recorder.replay / window.activate / system / ui_click 全漏。
-  const automation = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "automation") {'));
-  assert.match(automation.slice(0, 900), /_callDrivesDesktop\(call\) && \(await _showControlGlow\(\)|_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
+  // 按 AST 取整个分支块，不要「开放式切片 + 固定字符数」：实测三个窗口分别只盖住
+  // 目标分支的 29% / 35% / 76%（automation 3134 字给了 900、system 2548 给了 900、
+  // uiclick 2109 给了 1600）。接线挪到分支后半截就照样绿——而这三条守的正是
+  // 「红光真的在执行点被点亮」，用户看不见红光时根本不知道桌面正在被自动操作。
+  const automation = blockFrom('} else if (call.type === "automation") {', { code: true });
+  assert.match(automation, /_callDrivesDesktop\(call\) && \(await _showControlGlow\(\)|_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
     "automation 分支必须用统一判据，不能再用写死的正则");
 
-  const system = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "system") {'));
-  assert.match(system.slice(0, 900), /_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
+  const system = blockFrom('} else if (call.type === "system") {', { code: true });
+  assert.match(system, /_callDrivesDesktop\(call\)\) _showControlGlow\(\)/,
     "system 分支（open/focus/menu 会真的搬窗口点菜单）必须亮红光");
 
-  const uiclick = SRC.slice(RAW_SRC.indexOf('} else if (call.type === "uiclick") {'));
-  assert.match(uiclick.slice(0, 1600), /_showControlGlow\(\)/,
+  const uiclick = blockFrom('} else if (call.type === "uiclick") {', { code: true });
+  assert.match(uiclick, /_showControlGlow\(\)/,
     "ui_click 通过辅助功能真的操作前台 App，必须亮红光");
 });
 
