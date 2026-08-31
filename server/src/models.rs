@@ -1344,6 +1344,18 @@ fn route_header_ewma(route_id: uuid::Uuid) -> Option<Duration> {
 /// 「卡顿窗口内给 3×均值」，慢线路算出来 59s 反而盖过了原本 25 秒的惩罚，
 /// 于是切换比改之前更慢 —— 用户当场感觉到了。没有样本时退回 `base`，
 /// 也就是改动前的行为，不凭一个还不存在的均值去砍任何线路。
+/// 表头预算：**键由候选自己派生**，调用方没有传错的余地。
+///
+/// 存在的理由是一次真实的线上事故：读用 `candidate.id`、写用 `candidate.health_id()`，
+/// 而 `expand()` 把出口克隆成 Model 时 id 仍是**线路** id，于是
+/// `health_id() = endpoint_id.unwrap_or(id)` 对每一个出口候选都和 id 不相等。
+/// 两个自适应机制（EWMA 收紧、卡死后的短探测）因此对出口**全部静默失效**，
+/// 每个出口都拿满 30 秒；主力线路每条挂 3~6 个出口，也就是绝大多数候选。
+/// 单测抓不到这种错——错的是**调用点传了哪个键**，不是函数本身。所以把键收进来。
+fn header_wait_for_candidate(base: Duration, candidate: &Model, now: Instant) -> Duration {
+    header_wait_for_route(base, candidate.health_id(), now)
+}
+
 fn header_wait_for_route(base: Duration, route_id: uuid::Uuid, now: Instant) -> Duration {
     let by_speed = route_header_ewma(route_id)
         .map(|avg| (avg * 5 / 2).max(HEADER_WAIT_FLOOR))
@@ -10927,8 +10939,21 @@ pub async fn chat_completions(
                 // response body/stream that follows is untouched. That is the piece
                 // reqwest's own `.timeout()` cannot express for a streaming response.
                 // 最近卡满过的线路只给短探测预算，见 header_wait_for_route。
+                // 键必须是 `health_id()`，不是 `id`。
+                //
+                // 这两个自适应机制的**写入**侧全都用 health_id（出口有出口 id，线路自带
+                // 地址才回落到线路 id）：`record_route_header_ms(candidate.health_id())`、
+                // `mark_route_stall(candidate.health_id())`、`clear_route_stall(...)`。
+                // 而这里读的是 `candidate.id` —— `expand()` 把出口克隆成 Model 时 id 仍是
+                // **线路** id，所以对每一个出口候选，两个键永远不相等：
+                //     health_id() = endpoint_id.unwrap_or(id)
+                // 后果是 header_wait_for_route 里的两件事对出口**全部失效**：
+                //   · route_header_ewma 查不到 → by_speed 回落到 base，拿满 30 秒；
+                //   · route_recently_stalled 查不到 → 刚卡死过的出口下一轮照样给 30 秒。
+                // 线上主力线路每条挂 3~6 个出口，也就是说绝大多数候选从来没被收紧过 ——
+                // 这正是「响应太慢」：一个坏出口独吞 30 秒，58 秒预算里只够试两个。
                 let header_wait =
-                    remaining.min(header_wait_for_route(max_header_wait, candidate.id, Instant::now()));
+                    remaining.min(header_wait_for_candidate(max_header_wait, candidate, Instant::now()));
                 let send_started = Instant::now();
                 let sent = match tokio::time::timeout(header_wait, req.send()).await {
                     Ok(result) => {
@@ -20298,6 +20323,47 @@ mod route_cooldown_tests {
             "鉴权失败的冷却（{remaining:?}）必须比瞬时冷却（{CHAT_UPSTREAM_ROUTE_COOLDOWN:?}）长——坏 key 不会在 20 秒内变好",
         );
         assert!(remaining <= CHAT_UPSTREAM_AUTH_COOLDOWN);
+    }
+
+    /// 出口候选也必须吃到自适应收紧 —— 这条守的是一次真实的键错事故。
+    ///
+    /// 写入侧一直用 `health_id()`（出口 id），而读取侧曾经传 `candidate.id`（线路 id）。
+    /// `expand()` 克隆出来的出口候选，这两个键**永远不相等**，于是 EWMA 和「刚卡死过给
+    /// 短探测」两件事对所有出口静默失效，每个都拿满 30 秒上限。线上主力线路每条挂
+    /// 3~6 个出口，等于绝大多数候选从来没被收紧过。
+    ///
+    /// 注意这条**必须打在 `header_wait_for_candidate` 上**：函数本身没错，错的是调用点
+    /// 传了哪个键，所以只测 `header_wait_for_route(base, id, now)` 是抓不到的。
+    #[test]
+    fn an_endpoint_candidate_gets_its_own_adaptive_header_budget() {
+        let route_id = uuid::Uuid::new_v4();
+        let endpoint_id = uuid::Uuid::new_v4();
+        let mut candidate = Model::blank();
+        candidate.id = route_id;
+        candidate.endpoint_id = Some(endpoint_id);
+        assert_ne!(candidate.id, candidate.health_id(), "这条用例的前提是两个键不同");
+
+        let base = Duration::from_secs(30);
+        // 这个出口实测 5 秒回表头（polly 的量级）——写入用的是它自己的 health_id。
+        record_route_header_ms(candidate.health_id(), 5_000);
+
+        let got = header_wait_for_candidate(base, &candidate, Instant::now());
+        assert!(
+            got < base,
+            "出口候选没吃到自适应收紧，仍然是满额 {base:?}（读写键又对不上了）"
+        );
+        // 5s × 2.5 = 12.5s，但有 10 秒下限，所以是 12.5s。
+        assert_eq!(got, Duration::from_secs(12) + Duration::from_millis(500));
+
+        // 反向：没有样本的出口照旧拿满额，不许因为这条修法把新出口误压。
+        let mut fresh = Model::blank();
+        fresh.id = uuid::Uuid::new_v4();
+        fresh.endpoint_id = Some(uuid::Uuid::new_v4());
+        assert_eq!(
+            header_wait_for_candidate(base, &fresh, Instant::now()),
+            base,
+            "没有样本的新出口不该被收紧"
+        );
     }
 
     /// 冷却只延长、不缩短：已经在更长冷却里的线路，不会被一次新的鉴权失败缩回去。
