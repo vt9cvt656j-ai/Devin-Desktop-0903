@@ -59,25 +59,71 @@ export function preflightSettleLabel(sections) {
 }
 
 /**
- * 展开后的正文：四段按固定顺序排开，各带小标题。
+ * 展开后的正文。四段按固定顺序排开，各带小标题、条数和要点。
  *
  * 顺序取 sections 传进来的顺序（也就是 rubric 的定义顺序），不按命中数排——
  * 「适用条件 → 硬性约束 → 常见坑 → 必须做的检查」本身是一条阅读线，
  * 按数量重排会把它打乱。空的那一面也留着标题并写明没有，不静默消失：
  * 「这一面没查到」和「这一面不存在」是两件事。
+ *
+ * # 为什么出 HTML 而不是纯文本
+ *
+ * 原来出的是带换行和 `【】  ·` 的纯文本，调用方 `vp.textContent = …` 塞进卡里。而
+ * `.atc-viewport` 没有 `white-space: pre-wrap`——换行全被折叠掉，四个面、六条要点在
+ * 用户屏幕上是一整坨没有断点的段落（用户实拍：「知识检索里面的内容显示ui好好优化」）。
+ * 文本里其实**有**结构（面 / 条 / 来源小节），只是没有一个地方把它画出来。这里直接出
+ * 结构化 HTML：面成段、条成行、`来源 → 正文` 里的来源当行首标签。
+ *
+ * 三态照旧分开写：失败写「检索失败」、真零命中写「无可用命中」、命中了但没压出要点写
+ * 「命中 N 段，未压出要点」——和 facetSummary / preflightSettleLabel 同一口径。
+ *
+ * escapeHtml 由调用方注入（main.js 的 _escHtml）。没注入时**兜底也真转义**，不像
+ * attachFacetLine 那样退化成原样返回：那边喂的是我们自己拼的短标签，这边喂的是语料原文。
  */
-export function preflightBody(sections, cap = 6000) {
+export function preflightBodyHtml(sections, escapeHtml, cap = 6000) {
+  const esc = typeof escapeHtml === "function" ? escapeHtml : (x) => String(x ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  // 语料是 markdown，要点里常带 `**粗体**` 和 `` `代码` ``。转义**之后**再认这两种，
+  // 所以插进去的只有固定标签，语料本身没有机会变成标记。
+  const rich = (s) => esc(s)
+    .replace(/`([^`\n]{1,160})`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]{1,160})\*\*/g, "<b>$1</b>");
   const list = Array.isArray(sections) ? sections : [];
   const out = [];
+  let used = 0, cut = false;
   for (const s of list) {
     if (!s || !s.heading) continue;
     const bullets = Array.isArray(s.bullets) ? s.bullets : [];
-    out.push(`【${s.heading}】${s.failed ? "（检索失败，不等于库里没有）" : (bullets.length ? "" : "（无可用命中）")}`);
-    for (const b of bullets) out.push(`  · ${String(b).trim()}`);
-    out.push("");
+    const hits = Number(s.hits) || 0;
+    const n = s.failed ? "失败" : (bullets.length || (hits > 0 ? `0/${hits}` : 0));
+    out.push(`<div class="kpf__sec"><div class="kpf__head">`
+      + `<span class="kpf__facet">${esc(s.heading)}</span>`
+      + `<span class="kpf__n${s.failed ? " kpf__n--fail" : ""}">${esc(String(n))}</span>`
+      + `<span class="kpf__rule"></span></div>`);
+    if (s.failed) {
+      out.push(`<div class="kpf__empty kpf__empty--fail">检索失败，不等于库里没有</div>`);
+    } else if (!bullets.length) {
+      out.push(`<div class="kpf__empty">${hits > 0 ? `命中 ${hits} 段，未压出要点` : "无可用命中"}</div>`);
+    } else {
+      for (const b of bullets) {
+        const t = String(b ?? "").trim();
+        if (!t) continue;
+        if (used + t.length > cap) { cut = true; break; }
+        used += t.length;
+        // domainKnowledgeBullets 拼的是 `小节名 → 要点`，那个箭头是它加的分隔符，
+        // 不是语料里的字。拆开画：来源当行首标签，要点当正文。没有箭头就整条当正文。
+        const at = t.indexOf(" → ");
+        const src = at > 0 ? t.slice(0, at) : "";
+        const txt = at > 0 ? t.slice(at + 3) : t;
+        out.push(`<div class="kpf__item">${src ? `<span class="kpf__src">${esc(src)}</span>` : ""}`
+          + `<span class="kpf__txt">${rich(txt)}</span></div>`);
+      }
+    }
+    out.push(`</div>`);
+    if (cut) break;
   }
-  const text = out.join("\n").trimEnd();
-  return text.length > cap ? text.slice(0, cap) + "\n…（已截断）" : text;
+  if (cut) out.push(`<div class="kpf__cut">…（已截断）</div>`);
+  return out.length ? `<div class="kpf">${out.join("")}</div>` : "";
 }
 
 /**
@@ -183,7 +229,9 @@ export function settlePreflightCard(step, sections, deps = {}) {
     if (!step) return false;
     const { settleToolStep, knowledgeSettleLabel, escapeHtml } = deps;
     const vp = step.querySelector?.(".atc-viewport");
-    if (vp) vp.textContent = preflightBody(sections);
+    // innerHTML 而不是 textContent：正文里的结构（面 / 条 / 来源）要真画出来才看得见，
+    // .atc-viewport 没有 pre-wrap，纯文本的换行会被折叠成一整坨。转义在 preflightBodyHtml 里。
+    if (vp) vp.innerHTML = preflightBodyHtml(sections, escapeHtml);
     attachFacetLine(step, facetSummary(sections), escapeHtml);
     // 全失败时 label 是空串 → 交回 knowledgeSettleLabel 说「检索失败 · 原因」。
     const label = preflightSettleLabel(sections);

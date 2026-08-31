@@ -6711,6 +6711,49 @@ img.settings-dropdown__avatar--filled { object-fit: cover; }
   font-size: 11px;
 }
 
+/* 专业域预检那张卡展开后的正文（knowledge-preflight-card.js 的 preflightBodyHtml）。
+   原来是 textContent 塞进 .atc-viewport —— 而这一层没有 pre-wrap，换行全被折叠，四个面六条
+   要点在屏幕上是一整坨（用户：「知识检索里面的内容显示ui好好优化」）。文本里本来就有结构，
+   这里只是把它画出来：面成段带小标题和条数，条成行，来源当行首标签。 */
+.kpf { padding: 2px 14px 12px; }
+.kpf__sec { padding: 11px 0; }
+.kpf__sec + .kpf__sec { border-top: 1px solid rgba(128, 128, 128, .1); }
+.kpf__head { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
+.kpf__facet { font-size: 11.5px; font-weight: 650; letter-spacing: .01em; color: var(--atc-text, #1d1d1f); }
+.kpf__n {
+  font-size: 10.5px; font-weight: 600; line-height: 16px; padding: 0 6px;
+  border-radius: 999px; font-variant-numeric: tabular-nums;
+  color: var(--atc-dim, #86868b); background: rgba(128, 128, 128, .13);
+}
+.kpf__n--fail { color: var(--atc-danger, #d93025); background: color-mix(in srgb, var(--atc-danger, #d93025) 11%, transparent); }
+/* 标题右边那道渐隐的线：把面和面分开，又不像实线那样在窄卡里显得压抑。 */
+.kpf__rule { flex: 1 1 auto; height: 1px; background: linear-gradient(90deg, rgba(128, 128, 128, .2), transparent); }
+/* 一条要点一行。来源标签是**行内**的，正文接着它排、折行后占满整宽——
+   早先试过两栏网格（来源一栏、正文一栏），最长的那个小节名会把正文挤成窄条，
+   而小节名本身还得截断成「Common Amateur Mis…」。 */
+.kpf__item {
+  position: relative; padding-left: 13px;
+  font-size: 12.5px; line-height: 1.62;
+  color: var(--atc-text, #1d1d1f); overflow-wrap: break-word;
+}
+.kpf__item + .kpf__item { margin-top: 6px; }
+.kpf__item::before {
+  content: ""; position: absolute; left: 3px; top: .66em;
+  width: 3.5px; height: 3.5px; border-radius: 50%;
+  background: var(--atc-accent, #1a73e8); opacity: .45;
+}
+.kpf__src { font-weight: 650; color: var(--atc-accent, #1a73e8); margin-right: .42em; }
+.kpf__empty { font-size: 11.5px; color: var(--atc-dim, #86868b); }
+.kpf__empty--fail { color: var(--atc-danger, #d93025); }
+.kpf__cut { padding: 8px 0 0; font-size: 11px; color: var(--atc-dim, #86868b); }
+/* 必须写成 .atc-viewport .kpf code（0,2,1）：上面那条 .atc-viewport code 把行内代码的
+   底色和内边距全清了，同特异度靠源码顺序决定，写窄一点才盖得住。 */
+.atc-viewport .kpf code {
+  font-family: var(--atc-mono, var(--mono, ui-monospace, monospace));
+  font-size: .93em; padding: 1px 4px; border-radius: 4px;
+  background: rgba(128, 128, 128, .12);
+}
+
 .agent-tool-step.is-open .atc-viewport {
   display: block;
   animation: atcViewportOpen .2s ease both;
