@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fnSource, SRC } from "./helpers/source.mjs";
-import { facetSummary, preflightSettleLabel, preflightBody, movePreflightCardsAfter, attachFacetLine, createPreflightCard, settlePreflightCard, designPreflightSections }
+import { readFileSync } from "node:fs";
+import { blockFrom, fnSource, SRC } from "./helpers/source.mjs";
+import { facetSummary, preflightSettleLabel, preflightBodyHtml, movePreflightCardsAfter, attachFacetLine, createPreflightCard, settlePreflightCard, designPreflightSections }
   from "../src/agent/knowledge-preflight-card.js";
 
 /**
@@ -38,23 +39,57 @@ test("四个面的命中数直接写在卡面上，不用点开", () => {
 });
 
 test("展开的正文按 rubric 固定顺序排，空的那一面留着标题", () => {
-  const body = preflightBody(S);
+  const html = preflightBodyHtml(S);
   const order = ["适用条件", "硬性约束", "常见坑", "必须做的检查"]
-    .map((h) => body.indexOf(`【${h}】`));
+    .map((h) => html.indexOf(`>${h}<`));
   assert.ok(order.every((v, i) => v >= 0 && (i === 0 || v > order[i - 1])),
     "顺序被打乱了——「适用条件→硬性约束→常见坑→必须做的检查」本身是一条阅读线，不按命中数重排");
-  assert.match(preflightBody([{ heading: "常见坑", bullets: [], failed: true }]),
-    /【常见坑】（检索失败，不等于库里没有）/, "失败的那一面在正文里也被写成了零命中");
-  assert.match(body, /【常见坑】（无可用命中）/,
+  assert.match(preflightBodyHtml([{ heading: "常见坑", bullets: [], failed: true }]),
+    /kpf__empty--fail">检索失败，不等于库里没有/, "失败的那一面在正文里也被写成了零命中");
+  assert.match(html, /kpf__empty">无可用命中/,
     "空的那一面被静默丢掉了——「这一面没查到」和「这一面不存在」是两件事");
-  assert.ok(preflightBody(S, 40).endsWith("…（已截断）"), "超长没截断");
+  // 第三态：命中了 N 段但一条要点都没压出来，不能和真零命中共用一句话。
+  assert.match(preflightBodyHtml([{ heading: "常见坑", bullets: [], hits: 4 }]),
+    /命中 4 段，未压出要点/, "命中了没压出要点被说成了「无可用命中」");
+  assert.ok(preflightBodyHtml(S, null, 3).includes("已截断"), "超长没截断");
+});
+
+test("正文是画出来的结构，不是一坨文本", () => {
+  // 用户实拍：四个面六条要点糊成一整段。真凶是 .atc-viewport 没有 pre-wrap，而正文是
+  // textContent 塞进去的纯文本——换行全被折叠。文本里本来就有结构，只是没人画。
+  const html = preflightBodyHtml([{ heading: "常见坑", bullets: [
+    "docker-compose → Compose is for local dev **and** small deployments, see `.dockerignore`.",
+    "没有来源的一条",
+  ] }]);
+  // 面 / 条 / 来源三层都要在 DOM 里立得住。
+  assert.match(html, /<div class="kpf__sec">/, "面没有成段");
+  assert.equal((html.match(/class="kpf__item"/g) || []).length, 2, "条没有各自成行");
+  assert.match(html, /<span class="kpf__src">docker-compose<\/span>/,
+    "`来源 → 正文` 里的来源没有拆成行首标签——那个箭头是拼出来的分隔符，不是语料里的字");
+  assert.doesNotMatch(html, /→/, "分隔符箭头还留在正文里");
+  // 没有来源的那条不许凭空长出一个空标签。
+  assert.equal((html.match(/class="kpf__src"/g) || []).length, 1, "没有来源的一条也画了来源标签");
+  // markdown 的粗体/行内代码要真渲染——语料是 markdown，卡面上摊着 ** 和反引号很难看。
+  assert.match(html, /<b>and<\/b>/, "粗体没渲染");
+  assert.match(html, /<code>\.dockerignore<\/code>/, "行内代码没渲染");
+});
+
+test("正文默认就转义——它拼的是 HTML，语料是外来文本", () => {
+  // attachFacetLine 的兜底是「原样返回」，那边喂的是我们自己拼的短标签；这里喂的是语料原文，
+  // 不注入 escapeHtml 时兜底必须真转义，否则语料里一段 <script> 就直接进 DOM 了。
+  const html = preflightBodyHtml([{ heading: "常见坑", bullets: ["<img src=x onerror=alert(1)> → <b>x</b>"] }]);
+  assert.doesNotMatch(html, /<img/, "没注入转义器时兜底没转义——语料能往卡里注入标签");
+  assert.match(html, /&lt;img/, "尖括号没被转义成实体");
+  // 注入的转义器要真被用上。
+  const used = preflightBodyHtml([{ heading: "x", bullets: ["abc"] }], (t) => `[${t}]`);
+  assert.match(used, /\[abc\]/, "注入的 escapeHtml 没有被用");
 });
 
 test("坏输入一律不抛——它跑在渲染路径上", () => {
   for (const bad of [null, undefined, {}, [null], [{ bullets: null }], "x"]) {
     assert.doesNotThrow(() => facetSummary(bad));
     assert.doesNotThrow(() => preflightSettleLabel(bad));
-    assert.doesNotThrow(() => preflightBody(bad));
+    assert.doesNotThrow(() => preflightBodyHtml(bad));
   }
 });
 
@@ -209,17 +244,47 @@ test("调用点：一个域只建一张卡，且思考卡出现时会挪", () =>
   let settled = null;
   const okStep = { querySelector: (q) => (q === ".atc-viewport" ? vp : q === ".atc-action-row" ? row : null),
     ownerDocument: { createElement: () => ({ set className(v) { this._c = v; }, set innerHTML(v) { this._h = v; } }) } };
-  const vp = { textContent: "" };
+  const vp = { textContent: "", innerHTML: "" };
   const row = { parentNode: { insertBefore: (el) => { row._line = el._h; } } };
   settlePreflightCard(okStep, S, { settleToolStep: (_s, _r, l) => { settled = l; },
     knowledgeSettleLabel: (_c, _r, l) => l || "检索失败", escapeHtml: (x) => x });
   assert.match(String(row._line || ""), /适用条件 1/, "四个面没摆到卡面上");
   assert.equal(settled, "6 条 · 4 面");
-  assert.match(vp.textContent, /【适用条件】/, "正文没写进 viewport");
+  // innerHTML 而不是 textContent：.atc-viewport 没有 pre-wrap，纯文本的换行会被折叠成一坨。
+  assert.equal(vp.textContent, "", "正文又走回 textContent 了——换行会被折叠，四个面糊成一整段");
+  assert.match(vp.innerHTML, /class="kpf__facet">适用条件</, "正文没写进 viewport");
   // 全失败 → 交回 knowledgeSettleLabel。
   settlePreflightCard(okStep, [{ heading: "a", bullets: [], failed: true }],
     { settleToolStep: (_s, _r, l) => { settled = l; }, knowledgeSettleLabel: () => "检索失败 · 超时", escapeHtml: (x) => x });
   assert.equal(settled, "检索失败 · 超时", "全失败没走那个唯一区分失败/零命中的判据");
   for (const bad of [null, {}]) assert.doesNotThrow(() => settlePreflightCard(bad, S, {}));
   for (const bad of [null, {}]) assert.doesNotThrow(() => attachFacetLine(bad, "x", null));
+});
+
+test("知识检索有自己的图标，不再退回「读文件」那张纸", () => {
+  // typeIcons 里原来**没有 knowledge 这个键** → 走兜底 typeIcons.read，卡面上画的是一张
+  // 普通文档，和「读文件」一模一样（用户实拍）。这里把那张表真求值出来比，不比源码文本。
+  const icons = new Function(`return ${blockFrom("const typeIcons = {")}`)();
+  assert.ok(icons.knowledge, "typeIcons 里没有 knowledge —— 会退回兜底的 read 图标");
+  assert.notEqual(icons.knowledge, icons.read, "知识检索又和「读文件」共用一张图了");
+  assert.notEqual(icons.knowledge, icons._ksearch, "内置语料和外部检索工具该是两张图");
+  // 放大镜是从右页上挖空出来的，不是叠一层白：图标用 currentColor，底色随主题变，
+  // 叠白在深色下会露出一圈白边。
+  assert.match(icons.knowledge, /fill-rule="evenodd"/, "没有用挖空——深色下会露白边");
+  assert.doesNotMatch(icons.knowledge, /fill="#|fill="white"/, "图标写死了颜色，跟不了主题和状态");
+  assert.match(icons.knowledge, /viewBox="0 0 16 16"/, "和其余工具图标不同栅格");
+});
+
+test("展开正文的样式真在 CSS 里，且行内代码盖得住上面那条清零", () => {
+  const css = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
+  for (const cls of [".kpf__sec", ".kpf__facet", ".kpf__n", ".kpf__item", ".kpf__src", ".kpf__empty"]) {
+    assert.ok(css.includes(cls), `${cls} 没有样式——正文会退回没有结构的一坨`);
+  }
+  // .atc-viewport code 把行内代码的底色和内边距清零了，同特异度靠源码顺序决定；
+  // 写成 .atc-viewport .kpf code（0,2,1）才盖得住。
+  // 找带 { 的那条规则本身：上面那段注释里也写着这个选择器，按裸选择器找会匹配到注释，
+  // 规则被改窄成 .kpf code 也照样绿。
+  const i = css.indexOf(".atc-viewport .kpf code {");
+  assert.ok(i > 0, "行内代码没写成 .atc-viewport .kpf code —— 会被上面那条清零规则盖掉");
+  assert.match(css.slice(i, css.indexOf("}", i)), /background:/, "行内代码没有底色，等于没样式");
 });
