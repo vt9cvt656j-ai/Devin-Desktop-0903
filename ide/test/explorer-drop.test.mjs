@@ -468,6 +468,65 @@ test("落点是项目根时整棵树一起亮", () => {
     "整树高亮要用和行高亮同一个投放色");
 });
 
+test("右键的那一行要标出来，菜单关掉再清掉", () => {
+  // 用户：「被右键的那个内容 记得也要有被鼠标摸上那种效果，不然的话用户不知道点的是哪个
+  // 项目或者文件」。以前只有工作区根行会被选中，普通文件/目录右键后菜单浮在旁边、行上毫无
+  // 标记——而菜单里第一项之一就是不可逆的「删除」。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.match(src, /function openContextMenu\([^)]*\) \{[\s\S]{0,200}_paintCtxTarget\(entry\?\.path \|\| ""\)/,
+    "右键时没有标记目标行");
+  assert.match(src, /function closeContextMenu\(\) \{[\s\S]{0,220}_paintCtxTarget\(""\)/,
+    "菜单关掉后没有清掉标记——会留下一行看起来像被选中");
+  // 存路径不存节点引用：菜单开着时 fs-watcher 仍可能重建树。
+  const fn = src.slice(src.indexOf("function _paintCtxTarget"), src.indexOf("function openContextMenu"));
+  assert.match(fn, /querySelectorAll\("\.row\.is-ctx-target"\)/, "清理要按类名扫，不能存节点引用");
+  assert.match(fn, /\.row\[data-path="\$\{cssEscape\(_ctxTargetPath\)\}"\]/, "重贴要按路径找行");
+
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  assert.match(css, /#tree \.row\.is-ctx-target::before \{ background: var\(--active\); \}/,
+    "右键目标行没有高亮样式");
+  // 不能用 accent：那是「当前打开的文件」的语汇，混在一起分不清。
+  assert.doesNotMatch(css, /is-ctx-target::before \{ background: var\(--accent\)/, "别和 is-active 撞色");
+});
+
+test("右键菜单要窄", () => {
+  // 用户：「让这个框宽度窄一点，不然的话太长了，不好看」。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  const blk = css.slice(css.indexOf(".ctx-menu {"), css.indexOf(".ctx-menu .menu__item"));
+  const m = blk.match(/min-width:\s*(\d+)px/);
+  assert.ok(m, "找不到 .ctx-menu 的 min-width");
+  assert.ok(Number(m[1]) <= 150, `右键菜单还是太宽（${m[1]}px）`);
+});
+
+test("普通点击不留持久选中标记——屏幕上只该有一处高亮", () => {
+  // 用户实拍：点了 logs（紫底）之后，pyrightconfig.json 还带着"当前打开文件"的蓝底，
+  // 两处高亮同时在，分不清哪个才是"我选中的"。原话：「应该被选中的内容只能有一个才对」。
+  // 根因是普通点击也会把那一行塞进多选集合 _treeSel。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("function _treeSelectClick"), src.indexOf("async function _deleteSelectedTree"));
+  assert.ok(fn, "找不到 _treeSelectClick——测试台锚点失效了");
+  assert.doesNotMatch(fn, /_treeSel = new Set\(\[path\]\);/,
+    "普通点击又把那一行塞进多选集合了——会留下第二处高亮");
+  assert.match(fn, /_treeSel\.clear\(\);\n  _treeAnchor = path;/,
+    "普通点击应当清空选区、只留 anchor 供 ⇧ 连选起头");
+  // 多选本身要留着：批量删除和整组拖动都靠它。
+  assert.match(fn, /if \(e\.metaKey \|\| e\.ctrlKey\)/, "⌘ 点选没了");
+  assert.match(fn, /if \(e\.shiftKey && _treeAnchor\)/, "⇧ 连选没了");
+});
+
+test("选中高亮统一成蓝色，不再用紫色", () => {
+  // 用户：「不要用紫色 用 下面那种蓝色是好看的」。原来多选是写死的紫色，
+  // 和「当前打开的文件」(--sel，蓝) 是两套语汇，同屏出现像两种不同的"选中"。
+  const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
+  const sel = css.slice(css.indexOf(".row.is-selected::before"), css.indexOf(".row .chev,"));
+  assert.doesNotMatch(sel, /124, 92, 255/, "树的选中高亮还在用写死的紫色");
+  assert.match(sel, /\.row\.is-selected::before \{ background: color-mix\(in srgb, var\(--accent\)/,
+    "多选高亮没有走强调色");
+  // 叠加态（多选 + 当前文件）要更深，否则两者分不出层次。
+  assert.match(sel, /\.row\.is-selected\.is-active::before \{ background: color-mix\(in srgb, var\(--accent\) 22%/,
+    "多选叠加当前文件时没有加深");
+});
+
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
   // 纯逻辑对了但没接上等于没修。钉三件事：文件树是独立落区、树落点走复制而不是
   // openFolder、以及复制真的调了后端。

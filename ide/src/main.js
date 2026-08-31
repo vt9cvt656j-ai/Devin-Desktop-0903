@@ -11883,8 +11883,15 @@ function _treeSelectClick(e, path) {
     _applyTreeSel();
     return true;
   }
-  // plain click → single-select + set range anchor; caller proceeds to open/expand
-  _treeSel = new Set([path]);
+  // 普通点击**不留持久的选中标记**。
+  //
+  // 以前这里会把这一行塞进 _treeSel，于是点一下文件夹就留一块底色；而"当前打开的文件"
+  // 另有一块底色 —— 屏幕上同时有两处高亮，用户分不清哪个才是"我选中的"（用户原话：
+  // 「应该被选中的内容只能有一个才对」）。
+  // 选区只服务于**多选**（⇧ 连选 / ⌘ 点选，给批量删除和整组拖动用），所以普通点击把它清空，
+  // 只留下 anchor 供后续 ⇧ 连选起头。点文件 → 它成为当前打开的文件（蓝底）；点文件夹 →
+  // 展开/收起，不留标记。
+  _treeSel.clear();
   _treeAnchor = path;
   _applyTreeSel();
   return false;
@@ -12243,6 +12250,7 @@ function closeContextMenu() {
     ctxMenuEl.remove();
     ctxMenuEl = null;
   }
+  if (_ctxTargetPath) _paintCtxTarget("");
   // Flush any tree reloads that were deferred while the menu was open.
   if (_pendingReloadDirs.size) {
     const dirs = [..._pendingReloadDirs];
@@ -12257,9 +12265,19 @@ function closeContextMenu() {
     }, 150);
   }
 }
+// 右键的那一行要看得出来。普通文件/目录右键之后菜单浮在旁边、行上毫无标记，而菜单里
+// 就有不可逆的「删除」。存路径不存节点：菜单开着时 fs-watcher 仍可能重建树。
+let _ctxTargetPath = "";
+function _paintCtxTarget(path) {
+  for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
+  _ctxTargetPath = path || "";
+  if (!_ctxTargetPath) return;
+  treeEl?.querySelector(`.row[data-path="${cssEscape(_ctxTargetPath)}"]`)?.classList.add("is-ctx-target");
+}
 function openContextMenu(x, y, entry) {
   _suppressNativeSelection();
   closeContextMenu();
+  _paintCtxTarget(entry?.path || "");
   const isDir = !!entry.is_dir;
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isWorkspaceRoot = workspaceRoots.includes(entry.path);

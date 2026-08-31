@@ -1413,8 +1413,10 @@ body.is-win .tbtn { font-weight: var(--wt-medium); }
    makes the whole list twitch as you arrow through it. */
 .row.is-active { color: var(--accent); }
 /* multi-selection highlight (Shift/Cmd-click) — distinct from the active file */
-.row.is-selected::before { background: rgba(124, 92, 255, 0.18); }
-.row.is-selected.is-active::before { background: rgba(124, 92, 255, 0.28); }
+/* 多选高亮。原来是写死的紫色，和"当前打开的文件"(--sel，蓝) 完全两套语汇，屏幕上同时
+   出现时像两种不同的"选中"。统一到蓝色一族：多选比当前文件淡一档，叠在一起时最深。 */
+.row.is-selected::before { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.row.is-selected.is-active::before { background: color-mix(in srgb, var(--accent) 22%, transparent); }
 .row .chev,
 .row .chev-spacer {
   width: 14px;
