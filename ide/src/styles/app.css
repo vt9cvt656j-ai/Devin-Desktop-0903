@@ -54,6 +54,8 @@
   --accent-2: #7c5cff;
   --hover: rgba(0, 0, 0, 0.05);
   --active: rgba(0, 0, 0, 0.085);
+  /* 右键/焦点行的灰色选中。--active 只比 --hover 深 3.5%，右键一下几乎看不出变化。 */
+  --row-picked: rgba(0, 0, 0, 0.13);
   --sel: rgba(10, 132, 255, 0.14);
   --shimmer: rgba(10, 132, 255, 0.1);
   /* 拖放里「这一步会换掉整个项目」那一档的警示色，和 .problems__item--warn 同色系。 */
@@ -126,6 +128,7 @@
   --accent-2: #8b7cf6;
   --hover: rgba(255, 255, 255, 0.055);
   --active: rgba(255, 255, 255, 0.09);
+  --row-picked: rgba(255, 255, 255, 0.16);
   --sel: rgba(77, 170, 252, 0.22);
   --shimmer: rgba(255, 255, 255, 0.07);
   /* 琥珀在深底上要提亮，否则和边框糊成一片。 */
@@ -14873,7 +14876,19 @@ textarea.settings-input {
 /* 右键菜单开着时，被右键的那一行要标出来——否则菜单浮在旁边，用户不知道自己正在操作
    哪一项，而「删除」是不可逆的。比 hover 重一点，但不用 accent，免得和「当前打开的
    文件」(.row.is-active) 混淆。 */
-#tree .row.is-ctx-target::before { background: var(--active); }
+/* 右键菜单开着时，被右键的那一行。原来用的是 --active（只比 hover 深 3.5%），右键一下
+   几乎看不出变化——用户报「没有灰色的选中样式，不知道自己选了哪个」。换成更重的灰，
+   再加一圈内描边：菜单里有不可逆的「删除」，这一行必须一眼可辨。
+   用灰不用蓝：蓝是「当前打开的文件」和多选的语汇，撞在一起又分不清了。 */
+#tree .row.is-ctx-target::before { background: var(--row-picked); }
+#tree .row.is-ctx-target::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 0 -1000px;
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+  pointer-events: none;
+}
 /* .row::before 平时有 0.1s 背景过渡；VS Code 的 drop-target 没有任何过渡，而子树整块
    满染叠上过渡后，快速划过会拖出一条渐变尾巴。拖放期间关掉。 */
 #tree.is-dropping .row::before { transition: none; }
