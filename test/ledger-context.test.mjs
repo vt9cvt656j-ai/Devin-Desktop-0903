@@ -560,3 +560,24 @@ test("上下文摘要不许被 Tier 3 当成「模型自己写太长的回复」
   // 反向：普通的长 assistant 正文照旧要被折，别把这条守卫修成「Tier 3 整个失效」。
   assert.ok(String(msgs[2].content).includes("FOLDED"), "Tier 3 对普通长正文失效了");
 });
+
+test("工具成败台账：只失败没成功的工具不许被截断掉——这本账就是为失败存在的", async () => {
+  const { toolLedgerStats } = await import("../src/agent/tool-ledger.js");
+  // 原来按 okCount 降序再 slice(0, 20)：0✓/4✗ 的工具结构性地永远排最末、必被截掉。
+  // 三个消费方全部面向模型，其中两个的标题正是「避开已知失败路径，复用已验证工具」。
+  const entries = [];
+  for (let i = 0; i < 21; i++) for (let k = 0; k < 9; k++) entries.push({ tool: `ok_tool_${i}`, category: "file", ok: true });
+  for (const t of ["run_in_terminal", "browser", "db_query"])
+    for (let k = 0; k < 4; k++) entries.push({ tool: t, category: "other", ok: false, reason: "端口被占用 EADDRINUSE" });
+  const out = toolLedgerStats(entries);
+  for (const t of ["run_in_terminal", "browser", "db_query"])
+    assert.ok(out.includes(t), `连败的 ${t} 被截掉了——模型会照旧去撞同一堵墙`);
+  assert.ok(out.includes("EADDRINUSE"), "最近失败原因也要留着，否则只知道失败不知道为什么");
+  // 预算不许失控：仍是 20 行（外加类别汇总头和截断尾注）。
+  assert.ok(out.split("\n").length <= 23, `涨到 ${out.split("\n").length} 行，预算失守`);
+  // 截断要说出来，否则读起来像「本 run 只用过这些工具」。
+  assert.match(out, /其余 \d+ 个工具全部成功，未列出。/, "静默截断——被丢掉的那些无声无息");
+  // 反向：没有失败时不许硬塞尾注/失败行。
+  const clean = toolLedgerStats([{ tool: "read_file", category: "file", ok: true }]);
+  assert.ok(!/其余/.test(clean), "没截断却挂了截断尾注");
+});
