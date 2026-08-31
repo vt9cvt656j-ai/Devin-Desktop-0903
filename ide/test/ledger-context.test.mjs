@@ -366,3 +366,54 @@ test("源码顺序：名录的计算点在冷启动等待之后、技能块之�
   const line = send.slice(roster, send.indexOf("\n", roster));
   assert.doesNotMatch(line, /await/);
 });
+
+// ── 压缩摘要：模型对被压掉那段历史的**唯一**替代物 ────────────────────────────
+//
+// 同一个 bug 已经在这里被逮到过一次（multi_edit 不在那张手抄名单里，改过的文件从
+// Files: 静默消失）。下面两条守的是它的两个同门。
+
+test("摘要的 Files: 不许漏掉 move/copy —— 那两个的参数叫 from/to，不叫 path", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory();
+  const tc = (name, args) => ({ tool_calls: [{ function: { name, arguments: JSON.stringify(args) } }] });
+  const out = m._summarizeBatch([
+    tc("multi_edit", { path: "src/pay.ts" }),
+    tc("move_path", { from: "src/old.ts", to: "src/new.ts" }),
+    tc("copy_path", { from: "a/x.ts", to: "b/x.ts" }),
+  ]);
+  // 它们**既**不在名单里、就算加进来 `a.path` 也取不到——两层都漏。修之前的实测输出是
+  // 「Actions: multi_edit, move_path, copy_path」配「Files: src/pay.ts」：
+  // 摘要说"做过一次移动"，却说不出移的是什么，比不记还误导。
+  for (const f of ["src/pay.ts", "src/old.ts", "src/new.ts", "a/x.ts", "b/x.ts"]) {
+    assert.ok(out.includes(f), `压缩摘要丢了 ${f}——模型再也想不起来动过它`);
+  }
+});
+
+test("工具结果截断要掐中间，不能把末尾的根因砍掉", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory();
+  // 报错的价值分布在两头：第一行说"是什么错"，最后几行说"根因"，中间的 stack frame 是噪音。
+  // 而 slice(0, 320) 砍的正是末尾。实测这条 491 字符的 pg 连接失败，修之前模型看到
+  // 首行 + 五行 node_modules 栈，最后那句根因被截掉——于是压缩后它知道"连不上库"，
+  // 却不知道自己上一轮已经查出为什么，只能从头再查一遍。
+  const stack = [
+    "Error: connect ECONNREFUSED 127.0.0.1:5432",
+    "    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1595:16)",
+    "    at Protocol._enqueue (/app/node_modules/pg/lib/protocol.js:144:48)",
+    "    at Connection.connect (/app/node_modules/pg/lib/connection.js:109:18)",
+    "    at Pool._acquireClient (/app/node_modules/pg-pool/index.js:271:12)",
+    "    at async initDatabase (/app/src/db/index.ts:42:3)",
+    "    at async bootstrap (/app/src/main.ts:18:5)",
+    "根因：DATABASE_URL 指向 5432，而 docker-compose 里 postgres 映射的是 5433",
+  ].join("\n");
+  const line = m._summarizeBatch([{ role: "tool", content: stack }])
+    .split("\n").find((l) => l.startsWith("[tool]")) || "";
+  assert.ok(line.includes("ECONNREFUSED"), "首行的错误类型没保住");
+  assert.ok(line.includes("根因"), "末尾的根因被截掉了——模型只好重新查一遍");
+  // 预算不许因此失控：仍然在 320 上下（加上 "[tool] " 前缀）。
+  assert.ok(line.length <= 360, `摘要行涨到 ${line.length} 字符，预算失守`);
+  // 用户/助手的正文是连贯叙述，从头读就行，不该被掐中间。
+  const userLine = m._summarizeBatch([{ role: "user", content: "a".repeat(900) }])
+    .split("\n").find((l) => l.startsWith("[user]")) || "";
+  assert.ok(!userLine.includes("…"), "用户正文不该掐中间");
+});
