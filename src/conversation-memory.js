@@ -888,6 +888,17 @@ export class ConversationMemory {
     // 只能从头再查一遍——这正是「跑久了变蠢」。
     // 预算不变（还是 max），只是改成头 55% + 尾 45%，中间用 … 标出来。
     for (const msg of batch) {
+      // 出货路径上**没有一条**历史消息带 tool_calls：assistant 消息带 tool_calls 却没有
+      // 配套的 tool 角色回复是非法请求体，所以入账处一律 text-only（main.js 收尾那段有
+      // 原话）。下面那个 msg.tool_calls 分支因此在真实会话里从不进入——Files:/Actions:
+      // 两行恒为空。真正的来源是入账时挂在 _ideMeta 上的执行事实（_ideMeta 已在
+      // _sanitizeProviderMessages 里被摘掉，不会发给上游）。
+      const meta = msg?._ideMeta;
+      if (meta && Array.isArray(meta.files)) {
+        for (const f of meta.files) if (f) files.add(String(f));
+        // 截断要说出来，别让"只改了 60 个"看起来像全部。
+        if (Number(meta.filesTotal) > meta.files.length) files.add(`…共 ${meta.filesTotal} 个`);
+      }
       if (msg.tool_calls) for (const tc of msg.tool_calls) {
         const n = tc.function?.name;
         if (n) {

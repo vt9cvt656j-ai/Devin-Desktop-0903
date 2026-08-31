@@ -32,6 +32,7 @@ import { sqlDialects as _MPM_DIALECT } from "./agent/sql-dialects.js";
 import { applyLayoutDensity, viewportW, viewportH } from "./agent/layout-density.js";
 import { parseSkillDocument as _parseSkillDocument } from "./agent/skill-doc.js";
 import { symbolPatternsFor as _symbolPatternsFor } from "./agent/code-text.js";
+import { attachExecutionFacts as _attachExecutionFacts } from "./agent/execution-facts-meta.js";
 import { partialCause as _partialCauseOf, runOutcome as _runOutcomeOf, shouldReviewZeroDelivery as _shouldReviewZeroDelivery, settleBuildFailure as _settleBuildFailure } from "./agent/outcome.js";
 import { freshBuildFailure as _freshBuildFailure, evidenceCertifies as _evidenceCertifies } from "./agent/verification-evidence.js";
 import { parallelUnsafeCommand as _parallelUnsafeCommand } from "./agent/parallel-command.js";
@@ -57005,7 +57006,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     // for compaction + replay. The triggering user turn was already persisted before the run.
     try {
       const _record = String(summaryText || "").trim();
-      if (_record) { const _msg = { role: "assistant", content: _record, model: config.model || "" }; if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll; session.memory.push(_msg); }
+      // 执行事实（本轮动过哪些文件）挂在 _ideMeta 上跟着入账——为什么不能带 tool_calls、
+      // 为什么只能是 _ideMeta，见 agent/execution-facts-meta.js 的头注释。
+      if (_record) {
+        const _msg = { role: "assistant", content: _record, model: config.model || "" };
+        if (reasoningAll && reasoningAll.trim()) _msg.reasoning = reasoningAll;
+        _attachExecutionFacts(_msg, run?._mutatedFiles);
+        session.memory.push(_msg);
+      }
     } catch {
       if (!finalErr && summaryText) { try { session.memory.push({ role: "assistant", content: summaryText, model: config.model || "" }); } catch {} }
     }

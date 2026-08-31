@@ -443,3 +443,65 @@ test("归档的工具结果也要掐中间——否则 recall 连搜都搜不到
   assert.equal(m.searchArchive("ECONNREFUSED").length, 1, "recall 搜不到 → 模型以为这事没发生过");
   assert.equal(m.searchArchive("网关没起来").length, 1, "尾部的中文关键词同样要能搜到");
 });
+
+// ── 压缩摘要的 Files: 行，在出货路径上到底有没有内容 ──────────────────────
+// 样板那条 bug（「压缩会忘掉 multi_edit 改过的文件」）的根因比名单更深一层：
+// _summarizeBatch 的 Files:/Actions: 读的是 msg.tool_calls，而全仓 memory.push
+// **没有一个**带 tool_calls（收尾处注释原话 "Text-only (no tool_calls…)"，
+// 且这条限制必须保持——assistant 带 tool_calls 却无配套 tool 回复是非法请求体）。
+// 于是那两行恒为空：不是漏了某个工具，是一个文件都没有。
+test("压缩摘要的 Files: 有内容——执行事实走 _ideMeta，不靠 tool_calls", async () => {
+  const { ConversationMemory } = await import("../src/conversation-memory.js");
+  const m = new ConversationMemory({ summarize: async () => "S" });
+  m.push({ role: "user", content: "把 auth 模块重构一下" });
+  m.push({ role: "assistant", content: "已按你的要求完成 auth 模块重构。", model: "claude",
+    _ideMeta: { files: ["src/auth/session.ts", "src/auth/token.ts", "src/app/login/page.tsx"], filesTotal: 3 } });
+  for (let i = 0; i < 130; i++) m.push({ role: "user", content: `第 ${i} 轮` });
+  await m.maybeCompress?.();
+  await new Promise((r) => setTimeout(r, 60));
+  const sum = m.prefixMessages().find((x) => String(x.content).includes("[对话上下文摘要]"))?.content || "";
+  assert.ok(/(^|\n)Files: /.test(sum), "摘要里没有 Files: 行——压缩后模型对「我改过什么」完全失忆");
+  assert.ok(sum.includes("src/auth/session.ts"), "改过的文件没进摘要");
+  // 全路径，不是 basename：同名文件（page.tsx）不带目录等于没说。
+  assert.ok(sum.includes("src/app/login/page.tsx"), "只剩文件名的话，Next.js 那种一堆 page.tsx 的项目里定位不到");
+});
+
+test("_ideMeta 只在本机用，绝不发给上游", async () => {
+  // _sanitizeProviderMessages 是**排除法不是白名单**（它自己的注释写着「未知字段会
+  // 原样发给上游」）。挂执行事实的通道必须是已经在那份解构里的 _ideMeta，
+  // 否则用户的文件路径会跟着每一次请求送到第三方端点去。
+  const san = load("_sanitizeProviderMessages", {
+    _withoutLegacyReasoningSummary: (c) => c,
+    _wellFormedContent: (c) => c,
+    _stripLoneSurrogates: (s) => s,
+  });
+  const out = san([{ role: "assistant", content: "完成了", model: "claude",
+    _ideMeta: { files: ["src/auth/session.ts"], filesTotal: 1 } }]);
+  assert.ok(!("_ideMeta" in out[0]), "_ideMeta 漏给了上游");
+  assert.ok(!JSON.stringify(out).includes("session.ts"), "用户的文件路径跟着请求发出去了");
+});
+
+test("attachExecutionFacts 真的把改过的文件挂成 _ideMeta（全路径、带总数）", async () => {
+  const { attachExecutionFacts } = await import("../src/agent/execution-facts-meta.js");
+  const msg = attachExecutionFacts({ role: "assistant", content: "完成了" },
+    new Set(["src/app/dashboard/page.tsx", "src/app/settings/page.tsx"]));
+  assert.deepEqual(msg._ideMeta.files, ["src/app/dashboard/page.tsx", "src/app/settings/page.tsx"],
+    "必须是全路径——同名的 page.tsx 只留 basename 等于没说");
+  assert.equal(msg._ideMeta.filesTotal, 2);
+  // 没改文件就别挂空壳，省得摘要里多一行空的 Files:。
+  assert.equal(attachExecutionFacts({ role: "assistant", content: "只是回答了个问题" }, new Set())._ideMeta, undefined);
+  // 截断要报总数，别让「只改了 60 个」看起来像全部。
+  const many = attachExecutionFacts({ role: "assistant", content: "x" },
+    new Set(Array.from({ length: 75 }, (_, i) => `src/f${i}.ts`)));
+  assert.equal(many._ideMeta.files.length, 60);
+  assert.equal(many._ideMeta.filesTotal, 75, "总数丢了的话，模型会以为自己只改了 60 个");
+});
+
+test("收尾入账处真的调用了它，且喂的是 run._mutatedFiles（调用点，跑不动只能守源码）", () => {
+  const src = stripJsComments(SRC);
+  const at = src.indexOf('const _record = String(summaryText || "").trim();');
+  assert.ok(at > 0, "收尾入账处的锚点没了——这条守卫已经在守空气，重新定位");
+  const win = src.slice(at, at + 600);
+  assert.match(win, /_attachExecutionFacts\(\s*_msg\s*,\s*run\?\._mutatedFiles\s*\)/,
+    "收尾入账没把本轮改过的文件挂上去，Files: 行又会变空");
+});
