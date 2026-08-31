@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import * as acorn from "acorn";
-import { SRC, CODE, OVERRIDES, fnSource, blockFrom, load, loadConst, stripComments } from "./helpers/source.mjs";
+import { SRC, CODE, OVERRIDES, fnSource, blockFrom, at, load, loadConst, stripComments } from "./helpers/source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TEST_FILES = readdirSync(HERE).filter((f) => f.endsWith(".test.mjs"));
@@ -274,4 +274,27 @@ test("这个普查器本身没坏（不许量出 0 条还报通过）", () => {
   const wiring = stripComments(readFileSync(join(HERE, "wiring.test.mjs"), "utf8"));
   assert.match(wiring, /SRC\.slice\(\s*RAW_SRC\.indexOf\(/,
     "阳性对照不在剥注释后的文本里——普查结果不作数");
+});
+
+// ── at()：顺序断言的 -1 恒真 ────────────────────────────────────────────────
+test("at() 找不到就抛错——顺序断言不许再靠 -1 恒真", () => {
+  // `assert.ok(seg.indexOf(A) < seg.indexOf(B))` 有个哑掉的方向：A 被删掉时
+  // indexOf 返回 -1，而 -1 < 任何下标恒成立。于是这条守卫只挡得住「把 A 挪到 B
+  // 后面」，挡不住「把 A 整个删掉」——后者才是重构时真会发生、后果也一样的那种。
+  assert.equal(at("abcdef", "cd"), 2);
+  assert.throws(() => at("abcdef", "zz"), /找不到/);
+  // 这就是它要替掉的那个恒真形状：
+  const seg = "只剩下 B 了";
+  assert.ok(seg.indexOf("A") < seg.indexOf("B"), "旧写法：A 不在了却照样通过");
+  assert.throws(() => at(seg, "A", "被删掉的那半") < at(seg, "B"), /找不到/,
+    "at() 必须让「A 不在了」当场报错，而不是让比较静默通过");
+});
+
+test("blockFrom 的 enclosing 取的是包住锚点的函数体，不是锚点自己那条语句", () => {
+  // 锚点是一行普通语句时，最小节点就是那条语句本身；要整个回调得显式说。
+  const stmt = blockFrom('if (document.visibilityState !== "hidden") return;', { code: true });
+  const body = blockFrom('if (document.visibilityState !== "hidden") return;', { code: true, enclosing: true });
+  assert.ok(body.length > stmt.length, "enclosing 没有往上取到函数体");
+  assert.ok(body.startsWith("{"), "取到的应当是函数体块");
+  assert.ok(body.includes("_flushExitStateSync"), "取到的不是那个监听器的函数体");
 });
