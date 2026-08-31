@@ -9384,19 +9384,27 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   bottom: auto;
   left: 0;
   top: 0;
-  min-width: 184px;
-  padding: 5px;
-  border-radius: 11px;
+  min-width: 176px;
+  padding: 4px;
+  border-radius: 10px;
   animation: menu-in-down 0.12s ease both;
   user-select: none;
   -webkit-user-select: none;
 }
+/* 右键菜单压矮。Cursor / Windsurf 的上下文菜单行高都在 25px 上下，密而不挤；
+   这里原本是 6px 上下内边距 + 13px 字，条目一多整张菜单就显得笨重。 */
 .ctx-menu .menu__item {
-  gap: 10px;
-  padding: 6px 9px;
+  gap: 9px;
+  padding: 3px 9px;
+  min-height: 25px;
+  font-size: 12.5px;
+  border-radius: 6px;
   user-select: none;
   -webkit-user-select: none;
 }
+.ctx-menu .menu__item .ic { width: 14px; height: 14px; }
+/* 分隔线也跟着收：菜单只有五六项时，5px 的上下留白占的比例太大。 */
+.ctx-menu .menu__sep { margin: 4px 8px; }
 .ctx-menu .menu__item .name {
   flex: 1;
 }

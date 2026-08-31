@@ -33,6 +33,17 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * # 抬线记录
  *
+ * · 81_560（2026-08-30 第五次）：实测 81,510 行。买到的是右键菜单里的「移除文件 / 移除目录」
+ *   ——把条目从文件树里藏起来，**磁盘上原样不动**（用户原话：「不是移除到废纸篓，而是移除
+ *   让用户看不见 而不是真正的删除，我这里写了删除按钮了都」）。隐藏清单按项目分开存，
+ *   隐藏一个目录会连同它底下的东西一起藏，并且必须给一条回头路（「恢复已移除的 N 项」），
+ *   否则它就是个单向操作。
+ *   能进模块的都进了：清单的增删查、判定某条路径要不要藏、以及存取的薄包装（storage 从
+ *   参数传），全在 src/agent/explorer-drop.js。留在 main.js 的是读 rootPath、改 _treeSel、
+ *   reloadDir 和 toast —— 都要模块级可变状态或 DOM，搬出去只会变成把变量再传回来的假模块。
+ *   同期还**删了**东西：拖项目文件夹到根改成直接换项目之后，那个三按钮弹框和它的文案函数
+ *   rootDropQuestion 一起去掉了。
+ *
  * · 81_500（2026-08-30 第四次）：实测 81,431 行。用户两句：「不能替换整体目录了」「完全和
  *   vscode 不一样，好好学些 vscode」。于是去读了 VS Code 的真实实现（Cursor 是它的分支，
  *   读的是打包产物），按读到的代码对齐，顺带修掉四个照着它才发现的真 bug：
@@ -127,7 +138,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   加一行名单救不了下一个模块。
  *
  */
-const MAIN_JS_MAX_LINES = 81_500;
+const MAIN_JS_MAX_LINES = 81_560;
 
 test("main.js 不许再长胖——要加东西先腾地方", () => {
   const src = readFileSync(join(ROOT, "src/main.js"), "utf8");

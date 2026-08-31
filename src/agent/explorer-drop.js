@@ -68,29 +68,6 @@ export function dropDirFor({ rowPath = "", rowIsDir = false, rootPath = "" } = {
 }
 
 /**
- * 文件夹落在**工作区根**上时那个问句的文案。
- *
- * VS Code 在这一刻会弹框（doImport 里 `if (dirs.length && target.isRoot)`），原文是
- *   "Do you want to copy 'X' or add 'X' as a folder to the workspace?"
- * 按钮 Add Folder to Workspace / Copy Folder / Cancel。我们多一个「打开为新项目」——
- * 用户原来就是靠拖到侧栏换项目的，那条路必须留着。
- *
- * 纯文案计算，单独拎出来是为了能在 Node 里断言（弹框本身没法在测试里点）。
- */
-export function rootDropQuestion({ dirs = [], destDir = "", rootPath = "" } = {}) {
-  const n = dirs.length;
-  const what = n > 1 ? `${n} 个文件夹` : `「${baseName(dirs[0] || "")}」`;
-  const here = baseName(destDir) || "项目根目录";
-  const cur = baseName(rootPath) || "当前项目";
-  // 一句话就够。VS Code 的原文也只有一句——把每个按钮都解释一遍，反而让人不知道该点哪个。
-  void here;
-  return {
-    title: `${what}要怎么加进来？`,
-    message: `打开为新项目会关掉当前的「${cur}」；添加到工作区则是当前项目继续开着，多一个根目录。`,
-  };
-}
-
-/**
  * 树**内部**拖动（把树里的文件/目录拖到另一个目录）的合法性判据。
  *
  * VS Code 的 handleDragOver 里对应这几条 return false：目标就是它自己、目标是它的子目录、
@@ -182,4 +159,53 @@ export function planExplorerDrop({ items = [], destDir = "", existingNames = [] 
     copies.push({ from, to: joinPath(dest, finalName), name: finalName, renamed: finalName !== name });
   }
   return { copies, skipped };
+}
+
+/**
+ * 「移除」出来的隐藏清单。
+ *
+ * 注意它**不是删除**：文件仍然在磁盘上，只是不在文件树里显示。右键菜单里的「删除」
+ * 才是真删。所以这里全程只跟路径字符串打交道，一次也不碰文件系统。
+ *
+ * 形状是 { [工作区根]: [被隐藏的绝对路径, ...] } —— 按项目分开，换个项目互不影响。
+ */
+export function hiddenFor(store, root) {
+  const list = store && typeof store === "object" ? store[trimSlash(root)] : null;
+  return Array.isArray(list) ? list.map(trimSlash).filter(Boolean) : [];
+}
+
+/** 加一条隐藏。返回新的 store（不改原对象）；已经在里面就原样返回。 */
+export function addHidden(store, root, path) {
+  const r = trimSlash(root);
+  const p = trimSlash(path);
+  if (!r || !p) return store || {};
+  const cur = hiddenFor(store, r);
+  if (cur.includes(p)) return store || {};
+  return { ...(store || {}), [r]: [...cur, p] };
+}
+
+/** 清空某个项目的隐藏清单（「恢复已移除的项」）。 */
+export function clearHidden(store, root) {
+  const next = { ...(store || {}) };
+  delete next[trimSlash(root)];
+  return next;
+}
+
+/**
+ * 这个条目该不该被藏起来。隐藏一个目录时**连同它底下的东西**一起藏——否则展开父目录
+ * 时它又冒出来了。同前缀的兄弟（logs / logs2）不受影响。
+ */
+export function isHidden(hiddenList, path) {
+  const p = trimSlash(path);
+  if (!p) return false;
+  return (hiddenList || []).some((h) => isInsideOrSame(p, h));
+}
+
+/** 从存储里读出整份隐藏清单；坏数据一律当空。storage 从参数传，模块本身不碰全局。 */
+export function loadHidden(storage, key) {
+  try { return JSON.parse(storage?.getItem?.(key) || "{}") || {}; } catch { return {}; }
+}
+/** 写回；写不进去（隐私模式、配额满）不该炸掉调用方。 */
+export function saveHidden(storage, key, store) {
+  try { storage?.setItem?.(key, JSON.stringify(store || {})); } catch { /* 存不了就算了 */ }
 }

@@ -122,7 +122,10 @@ import * as growth from "./growth.js";
 import { ConversationMemory, extractExplicitCorrection, serializeMessagesForPersistence } from "./conversation-memory.js";
 import { compactToolGuide, enrichedCatalogLine, autoEnrichToolMetadata, toolCapabilityIndex, TOOL_METADATA } from "./tool-guides.js";
 import { installWindowsCanvasFix } from "./agent/win-canvas-fix.js";
-import { dropDirFor, planExplorerDrop, planMove, rootDropQuestion, topLevelOf } from "./agent/explorer-drop.js";
+import {
+  addHidden, clearHidden, dropDirFor, hiddenFor, isHidden, loadHidden, saveHidden,
+  planExplorerDrop, planMove, topLevelOf,
+} from "./agent/explorer-drop.js";
 
 // Windows 的 WebView2 上，GPU 后端的 2D canvas 用 putImageData+脏矩形贴图会留白，
 // Monaco 的代码缩略图（minimap）正是这样渲染的——于是 Windows 上 minimap 整条消失，
@@ -11965,6 +11968,24 @@ function _pathToRel(abs) {
   return abs.split("/").filter(Boolean).pop() || abs;
 }
 
+// 「移除」出来的隐藏清单：文件还在磁盘上，只是不在树里显示（真删走右键的「删除」）。按项目分开存。
+const _HIDDEN_KEY = "michael-ide.tree-hidden";
+let _hiddenStore = loadHidden(localStorage, _HIDDEN_KEY);
+const _hiddenNow = () => hiddenFor(_hiddenStore, rootPath);
+const _saveHidden = () => saveHidden(localStorage, _HIDDEN_KEY, _hiddenStore);
+async function _hideEntry(path, isDir) {
+  _hiddenStore = addHidden(_hiddenStore, rootPath, path);
+  _saveHidden(); _treeSel.delete(path);
+  await reloadDir(parentDir(path));
+  showToast(`已移除${isDir ? "目录" : "文件"}「${basename(path)}」——只是不再显示，磁盘上还在`);
+}
+async function _restoreHidden() {
+  const n = _hiddenNow().length;
+  _hiddenStore = clearHidden(_hiddenStore, rootPath);
+  _saveHidden();
+  await reloadDir(rootPath);
+  showToast(`已恢复 ${n} 项`);
+}
 async function renderChildren(path, container) {
   let entries;
   try {
@@ -11982,8 +12003,11 @@ async function renderChildren(path, container) {
     try { _refreshChatHintIfEmpty(); } catch {}
   }
   container.innerHTML = "";
+  const _hidden = _hiddenNow();
   for (const entry of entries) {
     const item = { ...entry, path: _treePath(entry.path), name: entry.name || basename(entry.path) };
+    // 被「移除」的条目不显示（连同它底下的东西）。磁盘上没动过，随时能恢复。
+    if (_hidden.length && isHidden(_hidden, item.path)) continue;
     const row = document.createElement("div");
     // 构建产物 / 依赖目录置灰（后端 read_dir 已经按搜索那份规则标好 ignored，并把它们排到
     // 最后）。**只弱化不隐藏**：没有"显示隐藏文件"开关，直接过滤掉会让 .vscode/、dist/
@@ -12272,8 +12296,13 @@ function openContextMenu(x, y, entry) {
       { sep: true },
       { label: t("ctx.rename"), icon: "i-rename", action: () => renameEntry(entry.path, entry.name, isDir) },
       { label: t("ctx.delete"), icon: "i-trash", danger: true, action: () => deleteEntry(entry.path, entry.name, isDir) },
+      // 「移除」不是删除：只是不在树里显示，文件仍在磁盘上（上面那一项才是真删）。
+      { label: isDir ? "移除目录" : "移除文件", icon: "i-minus", action: () => _hideEntry(entry.path, isDir) },
     );
   }
+  // 移除过东西就给一条回头路——否则「移除」是单向操作，用户找不回来。
+  const _nHidden = _hiddenNow().length;
+  if (_nHidden) items.push({ sep: true }, { label: `恢复已移除的 ${_nHidden} 项`, icon: "i-refresh", action: () => _restoreHidden() });
   items.push({ sep: true }, { label: t("ctx.openProjectPath"), icon: "i-folder", action: () => _revealEntryInSystemExplorer(entry) });
 
   // Bulk delete when right-clicking an item that's part of a multi-selection.
@@ -80420,27 +80449,13 @@ async function _copyIntoWorkspace(paths, destDir) {
   // 我们把次选项换成「打开为新项目」——用户原来就是靠拖到侧栏换项目的，改成复制之后
   // 那条路就没了，这一问正好把它还回来（加进工作区仍在 文件菜单 → 添加文件夹到工作区）。
   const _dirs = items.filter((x) => x.isDir);
-  // 判据是「落在**任意**工作区根上」，不只是活动根：多根工作区里往另一个根上放文件夹，
-  // VS Code 同样会问（它的条件就是 e.isRoot）。
+  // 文件夹落在工作区根上 = **直接换成这个项目**，不再弹框问（用户：「直接替换工作区目录内容
+  // 就行，不然的话没啥意义」）。拖文件、或把文件夹拖进**子目录**走下面的复制路径，不受影响。
   if (_dirs.length && workspaceRoots.includes(destDir)) {
-    const q = rootDropQuestion({ dirs: _dirs.map((x) => x.path), destDir, rootPath });
-    // 只留三档：打开为新项目（主）/ 添加到工作区 / 取消。
-    // 「复制进来」那一档按用户要求去掉了——把一个**项目文件夹**拖进来，想要的从来不是
-    // 把它复制一份进当前项目，而是打开它或把它挂成另一个根。（拖文件、拖子目录进子文件夹
-    // 走的是另一条路，那条照旧直接复制，不弹框。）
-    const pick = await ioConfirm({
-      title: q.title, message: q.message,
-      okLabel: "打开为新项目", altLabel: "添加到工作区",
-    });
-    if (pick === "cancel" || pick === false) return;
-    if (pick === "alt") { for (const d of _dirs) await _addWorkspaceRoot(d.path); return; }
-    // 打开为新项目：第一个当新根打开，其余的加进工作区（等价于 VS Code 拖多个文件夹
-    // 到编辑器区时的 createAndEnterWorkspace，而不是把多余的静默丢掉）。
-    if (pick === "ok" || pick === true) {
-      await openFolder(_dirs[0].path);
-      for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
-      return;
-    }
+    await openFolder(_dirs[0].path);
+    // 一次拖进来好几个：第一个当新项目打开，其余的挂成额外的根，别静默丢掉。
+    for (const d of _dirs.slice(1)) await _addWorkspaceRoot(d.path);
+    return;
   }
   let existingNames = [];
   try { existingNames = (await backend.readDir(destDir)).map((e) => e?.name || basename(e?.path || "")); } catch {}
