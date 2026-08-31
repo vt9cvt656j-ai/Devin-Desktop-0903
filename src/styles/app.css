@@ -14962,23 +14962,42 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   box-shadow: inset 0 0 0 1px #a8c7fa;                  /* soft blue ring */
 }
 /* @-reference rendered as a real card in a chat message bubble (clickable → opens the file/folder). */
+/* 内联的实体片（@文件 / @github:owner/repo / @模型 …）。
+   两条原则，和 GitHub / Linear 这类产品里的内联引用一致：
+   ① 不用全圆角。999px 的胶囊读起来是「标签」，而这是一个**被引用的对象**，
+      6px 的小圆角矩形更像"一个东西"，也不会在正文里显得像个按钮。
+   ② 颜色跟主题走。原来是写死的 Google 蓝（#1a73e8/#e8f0fe/#d2e3fc），
+      深浅主题、以及用户换强调色之后全都对不上。 */
 .msg-mention {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 1px 8px 1px 6px; margin: 0 1px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 7px 1px 5px; margin: 0 1px;
   font-size: .9em; font-weight: 500; line-height: 1.5; vertical-align: baseline;
-  color: #1a73e8;                       /* Google blue */
-  background: #e8f0fe; border: 1px solid #d2e3fc; border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 6px;
   cursor: pointer; user-select: none;
   transition: background .12s ease, border-color .12s ease;
 }
-.msg-mention:hover { background: #d2e3fc; border-color: #a8c7fa; }
-.msg-mention img { width: 13px; height: 13px; flex: 0 0 auto; }
-.msg-mention__name { white-space: nowrap; }
-/* On the user's own (blue) bubble, invert to stay legible on the accent background. */
-.msg.user .msg-mention, .msg__body .msg-mention {
-  color: #fff; background: rgba(255, 255, 255, 0.22); border-color: rgba(255, 255, 255, 0.35);
+.msg-mention:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
 }
-.msg.user .msg-mention:hover, .msg__body .msg-mention:hover { background: rgba(255, 255, 255, 0.32); }
+.msg-mention img, .msg-mention .ic { width: 13px; height: 13px; flex: 0 0 auto; }
+.msg-mention__name { white-space: nowrap; }
+/* 用户自己那条是 accent 渐变气泡。原来在上面铺一层 22% 的半透明白 —— 蓝上加淡蓝，
+   对比很弱，那个片几乎糊在气泡里（用户实拍就是这样）。改成**实心白底 + 强调色字**：
+   在彩色气泡上这是对比最强、也最像"一枚被引用的实体"的做法。 */
+.msg.user .msg-mention, .msg__body .msg-mention {
+  color: var(--accent-solid);
+  background: #fff;
+  border-color: transparent;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+}
+.msg.user .msg-mention:hover, .msg__body .msg-mention:hover {
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .2);
+}
 
 /* ---- Rich composer (contenteditable): #prompt is now a div, so style it directly ---- */
 #prompt {
@@ -15027,17 +15046,22 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 }
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 1px 8px 1px 6px; margin: 0 1px;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 7px 1px 5px; margin: 0 1px;
   vertical-align: baseline;
   font-size: .92em; font-weight: 500; line-height: 1.5;
-  color: #1a73e8;
-  background: #e8f0fe; border: 1px solid #d2e3fc; border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 6px;
   cursor: default; user-select: none; white-space: nowrap;
   transition: background .12s ease, border-color .12s ease;
 }
-.composer-chip:hover { background: #d2e3fc; border-color: #a8c7fa; }
-.composer-chip img { width: 13px; height: 13px; flex: 0 0 auto; }
+.composer-chip:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+}
+.composer-chip img, .composer-chip .ic { width: 13px; height: 13px; flex: 0 0 auto; }
 .composer-chip__name { white-space: nowrap; }
 /* ===== 抓包 (MITM capture inspector) ===== */
 .capture-tool { display: flex; flex-direction: column; height: 100%; min-height: 440px; gap: 8px; }
@@ -15575,10 +15599,11 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
   color: #c9c9cf;
 }
 
-[data-theme="dark"] .composer-chip,
-.dark .composer-chip,
-[data-theme="dark"] .msg__body .msg-mention,
-.dark .msg__body .msg-mention,
+/* 深色下只需要覆盖拖拽幽灵（它是写死的浅色卡片）。
+   .composer-chip / .msg-mention 已经全部走 var(--accent) + color-mix，两套主题自动成立；
+   再在这里硬覆盖一遍反而会把它们盖回写死的蓝。
+   尤其 .msg__body .msg-mention 是**用户那条蓝气泡上**的片，深色下气泡仍是蓝的，
+   套上这层淡蓝就又糊回去了——那正是用户实拍的问题。 */
 [data-theme="dark"] .row-drag-ghost,
 .dark .row-drag-ghost {
   background: rgba(77, 170, 252, 0.14);
