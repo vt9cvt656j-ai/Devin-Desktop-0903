@@ -12890,6 +12890,9 @@ test("natural-language capability queries are routed by the semantic tool orches
   let request = null;
   const scenarioSignature = load("_buildScenarioSignature");
   const route = load("_semanticToolOrchestrator", {
+    // 2026-08-30：弱模型上限挪进来之后，这个依赖必须注入——不注入会抛 ReferenceError，
+    // 被函数尾部的 `catch { return null; }` 吞掉，测试拿到 null 而不是一个明确的错误。
+    _isWeakModel: () => false,
     _cognitiveLegEffort: load("_cognitiveLegEffort"),
     _criticToolCatalog: catalog,
     _criticRequestedToolSchemas: requested,
@@ -14603,12 +14606,31 @@ test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
     "await_subagent 的查找判据变了，上面那条回执格式要跟着改");
 });
 
-test("弱模型收敛只做 slice，不再套一层恒等变换", () => {
+test("入参归一不许把数组拍平——system 的菜单路径就是数组", () => {
+  // `path` 在绝大多数工具里是文件路径（字符串），所以它在 _STR_ARG_KEYS 里。但 system 的
+  // action:"menu"/"menu_items" 把 path 声明成 array（菜单层级），后端签名也是
+  // `system_menu(app, path: Vec<String>)`。原来那个 for 无差别 String()，
+  // ["File","New Folder"] 变成 "File,New Folder" —— 两层以上的菜单路径必然点不中，
+  // 而那正是这个动作唯一的用途；报错还长得像"找不到菜单项"，看不出参数在半路换了形状。
+  const src = SRC.slice(SRC.indexOf("for (const k of _STR_ARG_KEYS) {"), SRC.indexOf("for (const k of _STR_ARG_KEYS) {") + 700);
+  assert.match(src, /if \(Array\.isArray\(v\)\) continue;/,
+    "数组又被 String() 拍平了——system 的多层菜单路径会静默失效");
+  // schema 那边确实声明成 array，别把这条测试写成对着空气断言。
+  const sysSchema = TOOL_CATALOG_SRC.slice(TOOL_CATALOG_SRC.indexOf('name: "system"'), TOOL_CATALOG_SRC.indexOf('name: "system"') + 6000);
+  assert.match(sysSchema, /path: \{ type: "array"/, "system.path 不再是 array 了，这条测试的前提要重看");
+});
+
+test("弱模型收敛只做一次上限，不再套一层恒等变换", () => {
   assert.doesNotMatch(SRC, /_prioritizeNamedTools/,
     "那个恒等变换又回来了——它按 s.function?.name 取名，而传进去的是字符串数组");
-  const loop = extractFn("_runAgenticLoop");
-  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
-    "弱模型的工具收敛没了");
+  // 2026-08-30：收敛点从 _runAgenticLoop 挪到 _semanticToolOrchestrator 真正裁剪的那一行。
+  // 原来那条 `routeToolNames.length > 10 && _isWeakModel(...)` 在下游，而列表到那儿已经被
+  // 上游裁到 ≤10 —— 实测喂 3/8/10/14/20/40 六种输入全为 false，弱模型窗口一次都没收窄过。
+  const orch = extractFn("_semanticToolOrchestrator");
+  assert.match(orch, /_isWeakModel\(config\?\.model\) \? 8 : 10/,
+    "弱模型的工具收敛没了（或又被挪回那个恒不触发的位置）");
+  assert.match(orch, /_criticRequestedToolSchemas\(j\.tools, toolRegistry, _toolCap\)/,
+    "上限没有真的用在裁剪那一行");
 });
 
 test("existing-file edits execute against current disk while exact anchors and CAS stay objective", () => {
@@ -19663,8 +19685,10 @@ test("多角色协作时派发工具必须前置——追加会被两道尾部�
     "这条反证：追加时确实会被切掉（夹具没构造出问题就说明断言是摆设）");
 
   // 真正在裁的那处必须出声，否则用户和排查者看不到「工具被裁过」。
-  assert.match(loop, /编排选了 \$\{_beforeCap\} 个工具，按注意力预算只装载了/,
-    "10 个上限那处仍然是静默裁剪");
+  // 2026-08-30 修正：那处**在上游** _semanticToolOrchestrator 里（下游比较的是裁后长度，
+  // 恒等于自己，说不出任何东西）。所以事实由编排器随返回值带出，下游只负责转成 note。
+  assert.match(loop, /decision\?\.dropped > 0/, "下游没有消费上游带出的裁剪事实");
+  assert.match(loop, /编排选了 \$\{decision\.picked\} 个工具/, "裁剪仍然是静默的");
 });
 
 test("编排合理性检查：收敛不 reject，notes 把事实留给主模型权衡", () => {
@@ -19699,9 +19723,16 @@ test("工具失败记账与弱模型收敛接入编排链路", () => {
   assert.match(loop, /raw\.slice\(0, 200\)/, "失败细节从 70 字放宽到 200 字");
   assert.match(loop, /_validateToolOrchestration\(decision\.tools, run\._toolRegistry, run\.engineering\)/,
     "编排结果装载 schema 前必须先过硬性合理性检查");
-  assert.match(loop, /_isWeakModel\(config\?\.model\)/, "弱模型才收敛工具窗口，强模型保持现状");
-  assert.match(loop, /routeToolNames = routeToolNames\.slice\(0, 8\);/,
-    "弱模型超额时收敛到 8 个（原来这里还套了一层 _prioritizeNamedTools，实测是恒等变换，已删）");
+  // 2026-08-30：弱模型的 8 工具窗口从 _runAgenticLoop 挪到 _semanticToolOrchestrator 里
+  // **真正裁剪的那一行**。原来的判据 `routeToolNames.length > 10` 在那时已经被上游裁到
+  // ≤10，实测喂 3/8/10/14/20/40 六种输入全为 false —— 窗口从来没收窄过，_isWeakModel 空转。
+  const orch = extractFn("_semanticToolOrchestrator");
+  assert.match(orch, /_isWeakModel\(config\?\.model\) \? 8 : 10/,
+    "弱模型上限没有落在真正裁剪的那一行——写在下游就是恒不触发");
+  assert.doesNotMatch(loop, /routeToolNames = routeToolNames\.slice\(0, 8\)/,
+    "下游那条恒假的 slice(0,8) 又回来了");
+  assert.match(orch, /dropped = Math\.max\(0, _picked - tools\.length\)/,
+    "裁剪事实没有被带出来，下游就说不出「工具被裁过」");
   assert.match(loop, /编排收敛提示/, "收敛 notes 必须拼进编排 nudge 告知主模型");
   const stats = extractFn("_toolLedgerStats");
   assert.match(stats, /_classifyToolFailure\(e\.reason \|\| ""\)/, "会话账本必须带失败类别分布");
