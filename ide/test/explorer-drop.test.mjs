@@ -371,6 +371,39 @@ test("移动之后要把原本打开着的文件重新打开", () => {
   assert.match(mv, /for \(const rp of reopened\)[\s\S]{0,80}openFile\(rp/, "移动后没有把页签开回来");
 });
 
+test("拖进来的东西必须用 stat 探类型，不能借 readDir", () => {
+  // 两个真实症状都出自「拿 readDir 当 is-directory 探针」：
+  //  ① readDir 要求路径在工作区内 → 从 /Volumes、/Applications 拖进来的**文件夹被误判成
+  //     文件**，接着 copyPath 报 "access denied: ... outside all workspace roots"；
+  //  ② readDir 会把整个目录枚举一遍 → 拖一个大文件夹进来，光探测就卡好几秒。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  assert.doesNotMatch(src, /backend\.readDir\(p\)\.then\(\(\) => true\)/,
+    "又拿 readDir 当类型探针了——大目录会卡、工作区外的目录会被误判成文件");
+  // 三条拖放路径（侧栏复制 / 编辑器区打开 / drag-enter 预判）都要走 stat。
+  assert.ok((src.match(/backend\.pathKinds\(/g) || []).length >= 3,
+    "还有拖放路径没换成 pathKinds");
+  // 探测失败时要有兜底，不能整批崩掉。
+  assert.match(src, /\.catch\(\(\) => \w+\.map\(\(\) => 1\)\)/, "pathKinds 失败时没有兜底");
+});
+
+test("从工作区外拖进来要能复制，但写入侧边界不许松", () => {
+  // 用户实拍："复制失败: access denied: path '/Volumes/API for Cursor' is outside all
+  // workspace roots"。根因是 copy_path 连**源**也要求在工作区内，而拖进来的东西按定义
+  // 就在外面。新增的 import_path 只放开读侧，写入仍然必须落在已打开的工作区根里。
+  const src = readFileSync(join(HERE, "..", "src", "main.js"), "utf8");
+  const fn = src.slice(src.indexOf("async function _copyIntoWorkspace"), src.indexOf("async function _handleDrop"));
+  assert.match(fn, /backend\.importPath\(c\.from, c\.to\)/,
+    "拖放导入还在用 copyPath——源在工作区外时会被拒");
+  const rs = readFileSync(join(HERE, "..", "src-tauri", "src", "files.rs"), "utf8");
+  const imp = rs.slice(rs.indexOf("pub fn import_path"), rs.indexOf("pub fn copy_path"));
+  assert.match(imp, /require_inside_workspace\(&to, true\)/, "目标必须仍然受工作区约束");
+  assert.doesNotMatch(imp, /require_inside_workspace\(&from/, "源不该再要求在工作区内");
+  // path_kinds 只吐类型码，不泄漏目录内容。
+  const pk = rs.slice(rs.indexOf("pub fn path_kinds"), rs.indexOf("pub fn import_path"));
+  assert.match(pk, /std::fs::metadata\(p\)/, "类型探测要用 stat");
+  assert.doesNotMatch(pk, /read_dir/, "类型探测不该枚举目录");
+});
+
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
   // 纯逻辑对了但没接上等于没修。钉三件事：文件树是独立落区、树落点走复制而不是
   // openFolder、以及复制真的调了后端。

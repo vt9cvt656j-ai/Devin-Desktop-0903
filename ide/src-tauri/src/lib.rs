@@ -293,6 +293,8 @@ pub fn run() {
             files::create_dir,
             files::rename_path,
             files::copy_path,
+            files::path_kinds,
+            files::import_path,
             files::delete_path,
             files::search_in_project,
             files::list_project_files,

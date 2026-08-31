@@ -2197,6 +2197,63 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 拖放专用：只回「这个路径是什么」，不列内容、不回名字。
+///
+/// 为什么要单开一个：判断「拖进来的是文件还是文件夹」原本借的是 `read_dir`，那有两个毛病——
+///   ① `read_dir` 要求路径在工作区内，而用户从 Finder 拖进来的东西按定义就在外面
+///      （/Volumes 上的挂载盘、/Applications），于是**文件夹一律被误判成文件**；
+///   ② `read_dir` 会把整个目录枚举一遍（还带 gitignore 标注），拿它当类型探针，
+///      拖一个大文件夹进来光探测就要好几秒 —— 用户报的「松手卡顿几秒」就是这个。
+/// 这里只做一次 stat，O(1)，且只吐一个类型码，不泄漏目录内容。
+///
+/// 返回值与 paths 一一对应：0 = 不存在 / 读不到，1 = 文件，2 = 目录。
+#[tauri::command(async)]
+pub fn path_kinds(paths: Vec<String>) -> Vec<u8> {
+    paths
+        .iter()
+        .take(512)
+        .map(|p| match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => 2u8,
+            Ok(_) => 1u8,
+            Err(_) => 0u8,
+        })
+        .collect()
+}
+
+/// 把工作区**外面**的文件/目录复制进工作区（拖放导入专用）。
+///
+/// 和 `copy_path` 的唯一区别是**不要求源在工作区内**：用户从 Finder 把东西拖进窗口，
+/// 这个动作本身就是授权，正如任何文件管理器。写入侧的边界一点没松——`to` 仍然必须落在
+/// 已打开的工作区根里，复制策略、重名报错、递归拷贝全部复用 `copy_path`。
+///
+/// 注意：这个命令只给拖放落地用，没有接进任何智能体工具；智能体那条路仍然走 `copy_path`，
+/// 两端都受工作区约束。
+#[tauri::command(async)]
+pub fn import_path(from: String, to: String) -> Result<(), String> {
+    let _guard = FILE_MUTATION_LOCK.lock().map_err(|e| e.to_string())?;
+    let to_path = require_inside_workspace(&to, true)?;
+    let from_p = Path::new(&from);
+    if !from_p.exists() {
+        return Err("source does not exist".into());
+    }
+    if to_path.exists() {
+        return Err("a file or folder with that name already exists".into());
+    }
+    if let Some(parent) = to_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| friendly_write_error("创建目录", &to, &e))?;
+    }
+    let meta = std::fs::symlink_metadata(from_p)
+        .map_err(|e| friendly_write_error("读取源文件", &from, &e))?;
+    if meta.is_dir() {
+        copy_dir_recursive(from_p, &to_path)
+            .map_err(|e| friendly_write_error("复制目录", &from, &e))
+    } else {
+        std::fs::copy(from_p, &to_path)
+            .map(|_| ())
+            .map_err(|e| friendly_write_error("复制文件", &from, &e))
+    }
+}
+
 /// Copy a file, or a directory and all of its contents, to `to`. Errors if the
 /// destination already exists. Both endpoints must be inside the workspace.
 #[tauri::command(async)]
