@@ -100,8 +100,20 @@ test("每一处「按画像否决」都要写明：裁决缺席时它倒向哪�
 test("工具编排的闸门必须区分「裁决未到」和「裁决说不适用」", () => {
   // 这是那天那个 bug 的原位，单独钉一条：它是**唯一**一处倒向 capability 的否决，
   // 也是「我让他干什么他什么都不知道」的直接成因。回退它不该只让上面那条泛化断言变红。
-  const loop = SRC.slice(RAW_SRC.indexOf("const _startInitialToolRoutingAfterFirstTurn"));
-  const gate = loop.slice(0, 1400);
+  // 区间按 AST 取整条声明，不再是「从锚点起数 1400 个字」。
+  //
+  // 原来两行：`SRC.slice(RAW_SRC.indexOf("const _startInitialToolRoutingAfterFirstTurn"))`
+  // 再 `.slice(0, 1400)`。它当时还抓得住回归，但余量薄得只剩一次改动：
+  //   · 声明真身 1012 字，窗口 1400——余量 388 字；而这 1012 字里有 600 字是复盘那次事故的
+  //     注释（CODE 把注释置换成**等量空格**，长度不变、照样占偏移）。往这段注释里再补
+  //     623 字说明（实测：声明涨到 1635 字），末尾的代码就滑出窗口——两条 assert.match 仍
+  //     落在 1000/1162 偏移上、照样绿，而下面那条 assert.doesNotMatch（正是拦「旧的无条件
+  //     否决又长回来」的那条）从此恒真。实测过这个变异：把 `|| !run.engineering?.applies ||`
+  //     追加到声明末尾（偏移 1424，窗口外），整个文件 8/8 全绿，一声不吭。
+  //   · 反过来，那 388 字余量今天已经越过声明尾部，doesNotMatch 正管着声明**后面**一段
+  //     不相干的代码——那边写出这个形状会假红。
+  // fnSource 按 AST 节点边界切：声明长成什么样都盖得住，也一个字都不会盖到声明外面。
+  const gate = fnSource("_startInitialToolRoutingAfterFirstTurn", { code: true });
   assert.match(gate, /const _verdictLanded = run\.engineering\?\.intentSource === "ai";/,
     "工具编排闸门不再区分「裁决未到」——画像为空时整轮 128 个工具都进不来");
   assert.match(gate, /\(_verdictLanded && !run\.engineering\.applies\)/,
