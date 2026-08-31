@@ -15052,9 +15052,10 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
 /* A dragged-in @-reference as a REAL inline card (Google-light pill: icon + name, atomic). */
 .composer-chip {
   display: inline-flex; align-items: center; gap: 5px;
-  /* 左右各留 5px：光标落到片旁边时（按左/右键跨过来的那一下）原来只有 1px，
-     光标紧贴着片边，看着像粘在一起、分不清自己在片的哪一侧。 */
-  padding: 1px 7px 1px 5px; margin: 0 5px;
+  /* 左右各留 8px ≈ 两个空格宽。光标按左/右键跨到片旁边时会紧挨着它，间距太小就"粘"在
+     一起、看不出自己停在哪一侧（用户先试 5px 仍嫌挤，自己敲了两个空格才觉得对）。
+     两侧对称：往左走时片右边有空，往右走时片左边也有空。 */
+  padding: 1px 7px 1px 5px; margin: 0 8px;
   vertical-align: baseline;
   font-size: .92em; font-weight: 500; line-height: 1.5;
   color: var(--accent);

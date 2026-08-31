@@ -666,6 +666,16 @@ test("光标紧挨着片时，左右键能跨过去（直接跑模块函数）",
   link([lead, chip2], box2);
   assert.equal(chipBeside({ container: box2, node: lead, offset: 2, left: false, isChip }), chip2);
 
+  // 关键回归：按左键跨到片**之前**以后，光标停在容器上、offset 正指着片。这时按右键要能
+  // 再跨回去。早先左右都取 childNodes[offset] 再找兄弟——右移时等于把片本身跳过去了，
+  // 表现就是"往左走了就再也回不来"（用户实拍）。
+  assert.equal(chipBeside({ container: box, node: box, offset: 0, left: false, isChip }), chip,
+    "从片之前按右键跨不回去");
+  assert.equal(chipBeside({ container: box, node: box, offset: 1, left: true, isChip }), chip,
+    "从片之后按左键跨不过去");
+  // 容器最左端按左键：那边什么都没有，放行给浏览器。
+  assert.equal(chipBeside({ container: box, node: box, offset: 0, left: true, isChip }), null);
+
   // 这一侧还有真字符可走时**不许**接管，否则逐字移动会被吞掉。
   assert.equal(chipBeside({ container: box2, node: lead, offset: 1, left: false, isChip }), null,
     "文本中间也接管了——逐字移动会失灵");
@@ -692,7 +702,8 @@ test("片左右要留出间距，否则光标跨过来就贴在片上", () => {
   const blk = css.slice(i, css.indexOf("}", i));
   const m = blk.match(/margin:\s*0\s+(\d+)px/);
   assert.ok(m, "找不到 .composer-chip 的横向 margin");
-  assert.ok(Number(m[1]) >= 4, `片左右间距太小（${m[1]}px），光标跨过来会贴在片上`);
+  // ≈ 两个空格宽。5px 试过仍嫌挤（用户自己敲了两个空格才觉得对）。
+  assert.ok(Number(m[1]) >= 8, `片左右间距太小（${m[1]}px），光标跨过来会贴在片上`);
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
