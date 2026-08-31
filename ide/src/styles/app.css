@@ -7525,15 +7525,17 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
   font-family: var(--font); font-size: 12px;
   max-height: 280px; overflow: auto; overscroll-behavior: contain;
   background: var(--atc-bg);
-  /* 每一行都要铺到**最宽那行**的宽度，不然一横向滚动，增/删的底色就只剩最长的那一两行有，
-     其余全是白的（用户实拍：「被删除的和新增的代码那个背景颜色没覆盖全，后面还是白色的」）。
-     根因不是底色画少了：行是块级 flex，宽度 auto = 容器可视宽；只有最长那行被
-     min-width: fit-content 顶宽，于是它一个人撑出了滚动宽度，别人都停在可视宽的边上。
-     width:100% 治不了——在滚动容器里 100% 就是可视宽，不是滚动宽。
-     单列网格才治得了：轨道宽 = max(可视宽, 最宽那行)，所有行按轨道拉伸。 */
-  display: grid;
-  grid-template-columns: minmax(100%, max-content);
 }
+/* 每一行都要铺到**最宽那行**的宽度，不然一横向滚动，增/删的底色就只剩最长的那一两行有，
+   其余全是白的（用户实拍两次）。行的宽度 auto 在滚动容器里等于**可视宽**，width: 100% 也
+   一样——100% 就是可视宽，不是滚动宽。
+   先试过单列网格 minmax(100%, max-content)，**不成立**：轨道基准是 100%，上限是 max-content，
+   而轨道只有在容器里还有剩余空间时才会长向上限；容器正好等于可视宽，剩余为 0，轨道就停在
+   可视宽上（浏览器里实测 gridTemplateColumns = "280px"，每行也都是 280）。
+   成立的是这一层：内层长到最宽那行（max-content），内容窄时不短于可视宽（min-width: 100%），
+   行是块级、宽度 auto，自然铺满它。四种写法在浏览器里逐个量过，只有这种让每行都等于
+   scrollWidth，且内容窄时也正好等于可视宽。 */
+.atc-diff-inner { width: max-content; min-width: 100%; }
 .atc-diff-header {
   display: flex; align-items: center; gap: 6px;
   padding: 5px 12px; background: var(--atc-head);
@@ -7544,9 +7546,8 @@ button.agent-plan__fold--toggle:focus-visible { outline: 2px solid #1a73e8; outl
 .atc-diff-row {
   display: flex; line-height: 1.5; padding: 0 4px 0 0;
   border-left: 3px solid transparent;
-  /* 宽度交给上面那个网格轨道。原来这里是 min-width: fit-content —— 它只让**这一行**长到
+  /* 宽度交给 .atc-diff-inner。原来这里是 min-width: fit-content —— 它只让**这一行**长到
      自己的内容宽，别的行照旧停在可视宽，正是底色铺不满的来源。 */
-  min-width: 0;
 }
 .atc-diff-row:hover { filter: brightness(.97); }
 .atc-diff-row--add {
