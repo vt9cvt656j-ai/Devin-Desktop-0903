@@ -483,8 +483,13 @@ test("右键的那一行要标出来，菜单关掉再清掉", () => {
   assert.match(fn, /\.row\[data-path="\$\{cssEscape\(_ctxTargetPath\)\}"\]/, "重贴要按路径找行");
 
   const css = readFileSync(join(HERE, "..", "src", "styles", "app.css"), "utf8");
-  assert.match(css, /#tree \.row\.is-ctx-target::before \{ background: var\(--active\); \}/,
-    "右键目标行没有高亮样式");
+  // --active 只比 --hover 深 3.5%，右键一下几乎看不出变化（用户报「没有灰色的选中样式，
+  // 不知道自己选了哪个」）。要用更重的灰 + 一圈描边，因为菜单里有不可逆的「删除」。
+  assert.match(css, /#tree \.row\.is-ctx-target::before \{ background: var\(--row-picked\); \}/,
+    "右键目标行的高亮太淡——看不出来选的是哪一行");
+  assert.equal((css.match(/--row-picked:/g) || []).length, 2, "灰色选中缺深浅两套");
+  assert.match(css, /#tree \.row\.is-ctx-target::after \{[^}]*box-shadow: inset 0 0 0 1px var\(--line-strong\);/s,
+    "右键目标行没有描边");
   // 不能用 accent：那是「当前打开的文件」的语汇，混在一起分不清。
   assert.doesNotMatch(css, /is-ctx-target::before \{ background: var\(--accent\)/, "别和 is-active 撞色");
 });
