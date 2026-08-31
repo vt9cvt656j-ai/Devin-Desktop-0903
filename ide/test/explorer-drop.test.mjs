@@ -564,7 +564,9 @@ test("发出去之后 @github:owner/repo 仍然是 GitHub 图标和全名", () =
   const fn = src.slice(src.indexOf("function _renderMentionsToHtml"), src.indexOf("function _renderMentionsToHtml") + 2200);
   assert.match(fn, /\^\(github\|gitlab\|mcp\):/, "消息端没有识别带前缀的引用");
   assert.match(fn, /iconSvg\(`i-brand-\$\{kind\}`/, "没有用品牌图标");
-  assert.match(fn, /const shown = pfx\[2\]/, "仓库名被截了——owner/repo 要显示全名");
+  // 只显示仓库名，owner 收进 tooltip：组织名常常比仓库名还长，摆在气泡里挤掉正文。
+  assert.match(fn, /pfx\[2\]\.split\("\/"\)\.filter\(Boolean\)\.pop\(\)/, "仓库名没有取最后一段");
+  assert.match(fn, /title="\$\{relAttr\}"/, "完整的 owner/repo 要留在 tooltip 里");
   // 本地文件那条老路要留着
   assert.match(fn, /folderIconUrl\(name, false\) : fileIconUrl\(name\)/, "本地文件/文件夹的图标丢了");
 
@@ -582,10 +584,12 @@ test("蓝气泡上的片不能是纯白块", () => {
   const i = css.indexOf(".msg.user .msg-mention, .msg__body .msg-mention {");
   const blk = css.slice(i, css.indexOf("}", i));
   assert.ok(i > 0, "找不到气泡上的覆盖规则");
+  // 三版都被否掉了：纯白块（挖洞）、22% 半透明白（糊住）、压深的黑（在蓝底上读成黑块）。
+  // 它们的共同毛病是都在给片找一个**新的面**。现在靠描边成立，让气泡的蓝直接透上来。
   assert.doesNotMatch(blk, /background: #fff;/, "又变回纯白块了");
-  assert.doesNotMatch(blk, /rgba\(255, 255, 255, 0\.22\)/, "也不能回到半透明白（糊在气泡里）");
-  assert.match(blk, /background: rgba\(0, 0, 0, \.22\)/, "气泡上的片应当是压深的一层");
-  assert.match(blk, /color: #fff;/, "深底上的字要白");
+  assert.doesNotMatch(blk, /background: rgba\(0, 0, 0/, "又变回黑块了");
+  assert.match(blk, /border-color: rgba\(255, 255, 255, \.55\)/, "描边不够清晰，片会立不住");
+  assert.match(blk, /color: #fff;/, "字要白");
 });
 
 test("main.js 真的按落点分工，且复制路径接上了 copyPath", () => {
