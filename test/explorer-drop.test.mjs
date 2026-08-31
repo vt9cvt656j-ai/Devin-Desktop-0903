@@ -693,6 +693,86 @@ test("光标紧挨着片时，左右键能跨过去（直接跑模块函数）",
   assert.match(h, /to\.collapse\(left\)/, "左键要落到片之前、右键落到片之后");
 });
 
+test("跨过片只需要按一下：垫出来的那一格不算「还有字符可走」", () => {
+  // 用户实拍：「我光标 往左 往右 都要 点两下，不然的话 过不去 不应该这样啊 应该一下就能
+  // 过去 且不挨在一起」。真凶是上一版自己埋的：chipPadMove 在光标和片之间放了一个**普通
+  // 空格**，而 chipBeside 把普通空格当成"这一侧还有真字符可走"，于是第一下只走进那一格、
+  // 第二下才跨过片。那一格是画出来的间距不是内容，必须和零宽空格一样当垫料。
+  const TXT = (v) => ({ nodeType: 3, nodeValue: v, previousSibling: null, nextSibling: null, parentNode: null });
+  const CHIP = () => ({ nodeType: 1, _chip: true, previousSibling: null, nextSibling: null, parentNode: null, childNodes: [] });
+  const isChip = (n) => !!n._chip;
+  // 会自己维护 previousSibling/nextSibling 的极简容器，好让 insertBefore/removeChild 之后
+  // 遍历仍然成立——不然测的就不是真链路了。
+  const mkBox = (nodes) => {
+    const box = { nodeType: 1, childNodes: [] };
+    const relink = () => box.childNodes.forEach((n, k) => {
+      n.parentNode = box; n.previousSibling = box.childNodes[k - 1] || null; n.nextSibling = box.childNodes[k + 1] || null;
+    });
+    box.insertBefore = (n, ref) => {
+      const i = ref ? box.childNodes.indexOf(ref) : box.childNodes.length;
+      box.childNodes.splice(i < 0 ? box.childNodes.length : i, 0, n); relink();
+    };
+    box.removeChild = (n) => {
+      const i = box.childNodes.indexOf(n);
+      if (i >= 0) box.childNodes.splice(i, 1);
+      relink(); n.parentNode = null; n.previousSibling = n.nextSibling = null;
+    };
+    box.childNodes = nodes.slice(); relink(); return box;
+  };
+  // 照 main.js 那段的写法按一下方向键：认片 → 挪那一格 → 落光标。返回是否真的跨过去了。
+  const presser = (box, state) => (left) => {
+    const chip = chipBeside({ container: box, node: state.caret.node, offset: state.caret.offset, left, isChip });
+    if (!chip) return false;                       // 交回浏览器 = 这一下没跨过去
+    const { drop, add } = chipPadMove({ prev: chip.previousSibling, next: chip.nextSibling, left, pad: state.pad });
+    if (drop) drop.parentNode.removeChild(drop);
+    state.pad = null;
+    if (add) {
+      const sp = TXT(" ");
+      chip.parentNode.insertBefore(sp, add === "left" ? chip : chip.nextSibling);
+      state.pad = sp;
+    }
+    const gap = left ? chip.previousSibling : chip.nextSibling;
+    if (gap && gap.nodeType === 3) state.caret = { node: gap, offset: left ? Math.max(0, (gap.nodeValue || "").length - 1) : 1 };
+    else state.caret = { node: box, offset: box.childNodes.indexOf(chip) + (left ? 0 : 1) };
+    return true;
+  };
+  const shape = (box) => box.childNodes.map((n) => (n.nodeType === 1 ? "#" : "_")).join("");
+
+  // 判据本身：光标和片之间只隔着那一格空格时，chipBeside 必须直接看到片。
+  const c0 = CHIP(), sp0 = TXT(" "), b0 = mkBox([sp0, c0]);
+  assert.equal(chipBeside({ container: b0, node: sp0, offset: 0, left: false, isChip }), c0,
+    "隔着一格空格就认不出片了——按右键会先走进那一格，要按两下");
+  const c1 = CHIP(), sp1 = TXT(String.fromCharCode(0xa0)), b1 = mkBox([c1, sp1]);
+  assert.equal(chipBeside({ container: b1, node: sp1, offset: 1, left: true, isChip }), c1,
+    "contenteditable 把空格换成 &nbsp; 之后就认不出片了");
+  // 反过来，真字符仍然不许被当成垫料——否则逐字移动会被吞掉。
+  const c2 = CHIP(), t2 = TXT("hi"), b2 = mkBox([t2, c2]);
+  assert.equal(chipBeside({ container: b2, node: t2, offset: 1, left: false, isChip }), null,
+    "文本中间也接管了——逐字移动会失灵");
+
+  // 整条链路：一个片，来回按，每一下都要真跨过去，且任何时刻只留一格空格。
+  const box = mkBox([CHIP()]);
+  const st = { caret: { node: box, offset: 1 }, pad: null };
+  const press = presser(box, st);
+  assert.equal(press(true), true, "从片之后按一下左键跨不过去");
+  assert.equal(shape(box), "_#", "往左跨完，片左边应该只垫一格");
+  assert.equal(press(false), true, "跨回去还得再按一下——这正是用户报的 bug");
+  assert.equal(shape(box), "#_", "往右跨完，左边那格没收回 / 右边没垫上");
+  assert.equal(press(true), true, "第三下又跨不动了");
+  assert.equal(shape(box), "_#");
+  assert.equal(box.childNodes.filter((n) => n.nodeType === 3).length, 1,
+    "空格攒下来了——来回按会越按越宽");
+
+  // 两个片相邻：跨过右边那个之后中间垫一格；再往左跨，那一格要跟着光标走。
+  const A = CHIP(), B = CHIP(), bx = mkBox([A, B]);
+  const st2 = { caret: { node: bx, offset: 2 }, pad: null };
+  const press2 = presser(bx, st2);
+  assert.equal(press2(true), true, "两个片时按左键跨不过右边那个");
+  assert.equal(shape(bx), "#_#", "跨过 B 之后应该是 [A][空格][B]");
+  assert.equal(press2(true), true, "接着按左键跨不过 A——用户说的「要点两下」");
+  assert.equal(shape(bx), "_##", "跨到 A 左边之后，A 和 B 中间那一格没收回");
+});
+
 test("片左右要留出间距，否则光标跨过来就贴在片上", () => {
   // 用户：「左键移动过来时候应该往右边空格2下，不然会挨在一起」。
   // 方向键接管之后光标会落在片的紧邻位置，原来左右各只有 1px，光标和片边贴在一起，
@@ -736,6 +816,13 @@ test("跨过片时那一格空格跟着光标走：落位那侧垫上，离开�
   r = chipPadMove({ prev: pad2, next: T("在哪"), left: false, pad: pad2 });
   assert.equal(r.drop, pad2, "往右跨没有收回左边那一格");
   assert.equal(r.add, "right");
+  // contenteditable 会把落单的空格换成 &nbsp;：那还是我们垫的那一格，照样要收回、
+  // 也照样算"这一侧已经有空格了"。认不出来的话，它就永远躺在那儿，再垫一格进去。
+  const nb = T(String.fromCharCode(0xa0));
+  assert.equal(chipPadMove({ prev: T("看看"), next: nb, left: true, pad: nb }).drop, nb,
+    "被浏览器换成 &nbsp; 的那一格收不回了——空格会一格格攒下来");
+  assert.equal(chipPadMove({ prev: T("看看" + String.fromCharCode(0xa0)), next: null, left: true }).add, null,
+    "&nbsp; 没算成「已经有空格」，会在它旁边再垫一格");
 });
 
 test("只收回自己垫的那一格：用户敲的空格不动", () => {

@@ -217,15 +217,20 @@ export function saveHidden(storage, key, store) {
  * 里第一个元素，按左键就"没反应"。两侧垫零宽空格不够（浏览器有时不把空文本节点当落脚点），
  * 所以要自己接管方向键，而"该不该接管"就是这个函数回答的。
  *
+ * 「垫」不只是零宽空格：chipPadMove 会在光标和片之间放一个**普通空格**，那一格是画出来的
+ * 间距、不是内容。它要是算成"还有真字符可走"，光标就得先走进那一格、再按一下才过得去 ——
+ * 用户实拍：「我光标 往左 往右 都要 点两下，不然的话 过不去」。所以空格（含浏览器在
+ * contenteditable 里替换成的 &nbsp;）和零宽空格一样，一律当垫料，一下跨过去。
+ *
  * 纯 DOM 遍历，节点全部从参数进；isChip 也由调用方给，模块里不认 class 名。
  */
 export function chipBeside({ container, node, offset = 0, left = true, isChip } = {}) {
-  const bare = (t) => String(t || "").replace(/\u200b/g, "");
+  const bare = (t) => String(t || "").replace(/[\u200b\u00a0 ]/g, "");
   if (!container || !node) return null;
   let probe;
   if (node.nodeType === 3) {
     const txt = node.nodeValue || "";
-    // 这一侧还有真字符可走 → 交给浏览器，别抢，否则逐字移动会被吞掉。
+    // 这一侧还有真字符可走 → 交给浏览器，别抢，否则逐字移动会被吞掉（垫料不算真字符）。
     if (bare(left ? txt.slice(0, offset) : txt.slice(offset))) return null;
     // 从这个文本节点往外走一步，找到它这一侧的兄弟。
     probe = node;
@@ -243,7 +248,7 @@ export function chipBeside({ container, node, offset = 0, left = true, isChip } 
     probe = left ? kids[offset - 1] : kids[offset];
     if (!probe) return null;
   }
-  // 跳过垫在中间的零宽空格，再看过去是不是片。
+  // 跳过垫在中间的空格 / 零宽空格，再看过去是不是片。
   while (probe && probe.nodeType === 3 && !bare(probe.nodeValue)) {
     probe = left ? probe.previousSibling : probe.nextSibling;
   }
@@ -265,10 +270,12 @@ export function chipBeside({ container, node, offset = 0, left = true, isChip } 
  * add 是 "left" | "right" | null，指相对片本身垫在哪一侧。
  */
 export function chipPadMove({ prev = null, next = null, left = true, pad = null } = {}) {
+  // contenteditable 会把落单的空格换成 &nbsp;，两种都得认，否则收不回、还会再垫一格。
+  const one = (n) => n && n.nodeType === 3 && /^[ \u00a0]$/.test(n.nodeValue || "");
   const gone = left ? next : prev;                        // 光标离开的那一侧
-  const drop = pad && pad === gone && pad.nodeType === 3 && pad.nodeValue === " " ? pad : null;
+  const drop = pad && pad === gone && one(pad) ? pad : null;
   const at = left ? prev : next;                          // 光标落到的那一侧
   const txt = at && at.nodeType === 3 ? (at.nodeValue || "") : "";
-  const has = left ? / $/.test(txt) : /^ /.test(txt);     // 那一侧已经贴着空格了
+  const has = left ? /[ \u00a0]$/.test(txt) : /^[ \u00a0]/.test(txt);  // 那一侧已经贴着空格了
   return { drop, add: has ? null : left ? "left" : "right" };
 }
