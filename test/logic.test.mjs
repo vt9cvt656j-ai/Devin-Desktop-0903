@@ -24512,8 +24512,17 @@ test("stale write-preview re-bases instead of blocking; CAS still guards the wri
   assert.match(region, /_rollbackLiveEditorWritePreview\(liveWritePreview\)/);
   assert.match(region, /call\._liveWritePreview = null;/);
   // Guard 1: an unsaved human edit is still refused, EARLIER than this point.
-  assert.ok(RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale"),
-    "the dirty-buffer check must run before the preview check it now relies on");
+  // 原来写的是 `RAW_SRC.indexOf("编辑器有未保存内容") < RAW_SRC.indexOf("const _previewStale")`，
+  // 两层错叠在一起：① 查的是 RAW_SRC（含注释），而这句话在全文的**第一次**出现是
+  // main.js:9647 的一句注释（offset 445263），拿一句注释去和一段真代码比先后；
+  // ② 它声称的顺序在生产代码里**本来就是假的**——剥掉注释后真代码在 offset 3014957，
+  // 而 _previewStale 在 3013208，脏缓冲检查其实排在**后面**。（_previewStale 那个块里
+  // 的注释也跟着写错了，说"上面已经拒掉了脏缓冲"，已一并订正。）
+  //
+  // 真正保住"未保存的人工改动不会被覆盖"的是这条：脏缓冲检查排在**真正落盘之前**。
+  // 预览回滚不写磁盘，排在它前面无害。用 CODE 而不是 RAW_SRC，用 at() 让缺失当场报错。
+  assert.ok(at(SRC, "_openFileWriteConflict(fp)", "脏缓冲检查") < at(SRC, "writeTextFileIfUnchanged(fp, existed ? old : null, newContent)", "落盘"),
+    "脏缓冲检查必须排在真正落盘之前，否则未保存的人工改动会被覆盖");
   // Guard 2: the write itself is still compare-and-swap against freshly-read disk.
   assert.match(SRC, /writeTextFileIfUnchanged\(fp, existed \? old : null, newContent\)/,
     "a genuinely concurrent change must still fail at the CAS write");
@@ -34625,16 +34634,25 @@ test("消息被裁掉之后，它那块「接下来」按钮不许留下当孤�
 // ---- 四条「回执在骗模型」的修复 ----
 
 test("读不了的文件不许说成「找不到」，而且错误码要被失败识别器认出来", () => {
-  const src = SRC.slice(RAW_SRC.indexOf("} else if (unreadableMatches.length === 1) {"));
-  // 必须是**无条件**返回：只比字符串在不在的话，包一层 if (false) 照样绿（第一版就这么漏的）。
-  assert.match(src.slice(0, 1600),
-    /usedPath = unreadableMatches\[0\]\.path;[\s\S]{0,600}?\n        return \{ type: "read", path: usedPath, content:/,
-    "那一支不是无条件返回了 —— 一旦被条件包住，就又会掉回「找不到唯一文件」那条分支");
-  assert.match(src.slice(0, 1600), /\[ERROR\/UNREADABLE\] 文件确实存在/,
+  // 按 AST 取这个分支块，不要开放式切片 + 1600 定长窗口（实测那个窗口已经越过分支尾部
+  // 约 370 字、切进了下一个 if 块）。
+  const src = blockFrom('} else if (unreadableMatches.length === 1) {', { code: true });
+  // 必须是**无条件**返回。上一版写的是
+  //   /usedPath = …[\s\S]{0,600}?\n        return \{ type: "read", …/
+  // 里面真正起限制作用的只有 `\n` 后面那 8 个空格——它钉的是 return 的**缩进**，不是
+  // 它的无条件性。JS 不在乎缩进，所以「包一层 if 但不重排版」这个最省事的改法正好从
+  // 缝里穿过去；而注释里点名说第一版就栽在这儿，第二版换了个形状栽在同一处。
+  // 直接验分支体里没有任何条件分叉。
+  const body = src.slice(src.indexOf("{") + 1);
+  assert.doesNotMatch(body, /\bif\s*\(/,
+    "「读不了」的 return 被条件包住了 —— 又会掉回「找不到唯一文件」那条死路");
+  assert.match(body, /return \{ type: "read", path: usedPath, content:/,
+    "这一支不再返回读取结果");
+  assert.match(src, /\[ERROR\/UNREADABLE\] 文件确实存在/,
     "文件存在只是读不了，却仍然掉进「找不到唯一文件」那条分支 —— 模型会去 find_files，"
     + "搜到同一个路径、再读、同一句话，要么死循环要么对用户断言「项目里没有这个文件」");
-  assert.match(src.slice(0, 1600), /别再 find_files/, "没告诉模型别再去找路径");
-  assert.match(src.slice(0, 1600), /run_cmd/, "没给可行动的替代办法");
+  assert.match(src, /别再 find_files/, "没告诉模型别再去找路径");
+  assert.match(src, /run_cmd/, "没给可行动的替代办法");
   // 错误码必须落在失败识别器的枚举里，否则这次失败会被算成**成功**。
   const failMatch = load("_toolFailureMatch");
   assert.ok(failMatch("[ERROR/UNREADABLE] 文件确实存在: /a/b.db"),

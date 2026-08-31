@@ -11883,15 +11883,8 @@ function _treeSelectClick(e, path) {
     _applyTreeSel();
     return true;
   }
-  // 普通点击**不留持久的选中标记**。
-  //
-  // 以前这里会把这一行塞进 _treeSel，于是点一下文件夹就留一块底色；而"当前打开的文件"
-  // 另有一块底色 —— 屏幕上同时有两处高亮，用户分不清哪个才是"我选中的"（用户原话：
-  // 「应该被选中的内容只能有一个才对」）。
-  // 选区只服务于**多选**（⇧ 连选 / ⌘ 点选，给批量删除和整组拖动用），所以普通点击把它清空，
-  // 只留下 anchor 供后续 ⇧ 连选起头。点文件 → 它成为当前打开的文件（蓝底）；点文件夹 →
-  // 展开/收起，不留标记。
-  _treeSel.clear();
+  // plain click → single-select + set range anchor; caller proceeds to open/expand
+  _treeSel = new Set([path]);
   _treeAnchor = path;
   _applyTreeSel();
   return false;
@@ -12250,7 +12243,6 @@ function closeContextMenu() {
     ctxMenuEl.remove();
     ctxMenuEl = null;
   }
-  if (_ctxTargetPath) _paintCtxTarget("");
   // Flush any tree reloads that were deferred while the menu was open.
   if (_pendingReloadDirs.size) {
     const dirs = [..._pendingReloadDirs];
@@ -12265,19 +12257,9 @@ function closeContextMenu() {
     }, 150);
   }
 }
-// 右键的那一行要看得出来。普通文件/目录右键之后菜单浮在旁边、行上毫无标记，而菜单里
-// 就有不可逆的「删除」。存路径不存节点：菜单开着时 fs-watcher 仍可能重建树。
-let _ctxTargetPath = "";
-function _paintCtxTarget(path) {
-  for (const r of treeEl?.querySelectorAll(".row.is-ctx-target") || []) r.classList.remove("is-ctx-target");
-  _ctxTargetPath = path || "";
-  if (!_ctxTargetPath) return;
-  treeEl?.querySelector(`.row[data-path="${cssEscape(_ctxTargetPath)}"]`)?.classList.add("is-ctx-target");
-}
 function openContextMenu(x, y, entry) {
   _suppressNativeSelection();
   closeContextMenu();
-  _paintCtxTarget(entry?.path || "");
   const isDir = !!entry.is_dir;
   const targetDir = isDir ? entry.path : parentDir(entry.path);
   const isWorkspaceRoot = workspaceRoots.includes(entry.path);
@@ -22233,24 +22215,9 @@ function _renderMentionsToHtml(text) {
   while ((m = re.exec(text))) {
     out += _escHtmlLite(text.slice(last, m.index + m[1].length));
     const rel = m[2];
-    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-    // 带前缀的引用（@github:owner/repo、@gitlab:…、@mcp:…）不是本地路径：
-    // 发送之后消息里只剩纯文本，而这里原本只按"有没有扩展名"猜文件/文件夹，于是一个 GitHub
-    // 仓库被画成文件夹图标、名字还被截成最后一段（用户实拍：`ThesisX` 配一个文件夹图标）。
-    const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
-    if (pfx) {
-      const kind = pfx[1];
-      // 只显示仓库名，owner 收进 tooltip（title 已经是完整的 github:owner/repo）。
-      // 组织名往往比仓库名还长，摆在气泡里挤掉正文，而用户真正要认的是"哪个项目"。
-      const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
-      const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
-      out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
-        + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
-      last = re.lastIndex;
-      continue;
-    }
     const name = rel.split("/").filter(Boolean).pop() || rel;
     const isDir = !/\.[a-zA-Z0-9]{1,8}$/.test(name); // heuristic: no extension → folder
+    const relAttr = rel.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
     out += `<span class="msg-mention" data-rel="${relAttr}" data-dir="${isDir ? 1 : 0}" title="${relAttr}">`
       + `${iconImg(isDir ? folderIconUrl(name, false) : fileIconUrl(name))}<span class="msg-mention__name">${_escHtmlLite(name)}</span></span>`;
     last = re.lastIndex;
@@ -60442,8 +60409,10 @@ async function _executeToolStepInner(step, call, root, run) {
       if (_previewStale) {
         // The PREVIEW's baseline is stale — not the write. This used to hard-block with
         // "被其他编辑器或程序修改", but by this point two stronger facts already hold:
-        //   • a dirty editor buffer was rejected by the unsaved-changes check above, so
-        //     no unsaved human edit is at risk here;
+        //   • a dirty editor buffer is rejected by the unsaved-changes check a few lines
+        //     BELOW (_openFileWriteConflict), which still gates the actual write — this
+        //     block only drops a stale preview and never touches disk, so no unsaved
+        //     human edit is at risk here. (This used to say "above"; it never was.)
         //   • this is a whole-file write whose content is self-contained, and it lands
         //     through writeTextFileIfUnchanged(fp, existed ? old : null, newContent) with
         //     the `old` read moments ago — a genuinely concurrent change still fails CAS.
@@ -75254,10 +75223,6 @@ function _insertRefAtCursor(rel, kind = "file", labelText = "") {
   }
   if (!range.collapsed) range.deleteContents();
   range.insertNode(chip);
-  // 同上：片前面没有文本节点时，光标按左键过不去（片是原子节点）。
-  if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
-    chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
-  }
   // Give the caret a text node to land in: WKWebView renders NO visible caret directly after a
   // trailing atomic (contentEditable=false) chip, so dropping one made the cursor "disappear". If a
   // text node already follows, reuse it; otherwise pad with a zero-width space — invisible, zero
@@ -75699,8 +75664,7 @@ function _atRepoRows(kind, query) {
       icon: `i-brand-${kind}`,
       name: r.full_name,
       detail: r.private ? "Private" : "Public",
-      // 片上只显示仓库名，owner 收进 tooltip：组织名常常比仓库名长，摆在输入框里挤掉正文。
-      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name.split("/").pop() || r.full_name }),
+      onPick: () => _insertAtChip({ kind, value: r.full_name, label: r.full_name }),
     }));
   if (rows.length) return rows;
   // 三种"没有行"要说三句不同的话。以前只分了两种：缓存空就一律说「Loading…」，于是一个
@@ -76031,12 +75995,6 @@ function _insertAtChip({ kind, value, label }) {
     range.deleteContents();
     const chip = _makeComposerChip(value, kind, label);
     range.insertNode(chip);
-    // 片左边也要有落脚点。片是 contentEditable=false 的原子节点，它**前面**若没有文本节点
-    // （比如它就是输入框里的第一个元素），光标按左键无处可去 —— 表现就是"往左走不动"。
-    // 右边早就补了一个零宽空格，左边一直没有。_ceSerialize 会把零宽空格剥掉，不进发送文本。
-    if (!chip.previousSibling || chip.previousSibling.nodeType !== 3) {
-      chip.parentNode.insertBefore(document.createTextNode("\u200b"), chip);
-    }
     let pad = chip.nextSibling;
     if (!pad || pad.nodeType !== 3) {
       pad = document.createTextNode("​");
