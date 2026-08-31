@@ -17081,7 +17081,7 @@ function _modelPriceRows(m) {
     return `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.imageBilling"))}</span></div>`;
   }
   return `<div class="mic-plabel mic-plabel--center">${title}</div>`
-    + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.unknown"))}</span></div>`;
+    + `<div class="mic-row mic-row--hint"><span class="mic-u">${_escHtml(t("model.price.missing"))}</span></div>`;
 }
 
 function showModelInfoCard(m, anchorEl) {
@@ -37197,6 +37197,12 @@ function _mapToolCall(name, args, mcpToolMap = _mcpToolMap) {
     : _normalizeArgKeys(args || {});
   for (const k of _STR_ARG_KEYS) {
     const v = args[k];
+    // **数组不拍平。** `path` 在绝大多数工具里是文件路径（字符串），但 system 的
+    // action:"menu"/"menu_items" 把它声明成 array（菜单层级），后端签名也是
+    // `path: Vec<String>`。原来这里无差别 String()，["File","New Folder"] 变成
+    // "File,New Folder" —— 两层以上的菜单路径**必然点不中**，而那正是这个动作唯一的用途。
+    // 报错还长得像"找不到菜单项"，看不出是参数在半路被改了形状。
+    if (Array.isArray(v)) continue;
     if (v != null && typeof v !== "string") args[k] = String(v);
   }
   // Resolve weak-model tool-name variants (bash→run_cmd, typos…) to the real tool.
@@ -80179,13 +80185,32 @@ let _dropHideTimer = 0;
 const _treeEl = document.getElementById("tree");
 // 落点是否在某个元素里；命中就把**客户端坐标**还回去（后面 elementFromPoint 要用）。
 // 两套坐标都试：Tauri 报的可能是物理像素也可能是逻辑像素，浏览器路径给的是 client px。
+// 拖放事件里的坐标 → CSS 坐标要除以几。
+//
+// 这里原来是「两套都试，先试除以 devicePixelRatio 的那个」。而侧栏又窄又高：坐标减半之后
+// 往往**仍然落在侧栏矩形里**，于是那个错误候选每次都先命中 —— 用户看到的就是「高亮出现在
+// 光标位置的一半处」，光标在下面、亮的却是上面几行。
+//
+// 换成**实测**：问窗口它的 innerSize（物理像素）是 CSS 宽度的几倍，就除以几。
+// Tauri 报物理像素时算出 dpr、报 CSS 像素时算出 1，两种约定都对，且不用猜。
+// 浏览器路径没有这个对象，_dropScale 保持 1，client 坐标直接就是 CSS 坐标。
+let _dropScale = 1;
+if (inTauri) {
+  import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
+    const size = await getCurrentWindow().innerSize();
+    const w = window.innerWidth || 1;
+    const k = size?.width ? size.width / w : 1;
+    // 只认接近整数的比例（1 / 2 / 3）；量出别的数说明这次读数不可信，宁可不缩放。
+    if (Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1) _dropScale = Math.round(k);
+  }).catch(() => {});
+}
 function _dropPointIn(p, el) {
   if (!p || !el) return null;
   const r = el.getBoundingClientRect();
   if (!r.width || !r.height) return null;
-  const dpr = window.devicePixelRatio || 1;
-  const hit = (x, y) => (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? { x, y } : null);
-  return hit(p.x / dpr, p.y / dpr) || hit(p.x, p.y);
+  const x = p.x / _dropScale;
+  const y = p.y / _dropScale;
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? { x, y } : null;
 }
 // 三个落区。文件树那档是 VS Code 的分工：落进树里 = 复制成子文件/子目录，**不换工作区**；
 // 换项目留给编辑器区那档（"open"）。没打开项目时树里是空状态，这时拖文件夹进来用户要的
@@ -80366,16 +80391,14 @@ async function _handleDrop(paths, target, payload) {
 editorContainer.addEventListener("dragover", (e) => {
   e.preventDefault();
   e.dataTransfer.dropEffect = "copy";
-  // client 是 CSS 像素，而 _dropPointIn 先按物理像素试（Tauri 那条给的是物理像素）。
-  // 不乘回去的话 Retina 上 /dpr 之后仍可能落在又窄又高的侧栏里——分档对、坐标偏半屏。
-  const _p = { position: { x: e.clientX * (window.devicePixelRatio || 1), y: e.clientY * (window.devicePixelRatio || 1) } };
+  // client 本来就是 CSS 坐标，_dropScale 在浏览器路径下是 1，直接传。
+  const _p = { position: { x: e.clientX, y: e.clientY } };
   _showDrop(_dragTargetAt(_p), _p);
 });
 editorContainer.addEventListener("dragleave", () => _hideDropSoon());
 editorContainer.addEventListener("drop", async (e) => {
   e.preventDefault();
-  const _dpr = window.devicePixelRatio || 1;
-  const payload = { position: { x: e.clientX * _dpr, y: e.clientY * _dpr } };
+  const payload = { position: { x: e.clientX, y: e.clientY } };
   const target = _dragTargetAt(payload);
   _hideDrop();
   const files = [...(e.dataTransfer?.files || [])].map((f) => f.path).filter(Boolean);

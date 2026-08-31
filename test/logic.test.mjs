@@ -14606,6 +14606,20 @@ test("spawn_multiple_agents 的回执要打作业号，不是黑板键", () => {
     "await_subagent 的查找判据变了，上面那条回执格式要跟着改");
 });
 
+test("入参归一不许把数组拍平——system 的菜单路径就是数组", () => {
+  // `path` 在绝大多数工具里是文件路径（字符串），所以它在 _STR_ARG_KEYS 里。但 system 的
+  // action:"menu"/"menu_items" 把 path 声明成 array（菜单层级），后端签名也是
+  // `system_menu(app, path: Vec<String>)`。原来那个 for 无差别 String()，
+  // ["File","New Folder"] 变成 "File,New Folder" —— 两层以上的菜单路径必然点不中，
+  // 而那正是这个动作唯一的用途；报错还长得像"找不到菜单项"，看不出参数在半路换了形状。
+  const src = SRC.slice(SRC.indexOf("for (const k of _STR_ARG_KEYS) {"), SRC.indexOf("for (const k of _STR_ARG_KEYS) {") + 700);
+  assert.match(src, /if \(Array\.isArray\(v\)\) continue;/,
+    "数组又被 String() 拍平了——system 的多层菜单路径会静默失效");
+  // schema 那边确实声明成 array，别把这条测试写成对着空气断言。
+  const sysSchema = TOOL_CATALOG_SRC.slice(TOOL_CATALOG_SRC.indexOf('name: "system"'), TOOL_CATALOG_SRC.indexOf('name: "system"') + 6000);
+  assert.match(sysSchema, /path: \{ type: "array"/, "system.path 不再是 array 了，这条测试的前提要重看");
+});
+
 test("弱模型收敛只做一次上限，不再套一层恒等变换", () => {
   assert.doesNotMatch(SRC, /_prioritizeNamedTools/,
     "那个恒等变换又回来了——它按 s.function?.name 取名，而传进去的是字符串数组");
