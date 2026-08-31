@@ -80218,26 +80218,35 @@ const _treeEl = document.getElementById("tree");
 // 换成**实测**：问窗口它的 innerSize（物理像素）是 CSS 宽度的几倍，就除以几。
 // Tauri 报物理像素时算出 dpr、报 CSS 像素时算出 1，两种约定都对，且不用猜。
 // 浏览器路径没有这个对象，_dropScale 保持 1，client 坐标直接就是 CSS 坐标。
+// 拖放事件报来的坐标 → CSS 坐标。
+//
+// 踩过两次，记下来：
+//  ① 最早是「两套坐标都试，先试除以 dpr 的那个」。侧栏又窄又高，坐标减半后**仍然落在
+//     侧栏里**，于是错误候选每次先命中 —— 高亮永远出现在光标位置的一半处。
+//  ② 接着改成「向窗口要 innerSize，除以 CSS 宽算出比例」。但 documentElement.clientWidth
+//     会被界面缩放（--ui-zoom / style.zoom）改掉，于是在缩放不为 1 时又量出个错的倍数，
+//     表现还是「放在下面、亮的是上面」。
+//
+// 所以不再测量、也不假设约定，改成**自校正**：先当它是 CSS 坐标（wry 在 macOS 上报的
+// 就是逻辑点），一旦真的观察到某个坐标越出 CSS 视口——CSS 坐标不可能越出——就说明这台
+// 机器报的是物理像素，当场锁定成 dpr，本次会话之后都按它换算。
+// 好处是不依赖任何一侧的实现细节：报逻辑点时从第一帧就正确，报物理像素时最多错一帧。
 let _dropScale = 1;
-if (inTauri) {
-  import("@tauri-apps/api/window").then(async ({ getCurrentWindow }) => {
-    const size = await getCurrentWindow().innerSize();
-    // viewportW() 而不是 window.innerWidth：这里要的正是 **CSS 视口宽**（拿它和物理
-    // innerSize 相除得缩放比）。仓库里那条「浮层定位一律按 CSS 视口夹取」的守卫扫的
-    // 就是裸 innerWidth——documentElement.clientWidth 才是排除滚动条后的真 CSS 宽。
-    const w = viewportW() || 1;
-    const k = size?.width ? size.width / w : 1;
-    // 只认接近整数的比例（1 / 2 / 3）；量出别的数说明这次读数不可信，宁可不缩放。
-    if (Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1) _dropScale = Math.round(k);
-  }).catch(() => {});
+function _dropCssPoint(p) {
+  if (!p) return null;
+  if (_dropScale === 1) {
+    const dpr = window.devicePixelRatio || 1;
+    // 只在 dpr>1 时才有歧义可言；越界即证明是物理像素。
+    if (dpr > 1 && (p.x > viewportW() || p.y > viewportH())) _dropScale = dpr;
+  }
+  return { x: p.x / _dropScale, y: p.y / _dropScale };
 }
 function _dropPointIn(p, el) {
-  if (!p || !el) return null;
+  const pt = _dropCssPoint(p);
+  if (!pt || !el) return null;
   const r = el.getBoundingClientRect();
   if (!r.width || !r.height) return null;
-  const x = p.x / _dropScale;
-  const y = p.y / _dropScale;
-  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom ? { x, y } : null;
+  return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom ? pt : null;
 }
 // 三个落区。文件树那档是 VS Code 的分工：落进树里 = 复制成子文件/子目录，**不换工作区**；
 // 换项目留给编辑器区那档（"open"）。没打开项目时树里是空状态，这时拖文件夹进来用户要的
