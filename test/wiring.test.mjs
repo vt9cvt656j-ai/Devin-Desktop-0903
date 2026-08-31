@@ -550,7 +550,10 @@ test("交付事实必须每轮喂给模型，不能只挂在 iter>=6 的草稿�
   assert.match(after, /messages\[i\]\.content\.includes\(_DELIVERY_FACTS_TAG\)[\s\S]{0,80}?messages\.splice\(i, 1\)/,
     "注入前要先摘掉上一条，别在上下文里堆积");
   // 自带闸门：没动代码就返回空串 → 纯问答/只读 run 不受打扰。这是"执行事实"而非"意图分类"。
-  const dfl = SRC.slice(RAW_SRC.indexOf("function _deliveryFactsLine(run) {"), RAW_SRC.indexOf("function _deliveryFactsLine(run) {") + 2000);
+  // 按 AST 取整个函数，不要 `indexOf + 固定 2000 字符`：函数一变长，窗口尾部就滑出去，
+  // 下面那几条断言会突然红（这次就是），而更糟的形状是**悄悄绿着**——窗口滑到别处，
+  // 断言匹配到的是另一段代码。fnSource 的 code:true 顺带剥注释。
+  const dfl = fnSource("_deliveryFactsLine", { code: true });
   // 闸门还在，但多了一个**必须**的例外：写入尝试落空了要说。用户实撞过「它说已保存到
   // .doc/xxx.md，而文件不在」——那次模型手上没有任何与之矛盾的事实，因为这一行整个是空的。
   // 落空的写入是纯执行记录（run._writeLedger 逐条记着），不是对措辞的猜测。

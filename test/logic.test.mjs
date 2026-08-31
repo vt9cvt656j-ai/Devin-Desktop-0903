@@ -8,6 +8,7 @@
 //
 // Run:  node --test   (from ide/, or `npm test`)
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
 import { setBadgeText } from "../src/agent/escape.js";
 // 2026-08-26 搬进了 src/agent/skill-doc.js —— 直接 import 真模块，不再抠源码
 // （抠源码验得到行为，验不到它在真实调用链上还在不在）。
@@ -24948,6 +24949,7 @@ test("写失败后重试成功的文件，不许再每轮告诉模型「它此�
   // 「没能保存成功，请手动检查」——而文件好好躺在磁盘上。收尾门读同一本账，
   // 用的一直是「按 path 取最后一条」，两个消费方的判据必须一致。
   const facts = load("_deliveryFactsLine", {
+    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -24973,6 +24975,7 @@ test("写失败后重试成功的文件，不许再每轮告诉模型「它此�
 
 test("交付事实来自执行记录，不做任何推断", () => {
   const facts = load("_deliveryFactsLine", {
+    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -25103,6 +25106,7 @@ test("这一轮留下的一次性脚本要被清点出来——规则早就写�
 
   // 清点结果必须真的出现在收尾那行事实里——只写函数不接线，等于没做。
   const line = load("_deliveryFactsLine", {
+    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -25205,6 +25209,7 @@ test("收尾评审员必须真的被调用——它曾经零调用点，而三�
 
 test("评审结论只陈述、不拦回合", () => {
   const facts = load("_deliveryFactsLine", {
+    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -32555,6 +32560,7 @@ test("eager 落盘台账走权威失败判定，不是手写的三词正则", ()
 // ---- 写入落空必须进交付事实：模型收尾时手上要有与「已保存」矛盾的那条事实 ----
 test("写入没落盘要说出来，而纯问答/只改文档的 run 照旧不受打扰", () => {
   const line = load("_deliveryFactsLine", {
+    _failedWritePaths,
     _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
     _looksLikeTestFile: load("_looksLikeTestFile"),
     _deliveryFacts: load("_deliveryFacts", {
@@ -33219,12 +33225,19 @@ test("尝试写了没落盘时，结局里必须留下 writes_failed", () => {
   const loop = extractFn("_runAgenticLoop");
   assert.match(loop, /run\._incompleteReason \|\|= `writes_failed:\$\{_failedWrites\.length\}`/,
     "写入落空在结局里没有任何出口——用户看到的收尾卡片一个字都不会提这件事");
-  assert.match(loop, /for \(const a of \(Array\.isArray\(run\._writeLedger\) \? run\._writeLedger : \[\]\)\) if \(a\?\.path\) _lastWrite\.set\(String\(a\.path\), a\.ok === true\)/,
+  // 读法本身已经提到 agent/write-ledger.js（收尾门和喂给模型的交付事实共用一份，
+  // 这正是这个 bug 的成因——两个消费方读同一本账却各有各的判据）。这里守两件事：
+  // ① 调用点确实喂的是执行记录 run._writeLedger，不是从措辞里猜；
+  assert.match(loop, /_failedWritePaths\(run\._writeLedger\)/,
     "判据要读执行记录（每次写入尝试的成败），不是从措辞里猜");
-  // 账本顺序追加、整 run 不剪枝：写失败后重试成功的那条仍在账上，
-  // 直接 filter(ok === false) 会把已经补救成功的也算进 N。按 path 取最后一条。
-  assert.match(loop, /_failedWrites = \[\.\.\._lastWrite\]\.filter\(\(\[, ok\]\) => !ok\)/,
+  // ② 读法本身做真往返，不匹配源码文本——账本顺序追加、整 run 不剪枝，
+  //    写失败后重试成功的那条仍在账上，直接 filter(ok === false) 会把补救成功的也算进 N。
+  assert.deepEqual(
+    _failedWritePaths([{ path: "a.ts", ok: false }, { path: "a.ts", ok: true }]), [],
     "写失败后重试成功的那条又被算进 writes_failed 了");
+  assert.deepEqual(
+    _failedWritePaths([{ path: "a.ts", ok: true }, { path: "a.ts", ok: false }]), ["a.ts"],
+    "最后一次确实失败的必须留在结局里");
   // 闭合枚举必须认得它，否则界面回落到那句无意义的「继续没做完的部分」。
   const labels = loadConst("_INCOMPLETE_LABELS");
   assert.equal(labels.writes_failed, "重写那几个没写成的文件");
