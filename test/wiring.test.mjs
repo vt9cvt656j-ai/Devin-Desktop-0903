@@ -1900,13 +1900,16 @@ const KNOWN_UNCALLED = new Set([
   //   · _evidenceGradingHint / _structureReadinessHint 一族、_runApprovedVerification、
   //     _detectVerifyCmd、空根拦截三件（_emptyRootSkipMessage / _refreshEmptyRootBeforeSkip /
   //     _emptyExploreSkipMessage）——早先审计已判定为刻意保留的纯函数/备用件；
-  //   · _ctxNativeCeiling、recommendToolsForIntent、renderLspTool——同上，留着备用的渲染/推荐件。
+  //   · _ctxNativeCeiling、renderLspTool——同上，留着备用的渲染件。
+  //     （recommendToolsForIntent 2026-08-30 删除：它不只是没人调，内部也对不上——拿工具名
+  //      去查以技能 id 为键的熟练度表，两套词表零重合，接上也恒为 0。"留着备用"的前提是
+  //      将来能用，这个不能。按这条棘轮的规矩，名单只许变短。）
   // 新加的函数仍然一个都不许进这张表：它守的是"只减不增"。
   // _detectVerifyCmd 2026-08-23 接上了（_runAgenticLoop 的兜底自动验证），按这条棘轮的
   // 规矩从名单里删掉——名单只许变短。
   "_ctxNativeCeiling", "_emptyExploreSkipMessage", "_emptyRootSkipMessage",
   "_evidenceGradingHint", "_refreshEmptyRootBeforeSkip", "_runApprovedVerification",
-  "recommendToolsForIntent", "renderLspTool",
+  "renderLspTool",
   "_appendDeliveryFactsBar", "_appendRunRevertBar", "_adaptiveEnabled",
   // _agentAllowsExternalKind / _agentAllowsRuntimeKind 已于 2026-08-25 删除。
   // 它俩不只是"没人调"：它们还是 _addedRuntimeObligations / _addedExternalObligations

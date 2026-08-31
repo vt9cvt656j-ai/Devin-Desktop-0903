@@ -67,6 +67,18 @@ export function getAvgMastery() {
   try { load(); return avgMastery(); } catch { return 0.5; }
 }
 
+/**
+ * 和 getAvgMastery() 只差一件事：**拿不到就说拿不到**（返回 null），不编一个 0.5。
+ *
+ * 为什么要这个变体：0.5 不是中性值。按熟练度放宽工具窗口那条判据的阈值是 0.45 / 0.7，
+ * 0.5 恰好越过第一档——于是"读失败"会被当成"中等熟练"，把窗口从 10 放宽到 12。
+ * **失败路径反而给更多工具**，而工具窗口每一轮都收注意力税。
+ * 凡是"拿不到就该保守"的调用方用这个；只是要个数字显示的用上面那个。
+ */
+export function getAvgMasteryStrict() {
+  try { load(); const v = avgMastery(); return Number.isFinite(v) ? v : null; } catch { return null; }
+}
+
 // --- Bayesian Knowledge Tracing ------------------------------------------------
 // Classic 4-parameter BKT: a latent "mastered?" probability updated by each
 // observation. Interpretable and cheap — deep/LSTM knowledge tracing is overkill
