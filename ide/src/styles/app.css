@@ -14970,7 +14970,8 @@ body.tree-selecting, body.tree-selecting * { user-select: none !important; -webk
       深浅主题、以及用户换强调色之后全都对不上。 */
 .msg-mention {
   display: inline-flex; align-items: center; gap: 5px;
-  padding: 1px 7px 1px 5px; margin: 0 1px;
+  /* 和输入框里那枚同一条规则：margin 只保证别贴着字，间距靠正文里的空格补。 */
+  padding: 1px 7px 1px 5px; margin: 0 2px;
   font-size: .9em; font-weight: 500; line-height: 1.5; vertical-align: baseline;
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);

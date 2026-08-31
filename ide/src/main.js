@@ -22236,8 +22236,11 @@ function _renderMentionsToHtml(text) {
     const pfx = /^(github|gitlab|mcp):(.+)$/.exec(rel);
     if (pfx) {
       const kind = pfx[1];
-      // 只显示仓库名，owner 收进 tooltip（title 已是完整的 github:owner/repo）。
-      const shown = kind === "mcp" ? pfx[2] : (pfx[2].split("/").filter(Boolean).pop() || pfx[2]);
+      // 每一种片都是同一条规则：**只显示最后一段名字**，完整值收进 tooltip（title 已是
+      // 完整的 github:owner/repo、mcp:server/uri）。输入框那边 _makeComposerChip 一直就是
+      // 这么干的；早先只给 github/gitlab 截，mcp 在气泡里摊出整条 server/uri，同一枚片在
+      // 输入框和气泡里长得不一样（用户：「其他的这种组件囊卡片也要和这个一样的规则」）。
+      const shown = pfx[2].split("/").filter(Boolean).pop() || pfx[2];
       const ico = kind === "mcp" ? iconSvg("i-mcp", "ic--doc") : iconSvg(`i-brand-${kind}`, "ic--doc");
       out += `<span class="msg-mention msg-mention--${kind}" data-rel="${relAttr}" data-kind="${kind}" title="${relAttr}">`
         + `${ico}<span class="msg-mention__name">${_escHtmlLite(shown)}</span></span>`;
@@ -75399,6 +75402,11 @@ document.addEventListener("click", (e) => { if (_suppressTreeClick) { _suppressT
 // 左右方向键跨过内联的片。片是 contentEditable=false 的原子节点，WKWebView 不总能在它两侧
 // 摆放光标——片若是输入框第一个元素，按左键"没反应"（两侧垫零宽空格试过，不够）。所以自己
 // 接管：只在"光标紧挨着片"时越过它，其余一律放行，不影响逐字移动和选区。判断在模块里。
+// 「是不是一枚片」按**结构**判，不按类名：输入框里任何 contentEditable=false 的原子元素都算。
+// 下面三条规则（方向键一下跨过去、退格一次只删一个、那一格空格跟着光标走）讲的是"原子节点
+// 挡住了光标"这件事，跟片是文件、仓库还是 MCP 资源无关。写死 composer-chip 的话，以后加一种
+// 别的片就得记得回来改这两处——那种「手工维护的名单」正是本仓踩过的坑。
+const _isComposerAtom = (n) => n?.nodeType === 1 && n.getAttribute?.("contenteditable") === "false";
 promptEl.addEventListener("keydown", (e) => {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
   if (e.shiftKey || e.altKey || e.metaKey || e.ctrlKey || e.isComposing) return;
@@ -75408,7 +75416,7 @@ promptEl.addEventListener("keydown", (e) => {
   if (!promptEl.contains(r.startContainer)) return;
   const left = e.key === "ArrowLeft";
   const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left,
-    isChip: (n) => n.classList?.contains("composer-chip") });
+    isChip: _isComposerAtom });
   if (!chip) return;
   e.preventDefault();
   // 落位之前先保证光标和片之间有一个真空格，光标停到空格的**外**侧。
@@ -75435,7 +75443,7 @@ promptEl.addEventListener("keydown", (e) => {
   if (!promptEl.contains(r.startContainer)) return;
   const back = e.key === "Backspace";                 // 退格删左边那个，Delete 删右边那个
   const chip = chipBeside({ container: promptEl, node: r.startContainer, offset: r.startOffset, left: back,
-    isChip: (n) => n.classList?.contains("composer-chip") });
+    isChip: _isComposerAtom });
   if (!chip) return;
   e.preventDefault();
   // 把光标停在被删片原来的位置上，再只移除它自己。
