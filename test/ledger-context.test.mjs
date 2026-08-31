@@ -530,3 +530,33 @@ test("压缩的删除范围被 fitCount 夹住（调用点）", () => {
   assert.match(loop, /covered = Math\.min\(covered, _fitCount\)/,
     "删除范围没有被摘要器实际看过的条数夹住——装不下的那些又会被悄悄删掉");
 });
+
+test("上下文摘要不许被 Tier 3 当成「模型自己写太长的回复」对折", () => {
+  // Tier 3 折的是「长的 assistant 正文」，而摘要形状上完全符合（assistant / 无
+  // tool_calls / >600 字）且坐在 i=1。实测 3893 → 400：被压掉那段历史唯一的替代物
+  // 就这么没了。而且 _foldAssistantText 贴的话对摘要三项全错（不是「你早先的回复」、
+  // 结尾不是「当时的结论」、也不是「无法取回」——archive 里还在）。
+  const trim = load("_trimMessagesIfHuge", {
+    _gatewayHandlesCompression: () => false,
+    _mcPrefixInvalidate: () => {},
+    _msgSize: (m) => String(m?.content || "").length,
+    _estTokens: (msgs) => msgs.reduce((n, m) => n + String(m?.content || "").length, 0),
+    _readEvidenceCovers: () => false,
+    _REFETCHABLE: new Set(),
+    _IMPORTANT_LINE: /error/i,
+    _smartCompress: (s) => s,
+    _syncRunReadCoverageFromMessages: () => {},
+    _foldAssistantText: () => "FOLDED",
+    _lexCompress: (s) => s,
+  });
+  const summary = { role: "assistant", _ideMeta: { kind: "context_summary" },
+    content: "[对话上下文摘要]\n接口前缀 /api/v2；金额用 amountCents 存。" + "x".repeat(4000) };
+  const plain = { role: "assistant", content: "我分析下来根因是 X。" + "y".repeat(4000) };
+  const msgs = [{ role: "system", content: "s" }, summary, plain,
+    ...Array.from({ length: 30 }, (_, i) => ({ role: "user", content: "z".repeat(4000) + i }))];
+  trim(msgs, { model: "gpt-4o-mini" });
+  assert.ok(!String(msgs[1].content).includes("FOLDED"), "摘要被对折了——压缩的成果整份丢掉");
+  assert.ok(String(msgs[1].content).includes("/api/v2"), "用户定下的硬约束没保住");
+  // 反向：普通的长 assistant 正文照旧要被折，别把这条守卫修成「Tier 3 整个失效」。
+  assert.ok(String(msgs[2].content).includes("FOLDED"), "Tier 3 对普通长正文失效了");
+});

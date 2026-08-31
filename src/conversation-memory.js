@@ -754,7 +754,20 @@ export class ConversationMemory {
       const recallHint = this.archive.length
         ? '\n\n（以上是早期对话的压缩摘要；需要某段早期对话的原文细节时，用 recall_conversation 工具按关键词检索归档）'
         : '';
-      result.push({ role: 'assistant', content: `[对话上下文摘要]\n${merged}${recallHint}` });
+      // _ideMeta 打标，让下游 _trimMessagesIfHuge 的 Tier 3 放过这条。
+      //
+      // Tier 3 把「长的 assistant 正文」对折成 400 字，而这条消息形状上完全符合
+      // （assistant / 无 tool_calls / >600 字）且坐在 i=1。实测 3893 字被折成 400 字：
+      // 用户第一轮定下的硬约束（接口前缀 /api/v2、金额用分存）当场消失——它们既不在
+      // recent 里（已被压掉），也不在摘要里（刚被折掉）。它是被压掉那段历史的**唯一**
+      // 替代物，折它等于把压缩的成果直接扔掉。
+      //
+      // 更糟的是 _foldAssistantText 贴的那句话对摘要三项全错：它不是「你这段早先的
+      // 回复」，结尾不是「当时的结论、以它为准不要重新推导」，也不是「无法取回」
+      // （archive 里还在，recall_conversation 捞得回来）——等于把唯一的退路也劝退了。
+      //
+      // 标记本身不会发给上游：_sanitizeProviderMessages 的解构里已经摘掉 _ideMeta。
+      result.push({ role: 'assistant', _ideMeta: { kind: 'context_summary' }, content: `[对话上下文摘要]\n${merged}${recallHint}` });
     }
     return result;
   }
