@@ -22,7 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource } from "./helpers/source.mjs";
 
 // 按**代码文本**登记，不按行号：这个文件几万行，行号每天都在漂，按行号钉的清单第二天就是
 // 一堆假红。改了那一行的文本 = 改了那处判断，本来就该重新过一遍。
@@ -198,8 +198,11 @@ test("默认完整交付、先读懂再动手、每一步先想", () => {
   // ……才能去修改代码」「每写一个文件每做一步就需要去思考」。
   // 补之前全仓搜 MVP / 最小可用 / 糊弄，服务端提示词和客户端**零命中**——从来没有任何一条
   // 规则要求它别缩水。没有规则，模型缩到能跑就交，而且缩水本身不会被说出来。
-  const frame = SRC.slice(RAW_SRC.indexOf("function _agentDecisionFrameBlock"));
-  const laws = frame.slice(0, 8000);
+  // 按 AST 取整个函数，不要 `开放式切片 + slice(0, 8000)`：这个函数实测 18041 字，
+  // 8000 的窗口只盖住 44%。正向断言落在 3470–4889，都在窗口内所以照常工作；而**反向**
+  // 断言（下面那条「降级那条路不许回来」）对窗口外的后 56% 天然恒真——正向断言失效会
+  // 吵，反向断言失效是哑的，而这条守的正是最高优先级的产品约束。
+  const laws = fnSource("_agentDecisionFrameBlock", { code: true });
 
   // ① 不降级。需求大就拆切片，不是砍功能。
   assert.match(laws, /交付规格律：默认按\*\*完整可用\*\*交付，不降级、不做演示版/,

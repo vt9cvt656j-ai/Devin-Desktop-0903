@@ -220,12 +220,12 @@ const SLICE_BASELINE = {
   "comment-quality.test.mjs": 2,
   "control-glow.test.mjs": 3,
   "desktop-automation.test.mjs": 2,
-  "gate-tristate.test.mjs": 2,
+  "gate-tristate.test.mjs": 1,
   "interrupt-transcript.test.mjs": 1,
   "knowledge-preflight-card.test.mjs": 1,
   "knowledge-routing.test.mjs": 1,
   "logic.test.mjs": 93,
-  "mcp-visibility.test.mjs": 2,
+  
   "mcp.test.mjs": 7,
   "prefix-cache.test.mjs": 14,
   "runtime-state-cache.test.mjs": 1,
@@ -233,7 +233,7 @@ const SLICE_BASELINE = {
   "skill-catalog.test.mjs": 7,
   "skills.test.mjs": 2,
   "truthfulness.test.mjs": 1,
-  "wiring.test.mjs": 29,
+  "wiring.test.mjs": 26,
 };
 
 /** 每个测试文件里「SRC.slice(SRC.indexOf(…))」的条数。先剥注释——注释里会**讲**这个

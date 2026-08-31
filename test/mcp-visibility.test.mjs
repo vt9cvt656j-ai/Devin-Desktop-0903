@@ -21,7 +21,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // 只在注释里留一句，assert.match 照样绿——本仓库已经这样漏过一整组模型可见的工具契约。
 // 所以 `SRC` 绑定的是 CODE（注释整段置空，行号与偏移和原文一字不差）；
 // 真要匹配注释本身的断言显式用 RAW_SRC，并在那一行写清为什么。
-import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn } from "./helpers/source.mjs";
+import { CODE as SRC, SRC as RAW_SRC, fnSource as topLevelFn, load } from "./helpers/source.mjs";
 
 function topLevelConst(name) {
   const m = SRC.match(new RegExp(`^const ${name} = .*?;$`, "m"));
@@ -309,21 +309,43 @@ test("名录读的是不带免责前缀的那份说明", () => {
   assert.ok(!out.includes("第三方服务自述"), "每条说明里还在重复整段已经声明过的免责话术");
 });
 
-test("没打开文件夹也要预热——全局服务不属于任何项目", () => {
+test("没打开文件夹也要预热——全局服务不属于任何项目", async () => {
   /*
    * 这两处以前各有一个 `!root` 早退，于是"启动 IDE、不开文件夹、直接提问"这条最常见的
    * 路径上，MCP **从来没被预热过**。第一轮既没有工具 schema，也没有那份「有哪些服务」的
    * 名录——而模型不会去搜一件自己不知道存在的东西。第二轮才正常。
    */
-  const warm = SRC.slice(RAW_SRC.indexOf("async function _warmMcpTools("), RAW_SRC.indexOf("async function _warmMcpTools(") + 900);
-  assert.doesNotMatch(warm, /if \(!inTauri \|\| !root\) return;/,
-    "空根又被早退挡掉了——不开文件夹就永远不预热 MCP");
-  assert.match(warm, /if \(!inTauri\) return;/, "预热的守卫应当只看在不在桌面端");
+  // 两条原来都钉的是**那一行历史代码的确切字节串**（`if (!inTauri || !root) return;`），
+  // 不是「有没有空根早退」这个性质：回归只要换个写法（拆两行、写成 `if (root === "")`、
+  // 或者挪到 900 字窗口之外）就完全绕开。这个函数能在 Node 里跑，直接验行为。
+  const warmCalls = [];
+  const warm = load("_warmMcpTools", {
+    inTauri: true,
+    _toPosix: (x) => String(x),
+    _ensureMcpTools: async (r) => { warmCalls.push(r); },
+  });
+  await warm("");
+  await warm("/w/proj");
+  assert.deepEqual(warmCalls, ["", "/w/proj"],
+    "空根也必须预热——用户级（scope=\"user\"）的服务不属于任何项目，"
+    + "「没打开文件夹」和「该不该连它们」毫无关系");
+  // 非桌面端仍然要早退（别把这条修成守卫整个失效）。
+  const warmCalls2 = [];
+  const warmWeb = load("_warmMcpTools", {
+    inTauri: false,
+    _toPosix: (x) => String(x),
+    _ensureMcpTools: async (r) => { warmCalls2.push(r); },
+  });
+  await warmWeb("/w/proj");
+  assert.deepEqual(warmCalls2, [], "网页端不该去连 MCP");
 
-  const sched = SRC.slice(RAW_SRC.indexOf("function _scheduleWorkspaceAgentWarmup("), RAW_SRC.indexOf("function _scheduleWorkspaceAgentWarmup(") + 1200);
-  assert.doesNotMatch(sched, /if \(!inTauri \|\| !normalized\) return null;/,
-    "整批预热又被空根挡掉了");
-  // 真正跟项目走的只有工作区上下文，空根时跳过它就够了。
+  // 整批预热：反向断言从「某一行字面量」抬到「函数头部不许有任何以 normalized 为
+  // 条件的早退」，并且窗口钉在真正的头部而不是固定字符数。
+  const sched = topLevelFn("_scheduleWorkspaceAgentWarmup", { code: true });
+  const head = sched.slice(0, sched.indexOf("const state = {"));
+  assert.ok(head.length > 0, "切不出函数头部——锚点失效，下面那条断言会变成守空气");
+  assert.doesNotMatch(head, /\bnormalized\b[^\n]*\breturn\b/,
+    "任何形式的空根早退都不许挡住整批预热（只有工作区上下文那一项跟项目走）");
   assert.match(sched, /normalized \? \[_gatherAgentContext\("", normalized\)\] : \[\]/,
     "空根时应当只跳过工作区上下文，而不是整批不跑");
 });
