@@ -54151,8 +54151,9 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
               } catch {}
             });
           const _gone = _removedDeclarationsUnchecked(run, _terms);
+          // 空数组也写回去（理由见写时那处）：查过引用之后就得从事实里消失。
+          run._removedDecls = _gone;
           if (_gone.length) {
-            run._removedDecls = _gone;
             run._incompleteReason = run._incompleteReason || `removed_unchecked:${_gone.length}`;
           }
         }
@@ -56167,7 +56168,13 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
             } catch {}
           }
           const _wfGone = _removedDeclarationsUnchecked(run, _wfTerms);
-          if (_wfGone.length) run._removedDecls = _wfGone;
+          // 空数组也要写回去（同 _stubFindings，理由见上一段）：模型第 4 轮真的跑了
+          // lsp_references 确认没人再用，这条事实就不成立了；不清零的话
+          // _deliveryFactsLine 从第 5 轮到 run 结束每轮都还在说「这一轮删掉了 1 个还没
+          // 查过引用的声明」。它要么把同一个符号再查两三遍（用户看到的正是「反复做
+          // 同一件事」），要么开始整体不信这块事实——而同一块里还有「有 N 次写入没有
+          // 落盘」这种真需要看的。
+          run._removedDecls = _wfGone;
           for (const g of _wfGone) {
             const k = `removed:${g.name}@${g.path}`;
             if (_wfSaid.has(k)) continue;
@@ -56639,7 +56646,14 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
       // --- Stuck / loop detection → diagnostic rethink (Reflexion-style). ---
       for (let i = 0; i < items.length; i++) {
         const c = items[i].call;
-        if (!c || !_toolExecutionAttempted(items[i].rawResult)) continue;
+        // `_notAttempted` 也要排除：补空洞那段只写消息、不写 rawResult，而
+        // _toolExecutionAttempted(undefined) 是 true，于是"根本没跑"的调用会被算成失败。
+        // 台账那处（_recordToolCall）早就排除了它，注释里点名说的正是**这个**消费方。
+        // 撞上了会两条指令正面对撞：模型收到 4 条「[未执行]…重新发起这次调用」，同一轮
+        // 又收到「你在重复同样的动作/连续失败……别再原样重试，换一种真正不同的策略」。
+        // 后一条更强、更晚到，模型于是不去重发那几次读取，改去「换个思路」或者干脆
+        // ask_user 问一件它自己 read_file 就能知道的事——用户看到的是「它突然放弃了」。
+        if (!c || items[i]._notAttempted || !_toolExecutionAttempted(items[i].rawResult)) continue;
         // Signature must DISTINGUISH distinct calls. Truncating to 80 chars collapsed different
         // commands that share a boilerplate prefix (e.g. many `python3 -c "import requests…"`
         // one-liners hitting DIFFERENT urls) into ONE sig → the loop-detector falsely screamed

@@ -9,6 +9,7 @@
 // 这里守的是行为：用源码里真实的装配表达式、真实的保留段、真实的差集判据跑一遍，
 // 不手抄任何标题。
 import test from "node:test";
+import { failedWritePaths as _failedWritePaths } from "../src/agent/write-ledger.js";
 import assert from "node:assert/strict";
 // 按名字取真源码 / 取顶层常量的值，只有一份实现：test/helpers/source.mjs。
 // 这个文件的源码断言历来跑在**原文**上（下面自己剥注释），所以 SRC 绑定 main.js 原文。
@@ -620,4 +621,53 @@ test("知识库检索成功了就别判成失败——正文本来就是别人�
   for (const bad of ["[失败] michael-design 预取异常: timeout", "[ERROR/UNREADABLE] 语料读不出来",
                      "〔外部数据〕[失败] 检索链路异常"])
     assert.equal(f({ type: "knowledge" }, { content: bad }), false, `真失败 ${bad.slice(0, 12)} 漏判了`);
+});
+
+test("查过引用之后，「删了没查引用的声明」这条事实要能撤掉", () => {
+  // 两个写回点原来都是 `if (_gone.length) run._removedDecls = _gone`，而全仓没有任何
+  // 一处清零。模型第 4 轮真的跑了 lsp_references 确认没人再用，扫描结果已经是 []，
+  // 但 run._removedDecls 还留着上一轮的值——_deliveryFactsLine 从第 5 轮到 run 结束
+  // 每轮都还在说「这一轮删掉了 1 个还没查过引用的声明」。同门的 _stubFindings 两处
+  // 都已经改成无条件写回，这一对被漏了。
+  const src = stripJsComments(SRC);
+  assert.doesNotMatch(src, /if \(_wfGone\.length\) run\._removedDecls = _wfGone;/,
+    "空数组仍然不写回——已经不成立的事实会每轮重播");
+  assert.match(src, /run\._removedDecls = _wfGone;/, "写回点没了");
+  assert.match(src, /run\._removedDecls = _gone;\s*\n\s*if \(_gone\.length\) \{/,
+    "收尾那处也要无条件写回，只有 _incompleteReason 才按非空挂");
+  // 行为面：事实行本身在空数组时必须是空的。
+  const facts = load("_deliveryFactsLine", {
+    _failedWritePaths,
+    _CODE_FILE_RE: loadConst("_CODE_FILE_RE"),
+    _looksLikeTestFile: load("_looksLikeTestFile"),
+    _deliveryFacts: load("_deliveryFacts", {
+      _CODE_FILE_RE: loadConst("_CODE_FILE_RE"), _looksLikeTestFile: load("_looksLikeTestFile"),
+    }),
+    _strayScratchFiles: load("_strayScratchFiles"),
+    _projectStacks: new Map(),
+  });
+  const run = { _mutatedFiles: new Set(["src/plan.ts"]), _executionEvidence: [], _removedDecls: [] };
+  assert.doesNotMatch(facts(run), /还没查过引用的声明/, "空数组还在报——说明这条事实撤不掉");
+  run._removedDecls = [{ path: "src/plan.ts", name: "renderPlan" }];
+  assert.match(facts(run), /还没查过引用的声明/, "真有未查引用的删除时必须报出来");
+});
+
+test("调度器留下的空洞不算失败——否则「重新发起」和「别再重试」正面对撞", () => {
+  // 补空洞那段只写消息、**不写 rawResult**，而 _toolExecutionAttempted(undefined) 是
+  // true（判据是 result?.failure?.attempted !== false），所以光靠它排不掉。台账那处
+  // （_recordToolCall）早就一起排除了 _notAttempted，注释里点名说的正是死循环检测
+  // 这个消费方，而它自己漏了。
+  //
+  // 撞上了模型会同时收到两条相反的指令：4 条「[未执行] 这次调用没有被执行……仍然
+  // 需要的话，重新发起这次调用」，以及同一轮的「你在重复同样的动作/连续失败，看起来
+  // 卡住了。别再原样重试，换一种真正不同的策略」。后一条更强、更晚到，于是它不去重发
+  // 那几次读取，改去「换个思路」或者 ask_user 问一件自己 read_file 就能知道的事。
+  const loop = extractFn("_runAgenticLoop");
+  const at = loop.indexOf("Stuck / loop detection");
+  assert.ok(at > 0, "死循环检测的锚点没了——这条守卫在守空气，重新定位");
+  assert.match(loop.slice(at, at + 1200), /items\[i\]\._notAttempted/,
+    "死循环检测没排除「根本没执行」的调用，会把调度器的空洞算成连续失败");
+  // 台账那处必须一直是排除的（两个消费方判据要一致）。
+  assert.match(loop, /!it\._skipped && !it\._notAttempted && _toolExecutionAttempted\(it\.rawResult\)/,
+    "台账那处的排除被改掉了");
 });
