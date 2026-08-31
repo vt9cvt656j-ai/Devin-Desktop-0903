@@ -40,15 +40,55 @@ test("buildDiffView renders new-file additions with escaped code and language", 
 });
 
 test("buildDiffView renders deletes, adds, context, and skipped-line markers", () => {
-  const oldText = ["same0", "same1", "old2", "same3", "same4", "same5", "same6", "old7"].join("\n");
-  const newText = ["same0", "same1", "new2", "same3", "same4", "same5", "same6", "new7"].join("\n");
+  // 2026-08-30 夹具加长了中间那段：原来两处改动之间只隔 4 行，而上下文是各 2 行，
+  // 折叠标记恰好折不出来（2+2 就把 4 行全占了）。原来那版渲染器按同一下标配对、
+  // 上下文逻辑也不同，才在这个夹具上吐出 @@ 4 @@。现在中间隔 10 行，标记如实出现。
+  const mid = Array.from({ length: 10 }, (_, i) => `mid${i}`);
+  const oldText = ["same0", "same1", "old2", ...mid, "old7"].join("\n");
+  const newText = ["same0", "same1", "new2", ...mid, "new7"].join("\n");
   const html = buildDiffView(oldText, newText, "src/app.ts");
 
   assert.match(html, /data-lang="ts"/);
   assert.match(html, /atc-diff-row--ctx/);
   assert.match(html, /atc-diff-row--del/);
   assert.match(html, /atc-diff-row--add/);
-  assert.match(html, /@@ 4 unchanged lines @@/);
+  assert.match(html, /@@ 6 unchanged lines @@/);
+});
+
+test("diff 视图和它上面那个 +N/-M 徽章必须给出同一个结论", () => {
+  // 渲染循环原来按**同一个下标**配对 oldL[i] / newL[i]，于是只要有一行插入，后面全错位。
+  // 实测：40 行文件最前面插一行 import → 徽章（diffStat 用行的多重集，算得对）显示 +1，
+  // 正下方那块 diff 画出 30 增 30 删。同一次写入，两个数字差 30 倍，用户不知道信哪个。
+  const count = (h, c) => (String(h).match(new RegExp(`atc-diff-row--${c}`, "g")) || []).length;
+  const base = Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n");
+  for (const [label, oldT, newT] of [
+    ["头部插一行", base, "import x from 'y';\n" + base],
+    ["尾部插一行", base, base + "\nexport {};"],
+    ["中间改一行", base, base.split("\n").map((l, i) => (i === 9 ? "line NINE" : l)).join("\n")],
+    ["删掉一行", base, base.split("\n").filter((_, i) => i !== 5).join("\n")],
+    ["完全没变", base, base],
+    // 交错编辑：中段既有插入又有修改。前后缀裁剪解决不了这种，必须真的跑 LCS——
+    // 把预算调成 0 强制走退化路径时，这一条会给出 4 增 3 删（正确答案是 2 增 1 删），
+    // 所以它是唯一能把「LCS 真的在跑」和「只靠裁剪蒙对」分开的用例。
+    ["交错插入+修改",
+      ["a", "b", "c", "d", "e", "f", "g", "h"].join("\n"),
+      ["a", "b", "INSERT", "c", "d", "CHANGED", "f", "g", "h"].join("\n")],
+  ]) {
+    const st = diffStat(oldT, newT);
+    const html = buildDiffView(oldT, newT, "a.ts") || "";
+    assert.equal(count(html, "add"), st.added, `${label}：视图的新增行数和徽章对不上`);
+    assert.equal(count(html, "del"), st.removed, `${label}：视图的删除行数和徽章对不上`);
+  }
+});
+
+test("对齐有规模守卫：超大整体重写不去算 O(n·m)", () => {
+  // 中段乘积超预算时退回逐行配对——那是旧行为，不好但**有界**。这块 diff 只渲染 60 行，
+  // 为一个几千行的整体重写去跑 LCS 不值得（而且会吃掉几十 MB 的表）。
+  const big = (tag) => Array.from({ length: 2600 }, (_, i) => `${tag} ${i}`).join("\n");
+  const t0 = Date.now();
+  const html = buildDiffView(big("a"), big("b"), "big.ts");
+  assert.ok(Date.now() - t0 < 3000, "超大重写把渲染卡住了");
+  assert.ok(String(html).includes("atc-diff-row"), "退化路径也要能渲染出东西");
 });
 
 test("buildDiffView caps large previews", () => {
