@@ -267,6 +267,29 @@ export function blockFrom(anchor, { code = false, nth = null } = {}) {
   return (code ? CODE : SRC).slice(best.start, best.end);
 }
 
+/**
+ * 找不到就抛错的 indexOf —— 专治「顺序断言恒真」。
+ *
+ * `assert.ok(seg.indexOf(A) < seg.indexOf(B))` 有个哑掉的方向：**A 被删掉时
+ * indexOf 返回 -1，而 `-1 < 任何下标` 恒成立**。于是这条守卫只挡得住「把 A 挪到 B
+ * 后面」，挡不住「把 A 整个删掉」——而后者才是重构时真会发生、后果也一样的那种。
+ * 实测两例：删除锁 `_treeDeleteBusy = true;`（删掉它，连点几下就叠出好几个确认框）、
+ * 大写入的上限判断 `_LIVE_EDITOR_PREVIEW_MAX_CHARS`（删掉它，大文件照旧走编辑器
+ * 预览路径）——两条测试都一声不吭。
+ *
+ * 用法：`assert.ok(at(seg, A) < at(seg, B), "…")`，A 不在了就当场报「找不到」。
+ */
+export function at(text, needle, what = "") {
+  const i = String(text).indexOf(needle);
+  if (i < 0) {
+    throw new Error(
+      `顺序断言的锚点找不到${what ? `（${what}）` : ""}：${JSON.stringify(String(needle).slice(0, 70))}\n`
+      + "它要么被删了、要么改了写法。注意 indexOf 返回 -1 会让 `-1 < 下标` 恒成立，"
+      + "所以这里必须抛错，而不是让比较静默通过。");
+  }
+  return i;
+}
+
 /** 一条依赖的源码：名字在 OVERRIDES 里就拼字面量，否则回 main.js 抓真源。 */
 function _depSource(name) {
   if (Object.hasOwn(OVERRIDES, name)) return `const ${name} = ${JSON.stringify(OVERRIDES[name])};`;
