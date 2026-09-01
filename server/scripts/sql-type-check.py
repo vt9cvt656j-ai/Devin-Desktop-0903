@@ -171,13 +171,14 @@ def compare(items, out_path):
     # PREPARE 失败的行长这样：`psql:<stdin>:50: ERROR:  column "x" does not exist`
     # 行号对应 emit-prepare 的输出，第 1 行是 \set，所以 PREPARE pN 在第 N+2 行。
     errs = {}
+    # **两个都用 search 而不是 match，也不锚定行尾。** psql 把 stderr 插进 stdout 时
+    # 不保证换行：实测出现过 `p54  | {text,...}psql:<stdin>:8: ERROR: …` 挤在同一行，
+    # 于是锚定行尾的结果正则漏掉 p54、锚定行首的错误正则漏掉那条 ERROR ——
+    # 两边各少一条，而工具照样打印「没有对不上的」。
     for line in open(out_path, encoding="utf8", errors="replace"):
-        m = re.match(r'\s*(p\d+)\s*\|\s*\{(.*)\}\s*$', line)
-        if m:
+        for m in re.finditer(r'(p\d+)\s*\|\s*\{([^}]*)\}', line):
             res[m.group(1)] = [t.strip().strip('"') for t in m.group(2).split(",")] if m.group(2) else []
-            continue
-        m = re.match(r'psql:[^:]*:(\d+): ERROR:\s*(.*)$', line)
-        if m:
+        for m in re.finditer(r'psql:[^:]*:(\d+): ERROR:\s*([^\n]*)', line):
             errs[int(m.group(1)) - 2] = m.group(2).strip()
     bad = []
     cols = 0
@@ -222,6 +223,13 @@ def compare(items, out_path):
             it = items[i]
             print(f"  {it['file']}:{it['line']}  {e}")
         print("常见原因：引用了还没迁移上去的列。先把迁移跑到这个库上，再跑这道检查。")
+        return 1
+    # 总账必须平。抽到 122 条、核对 119 条、报了 1 条跳过 —— 少掉的那 2 条去哪了？
+    # 没有这一条的话，任何解析上的疏漏都表现为「悄悄少查了几条」，而输出仍是全绿。
+    missing = len(items) - len(res) - len(errs)
+    if missing != 0:
+        print(f"sql-type-check: 对不上账 —— 抽到 {len(items)} 条，psql 回了 {len(res)} 条结果 "
+              f"+ {len(errs)} 条错误，差 {missing} 条。解析漏了东西，这次结果不作数。")
         return 1
     if not bad:
         print("sql-type-check: 没有对不上的")
