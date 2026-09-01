@@ -6639,6 +6639,31 @@ fn split_fused_charge(
             "订阅放行但配额与钱包同时为 0：这一次的成本由运营方吸收，未向用户计费"
         );
     }
+    // 按量付费这一侧把余额扣成负数的那一笔，也要留一行。
+    //
+    // 上面那条只打「订阅吸收」。而运营真正在问的是另一件事：**没钱的用户还能用掉多少**。
+    // 门禁（`admit_billing`）在 `credits <= 0` 时就 402 了，所以理论上不该发生；实际会
+    // 发生的是**在途请求**：放行的那一刻池子/余额还够，等上游回话、结算落地时已经不够了。
+    // 上限是并发上限（MAX_INFLIGHT_PER_USER = 8）乘单次成本，不是一笔。
+    //
+    // 2026-09-01 实测一例：1920444354@qq.com 的免费池在 02:49:42 被抽干（那一笔部分覆盖，
+    // 池子出 6522 毫点、钱包补 131 分），随后两笔在途请求各扣 340 分落地 → 余额 -811。
+    // 再往后门禁就拦住了，6 分钟内零调用、总负债没再动。也就是说这条路是**有界**的，
+    // 但界是「并发数 × 单价」——而单价刚因为一次配置改动涨了两个量级（deepseek-v4-pro
+    // 从 ¥0 变成约 ¥3.4/次）。所以这个界值多少必须能被量出来，不能只写在注释里。
+    //
+    // 只记录，不改金额：要不要为此收紧并发（对照数据说「按预估拒绝」每省 ¥1 会误杀
+    // 27~89 次正常调用）是运营决策。
+    if !use_quota && wallet_cents > credits.max(0) {
+        tracing::warn!(
+            requested_cost,
+            credits_before = credits,
+            wallet_cents,
+            new_debt_cents = wallet_cents - credits.max(0),
+            event = "wallet_overdraft",
+            "按量付费扣成负余额：这一笔是在途请求，放行时还够、结算时已不够"
+        );
+    }
     FusedCharge {
         quota_cents,
         wallet_cents,
@@ -15694,6 +15719,49 @@ mod billing_tests {
     ///
     /// 断的是**机制**，不是措辞：只要「池子扣不到时余数原样留着」这件事回来，
     /// 门就会永远说「免费池能付」，这条就红。
+    /// 透支必须留痕，而且只在**真的**扣成负数时留。
+    ///
+    /// 这条守的是「没钱的用户还能用掉多少」这个数能不能被量出来。门禁在 credits <= 0 时
+    /// 就 402 了，所以透支只可能来自**在途请求**（放行时还够、结算时已不够），上限是
+    /// 并发上限 × 单次成本。2026-09-01 实测一例 811 分。
+    ///
+    /// 判据要精确到「新欠了多少」，不是「余额是不是负的」：同一个用户第二笔透支时
+    /// credits 已经是负的，两者都为真，但只有前者是这一笔造成的。
+    #[test]
+    fn an_overdraft_is_recorded_and_only_when_it_is_one() {
+        // 余额 100，这一笔要 340 → 新增债务 240，余额变 -240。
+        let c = super::split_fused_charge(340, false, 0, 0, 0, 0, 100);
+        assert_eq!(c.wallet_cents, 340, "按量付费必须全额记账，超出部分记成债务");
+        assert_eq!(c.quota_cents, 0);
+
+        // 余额刚好够 → 不是透支。这一半同样要钉住：判据写成 `wallet_cents > 0` 的话
+        // 每一笔正常付费都会被记成透支，日志里全是噪音，真的那条就淹了。
+        let ok = super::split_fused_charge(100, false, 0, 0, 0, 0, 100);
+        assert_eq!(ok.wallet_cents, 100);
+
+        // 订阅那一侧**不**制造钱包债务（配额放行的超支由运营吸收），行为不许被这条改动带偏。
+        let sub = super::split_fused_charge(340, true, 0, 0, 0, 0, 0);
+        assert_eq!(sub.wallet_cents, 0, "订阅放行的调用不该给用户记债");
+        assert_eq!(sub.quota_cents, 0);
+
+        // 告警条件本身：只在「这一笔新欠了钱」时成立。
+        let src = include_str!("models.rs");
+        let at = src.find("fn split_fused_charge(").expect("split_fused_charge 改名了");
+        let rest = &src[at..];
+        let end = rest.find("\nfn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("if !use_quota && wallet_cents > credits.max(0) {"),
+            "透支告警的判据变了 —— 少了 !use_quota 会把运营吸收也算成用户欠款；\
+             用 `credits < 0` 代替 `wallet_cents > credits.max(0)` 会把第二笔之后的\
+             正常扣费也当成新增透支",
+        );
+        assert!(
+            body.contains("event = \"wallet_overdraft\""),
+            "透支事件名没了，日志上就搜不到这一类",
+        );
+    }
+
     /// 参考成本必须**无视售价**，包括「显式配 0」。
     ///
     /// 这是免费额度池那个 1544 倍偏差的根：`compute_cost` 看到每模型价被显式填成
