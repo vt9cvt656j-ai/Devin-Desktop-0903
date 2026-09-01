@@ -193,6 +193,14 @@ pub async fn reports(State(state): State<AppState>) -> (StatusCode, Json<serde_j
             .then(|| "zero_priced_24h 没有返回 models 数组".to_string()),
     );
 
+    // 免费额度池那一栏。同样走 stats 用的那个函数。
+    let fp = crate::realtime::free_pool_value_24h(&state).await;
+    note(
+        "stats.free_pool_24h",
+        (!fp.get("models").map(|m| m.is_array()).unwrap_or(false))
+            .then(|| "free_pool_24h 没有返回 models 数组".to_string()),
+    );
+
     let code = if all_ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR };
     (code, Json(json!({ "ok": all_ok, "checks": checks })))
 }

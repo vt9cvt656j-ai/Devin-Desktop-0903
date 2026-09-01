@@ -168,10 +168,17 @@ def unwrap(t):
 
 def compare(items, out_path):
     res = {}
+    # PREPARE 失败的行长这样：`psql:<stdin>:50: ERROR:  column "x" does not exist`
+    # 行号对应 emit-prepare 的输出，第 1 行是 \set，所以 PREPARE pN 在第 N+2 行。
+    errs = {}
     for line in open(out_path, encoding="utf8", errors="replace"):
         m = re.match(r'\s*(p\d+)\s*\|\s*\{(.*)\}\s*$', line)
         if m:
             res[m.group(1)] = [t.strip().strip('"') for t in m.group(2).split(",")] if m.group(2) else []
+            continue
+        m = re.match(r'psql:[^:]*:(\d+): ERROR:\s*(.*)$', line)
+        if m:
+            errs[int(m.group(1)) - 2] = m.group(2).strip()
     bad = []
     cols = 0
     for i, it in enumerate(items):
@@ -199,7 +206,23 @@ def compare(items, out_path):
                 continue          # 不认识的 Rust 类型，宁可不报
             if p not in allowed:
                 bad.append((it, f"第 {idx+1} 列：SQL={p} / Rust={r}"))
-    print(f"sql-type-check: 核对 {len(res)} 条查询 / {cols} 个列位")
+    # **PREPARE 没跑通的必须报出来。** 静默跳过的话，一条引用了尚未迁移的列的查询
+    # 会被算成「检查过了、没问题」——而它其实一次都没被检查。本仓当场踩到：新加的
+    # ref_micro_usd 列还没迁移，那条查询 PREPARE 失败，而工具照样打印「没有对不上的」。
+    # 带 `{` 的是运行时拼接的动态 SQL（format! 占位符），那种本来就 PREPARE 不了。
+    hard = {
+        i: e for i, e in errs.items()
+        if 'syntax error at or near "{"' not in e and 0 <= i < len(items)
+    }
+    print(f"sql-type-check: 核对 {len(res)} 条查询 / {cols} 个列位"
+          + (f"，另有 {len(errs) - len(hard)} 条动态 SQL 跳过" if len(errs) > len(hard) else ""))
+    if hard:
+        print("sql-type-check: 下面这些查询**根本没能被检查**（PREPARE 就失败了）：")
+        for i, e in sorted(hard.items()):
+            it = items[i]
+            print(f"  {it['file']}:{it['line']}  {e}")
+        print("常见原因：引用了还没迁移上去的列。先把迁移跑到这个库上，再跑这道检查。")
+        return 1
     if not bad:
         print("sql-type-check: 没有对不上的")
         return 0

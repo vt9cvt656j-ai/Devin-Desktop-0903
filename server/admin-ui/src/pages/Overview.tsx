@@ -60,6 +60,19 @@ type Stats = {
     tokens: number;
     models: { model: string; calls: number; tokens: number }[];
   };
+  // 免费额度池收了多少点，而那些调用按实时目录价**实际值多少钱**。
+  // 池子扣的是售价，所以同一份「每日免费额度」在不同模型上不是同一个东西。
+  free_pool_24h?: {
+    milli_points: number;
+    ref_micro_usd: number;
+    /// 服务端按后台那个全局汇率折好的人民币分。别在前端写死汇率——它是可配置的。
+    ref_cny_cents: number;
+    unpriced_calls: number;
+    models: {
+      model: string; calls: number; milli_points: number;
+      ref_micro_usd: number; should_milli_points: number; unpriced_calls: number;
+    }[];
+  };
 };
 
 /** pay.rs Order（只取这一屏用得上的字段）。email / amount_cents / status 在库里都是非空。 */
@@ -311,6 +324,80 @@ export function Overview() {
                 </li>
               ))}
             </ul>
+          </div>
+        </SectionReveal>
+      )}
+
+      {/* 免费额度池：收了多少点 vs 实际值多少钱。
+          只在池子今天真的动过时出现。这一格不改任何行为，它回答的是一个此前没人能回答
+          的问题——「每天送出去的免费额度，成本到底是多少」。池子扣点扣的是**售价**，
+          而售价可以被显式配成 0，于是 deepseek-v4-pro 那种模型每次只扣地板 1 毫点，
+          4.5 万 token 和 45 个 token 一样。 */}
+      {!!stats?.free_pool_24h?.milli_points && (
+        <SectionReveal as="section" delay={100}>
+          <div className="rounded-xl border border-border bg-card">
+            <header className="flex items-baseline justify-between border-b border-border px-5 py-3">
+              <h2 className="text-sm font-semibold">免费额度池 · 近 24 小时</h2>
+              <span className="text-sm tabular-nums text-muted-foreground">
+                收 {num(stats.free_pool_24h.milli_points)} 毫点 · 实际值 ¥
+                {(stats.free_pool_24h.ref_cny_cents / 100).toFixed(2)}
+              </span>
+            </header>
+            <div className="p-5">
+              <table className="w-full text-sm">
+                <thead className="text-left type-eyebrow text-muted-foreground">
+                  <tr>
+                    <th className="pb-2 font-normal">模型</th>
+                    <th className="pb-2 text-right font-normal">调用</th>
+                    <th className="pb-2 text-right font-normal">实扣毫点</th>
+                    <th className="pb-2 text-right font-normal">按成本该扣</th>
+                    <th className="pb-2 text-right font-normal">偏差</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.free_pool_24h.models.map((m) => {
+                    // 两边都要非零才谈得上倍数；否则只说明还没有参考价。
+                    const r = m.milli_points > 0 && m.should_milli_points > 0
+                      ? m.should_milli_points / m.milli_points
+                      : null;
+                    return (
+                      <tr key={m.model} className="border-t border-border">
+                        <td className="py-1.5 font-mono text-xs">{m.model}</td>
+                        <td className="py-1.5 text-right tabular-nums">{num(m.calls)}</td>
+                        <td className="py-1.5 text-right tabular-nums">{num(m.milli_points)}</td>
+                        <td className="py-1.5 text-right tabular-nums">
+                          {m.unpriced_calls === m.calls ? "—" : num(m.should_milli_points)}
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums">
+                          {r === null ? (
+                            <span className="text-muted-foreground">—</span>
+                          ) : r >= 2 ? (
+                            <span className="text-amber-600">少扣 {r.toFixed(0)} 倍</span>
+                          ) : r <= 0.5 ? (
+                            <span className="text-sky-600">多扣 {(1 / r).toFixed(0)} 倍</span>
+                          ) : (
+                            <span className="text-muted-foreground">大致相当</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <p className="mt-3 text-sm text-muted-foreground">
+                池子扣的是<strong>售价</strong>：把某个模型的每模型价显式配成
+                {" "}<code className="text-xs">{'{"in":0,"out":0}'}</code>{" "}
+                之后，它每次只扣地板 1 毫点——4.5 万 token 和 45 个 token 一样。
+                反过来，按次计价的模型每次扣固定点数，而它一次可能只值 $0.003。
+                这一栏只报数，不改扣费：免费额度该值多少是定价决策。
+                {stats.free_pool_24h.unpriced_calls > 0 && (
+                  <>
+                    {" "}其中 {num(stats.free_pool_24h.unpriced_calls)} 次还没有参考价
+                    （实时目录里没有这个模型，或这一行写在参考价上线之前），没算进「按成本该扣」。
+                  </>
+                )}
+              </p>
+            </div>
           </div>
         </SectionReveal>
       )}

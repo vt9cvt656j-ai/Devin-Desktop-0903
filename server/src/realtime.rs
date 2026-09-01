@@ -344,6 +344,67 @@ pub(crate) async fn zero_priced_24h(state: &AppState) -> serde_json::Value {
     })
 }
 
+/// 免费额度池收了多少点，而那些调用**实际值多少钱**。近 24 小时，按模型。
+///
+/// 池子扣点扣的是**售价**，于是同一份「每日免费额度」在不同模型上根本不是同一个东西：
+///   · 显式配 `{"in":0,"out":0}` 的模型（deepseek-v4-pro 就是）售价为 0 →
+///     `free_points_needed(0)` 落到地板 1 → **4.5 万 token 和 45 个 token 一样扣 1 毫点**；
+///   · 按次计价的 glm-5.3-flash 每次扣 4000 毫点，而它一次只值 $0.003。
+/// 2026-08-29~31 三天实测，「实扣毫点」和「按目录价该扣多少」的比值：
+///     deepseek-v4-pro    2954 次   实扣    2954   应扣 4,561,533   少 1544 倍
+///     deepseek-v4-flash   159 次   实扣     159   应扣     8,223   少   52 倍
+///     glm-5.3-flash        95 次   实扣 380,000   应扣     5,813   多   65 倍
+///     glm-5.3              53 次   实扣 544,603   应扣    33,251   多   16 倍
+///
+/// **这一格只报数，不改行为。** 免费额度值多少是运营决策：按参考成本扣点会让
+/// deepseek-v4-pro 从「实际无限」变成每天约 65 次，而 glm-5.3-flash 从每天 25 次
+/// 变成约 1600 次。那是产品定价，不该由计费这一层替谁定。
+///
+/// `ref_micro_usd` 是 2026-09-01 才加的列，之前的行是 NULL。所以要**把没有参考价的
+/// 次数报出去**——不报的话这一格在刚上线那天会显示「免费额度几乎不花钱」，而那只是
+/// 因为数据还没攒够，和真结论长得一模一样。
+pub(crate) async fn free_pool_value_24h(state: &AppState) -> serde_json::Value {
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT model_name, count(*)::bigint, \
+                COALESCE(sum(free_milli_points_spent), 0)::bigint, \
+                COALESCE(sum(ref_micro_usd), 0)::bigint, \
+                count(*) FILTER (WHERE ref_micro_usd IS NULL)::bigint \
+         FROM model_usage \
+         WHERE created_at > now() - interval '24 hours' AND free_milli_points_spent > 0 \
+         GROUP BY 1 ORDER BY 3 DESC LIMIT 20",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    // 一毫点 = 50 micro-USD（MICRO_USD_PER_MILLI_POINT）。两边同口径才能比。
+    const MICRO_USD_PER_MILLI_POINT: i64 = 50;
+    let total_micro: i64 = rows.iter().map(|r| r.3).sum();
+    // micro-USD → 人民币分。推导：usd_cents = micro/10000，cny_cents = usd_cents*10000/bps，
+    // 约掉就是 micro/bps。**别在前端写死 7.1023**：那个数是后台设置，改了之后前端不会跟。
+    let bps = crate::settings::usd_per_cny_bps().max(1);
+    json!({
+        "milli_points": rows.iter().map(|r| r.2).sum::<i64>(),
+        "ref_micro_usd": total_micro,
+        "ref_cny_cents": total_micro / bps,
+        "unpriced_calls": rows.iter().map(|r| r.4).sum::<i64>(),
+        "models": rows
+            .iter()
+            .map(|(model, calls, milli, micro, unpriced)| {
+                // 「按参考成本该扣多少毫点」——同一把尺子换算过去。
+                let should = micro / MICRO_USD_PER_MILLI_POINT;
+                json!({
+                    "model": model,
+                    "calls": calls,
+                    "milli_points": milli,
+                    "ref_micro_usd": micro,
+                    "should_milli_points": should,
+                    "unpriced_calls": unpriced,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// GET /api/admin/stats — headline numbers for the dashboard (admin only).
 pub async fn stats(
     State(state): State<AppState>,
@@ -409,6 +470,7 @@ pub async fn stats(
         "revenue_cents": revenue,
         "plan_mix": plan_mix,
         "zero_priced_24h": zero_priced,
+        "free_pool_24h": free_pool_value_24h(&state).await,
     })))
 }
 

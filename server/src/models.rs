@@ -5049,10 +5049,57 @@ fn report_upstream_cost_fields(model_id: &str, u: &serde_json::Value) {
     );
 }
 
-fn compute_cost(
+/// 这一次调用按**参考价**（实时目录）值多少 micro-USD。**和售价完全无关。**
+///
+/// 存在的理由：售价可以是 0（运营决定这个模型免费），但成本不是 0。而
+/// `model_usage.cost_cents` 记的是售价，于是所有成本报表都说这些模型不花钱。
+/// 实测 deepseek-v4-pro（配的是 mode:free + {"in":0,"out":0}）三天 2954 次调用、
+/// 1.36 亿 token，`cost_cents` 全是 0，而同一批 token 按目录价值 $228。
+///
+/// 同一个数还能回答免费额度池那个更难看的问题：它按**售价**扣点，所以
+///   · 显式配 0 的模型每次只扣地板 1 毫点（不论 4.5 万 token 还是 45 个）；
+///   · 按次计价的 glm-5.3-flash 每次扣 4000 毫点，而它一次只值 $0.003。
+/// 三天实测两头差 1544 倍 —— 同一份「免费额度」在两个模型上根本不是同一个东西。
+/// 这里只**记录**，不改扣点行为：免费额度值多少是运营决策，不该由这一层替他定。
+///
+/// `None` = 目录里没有这个模型的价（实验模型、自建模型）。**不是 0**：报表必须能
+/// 区分「不花钱」和「不知道花了多少」，混成 0 正是今天这张表的毛病。
+pub(crate) fn reference_micro_usd(
     usage: Option<&serde_json::Value>,
     model_id: &str,
-    rate: f64,
+) -> Option<i64> {
+    // admin_in/out 和两个缓存价全传 0、model_over 传 None → `effective_token_prices`
+    // 必然落到 `official_price`（实时目录）。走的是**和计费同一份** token 解析。
+    // warn_missing = false：查不到目录价在这条路上是常态，不该刷日志。
+    priced_usd(usage, model_id, 0.0, 0.0, 0.0, 0.0, None, false, false)
+        .map(|p| (p.usd * 1_000_000.0).round() as i64)
+}
+
+/// 一次调用的计价分项。`usd` 是未乘线路倍率、未取整的原始金额，其余是给
+/// `[billing]` 那条明细日志用的 —— 「这一笔为什么收这么多」全靠它对账。
+struct PricedCall {
+    usd: f64,
+    prompt: f64,
+    completion: f64,
+    read_tok: f64,
+    write_tok: f64,
+    off_in: f64,
+    off_out: f64,
+    read_price: f64,
+    write_price: f64,
+}
+
+/// 一次调用按给定价目值多少**美元**（未乘线路倍率、未取整）。
+///
+/// 从 `compute_cost` 里抽出来，是为了让「参考成本」和「售价」共用**同一套** token 解析。
+/// 那一段是这个文件里最微妙的代码：缓存读/写在各家回执里字段名不同、prompt_tokens 含不
+/// 含 cached 两家相反、只报 total_tokens 时要反推输入。抄一份出来算参考价的话两份会漂，
+/// 而漂掉的那一侧不会报错，只会给出一个看起来精确的错数字。
+///
+/// `None` = 算不出（没有 usage、token 全 0、或三样价都没配），不是「值 0 元」。
+fn priced_usd(
+    usage: Option<&serde_json::Value>,
+    model_id: &str,
     admin_in: f64,
     admin_out: f64,
     cache_read_price: f64,
@@ -5065,11 +5112,14 @@ fn compute_cost(
     // 而两边都不报错。见 `effective_token_prices`。
     model_over: Option<(f64, f64)>,
     cache_disabled: bool,
-) -> i64 {
-    const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
+    // 解析不出单价时要不要告警。**参考成本那条路要传 false**：它本来就常常查不到
+    // 目录价（实验模型、自建模型），每次都 error 一行会把日志刷成噪音，而真正该喊的
+    // 是「按售价计费时找不到价」那一种。
+    warn_missing: bool,
+) -> Option<PricedCall> {
     let u = match usage {
         Some(u) if u.is_object() => u,
-        _ => return 0,
+        _ => return None,
     };
     // 上游自己报没报「这一笔花了多少」。**零成本的探针**：不发任何额外请求，
     // 只看已经收到的回执里有没有成本字段。有的话那就是最好的价目来源 ——
@@ -5093,7 +5143,7 @@ fn compute_cost(
         })
         .unwrap_or(0.0);
     if prompt <= 0.0 && completion <= 0.0 {
-        return 0;
+        return None;
     }
     // Price priority: admin's PER-MODEL override (model_in/out, set in the backend per enabled
     // model) wins; else the built-in official catalog; else the connection-level input/output
@@ -5117,14 +5167,14 @@ fn compute_cost(
         //
         // 只告警不改行为：这一层不该替运营决定「没配价的模型按多少收」。要看规模去
         // 总览页，那里按 model_usage 现算（见 realtime::stats 的 zero_priced_24h）。
-        if price_source != "model_override" {
+        if warn_missing && price_source != "model_override" {
             tracing::error!(
                 model = %model_id, prompt, completion,
                 event = "billing_zero_price",
                 "解析不出单价，这一次按 0 收 —— 上游的钱照付。去后台给这个模型补一条每模型价格"
             );
         }
-        return 0; // no known price for this model → can't compute a real cost
+        return None; // no known price for this model → can't compute a real cost
     }
     let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_f64()); // Anthropic
     // GPT-5.6 起，OpenAI 也开始**对缓存写入收 1.25×**，并在回执里给 `cache_write_tokens`。
@@ -5208,6 +5258,53 @@ fn compute_cost(
         + write_tok * write_price
         + completion * off_out)
         / 1_000_000.0;
+    Some(PricedCall {
+        usd,
+        prompt,
+        completion,
+        read_tok,
+        write_tok,
+        off_in,
+        off_out,
+        read_price,
+        write_price,
+    })
+}
+
+fn compute_cost(
+    usage: Option<&serde_json::Value>,
+    model_id: &str,
+    rate: f64,
+    admin_in: f64,
+    admin_out: f64,
+    cache_read_price: f64,
+    cache_create_price: f64,
+    // **`Some` 表示后台为这个模型显式填了价格，包括显式填 0。**
+    //
+    // 上一版这里是两个裸 f64，用 `> 0.0` 当「有没有覆盖」的判据 —— 于是「填 0」和
+    // 「留空」在计价这一层不可分：运维把入价出价都填 0 想开一条免费线路，判据说
+    // 「没覆盖」→ 落到官方目录价 → 照收钱。后台配的是 0、用户被扣的是目录价，
+    // 而两边都不报错。见 `effective_token_prices`。
+    model_over: Option<(f64, f64)>,
+    cache_disabled: bool,
+) -> i64 {
+    const COST_CEILING_CENTS: f64 = 5000.0; // $50/call backstop — no legit single call hits this
+    let Some(PricedCall {
+        usd,
+        prompt,
+        completion,
+        read_tok,
+        write_tok,
+        off_in,
+        off_out,
+        read_price,
+        write_price,
+    }) = priced_usd(
+        usage, model_id, admin_in, admin_out, cache_read_price, cache_create_price, model_over,
+        cache_disabled, true,
+    ) else {
+        return 0;
+    };
     let uncapped = (usd * 100.0 * rate.max(0.0)).round();
     let cents = uncapped.clamp(0.0, COST_CEILING_CENTS) as i64;
     // The ceiling is a backstop, not a policy — if it ever fires, both the charge AND
@@ -6245,6 +6342,9 @@ struct BillTokens {
     /// First tool the model called back; None when it answered in prose. A call whose
     /// entire output is one tool dispatch is the prime routing candidate.
     emitted_tool: Option<String>,
+    /// 这一笔按**参考价**（实时目录）值多少 micro-USD。见 [`reference_micro_usd`]。
+    /// `None` = 目录里没有这个模型的价，和「值 0 元」是两回事。
+    ref_micro_usd: Option<i64>,
 }
 
 // 手写 Default 而不是 derive：`prompt_includes_cached` 的中性值是 **true**（OpenAI 形状，
@@ -6265,6 +6365,7 @@ impl Default for BillTokens {
             mode: None,
             tool_turn: None,
             emitted_tool: None,
+            ref_micro_usd: None,
         }
     }
 }
@@ -6422,6 +6523,9 @@ fn extract_bill_tokens(
         mode: None,
         tool_turn: None,
         emitted_tool: None,
+        // 在这里算，是因为这是唯一同时拿得到**原始 usage JSON** 和模型名的地方。
+        // 往下只传 BillTokens 的话就得再抄一遍 token 解析，而那正是最不该抄的一段。
+        ref_micro_usd: reference_micro_usd(usage, model_name),
     }
 }
 
@@ -6559,8 +6663,8 @@ async fn record_usage_row(
     // model_id 走子查询，理由同下面付费那条：线路被删之后直接绑 conn_id 会撞外键，
     // 这一行用量就永远记不进去。NULL 是这张表既有的「线路已删」表示法。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached, endpoint_id, wallet_cents, quota_cents) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached, endpoint_id, wallet_cents, quota_cents, ref_micro_usd) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0,$17)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -6579,6 +6683,7 @@ async fn record_usage_row(
     .bind(tokens.prompt_includes_cached)
     // 免费池全额付掉的这一路，钱包和套餐额度一分没动 —— 上面写死 0，是事实不是缺省。
     .bind(endpoint_id)
+    .bind(tokens.ref_micro_usd)
     .execute(&state.db)
     .await
     {
@@ -7090,6 +7195,11 @@ pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::Unsettle
         mode: row.ide_mode.clone(),
         tool_turn: row.is_tool_turn,
         emitted_tool: row.emitted_tool.clone(),
+        // 队列行里没有原始 usage JSON，参考成本算不出来。如实 None ——
+        // 不拿目录价乘队列里那几个 token 数硬凑：那会绕过 priced_usd 的形状判定
+        // （prompt 含不含 cached 两家相反），凑出来的是一个看着精确的错数。
+        // 影响面已量过：线上 unsettled 只有 1 行 / 12 分。
+        ref_micro_usd: None,
     };
     // 出口 id 队列行里没存（`unsettled_charges` 建表时还没有这一列），如实传 None ——
     // 而不是拿线路 id 顶上：那会让一条补扣行在对账页上算到「线路自带地址」那个出口头上。
@@ -7445,8 +7555,8 @@ async fn bill_inner(
     // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
     // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent, endpoint_id, wallet_cents, quota_cents) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent, endpoint_id, wallet_cents, quota_cents, ref_micro_usd) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -7481,6 +7591,8 @@ async fn bill_inner(
     .bind(endpoint_id)
     .bind(charge.wallet_cents)
     .bind(charge.quota_cents)
+    // 参考成本：和售价分开的一列。售价可以是 0，成本不是。
+    .bind(tokens.ref_micro_usd)
     .execute(&mut *tx)
     .await
     {
@@ -15449,9 +15561,12 @@ mod billing_tests {
         // 汇率 —— 实测同一批流水，zyz 那条线路两把尺子差 37.6 倍，合计低画 40%。
         // 分开记之后收入不用折算，差额本身就是被吸收的那部分。
         // endpoint_id 则是因为对账按**出口**分组，而这张表此前只有线路 id。
-        assert_eq!(cols, 19, "model_usage 列数变了");
-        assert_eq!(max_ph, 19, "占位符和列数对不上");
-        assert_eq!(binds, 19, ".bind() 和列数对不上——结算会运行时报错");
+        // 20 = 上面 19 列 + ref_micro_usd（这一笔按实时目录价值多少，与售价无关）。
+        // 加它是因为 cost_cents 记的是售价，而售价为 0 的模型让所有成本报表说它们不花钱：
+        // deepseek-v4-pro 三天 1.36 亿 token 的 cost_cents 全是 0，同一批 token 目录价 $228。
+        assert_eq!(cols, 20, "model_usage 列数变了");
+        assert_eq!(max_ph, 20, "占位符和列数对不上");
+        assert_eq!(binds, 20, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
@@ -15579,6 +15694,69 @@ mod billing_tests {
     ///
     /// 断的是**机制**，不是措辞：只要「池子扣不到时余数原样留着」这件事回来，
     /// 门就会永远说「免费池能付」，这条就红。
+    /// 参考成本必须**无视售价**，包括「显式配 0」。
+    ///
+    /// 这是免费额度池那个 1544 倍偏差的根：`compute_cost` 看到每模型价被显式填成
+    /// `{"in":0,"out":0}` 就返回 0（那是对的，运营就是要它免费），可池子拿这个 0 去扣点，
+    /// 于是 `free_points_needed(0)` 落到地板 1 —— 4.5 万 token 和 45 个 token 一样扣 1 毫点。
+    /// 线上实测 deepseek-v4-pro 三天 2954 次调用扣了整整 2954 毫点。
+    ///
+    /// 所以这条测的是**行为**不是源码：同一份回执、同一个模型，售价那条路返回 0，
+    /// 参考成本那条路必须返回真实金额。两者一旦被接成同一个数，这条就红。
+    #[test]
+    fn the_reference_cost_ignores_an_explicit_zero_sell_price() {
+        seed_catalog();
+        // grok-4.6 目录价 $2 / $6（见 seed_catalog）。
+        let usage = serde_json::json!({ "prompt_tokens": 1_000_000, "completion_tokens": 100_000 });
+
+        // 售价：后台把这个模型显式配成 0 → 一分不收。这是**要的**行为。
+        let sold = super::compute_cost(
+            Some(&usage), "grok-4.6", 1.0, 0.0, 0.0, 0.0, 0.0, Some((0.0, 0.0)), false,
+        );
+        assert_eq!(sold, 0, "显式配 0 的模型不该收钱 —— 这一半本来就是对的");
+
+        // 参考成本：同一份回执，必须给出真实金额，和上面那个 0 无关。
+        // 1e6 × $2/Mtok + 1e5 × $6/Mtok = $2 + $0.6 = $2.6 = 2_600_000 micro-USD
+        assert_eq!(
+            super::reference_micro_usd(Some(&usage), "grok-4.6"),
+            Some(2_600_000),
+            "参考成本被售价影响了 —— 免费模型在成本报表上又会变成不花钱",
+        );
+
+        // 目录里没有的模型：必须是 None，不能是 0。
+        // 「不花钱」和「不知道花了多少」是两句话，压成 0 之后毛利率看起来还特别好。
+        assert_eq!(
+            super::reference_micro_usd(Some(&usage), "some-model-nobody-has-priced"),
+            None,
+            "目录里没有的模型给出了 0 —— 报表会把「不知道」当成「免费」",
+        );
+
+        // 没有 usage / token 全 0 也必须是 None，同上。
+        assert_eq!(super::reference_micro_usd(None, "grok-4.6"), None);
+        assert_eq!(
+            super::reference_micro_usd(
+                Some(&serde_json::json!({ "prompt_tokens": 0, "completion_tokens": 0 })),
+                "grok-4.6",
+            ),
+            None,
+        );
+
+        // 和售价共用同一套 token 解析：把每模型价设成目录价本身，两条路必须给出同一个数。
+        // 抄一份解析出来算参考价的话，这条会在某次形状改动后红 —— 那正是它的用途。
+        let sold_at_catalog = super::compute_cost(
+            Some(&usage), "grok-4.6", 1.0, 0.0, 0.0, 0.0, 0.0, Some((2.0, 6.0)), false,
+        );
+        assert_eq!(
+            sold_at_catalog, 260,
+            "按目录价卖应当是 260 分 = $2.60",
+        );
+        assert_eq!(
+            super::reference_micro_usd(Some(&usage), "grok-4.6").unwrap() / 10_000,
+            sold_at_catalog,
+            "参考成本和售价用的不是同一套 token 解析了 —— 两份会各自漂",
+        );
+    }
+
     /// 抽干这件事**发生在 SQL 里**，单测跑不到——所以守调用点和 SQL 本身的形状。
     ///
     /// 上一条只证明了「假如池子被抽干，门就会拦」，它对「池子到底会不会被抽干」一无所知：
