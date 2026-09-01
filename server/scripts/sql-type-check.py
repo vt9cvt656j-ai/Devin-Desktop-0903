@@ -125,6 +125,10 @@ PATTERNS = [
     re.compile(r'let\s+\w+\s*:\s*Vec<\(([^;]*?)\)>\s*=\s*sqlx::query_as\s*\('),
     re.compile(r'let\s+\w+\s*:\s*Option<\(([^;]*?)\)>\s*=\s*sqlx::query_as\s*\('),
 ]
+# `sqlx::query_as::<_, (A, B, …)>(` —— 元组类型写在 turbofish 里，不在 let 上。
+# 漏了这一种的后果和「切早了」一样：那些查询一次都不会被检查，而工具照样报绿。
+AS_TURBOFISH = re.compile(r'sqlx::query_as::<\s*_\s*,\s*\(([^;]*?)\)\s*>\s*\(')
+
 SCALAR = re.compile(r'let\s+\w+\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*=\s*sqlx::query_scalar\s*\(')
 SCALAR_T = re.compile(r'sqlx::query_scalar::<\s*_\s*,\s*([A-Za-z0-9_:<>, ]+?)\s*>\s*\(')
 AS_STRUCT = re.compile(r'let\s+\w+\s*:\s*(?:Vec|Option)<\s*([A-Za-z_]\w*)\s*>\s*=\s*sqlx::query_as\s*\(')
@@ -151,6 +155,11 @@ def main():
                 sql,_ = grab_sql_after(body, m.end())
                 if sql and 'SELECT' in sql.upper():
                     items.append(dict(file=base, line=line_of(m.start()), kind="tuple", types=types, sql=sql))
+        for m in AS_TURBOFISH.finditer(body):
+            types = split_tuple(m.group(1))
+            sql,_ = grab_sql_after(body, m.end())
+            if sql and 'SELECT' in sql.upper():
+                items.append(dict(file=base, line=line_of(m.start()), kind="tuple", types=types, sql=sql))
         for m in SCALAR.finditer(body):
             t=m.group(1).strip()
             sql,_ = grab_sql_after(body, m.end())

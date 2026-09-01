@@ -102,6 +102,10 @@ type Row = {
   cost_by_balance_usd: number | null;
   balance_basis: "used" | "remaining" | null;
   balance_note: string;
+  /** 这个出口的进价还能从哪儿拿：panel=已自动拿到 / calibrate=可一键标定 / manual=只能手抄。 */
+  price_source: "panel" | "calibrate" | "manual";
+  /** 拉不到价时适配器给的原话（「站长把价目接口关了」「面板被人机校验挡住」…）。 */
+  price_hint: string;
   models: ModelRow[];
 };
 
@@ -311,13 +315,62 @@ export function Reconcile({ view }: { view: ReconcileView }) {
         而账单核对那一屏没有那个箭头 —— 一条照做不了的指引比没有指引更糟。
       */}
       {!!t && !accountsView && t.unpriced_models > 0 && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[13px]">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-          <span>
-            还有 <b>{t.unpriced_models}</b> 个模型没录进价。用到它们的出口<b>整行</b>成本都算不出来
-            —— 一行里漏一个模型，剩下那些乘出来的数字就不是这一行的成本了。
-            点开行末的箭头，在明细里把价填上（抄中转后台的价目页，单位是每百万 token 美元）。
-          </span>
+        <div className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[13px]">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+            <span>
+              还有 <b>{t.unpriced_models}</b> 个模型没录进价。用到它们的出口<b>整行</b>成本都算不出来
+              —— 一行里漏一个模型，剩下那些乘出来的数字就不是这一行的成本了。
+            </span>
+          </div>
+          {/*
+            **分诊，不是又一句「去把价填上」。**
+
+            进价有三种拿法，省事程度差很远，而它们此前在界面上分不出来：这条提示只说
+            「N 个模型待录价」，而「一键标定」那个按钮埋在某一行展开之后。线上实测 34 个
+            活跃出口里有 8 个属于「余额读得到」这一档 —— 也就是**可以一键反推真实进价**，
+            却一次都没被标定过。一个已经写好、能自动解决问题的功能，因为没人知道它对
+            哪些出口可用而闲置着。
+          */}
+          {(() => {
+            // allRows 是**全量**（头部四个数也按全量算）；分诊必须看全量，
+            // 不然翻到第二页才发现还有可标定的出口。
+            const need = allRows.filter((r) => r.unpriced_models.length > 0);
+            const cal = need.filter((r) => r.price_source === "calibrate");
+            const man = need.filter((r) => r.price_source === "manual");
+            return (
+              <div className="space-y-1 pl-6">
+                {cal.length > 0 && (
+                  <p>
+                    <b className="text-emerald-700 dark:text-emerald-400">
+                      {cal.length} 个出口可以「一键标定」
+                    </b>
+                    ：余额读得到，发两发真实请求按余额差反推真实进价 —— 比中转公布的价目还准
+                    （它含了分组倍率和活动折扣）。会花一点钱。点开这几行，用行内那个
+                    「标定进价」按钮：
+                    <span className="text-muted-foreground">
+                      {" "}
+                      {cal.map((r) => `${r.route_label}/${r.label}`).join("、")}
+                    </span>
+                  </p>
+                )}
+                {man.length > 0 && (
+                  <p>
+                    <b>{man.length} 个出口只能手工录</b>
+                    ：面板价目和余额都读不到，这两条自动路都走不通。点开行末的箭头，在明细里
+                    把价填上（单位是<b>每百万 token 美元</b>）。逐个的原因：
+                    <span className="block pl-2 text-muted-foreground">
+                      {man.map((r) => (
+                        <span key={r.endpoint_id} className="block">
+                          · {r.route_label}/{r.label}：{r.price_hint || "适配器没给原因"}
+                        </span>
+                      ))}
+                    </span>
+                  </p>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
 

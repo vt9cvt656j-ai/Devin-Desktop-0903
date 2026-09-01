@@ -344,6 +344,22 @@ pub struct ReconRow {
     pub cost_by_balance_cny: Option<f64>,
     pub balance_basis: Option<&'static str>,
     pub balance_note: String,
+    /// 这个出口的进价**还能从哪儿拿到**。三档，越靠前越省事：
+    ///
+    ///   `panel`     —— 中转的面板价目接口能读，已经自动拿到了，什么都不用做；
+    ///   `calibrate` —— 面板读不到，但**余额读得到** → 一键标定：发两发真实请求、
+    ///                  按余额差反推真实进价（比价目表还准，含了分组倍率和活动折扣）；
+    ///   `manual`    —— 面板和余额都读不到，只能人去抄。
+    ///
+    /// 加这一位是因为这三档此前在界面上**分不出来**：对账页只说「N 个模型待录价」，
+    /// 而标定按钮埋在某一行展开之后。线上实测 34 个活跃出口里有 **8 个属于 calibrate
+    /// 档、一次都没被标定过** —— 一个已经写好的、能自动解决问题的功能，因为没人知道
+    /// 它对哪些出口可用而闲置着。
+    pub price_source: &'static str,
+    /// 拉不到价时适配器给的原话（「站长把价目接口关了」「面板被人机校验挡住」…）。
+    /// 它一直存在 endpoint_adapter.note 里，但只在「适配器」那一屏显示 ——
+    /// 而人是在对账页上发现「这个出口没成本」的。
+    pub price_hint: String,
     /// 按模型展开。界面点开一行就是它，也是录价的地方。
     pub models: Vec<ModelRow>,
 }
@@ -594,6 +610,19 @@ pub async fn admin_reconciliation(
     .map(|l| (l.endpoint_id, (l.calls, l.cost_micro)))
     .collect();
 
+    // 适配器上一轮的结论：面板价目拿到几条、余额读不读得到、拉不到时的原话。
+    // 用来在这一页上分诊「这个出口的进价还能从哪儿拿」——见 ReconRow::price_source。
+    let adapters: HashMap<uuid::Uuid, (i64, bool, String)> =
+        sqlx::query_as::<_, (uuid::Uuid, i64, bool, Option<String>)>(
+            "SELECT endpoint_id, priced_models, balance_ok, note FROM endpoint_adapter",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, n, ok, note)| (id, (n, ok, note.unwrap_or_default())))
+        .collect();
+
     // 余额那条独立的证据链，留着和单价算出来的数互相印证。
     let edges: Vec<BalanceEdge> = sqlx::query_as(
         "WITH w AS ( \
@@ -722,6 +751,19 @@ pub async fn admin_reconciliation(
             let row_cost = unpriced.is_empty().then_some(cost).filter(|_| !used.is_empty());
             let margin = row_cost.map(|c| revenue - c);
             let (bal_cost, bal_basis, _samples, bal_note) = balance_cost(edges.get(&id));
+            // 进价还能从哪儿拿。**只在这一行真的缺价时才谈得上**，所以判据看
+            // `unpriced`：已经算得出成本的行不需要分诊。
+            let (ad_priced, ad_balance, ad_note) = adapters
+                .get(&id)
+                .cloned()
+                .unwrap_or((0, false, String::new()));
+            let price_source = if ad_priced > 0 {
+                "panel"
+            } else if ad_balance {
+                "calibrate"
+            } else {
+                "manual"
+            };
 
             // 折人民币。两家的汇率缺一不可 —— 拿另一家顶上会得到一个看起来精确的错数字。
             let cost_rate = crate::relay_rates::usd_per_cny(&base_url);
@@ -768,6 +810,8 @@ pub async fn admin_reconciliation(
                 derived_cost_usd: derived_cost,
                 derived_cost_cny: to_cny(derived_cost),
                 legacy_only: legacy_hit.is_some(),
+                price_source,
+                price_hint: ad_note,
                 cost_by_balance_usd: bal_cost,
                 cost_by_balance_cny: bal_cost.and_then(to_cny),
                 balance_basis: bal_basis,
