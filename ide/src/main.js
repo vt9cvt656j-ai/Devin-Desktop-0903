@@ -223,6 +223,7 @@ import { buildDiffView as _buildDiffView, diffStat as _diffStat, highlightDiffVi
 import { selectionLabel as _selectionLabel, selectionText as _selectionText, selectionToken as _selectionToken, parseSelectionToken as _parseSelectionToken, sliceLines as _sliceLines } from "./agent/selection-drag.js";
 import { pointInTermSelection as _pointInTermSelection, termChipLabel as _termChipLabel, termSnippetText as _termSnippetText } from "./agent/term-drag.js";
 import { normalizeAskOptions as _normalizeAskOptions, askMode as _askMode, askAnswerText as _askAnswerText, askAnswerLabel as _askAnswerLabel } from "./agent/ask-user.js";
+import { normalizeAppSkin, clampSkinOpacity, skinPanelAlpha, SKIN_ENCODE_LADDER } from "./agent/app-skin.js";
 import { toolIconSvg as _toolIconSvg, toolIconFamily as _toolIconFamily } from "./agent/tool-icons.js";
 import { ansiToHtml as _ansiHtml, ansiToText as _ansiText } from "./agent/ansi.js";
 
@@ -4164,6 +4165,9 @@ const DEFAULT_EDITOR_SETTINGS = {
   fontSize: 13,
   fontFamily: MONO_STACK,
   appIcon: "",
+  // 自定义皮肤：一张铺满窗口的底图 + 它的浓度（0–100）。空串 = 没设皮肤，一切照旧。
+  appSkin: "",
+  appSkinOpacity: 45,   // 默认就要看得见：22% 时有效可见度不到 2%，等于没生效
   lineHeight: 0,
   tabSize: 4,
   wordWrap: "off",
@@ -4272,6 +4276,81 @@ const BUNDLED_APP_ICON_SRC = new URL("./assets/logo.png", import.meta.url).href;
 
 function appIconSrc(value = effectivePrefs().appIcon) {
   return normalizeAppIcon(value) || BUNDLED_APP_ICON_SRC;
+}
+
+/*
+ * ── 自定义皮肤 ──────────────────────────────────────────────────────────────
+ *
+ * 一张用户自己的图铺在整个窗口后面，前面的界面按浓度**半透**，图从缝里透出来。
+ *
+ * 两条设计上的硬约束，都是为了"好看"不以"看不清"为代价：
+ *
+ *  ① **代码区不参与半透。** 编辑器的底色由 Monaco 自己的主题给，不走 CSS 变量，所以
+ *     天然不受影响 —— 这不是妥协，是想要的：壁纸透过来的是外框（标题栏、侧栏、面板、
+ *     助手栏），代码本身始终是实底。macOS 和 Warp 的做法一样，也正是它显得高级的原因。
+ *  ② **面板透明度有下限。** 浓度拉到 100 时面板仍保留 65% 不透明度（见 app.css 里
+ *     --skin-panel-a 的算法）。让用户能把界面调到读不清字，是把"可配置"做成了陷阱。
+ *
+ * 校验、夹取、以及那两个下限的算式都在 src/agent/app-skin.js —— 纯函数，测试真跑。
+ * 这一半只做 DOM 和 canvas：上传、缩到 2560px 再编码（手机原图十几兆，直接塞进偏好
+ * 文件会让每次保存都变慢）、把结果挂到根元素上。
+ */
+async function appSkinFromFile(file) {
+  if (!file || !String(file.type || "").startsWith("image/")) {
+    throw new Error(t("feature.appearance.appSkin.invalid"));
+  }
+  if (file.size > 24 * 1024 * 1024) throw new Error(t("feature.appearance.appSkin.tooLarge"));
+  const raw = await readFileAsDataUrl(file);
+  const img = await loadImageDataUrl(raw);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error(t("feature.appearance.appSkin.invalid"));
+  // 按 SKIN_ENCODE_LADDER 一档一档试（尺寸 + 格式 + 画质）。阶梯为什么长这样、
+  // 为什么 jpeg 必须在里面且排在 png 前面，见 src/agent/app-skin.js 里那段说明 ——
+  // 一句话：Safari 对不认识的 toDataURL 类型**静默回退成 PNG**，只靠 webp 的话
+  // 在 mac 上等于一直在编 PNG，一张正常照片就会撞上限被拒。
+  //
+  // 只缩不放：本来就小的图再放大只会糊，还白占体积。
+  let lastSide = 0;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error(t("feature.appearance.appSkin.invalid"));
+  for (const step of SKIN_ENCODE_LADDER) {
+    if (step.maxSide !== lastSide) {
+      lastSide = step.maxSide;
+      const scale = Math.min(1, step.maxSide / Math.max(w, h));
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    }
+    let out = "";
+    try { out = canvas.toDataURL(step.type, step.quality); } catch { continue; }
+    if (normalizeAppSkin(out)) return out;
+  }
+  throw new Error(t("feature.appearance.appSkin.tooLarge"));
+}
+
+/**
+ * 把皮肤挂到文档根上。
+ *
+ * 状态全部落在根元素：一个 data-skin 开关 + 两个自定义属性。样式那边只认这三样，
+ * 于是"皮肤生效"这件事在 CSS 里是一处判断，不需要在每个面板上各挂一份。
+ */
+function applyAppSkin(value = effectivePrefs().appSkin, opacity = effectivePrefs().appSkinOpacity) {
+  const root = document.documentElement;
+  const src = normalizeAppSkin(value);
+  const a = clampSkinOpacity(opacity);
+  if (!src) {
+    root.removeAttribute("data-skin");
+    root.style.removeProperty("--skin-img");
+    root.style.removeProperty("--skin-panel-a");
+    return;
+  }
+  root.style.setProperty("--skin-img", `url("${src}")`);
+  // 只有这一个派生值，由 src/agent/app-skin.js 算（那儿有可读性下限，且能被测试真跑）。
+  // 底图本身永远画满：浓度控制的是面板让出多少，让出多少就看见多少。
+  root.style.setProperty("--skin-panel-a", `${(skinPanelAlpha(a) * 100).toFixed(2)}%`);
+  root.setAttribute("data-skin", "on");
 }
 
 function setAppIconSource(img, src = appIconSrc()) {
@@ -4405,6 +4484,7 @@ function applyEditorPrefs() {
   applyModelOptions();
   if (p.theme) { currentTheme = normalizeTheme(p.theme); applyEditorTheme(); }
   applyAppIcon(p.appIcon);
+  applyAppSkin(p.appSkin, p.appSkinOpacity);
   autoSaveEnabled = p.autoSave !== false;
 }
 
@@ -28230,8 +28310,11 @@ async function _runDirectImageGen(text, config, sess, attachments = []) {
     sess.memory.push({ role: "assistant", content: "[失败] 生图（" + config.model + "）：" + msg, model: config.model || "" });
     saveChatHistory({ immediate: true });
   } finally {
-    const settlement = await _fetchGatewaySettlement(config, config.requestId);
-    _appendTurnStatsFooter(body, { elapsedMs: Date.now() - startedAt, settlement });
+    // 取结算是网络往返，reject 了不能连累界面复位（同 _agentRun / 纯对话那两处的理由）。
+    try {
+      const settlement = await _fetchGatewaySettlement(config, config.requestId);
+      _appendTurnStatsFooter(body, { elapsedMs: Date.now() - startedAt, settlement });
+    } catch (e) { console.error("[genimage] 取结算失败；界面照常复位：", e); }
     _setStreaming(sess, false);
     if (sess === _currentSession()) _setSendBtnStop(false);
     try { _chatFollow(sess); } catch {}
@@ -31532,29 +31615,43 @@ async function sendPrompt(text, attachments = [], readyConfig = null, opts = {})
     // 自己的活，用户读这个数的意思是「这次回答花了多久」，不是「包括收尾在内的一切」。
     // 放在 finally 的**第一行**：后面任何一步抛出来，计时器都已经停了。
     const _contentDoneMs = Date.now() - _taskStartedAt;
-    _liveStats.stop();
-    clearAgentRetryToast();
-    await Promise.allSettled(_turnBillingTasks);
-    await _awaitBillableAiTasks(sess._reqId);
-    const _plainSettlement = await _fetchGatewaySettlement(config, sess._reqId);
-    if (_plainSettlement?.usageReported) {
-      _recordUsage({
-        prompt_tokens: _plainSettlement.promptTokens,
-        completion_tokens: _plainSettlement.completionTokens,
-        cached_tokens: _plainSettlement.cachedTokens,
-        cache_creation_tokens: _plainSettlement.cacheCreationTokens,
-        // 服务端下发的形状位必须真的传进来。_recordUsage 里那两处
-        // `ev.promptIncludesCached === false ? …` 靠它决定分母和累计口径，而两个喂料点
-        // 原来都没传 —— 它运行时恒为 undefined、恒走「含缓存」那一支，于是 Anthropic
-        // 形状的路线上分母被结构性缩小、缓存命中率虚高。判据在代码里活着、路径走不到。
-        promptIncludesCached: _plainSettlement.promptIncludesCached,
-        model: _plainSettlement.model,
-        estimated: false,
-      }, { session: sess, requestId: sess._reqId });
-    }
-    // 确保所有悬空的<think>标签都流入思考卡而非答案
-    _flushUnfinishedThink();
-    collapseThink();
+    try { _liveStats.stop(); clearAgentRetryToast(); } catch {}
+    /*
+     * 从这里到 `_setStreaming(sess, false)` 之间夹着**两个网络往返**
+     * （_awaitBillableAiTasks / _fetchGatewaySettlement）。finally 保证的是「进入」，
+     * 不是「跑完」：其中任何一个 reject，后面全部跳过 —— 停止按钮永远红着、实时计时器
+     * 永远跳着（isLive 读的正是这里要置回的 sess.streaming）。而这两个是网络调用，
+     * 网关抖一下就会发生，一个字都不报。
+     *
+     * 对账失败只该丢掉这一轮的 token 和金额，不该把界面扣在「运行中」。
+     */
+    // 声明在 try **外面**：结算结果在下面渲染最终统计行时还要用，
+    // 放进 try 里就成了块级作用域，那一行会 ReferenceError（而它在 catch 之后，
+    // 等于把"对账失败只丢金额"变成"对账失败整轮界面全废"）。
+    let _plainSettlement = null;
+    try {
+      await Promise.allSettled(_turnBillingTasks);
+      await _awaitBillableAiTasks(sess._reqId);
+      _plainSettlement = await _fetchGatewaySettlement(config, sess._reqId);
+      if (_plainSettlement?.usageReported) {
+        _recordUsage({
+          prompt_tokens: _plainSettlement.promptTokens,
+          completion_tokens: _plainSettlement.completionTokens,
+          cached_tokens: _plainSettlement.cachedTokens,
+          cache_creation_tokens: _plainSettlement.cacheCreationTokens,
+          // 服务端下发的形状位必须真的传进来。_recordUsage 里那两处
+          // `ev.promptIncludesCached === false ? …` 靠它决定分母和累计口径，而两个喂料点
+          // 原来都没传 —— 它运行时恒为 undefined、恒走「含缓存」那一支，于是 Anthropic
+          // 形状的路线上分母被结构性缩小、缓存命中率虚高。判据在代码里活着、路径走不到。
+          promptIncludesCached: _plainSettlement.promptIncludesCached,
+          model: _plainSettlement.model,
+          estimated: false,
+        }, { session: sess, requestId: sess._reqId });
+      }
+    } catch (e) { console.error("[chat] 收尾对账失败；界面照常复位：", e); }
+    // 确保所有悬空的<think>标签都流入思考卡而非答案。
+    // 也要兜住：它们碰 DOM，抛了同样会把下面的界面复位整段跳过。
+    try { _flushUnfinishedThink(); collapseThink(); } catch (e) { console.error("[chat] 收尾整理思考卡失败：", e); }
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
     if (flushRaf) { cancelAnimationFrame(flushRaf); flushRaf = 0; }
     _setStreaming(sess, false);
@@ -52898,7 +52995,22 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
   session._lastTurnTokens = 0;
   _setStreaming(session, true);
   if (session === _currentSession()) _setSendBtnStop(true);
-  const _live = () => !!session.streaming && (session._runGen || 0) === (_runGenSnap || 0);
+  /*
+   * 「这一轮还活着吗」。两条判据，**第二条是为了不依赖收尾段**。
+   *
+   * 原来只看 session.streaming，而它是收尾段里 `_setStreaming(session, false)` 那一行置回的 ——
+   * 那一行前面排着十几条记账语句（结算计划、收子体、判验证、算 _incompleteReason）。
+   * finally 保证的是**进入**，不是**跑完**：其中任何一条抛出，后面全部跳过，于是
+   * streaming 永远是 true。用户看到的就是这一幕：回答早就写完了，停止按钮还是红的、
+   * 秒数还在一跳一跳（实拍「明明做完了所有内容 还是一直在运行中」）。
+   *
+   * 而计时器的"自停"补丁读的正是这个 _live()，等于**依赖那条被跳过的行**来救自己 ——
+   * 所以那次修复对这种情形完全无效。第二条判据 `_loopExitedAt` 在 finally 的第一句就写死，
+   * 前面没有任何可抛出的东西，循环一退出它必定为真。
+   */
+  const _live = () => !!session.streaming
+    && (session._runGen || 0) === (_runGenSnap || 0)
+    && !run._loopExitedAt;
   const _scroll = () => { if (session === _currentSession()) _chatFollow(); };
   const body = addMessage("assistant", "", session);
   body.appendChild(thinkingCard());
@@ -57451,7 +57563,12 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
     }
   } catch (e) { finalErr = String(e?.message || e); }
   finally {
-    planSteps = _settleRunPlan(run);
+    /*
+     * 这两句必须是 finally 的**头两句**，前面不许放任何可能抛出的东西。
+     * 顺序也是死的：_stoppedEarly 读的 _live() 含 !_loopExitedAt，取值必须在写它之前。
+     */
+    const _stoppedEarly = !_live();
+    run._loopExitedAt = Date.now(); // 循环已退出 → _live() 从此恒假 → 实时计时器自己冻住
     /*
      * 用户按停 / 这一轮被新一轮顶掉时，循环是**干净 break** 出来的：不抛异常，
      * 所以 finalErr 是空的；也没有走到那几个会设 _incompleteReason 的收尾门。
@@ -57461,134 +57578,147 @@ async function _runAgenticLoop({ config: _rawConfig, messages, root, memoryRoot 
      * 这正是「中断之后说继续，它还是从头重来」剩下的那一半：交接块写好了，但按停这条
      * 最常见的路径根本喂不到它。
      *
-     * 必须赶在下面 _setStreaming(session, false) 之前取值：那之后 _live() 对每一次运行
-     * 都会变成假，正常收尾的也会被误判成中断。_settleRunPlan 不碰 streaming，放它后面安全。
+     * 必须赶在 _setStreaming(session, false) 和 _loopExitedAt 之前取值：那之后 _live() 对
+     * 每一次运行都会变成假，正常收尾的也会被误判成中断。所以它上移成了 finally 的第一句 ——
+     * 原来它排在 `_settleRunPlan(run)` 后面，那一句一抛，连"是不是被按停的"都算不出来。
      */
-    const _stoppedEarly = !_live();
     if (_stoppedEarly && !finalErr) run._incompleteReason = run._incompleteReason || "user_stopped";
-    // === P2.1 取消传播：run 结束（Stop/换轮/异常/正常收尾）时，仍在跑的后台作业标 cancelled ===
-    // 子智能体本体由 _subGenSnap 代际快照在下个检查点自行退出，Rust 侧请求由下方
-    // _setStreaming(false) 遍历 session._cancelIds 取消；这里只做台账诚实记账，防幽灵作业。
-    let _cancelledSubagents = false;
-    if (run._subAgentJobs instanceof Map) {
-      // **先收割已经落定、但还没被消化的作业。**
-      //
-      // 后台作业的结果只有一条投递路：主循环**下一次迭代开头**的自动交付。模型静默收尾时
-      // 没有下一次迭代了，于是下面那几行把在途作业全标成 cancelled，而**已经跑完、报告
-      // 就摆在 job.result 里**的那些也跟着一起沉底——几十轮模型调用的钱照付，一个字都没进
-      // 上下文。派发回执还同时说着「结果就绪后会自动送达」和「不要立即 await」，
-      // 模型照做就必然落进这个形态。
-      //
-      // 这里只收割**已落定**的（钱已经付了，报告是现成的），不等在途的：等多久都是拍脑袋，
-      // 而且会让收尾延迟变得不可预测。在途的那些照旧取消，但下面会把它们数出来告诉用户。
-      const _unharvested = [...run._subAgentJobs.values()].filter(
-        (j) => !j.consumed && j.status !== "running" && String(j.result || "").trim(),
-      );
-      for (const j of _unharvested) {
-        j.consumed = true;
-        const _tag = j.status === "done" ? "完成"
+    /*
+     * 下面整段是**记账**：算结局、收子体、判验证、写 _incompleteReason。它一句都不该
+     * 挡住后面的界面复位，所以整段包起来。以前是裸的十几条语句，任意一条抛出
+     * ——`_settleRunPlan`、`_endRunCollaborationSession`、`[..._mutatedFiles]`、
+     * `_freshBuildFailure` 都在其中—— 停止按钮和计时器就一起卡死，而且一个字都不报。
+     * 抛了也不当没事：记一条结局原因，控制台留一行，用户至少知道这轮结局不可信。
+     */
+    try {
+      planSteps = _settleRunPlan(run);
+      // === P2.1 取消传播：run 结束（Stop/换轮/异常/正常收尾）时，仍在跑的后台作业标 cancelled ===
+      // 子智能体本体由 _subGenSnap 代际快照在下个检查点自行退出，Rust 侧请求由下方
+      // _setStreaming(false) 遍历 session._cancelIds 取消；这里只做台账诚实记账，防幽灵作业。
+      let _cancelledSubagents = false;
+      if (run._subAgentJobs instanceof Map) {
+        // **先收割已经落定、但还没被消化的作业。**
+        //
+        // 后台作业的结果只有一条投递路：主循环**下一次迭代开头**的自动交付。模型静默收尾时
+        // 没有下一次迭代了，于是下面那几行把在途作业全标成 cancelled，而**已经跑完、报告
+        // 就摆在 job.result 里**的那些也跟着一起沉底——几十轮模型调用的钱照付，一个字都没进
+        // 上下文。派发回执还同时说着「结果就绪后会自动送达」和「不要立即 await」，
+        // 模型照做就必然落进这个形态。
+        //
+        // 这里只收割**已落定**的（钱已经付了，报告是现成的），不等在途的：等多久都是拍脑袋，
+        // 而且会让收尾延迟变得不可预测。在途的那些照旧取消，但下面会把它们数出来告诉用户。
+        const _unharvested = [...run._subAgentJobs.values()].filter(
+          (j) => !j.consumed && j.status !== "running" && String(j.result || "").trim(),
+        );
+        for (const j of _unharvested) {
+          j.consumed = true;
+          const _tag = j.status === "done" ? "完成"
           : j.status === "timeout" ? "超时(部分结果)"
           : j.status === "truncated" ? "未完成·轮次用尽" : "失败";
         if (typeof run._pushRunFact === "function") {
           run._pushRunFact(`[子智能体 job#${j.id} ${_tag}·${j.desc}·收尾时补收]
 `
-            + _clipPreservingErrors(String(j.result), 4000));
+              + _clipPreservingErrors(String(j.result), 4000));
+          }
+        }
+        for (const j of run._subAgentJobs.values()) {
+          if (j.status === "running") { j.status = "cancelled"; j.consumed = true; _cancelledSubagents = true; }
         }
       }
-      for (const j of run._subAgentJobs.values()) {
-        if (j.status === "running") { j.status = "cancelled"; j.consumed = true; _cancelledSubagents = true; }
+      // This also releases SharedStore listeners when the user stops a run or an
+      // exception bypasses await_subagent. Jobs are marked above first so followers
+      // never receive another decision from a terminal main-agent session.
+      _endRunCollaborationSession(run, _cancelledSubagents ? "cancelled" : "completed");
+      // 这里曾经在收尾出口按分类器预测的义务/研究要求补 `required_effect_missing:` /
+      // `research_evidence_missing:` —— 已删除（AGENT_LOOP_REBUILD.md 阶段 2b）。原注释说它只管
+      // cap/异常出口，但静默收尾的 `break` 也落到这里，于是"模型自愿收尾、什么都没写"这种情况
+      // 会被预测标签重新盖上未完成——正是阶段 2a 在静默收尾腿删掉的那层，从这里漏了回来。
+      // 收尾出口的诚实记账现在只认执行事实：改了代码没验证 → `code_delivered_unverified`（下方），
+      // 撞上限 → `iteration_limit`（各有独立 _capReason），谁都不需要分类器的预测。
+      // Final truth pass: a model narrative or a `purpose=verify` declaration is not a
+      // result. Code verification must certify this exact implementation version with a
+      // structured exit 0 record; UI work must have a browser pass stamped at this version.
+      // Keep the reason concrete so a partial delivery is actionable instead of looking green.
+      const _codeNeedsVerification = didMutate && (
+        [..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)))
+        || run._codeWrittenByCommand === true
+      );
+      const _currentCodeVerified = !_codeNeedsVerification
+        || _verifiedAtImplOps === _implOps
+        || (Array.isArray(run._executionEvidence)
+          && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
+      if (run.engineering?.ui && didMutate) {
+        uiVerificationPassed = _uiVerifiedAtImplOps === _implOps;
+      } else {
+        // Non-UI work has no browser obligation.
+        uiVerificationPassed = true;
       }
-    }
-    // This also releases SharedStore listeners when the user stops a run or an
-    // exception bypasses await_subagent. Jobs are marked above first so followers
-    // never receive another decision from a terminal main-agent session.
-    _endRunCollaborationSession(run, _cancelledSubagents ? "cancelled" : "completed");
-    // 这里曾经在收尾出口按分类器预测的义务/研究要求补 `required_effect_missing:` /
-    // `research_evidence_missing:` —— 已删除（AGENT_LOOP_REBUILD.md 阶段 2b）。原注释说它只管
-    // cap/异常出口，但静默收尾的 `break` 也落到这里，于是"模型自愿收尾、什么都没写"这种情况
-    // 会被预测标签重新盖上未完成——正是阶段 2a 在静默收尾腿删掉的那层，从这里漏了回来。
-    // 收尾出口的诚实记账现在只认执行事实：改了代码没验证 → `code_delivered_unverified`（下方），
-    // 撞上限 → `iteration_limit`（各有独立 _capReason），谁都不需要分类器的预测。
-    // Final truth pass: a model narrative or a `purpose=verify` declaration is not a
-    // result. Code verification must certify this exact implementation version with a
-    // structured exit 0 record; UI work must have a browser pass stamped at this version.
-    // Keep the reason concrete so a partial delivery is actionable instead of looking green.
-    const _codeNeedsVerification = didMutate && (
-      [..._mutatedFiles].some((p) => _CODE_FILE_RE.test(String(p)))
-      || run._codeWrittenByCommand === true
-    );
-    const _currentCodeVerified = !_codeNeedsVerification
-      || _verifiedAtImplOps === _implOps
-      || (Array.isArray(run._executionEvidence)
-        && run._executionEvidence.some((e) => _evidenceCertifies(e, _implOps)));
-    if (run.engineering?.ui && didMutate) {
-      uiVerificationPassed = _uiVerifiedAtImplOps === _implOps;
-    } else {
-      // Non-UI work has no browser obligation.
-      uiVerificationPassed = true;
-    }
-    // 这两条是**记账**，不是拦截，所以不该被"模型末尾问了句话"豁免掉。
-    // 原来带着 !awaitingUserReply：模型只要用一个问号收尾（「我先这样改了，需要我跑一下
-    // 测试验证吗？」），改了代码没验证这个事实就一笔勾销——而这恰恰是最像"已经做完了"的
-    // 收尾形态。判据本身是执行事实（改没改代码、验没验过），和它怎么措辞无关。
-    // 界面上不加东西：awaiting_user 仍然不出建议 chip（举着问题时喊"继续执行计划"是错的，
-    // 那条判断保留），变的只是这一轮在 _lastRunState / 情景记忆里被如实记下来。
-    // 「没有可验证的东西」不等于「没验证」。只改了 README / Dockerfile / .csv /
-    // .svg / .gitignore 这类文件的 run，_codeNeedsVerification 本来就是假的——
-    // 可 verificationPassed 的初值是 false，而全文件只有「验证命令盖章」那一处会
-    // 把它置真。于是这类 run 必然落进下面收尾那句 didMutate && !verificationPassed，
-    // 被记成 partial：一次干干净净的文档改动被报成半成品，而模型下一轮还会被
-    // 「上次没做完」推着去补一个根本不存在的验证。
-    //
-    // 单独立一个标志，不去改 verificationPassed 的语义——它还要参与「评审说没验证
-    // 但记账说验过了」那道假绿检测，在这里置真会平白制造分歧。
-    run._nothingToVerify = !_codeNeedsVerification;
-    // 构建/测试红：中途不再记账（红了又修好会粘成假 partial），改成收尾按终态重判。
-    // `_freshBuildFailure` 自带版本钉：红完又改过代码的那条会被剔掉——对已经不存在的
-    // 那版代码断言「构建是红的」没有意义。**剔掉不会变成假绿**：那些新编辑让
-    // `_verifiedAtImplOps < _implOps`，下面 code_delivered_unverified 立刻补位，
-    // 结局仍是 partial，只是成因退化成更笼统的那个。
-    run._incompleteReason = _settleBuildFailure(run._incompleteReason, !!_freshBuildFailure(run, _implOps));
-    if (_codeNeedsVerification && !_currentCodeVerified) {
-      verificationPassed = false;
-      run._incompleteReason ||= "code_delivered_unverified";
-    }
-    if (run.engineering?.ui && didMutate && !uiVerificationPassed) {
-      run._incompleteReason ||= "ui_verification_missing";
-    }
-    // 尝试写了、没落盘：这是**用户侧**唯一的出口。模型那边已经在交付事实里收到这条
-    // （见 _deliveryFactsLine 里的落空写入），但用户看的是结局卡片——而这一整条链路上
-    // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
-    // （run._writeLedger 逐条记着每次写入尝试的成败），不读模型的任何措辞。
-    {
-      const _failedWrites = _failedWritePaths(run._writeLedger);
-      if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
-    }
-    // 声明了要改工作区，一个文件都没落盘 —— 第七条谎报路径。
-    //
-    // 用户实拍：「都他妈没改，给我来个优化完了」「同一个问题我要给他说 3-4 轮才能改好」。
-    // 模型回了一整页「删除了原来的 refreshAll()、新增 loadStats()、新增 loadCustomerList()」，
-    // 工作区一个字节没动，而这一轮被记成 success、通知栏打出「✅ 任务完成」。
-    //
-    // 为什么之前没人拦：静默轮（模型不调工具就收尾）按设计是**它的收尾决定**，harness 只在
-    // 「机器产生的事实」与之矛盾时才推翻——命令退出码、诊断增量、用户插话、update_plan 状态。
-    // 而一次工具都没调过的轮次，这四样一个都不存在，于是一段漂亮的完成叙述直接通过。
-    //
-    // 判据仍然**不读模型的正文措辞**（那条路走过：12 条基于正文的判据全部被反例打掉，
-    // 见静默轮那段注释）。这里用的是同一套「声明 + 执行事实」：
-    //   · 声明——`workspaceAction === "modify"`，模型自己的结构化判定。它已经被信任到
-    //     用来**授权**写操作（_agentAllowsWorkspaceMutation 就是这个函数）；可信到能发写权限，
-    //     就可信到能发现写从没发生。
-    //   · 事实——didMutate，落盘账本。
-    // 这**不是**被删掉的 required_effect_missing：那条是 _missingRequiredEffects 按关键词
-    // 推出来的效果预测（连同 _runtimeObligationsForTask 一族一起删的，有反漂移断言钉着），
-    // 和模型自己的声明是两回事。
-    //
-    // 只记账，不补回合——「缺席只记账、永不续跑」那条规矩原样遵守。变的只是这一轮不再
-    // 冒充 success：结局记成 partial，建议行给一句用户能照做的下一步。
-    // 排在最后，更具体的原因（写入失败、构建红、诊断新增）靠 ||= 先占位。
-    if (run.mode === "agent" && !didMutate && _agentAllowsWorkspaceMutation(run) && !_stoppedEarly) {
+      // 这两条是**记账**，不是拦截，所以不该被"模型末尾问了句话"豁免掉。
+      // 原来带着 !awaitingUserReply：模型只要用一个问号收尾（「我先这样改了，需要我跑一下
+      // 测试验证吗？」），改了代码没验证这个事实就一笔勾销——而这恰恰是最像"已经做完了"的
+      // 收尾形态。判据本身是执行事实（改没改代码、验没验过），和它怎么措辞无关。
+      // 界面上不加东西：awaiting_user 仍然不出建议 chip（举着问题时喊"继续执行计划"是错的，
+      // 那条判断保留），变的只是这一轮在 _lastRunState / 情景记忆里被如实记下来。
+      // 「没有可验证的东西」不等于「没验证」。只改了 README / Dockerfile / .csv /
+      // .svg / .gitignore 这类文件的 run，_codeNeedsVerification 本来就是假的——
+      // 可 verificationPassed 的初值是 false，而全文件只有「验证命令盖章」那一处会
+      // 把它置真。于是这类 run 必然落进下面收尾那句 didMutate && !verificationPassed，
+      // 被记成 partial：一次干干净净的文档改动被报成半成品，而模型下一轮还会被
+      // 「上次没做完」推着去补一个根本不存在的验证。
+      //
+      // 单独立一个标志，不去改 verificationPassed 的语义——它还要参与「评审说没验证
+      // 但记账说验过了」那道假绿检测，在这里置真会平白制造分歧。
+      run._nothingToVerify = !_codeNeedsVerification;
+      // 构建/测试红：中途不再记账（红了又修好会粘成假 partial），改成收尾按终态重判。
+      // `_freshBuildFailure` 自带版本钉：红完又改过代码的那条会被剔掉——对已经不存在的
+      // 那版代码断言「构建是红的」没有意义。**剔掉不会变成假绿**：那些新编辑让
+      // `_verifiedAtImplOps < _implOps`，下面 code_delivered_unverified 立刻补位，
+      // 结局仍是 partial，只是成因退化成更笼统的那个。
+      run._incompleteReason = _settleBuildFailure(run._incompleteReason, !!_freshBuildFailure(run, _implOps));
+      if (_codeNeedsVerification && !_currentCodeVerified) {
+        verificationPassed = false;
+        run._incompleteReason ||= "code_delivered_unverified";
+      }
+      if (run.engineering?.ui && didMutate && !uiVerificationPassed) {
+        run._incompleteReason ||= "ui_verification_missing";
+      }
+      // 尝试写了、没落盘：这是**用户侧**唯一的出口。模型那边已经在交付事实里收到这条
+      // （见 _deliveryFactsLine 里的落空写入），但用户看的是结局卡片——而这一整条链路上
+      // 原来没有任何一处告诉他「你以为生成好的那个文件此刻不在磁盘上」。判据是纯执行记录
+      // （run._writeLedger 逐条记着每次写入尝试的成败），不读模型的任何措辞。
+      {
+        const _failedWrites = _failedWritePaths(run._writeLedger);
+        if (_failedWrites.length) run._incompleteReason ||= `writes_failed:${_failedWrites.length}`;
+      }
+      // 声明了要改工作区，一个文件都没落盘 —— 第七条谎报路径。
+      //
+      // 用户实拍：「都他妈没改，给我来个优化完了」「同一个问题我要给他说 3-4 轮才能改好」。
+      // 模型回了一整页「删除了原来的 refreshAll()、新增 loadStats()、新增 loadCustomerList()」，
+      // 工作区一个字节没动，而这一轮被记成 success、通知栏打出「✅ 任务完成」。
+      //
+      // 为什么之前没人拦：静默轮（模型不调工具就收尾）按设计是**它的收尾决定**，harness 只在
+      // 「机器产生的事实」与之矛盾时才推翻——命令退出码、诊断增量、用户插话、update_plan 状态。
+      // 而一次工具都没调过的轮次，这四样一个都不存在，于是一段漂亮的完成叙述直接通过。
+      //
+      // 判据仍然**不读模型的正文措辞**（那条路走过：12 条基于正文的判据全部被反例打掉，
+      // 见静默轮那段注释）。这里用的是同一套「声明 + 执行事实」：
+      //   · 声明——`workspaceAction === "modify"`，模型自己的结构化判定。它已经被信任到
+      //     用来**授权**写操作（_agentAllowsWorkspaceMutation 就是这个函数）；可信到能发写权限，
+      //     就可信到能发现写从没发生。
+      //   · 事实——didMutate，落盘账本。
+      // 这**不是**被删掉的 required_effect_missing：那条是 _missingRequiredEffects 按关键词
+      // 推出来的效果预测（连同 _runtimeObligationsForTask 一族一起删的，有反漂移断言钉着），
+      // 和模型自己的声明是两回事。
+      //
+      // 只记账，不补回合——「缺席只记账、永不续跑」那条规矩原样遵守。变的只是这一轮不再
+      // 冒充 success：结局记成 partial，建议行给一句用户能照做的下一步。
+      // 排在最后，更具体的原因（写入失败、构建红、诊断新增）靠 ||= 先占位。
+      if (run.mode === "agent" && !didMutate && _agentAllowsWorkspaceMutation(run) && !_stoppedEarly) {
       run._incompleteReason ||= "declared_mutation_not_delivered";
+      }
+    } catch (e) {
+      console.error("[run] 收尾记账抛了；界面照常复位：", e);
+      run._incompleteReason ||= "epilogue_failed";
     }
     _setStreaming(session, false);
     _hideControlGlow(); // 灭掉红光：自动化结束（正常/报错/到顶/用户停止 都走这里）
@@ -59069,7 +59199,10 @@ function _createReadBatchGroup(total) {
   card.innerHTML =
     `<div class="agent-tool-row">` +
       `<svg class="atc-chev" viewBox="0 0 12 12" width="12" height="12"><path d="M4 2.5l3.5 3.5-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` +
-      `<div class="atc-type-icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1.75C5 .784 5.784 0 6.75 0h4.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v8.6A1.75 1.75 0 0113.25 14h-.75v-1.5h.75a.25.25 0 00.25-.25V4.06L10.94 1.5H6.75a.25.25 0 00-.25.25V3H5V1.75z"/><path d="M1 4.75C1 3.784 1.784 3 2.75 3h5.6a.75.75 0 01.53.22l2.9 2.9a.75.75 0 01.22.53v7.6A1.75 1.75 0 0110.25 16h-7.5A1.75 1.75 0 011 14.25v-9.5zm1.75-.25a.25.25 0 00-.25.25v9.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25V7.06L7.44 4.5H2.75z"/></svg></div>` +
+      // 图标走统一那张表（src/agent/tool-icons.js），不再在这里内联一份。
+      // 内联的那份是旧的实心 Octicon：整套图标换成描边之后它没跟上，成了一屏卡片里
+      // 唯一一个实心的、灰的（用户实拍：「批量读取怎么没国外风格大厂图标」）。
+      `<div class="atc-type-icon" data-fam="${_toolIconFamily("readbatch")}">${_toolIconSvg("readbatch")}</div>` +
       `<div class="atc-info"><div class="atc-action-row"><span class="atc-action">批量读取</span><span class="atc-path">${total} 个文件</span></div></div>` +
       `<span class="atc-result"><span class="atc-spin"></span><span class="atc-batch-count">0/${total}</span></span>` +
     `</div>` +
@@ -70771,6 +70904,8 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   if (key === "country") value = normalizeCountryCode(value, DEFAULT_EDITOR_SETTINGS.country);
   if (key === "theme") value = normalizeTheme(value);
   if (key === "appIcon") value = normalizeAppIcon(value);
+  if (key === "appSkin") value = normalizeAppSkin(value);
+  if (key === "appSkinOpacity") value = clampSkinOpacity(value);
   _editorPrefs[key] = value;
   await saveEditorPrefs();
   if (key === "theme") {
@@ -70779,6 +70914,12 @@ async function updateEditorPreference(key, value, { rerender = false } = {}) {
   }
   if (key === "appIcon") {
     applyAppIcon(value);
+    if (rerender) renderFeaturePanel();
+    return;
+  }
+  if (key === "appSkin" || key === "appSkinOpacity") {
+    // 两个键改哪一个都要整体重算：浓度决定面板透到什么程度，图决定有没有东西可透。
+    applyAppSkin(_editorPrefs.appSkin, _editorPrefs.appSkinOpacity);
     if (rerender) renderFeaturePanel();
     return;
   }
@@ -71212,6 +71353,136 @@ function renderAppIconSettings(body, p) {
   });
 }
 
+/*
+ * 「自定义软件皮肤」那一节。
+ *
+ * 排在软件图标下面，因为它俩是同一类事（拿用户自己的图替换外观），而皮肤影响面更大，
+ * 放前面会盖过图标那一行。
+ *
+ * 没设皮肤时**不显示浓度条**：一个调不出任何变化的滑块只会让人以为坏了。
+ */
+function renderAppSkinSettings(body, p) {
+  const sec = document.createElement("div");
+  sec.className = "settings-group appearance-skin-group";
+  const h = document.createElement("h3");
+  h.className = "settings-group__title";
+  h.textContent = t("feature.appearance.appSkin.section");
+  sec.appendChild(h);
+
+  const row = document.createElement("div");
+  row.className = "settings-row settings-row--skin";
+  const meta = document.createElement("div");
+  meta.className = "settings-row__meta";
+  const label = document.createElement("span");
+  label.className = "settings-row__label";
+  label.textContent = t("feature.appearance.appSkin.label");
+  const hint = document.createElement("span");
+  hint.className = "settings-row__hint";
+  hint.textContent = t("feature.appearance.appSkin.hint");
+  meta.append(label, hint);
+
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/*";
+  input.hidden = true;
+
+  const control = document.createElement("div");
+  control.className = "settings-row__control skin-control";
+  const current = normalizeAppSkin(p.appSkin);
+  const preview = document.createElement("div");
+  preview.className = `skin-preview${current ? " is-set" : ""}`;
+  if (current) {
+    preview.style.backgroundImage = `url("${current}")`;
+  } else {
+    // 空态画的是"这里会出现一张图"，不是一句 placeholder 文案：一张淡淡的山景线稿，
+    // 和上传后的样子占同一块地方，切换时不跳。
+    preview.innerHTML = `<svg viewBox="0 0 48 32" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">`
+      + `<rect x="2.8" y="2.8" width="42.4" height="26.4" rx="3"/>`
+      + `<circle cx="15" cy="11.5" r="3"/>`
+      + `<path d="M4 24l9.5-9 6.5 6.2 7.5-8 16.5 15.5"/></svg>`;
+  }
+  const actions = document.createElement("div");
+  actions.className = "skin-actions";
+  const upload = document.createElement("button");
+  upload.type = "button";
+  upload.className = "btn btn--primary";
+  upload.textContent = t(current ? "feature.appearance.appSkin.replace" : "feature.appearance.appSkin.upload");
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "btn";
+  reset.textContent = t("feature.appearance.appSkin.reset");
+  reset.disabled = !current;
+  actions.append(upload, reset);
+  control.append(preview, actions, input);
+  row.append(meta, control);
+  sec.appendChild(row);
+
+  if (current) {
+    const orow = document.createElement("div");
+    orow.className = "settings-row settings-row--skin-opacity";
+    const ometa = document.createElement("div");
+    ometa.className = "settings-row__meta";
+    const olabel = document.createElement("span");
+    olabel.className = "settings-row__label";
+    olabel.textContent = t("feature.appearance.appSkin.opacity");
+    const ohint = document.createElement("span");
+    ohint.className = "settings-row__hint";
+    ohint.textContent = t("feature.appearance.appSkin.opacityHint");
+    ometa.append(olabel, ohint);
+
+    const octl = document.createElement("div");
+    octl.className = "settings-row__control skin-opacity-control";
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = "100";
+    slider.step = "1";
+    slider.className = "skin-slider";
+    slider.value = String(clampSkinOpacity(p.appSkinOpacity));
+    const num = document.createElement("span");
+    num.className = "skin-opacity-value";
+    num.textContent = `${slider.value}%`;
+    octl.append(slider, num);
+    orow.append(ometa, octl);
+    sec.appendChild(orow);
+
+    // 拖动时**实时**改，松手才落盘：每一帧写一次偏好文件会把拖动拖卡。
+    slider.addEventListener("input", () => {
+      const v = clampSkinOpacity(slider.value);
+      num.textContent = `${v}%`;
+      document.documentElement.style.setProperty("--skin-panel-a", `${(skinPanelAlpha(v) * 100).toFixed(2)}%`);
+    });
+    slider.addEventListener("change", async () => {
+      await updateEditorPreference("appSkinOpacity", clampSkinOpacity(slider.value));
+    });
+  }
+
+  body.appendChild(sec);
+
+  upload.addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    upload.disabled = true;
+    upload.textContent = t("feature.appearance.appSkin.processing");
+    try {
+      const skin = await appSkinFromFile(file);
+      await updateEditorPreference("appSkin", skin, { rerender: true });
+      showToast(t("feature.appearance.appSkin.applied"));
+    } catch (e) {
+      showToast(e?.message || t("feature.appearance.appSkin.invalid"));
+      upload.disabled = false;
+      upload.textContent = t(current ? "feature.appearance.appSkin.replace" : "feature.appearance.appSkin.upload");
+    }
+    // 成功时不用恢复按钮文案：rerender 会把整节重画。
+  });
+  reset.addEventListener("click", async () => {
+    await updateEditorPreference("appSkin", "", { rerender: true });
+    showToast(t("feature.appearance.appSkin.resetDone"));
+  });
+}
+
 async function renderAppearanceTool(body) {
   await loadEditorPrefs();
   const p = effectivePrefs();
@@ -71230,6 +71501,7 @@ async function renderAppearanceTool(body) {
   );
   body.appendChild(themeGrid);
   renderAppIconSettings(body, p);
+  renderAppSkinSettings(body, p);
 
   const sec = document.createElement("div");
   sec.className = "settings-group appearance-options";
@@ -75584,8 +75856,32 @@ promptEl.addEventListener("input", () => {
   try { _renderComposerGhost(); } catch {}
 });
 _cePlaceholder();
-const _SEND_ICON = `<svg class="ic"><use href="#i-arrow-up" /></svg>`;
-const _STOP_ICON = `<svg class="ic" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></svg>`;
+/*
+ * 发送箭头自己画一份，不再借 `#i-arrow-up` 那个雪碧图：那一个还挂在 Git 的推送按钮上，
+ * 动它就把两处一起改了。
+ *
+ * 比例照 ChatGPT / Claude 那个：**杆长、头宽、笔画粗**（2.6，比工具图标的 1.75 粗得多）。
+ * 上一版用的是工具图标那套 1.75 的细描边——放进一个 30px 的实心圆里显得又细又飘，
+ * 用户原话「太丑了 不够国外大厂风格」。按钮图标和列表图标不是一个量级的东西：
+ * 前者要在一小块纯色上立得住，后者要在一屏几十个里不吵。
+ */
+const _SEND_ICON = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20V6.4"/><path d="M6 12.4L12 6.4l6 6"/></svg>`;
+/*
+ * 停止按钮：**一圈细环 + 中间一个圆角方块**，单色。
+ *
+ * 原来是「红色渐变胶囊 + 红光一呼一吸」。红色在这类界面里是留给破坏性动作的
+ * （删除、丢弃），而"停一下生成"不是破坏性的——ChatGPT / Claude / Cursor 三家都用单色，
+ * 靠**环在转**表示"还在跑"，靠中间那个方块表示"点它会停"。红光脉冲还有个副作用：
+ * 它一直在动，用户分不出"模型在跑"和"界面卡住了"，而这恰恰是这次要修的那个 bug 的表象。
+ *
+ * 环分两层：一整圈淡的当轨道，一段亮的在上面转。转的是 CSS（见 .send-stop__arc），
+ * 这里只给几何，减少动态效果的偏好设置里会停下来。
+ */
+const _STOP_ICON = `<svg class="ic send-stop" viewBox="0 0 24 24" fill="none" aria-hidden="true">`
+  + `<circle class="send-stop__track" cx="12" cy="12" r="10.25" stroke="currentColor" stroke-width="1.6"/>`
+  + `<circle class="send-stop__arc" cx="12" cy="12" r="10.25" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="17 48"/>`
+  + `<rect x="8.6" y="8.6" width="6.8" height="6.8" rx="1.7" fill="currentColor"/>`
+  + `</svg>`;
 
 function _setSendBtnStop(isStop) {
   if (!_sendBtnEl) return;
@@ -77863,12 +78159,21 @@ function _updateSlashMenu() {
   });
   if (!_slashMatches.length) return _hideSlash();
   _slashActive = 0;
-  const r = promptEl.getBoundingClientRect();
-  _slashMenu.style.left = r.left + "px";
-  // Narrower than the prompt: two short columns of text do not need its full width, and the
-  // old 520px cap made three commands look like a dialog.
-  _slashMenu.style.width = Math.min(r.width, 380) + "px";
-  _slashMenu.style.bottom = viewportH() - r.top + 6 + "px";
+  /*
+   * 宽度和左边缘都跟着**输入条那个圆角盒子**（.composer__box），不是里面的文本区。
+   *
+   * 原来按 promptEl 算、还封在 380px。用户实拍：弹窗比下面那条窄一截，右边差出一块，
+   * 「宽度要和下面的对话框对齐」。这类贴着输入框弹出来的面板，对齐是它像不像一个
+   * 整体的唯一线索——窄一点点比窄很多更显得没做好。
+   *
+   * 上沿也按盒子算：盒子里除了文本区还有下面那条模式/模型栏，按文本区算菜单会插进
+   * 盒子里去。三个值同源，菜单才是"贴在这条输入条上面"，而不是三个各算各的。
+   */
+  const box = promptEl.closest(".composer__box") || promptEl;
+  const b = box.getBoundingClientRect();
+  _slashMenu.style.left = b.left + "px";
+  _slashMenu.style.width = b.width + "px";
+  _slashMenu.style.bottom = viewportH() - b.top + 6 + "px";
   _slashMenu.hidden = false;
   _renderSlashActive();
 }
