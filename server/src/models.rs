@@ -5726,6 +5726,16 @@ fn _is_xai_route(model_id: &str, base_url: &str) -> bool {
         || base_url.to_ascii_lowercase().contains("x.ai")
 }
 
+/// 这条请求要不要带提示缓存的粘性键。
+///
+/// **只给真正需要机器亲和的那两族。** OpenAI 和 xAI 的自动缓存是按机器路由的
+/// （路由键 = prompt_cache_key + 组织），所以同一条对话必须带同一个键才落到同一台机器。
+/// DeepSeek / 智谱 / 通义那几家的缓存是**内容寻址**的（磁盘前缀缓存，不吃这个参数），
+/// 塞一个它们不认识的字段只有被严格中转 400 的风险，没有收益。
+///
+/// 2026-09-01 一度想改成「按线协议一律发」，因为这张名单在同一个中转内部不自洽
+/// （teamorouter 上的 gpt-4o 有键、同一个中转上的 deepseek-v4-pro 没有）。查完各家文档
+/// 之后否掉了：那个不自洽是**对的** —— 它跟的是上游用不用得上这个键，而不是它挂在哪。
 fn route_needs_cache_affinity(model_id: &str, base_url: &str) -> bool {
     let m = model_id.to_ascii_lowercase();
     let u = base_url.to_ascii_lowercase();
@@ -5739,6 +5749,7 @@ fn route_needs_cache_affinity(model_id: &str, base_url: &str) -> bool {
         || u.contains("x.ai")
         || u.contains("openrouter")
 }
+
 
 /// Deterministic cache key for a chat request. serde_json serializes Map keys sorted, so
 /// the same request always produces the same key.
@@ -8110,7 +8121,8 @@ fn anthropic_effort_word(requested: &str, passthrough: bool) -> &'static str {
 #[cfg(test)]
 
 fn oai_to_anthropic(body: &serde_json::Value) -> Result<serde_json::Value, String> {
-    oai_to_anthropic_with_cache(body, true, false)
+    // 预览/估算路径：不发实际请求，ttl 与否不影响结果，给 false 保持和今天一致。
+    oai_to_anthropic_with_cache(body, true, false, false)
 }
 
 /// 客户端这一轮到底要多深的思考：`reasoning_effort` 优先，没有就按 `thinking` 的形状推。
@@ -8368,10 +8380,42 @@ fn oai_to_xai_responses(
     Ok(serde_json::Value::Object(out))
 }
 
+/// 缓存断点的 `cache_control`。
+///
+/// # 为什么要有 ttl
+///
+/// 不带 ttl 的 `ephemeral` 只活 **5 分钟**。IDE 里两轮之间超过五分钟太常见了 —— 用户读一段
+/// 输出、想一想、改点东西再回话。一超时，整条前缀下一轮要按 **1.25× 输入价**重写一遍，
+/// 而读折扣（0.1×）一分拿不到。用户的原话是「每次相当于新开 chat」。
+///
+/// 粗算 10 轮、64k 前缀、每轮间隔都超 5 分钟：
+///   现在   每轮重写 64k×1.25 ≈ 800k 等效输入
+///   1 小时 首轮 64k×2.0 + 之后 9 轮各 64k×0.1 ≈ 186k
+/// 约 4 倍差距，延迟也一起降。间隔本来就短的会话则贵 0.75×（只贵在每代缓存的**第一次**
+/// 写入），所以只要缓存哪怕过期过一次，1 小时就是划算的。
+///
+/// # 为什么只给一方
+///
+/// `ttl` 要配 `extended-cache-ttl-2025-04-11` 这个 beta 才生效，而中转商那份 beta 集合
+/// 是**照着 Claude Code 的 Tv9 集合**挑的（有测试钉着项数和内容）—— 往里加一项会改变请求
+/// 指纹，而一批中转正是靠这个指纹认 Claude Code 流量的。那是另一个决定，不在这里顺手做。
+///
+/// # 回退
+///
+/// `MICHAEL_CACHE_TTL_1H=0` 关掉，退回今天的行为。计费相关的改动要能不重新部署就回退。
+fn anthropic_cache_control(extended_ttl: bool) -> serde_json::Value {
+    if extended_ttl && std::env::var("MICHAEL_CACHE_TTL_1H").ok().as_deref() != Some("0") {
+        json!({"type": "ephemeral", "ttl": "1h"})
+    } else {
+        json!({"type": "ephemeral"})
+    }
+}
+
 fn oai_to_anthropic_with_cache(
     body: &serde_json::Value,
     prompt_cache: bool,
     effort_passthrough: bool,
+    extended_ttl: bool,
 ) -> Result<serde_json::Value, String> {
     // 思考配置要在**遍历消息之前**就算出来：助手轮重放 thinking 块的判据用得上它
     // （见下面 "assistant" 分支）。同一份推导只写一次，别在两处各算一遍慢慢漂。
@@ -8397,7 +8441,7 @@ fn oai_to_anthropic_with_cache(
                         // from later dynamic Skill/system messages so those can change without
                         // invalidating the stable production prefix.
                         if prompt_cache && system_parts.is_empty() {
-                            block.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                            block.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
                         }
                         system_parts.push(serde_json::Value::Object(block));
                     }
@@ -8629,7 +8673,7 @@ fn oai_to_anthropic_with_cache(
             // 最前（tools→system→messages），断点打在末个工具上把整个工具表缓存住。
             if prompt_cache {
                 if let Some(last) = atools.last_mut().and_then(|v| v.as_object_mut()) {
-                    last.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                    last.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
                 }
             }
             out.insert("tools".into(), json!(atools));
@@ -8659,7 +8703,7 @@ fn oai_to_anthropic_with_cache(
                 if let Some(blocks) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                     if let Some(obj) = blocks.last_mut().and_then(|b| b.as_object_mut()) {
                         // tool_result 的 content 是嵌套结构也允许挂 cache_control（块级均可）。
-                        obj.insert("cache_control".into(), json!({"type":"ephemeral"}));
+                        obj.insert("cache_control".into(), anthropic_cache_control(extended_ttl));
                     }
                 } else if let Some(text) = last_msg
                     .get("content")
@@ -8669,7 +8713,7 @@ fn oai_to_anthropic_with_cache(
                     if let Some(obj) = last_msg.as_object_mut() {
                         obj.insert(
                         "content".into(),
-                        json!([{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]),
+                        json!([{"type":"text","text":text,"cache_control":anthropic_cache_control(extended_ttl)}]),
                     );
                     }
                 }
@@ -11071,6 +11115,10 @@ pub async fn chat_completions(
                             .get("reasoning_effort")
                             .and_then(|v| v.as_str())
                             .is_some_and(|e| crate::model_catalog::supports_effort(&model_id, e)),
+                    // 只有一方线路会真的发 extended-cache-ttl 那个 beta —— 中转商那份
+                    // 集合是照 Claude Code 的 Tv9 挑的，往里加项会改请求指纹。没有 beta 时
+                    // 发 ttl 是无效字段，所以判据和发头的判据用同一个。
+                    anthropic_is_first_party(&candidate.base_url)
                 ) {
                     Ok(v) => v,
                     Err(err) => {
@@ -17447,6 +17495,7 @@ mod billing_tests {
             &json!({"model": "claude-opus-5", "reasoning_effort": eff, "messages": []}),
             true,
             passthrough,
+            false,
         )
         .unwrap()
     }
@@ -17828,6 +17877,53 @@ mod billing_tests {
             !tp.contains("context-1m") && !fp.contains("context-1m"),
             "context-1m 又被焊回基础集合了 —— 体积闸就此失效，98.75% 的请求会无条件带上它",
         );
+    }
+
+    /// 缓存断点必须带 1 小时 TTL —— 不带的话 `ephemeral` 只活 **5 分钟**。
+    ///
+    /// IDE 里两轮之间超过五分钟太常见（读输出、想一想、改点东西再回话）。一超时，整条
+    /// 前缀下一轮按 1.25× 输入价重写，读折扣 0.1× 一分拿不到 —— 用户的原话是
+    /// 「每次相当于新开 chat」。粗算 10 轮 64k 前缀、每轮都超时：800k 等效 vs 186k。
+    ///
+    /// `extended-cache-ttl` 这个 beta 在一方集合里**声明了很久却从没被用上**：用它必须在
+    /// 块上写 `"ttl":"1h"`，而四处断点全是裸的 ephemeral。这条钉的就是那件事。
+    #[test]
+    fn cache_breakpoints_ask_for_the_one_hour_ttl() {
+        let ttl = super::anthropic_cache_control(true);
+        assert_eq!(ttl["type"], serde_json::json!("ephemeral"));
+        assert_eq!(ttl["ttl"], serde_json::json!("1h"), "断点又退回 5 分钟了");
+        // 三方线路不给：ttl 要配 beta 才生效，而三方那份 beta 集合是照 Claude Code 的
+        // Tv9 挑的（上面那条测试钉着项数），加一项会改请求指纹。发一个不生效的字段没意义。
+        let plain = super::anthropic_cache_control(false);
+        assert!(plain.get("ttl").is_none(), "没有 beta 的线路不该发 ttl");
+        // 判据必须和"发不发那个 beta"同源：一方才发 beta，也只有一方给 ttl。
+        //
+        // 断言要钉在**那个调用点**上，不能只查这串字符在不在文件里 —— 它在发 beta 那处
+        // 也出现，于是把调用点改成 `true` 照样绿（实测：变异没被抓到）。
+        // 这是「断言真实却守错了东西」那一类，本仓库为它付过很多次账。
+        let src = include_str!("models.rs");
+        let call = src
+            .split("match oai_to_anthropic_with_cache(")
+            .nth(1)
+            .and_then(|t| t.split_once(") {").map(|(a, _)| a))
+            .expect("生产调用点没找到，锚点漂了");
+        assert!(
+            call.contains("anthropic_is_first_party(&candidate.base_url)"),
+            "ttl 的判据和发 beta 的判据脱钩了——那会发出一个不生效的字段"
+        );
+        assert!(
+            call.contains("route_supports_prompt_cache(candidate)"),
+            "切出来的不是那个调用点"
+        );
+        // 计费相关的改动要能不重新部署就回退。
+        assert!(src.contains("MICHAEL_CACHE_TTL_1H"), "少了回退开关");
+        // 四处断点都要走这个构造器，漏一处那一段就还是 5 分钟。
+        //
+        // needle 运行时拼：这个文件里 #[cfg(test)] 不止一段，按第一个切会把实现整段切掉
+        // （断言恒假）；不切又会被断言自己的字面量喂饱（刚才实测数出 5 个，多的那个就是
+        // 这行代码本身）。旁边 openai_prompt_cache_key 那条测试躲的是同一个坑。
+        let needle = format!("anthropic_cache_{}(extended_ttl)", "control");
+        assert_eq!(src.matches(&needle).count(), 4, "有断点没走统一的构造器");
     }
 
     /// 体积闸：判据只看正文字节，不问模型目录。
@@ -23237,6 +23333,7 @@ mod audit_20260822_tests {
             }),
             false,
             false,
+            false,
         )
         .expect("OpenAI → Anthropic 转换失败");
         assert!(
@@ -23253,6 +23350,7 @@ mod audit_20260822_tests {
                 "model": "claude-sonnet-4-5",
                 "messages": [{ "role": "user", "content": "hi" }],
             }),
+            false,
             false,
             false,
         )
