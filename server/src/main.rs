@@ -1,4 +1,5 @@
 mod agent_trace;
+mod byo_upstream;
 mod api_key_store;
 mod auth;
 mod changelog;

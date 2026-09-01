@@ -10253,11 +10253,30 @@ pub async fn chat_completions(
         "thinking telemetry: inbound chat request"
     );
 
-    let conns = sqlx::query_as::<_, Model>(
-        "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    /*
+     * 用户自带上游：整段线路选择都不适用 —— 他已经指定了唯一一个上游。
+     *
+     * 桌面端「自定义模型」原来是客户端直连用户填的第三方地址。那条路上拿不到完整的系统
+     * 提示词和工具描述（它们由上面的 `prompts::assemble_into` 在服务端注入），长上下文压缩
+     * 也在网关侧 —— 所以那条路上的智能体一直比网关模型弱一截，弹窗里也是这么写的。
+     * 改走这里之后：装配照常发生，只是最后转发到**用户填的地址、用用户自己的密钥**。
+     * 用户拿回完整能力，而提示词和工具描述**始终没有进过客户端**（应用被逆向也取不到）。
+     *
+     * 校验（只收 https、DNS 解析之后逐个查网段、连接钉在验过的 IP 上）在 byo_upstream 里 ——
+     * 那是这条路唯一的 SSRF 防线，有独立测试。校验不过当场 400。
+     */
+    let byo = crate::byo_upstream::from_headers_async(&headers)
+        .await
+        .map_err(AppError::bad)?;
+    let conns = if byo.is_some() {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, Model>(
+            "SELECT * FROM models WHERE active = true ORDER BY sort, created_at",
+        )
+        .fetch_all(&state.db)
+        .await?
+    };
     // 「Claude 强力版」：IDE 打开那个开关时带 x-ide-power-route，这一轮只在运维勾了
     // power_route 的线路里挑。
     //
@@ -10279,7 +10298,12 @@ pub async fn chat_completions(
         Some(&model_id),
     )
     .await;
-    let mut candidates: Vec<Model> = conns
+    let mut candidates: Vec<Model> = if let Some(b) = &byo {
+        // 唯一候选，且计费全零（见 as_candidate）。失败就报上游的错，不换线：
+        // 悄悄改用网关自己的付费线路会花掉用户的额度，而他明确配了自己的端点。
+        vec![b.as_candidate(&model_id)]
+    } else {
+        conns
         .into_iter()
         .filter(|m| {
             // 出口带来的模型也算这条线路能接。真正派给哪个出口由 expand 再筛一次 ——
@@ -10290,8 +10314,9 @@ pub async fn chat_completions(
             )
             .contains(&model_id)
         })
-        .collect();
-    if want_power {
+        .collect()
+    };
+    if byo.is_none() && want_power {
         let power: Vec<Model> = candidates.iter().filter(|m| m.power_route).cloned().collect();
         if power.is_empty() {
             return Err(AppError::bad(format!(
@@ -11155,7 +11180,13 @@ pub async fn chat_completions(
                 // The first attempt uses the warm HTTP/1.1 pool. A retry after an actual
                 // send/status failure owns a client with no idle pool, so it cannot reuse the
                 // transport that just failed. Header stalls leave this loop without replaying.
-                let chat_client = if attempt == 0 {
+                // 自带上游必须用**钉住 IP** 的客户端：校验时解析过一次，如果这里让 reqwest
+                // 再解析一次，攻击者（他控制着那个域名的 DNS）就能在两次之间把记录改成
+                // 127.0.0.1 —— DNS 重绑定的第二步，也是最常被漏掉的一半。
+                // 代价是这条请求不复用连接池；自带上游不是热路径，正确性优先。
+                let chat_client = if let Some(b) = &byo {
+                    crate::byo_upstream::pinned_client(b)
+                } else if attempt == 0 {
                     GW_CHAT_HTTP.clone()
                 } else {
                     build_chat_http_client(0)
