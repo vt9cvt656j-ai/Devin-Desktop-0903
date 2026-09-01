@@ -251,6 +251,24 @@ pub fn usd_cents_to_wallet_cents(usd_cents: i64) -> i64 {
     ((usd_cents as i128 * 10_000) / bps as i128) as i64
 }
 
+/// **用户钱包口径的分 → 美元分。** [`usd_cents_to_wallet_cents`] 的逆。
+///
+/// 只有一个用途，但那个用途是钱：结算入队的快照存的是**折算前的美元分**（重放时
+/// 会再折一次），而免费池部分覆盖时，池子已经付掉的那一份是**人民币分**。要把它从
+/// 快照里减掉，就得先折回美元分——两边同口径才能相减。
+///
+/// 不这么做的后果是一个双扣：池子出了一部分、随后事务开启或认领失败 → 整笔按**原始
+/// 全额**入队 → 恢复重跑时 `from_recovery=true` 跳过免费分支 → 池子付过的那一份被向
+/// 钱包再收一次，而扣掉的点数不回滚。
+pub fn wallet_cents_to_usd_cents(wallet_cents: i64) -> i64 {
+    let bps = usd_per_cny_bps();
+    if bps <= 0 {
+        return wallet_cents;
+    }
+    // 正向是 usd * 10000 / bps，逆向就是 wallet * bps / 10000。
+    ((wallet_cents as i128 * bps as i128) / 10_000) as i64
+}
+
 /// 同一个数的浮点形式，供利润测算用（`models.rs` 原先的 6.63）。
 pub fn raw_usd_per_visible_usd() -> f64 {
     raw_cents_per_credit_usd() as f64 / 100.0

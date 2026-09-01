@@ -359,7 +359,7 @@ async fn measured_upstream_per_visible_usd(
            FROM model_usage u, span s WHERE u.created_at BETWEEN s.lo AND s.hi \
          ) \
          SELECT up.usd, q.raw_cents, q.reqs, \
-                EXTRACT(epoch FROM (s.hi - s.lo)) / 3600.0, \
+                (EXTRACT(epoch FROM (s.hi - s.lo)) / 3600.0)::float8, \
                 COALESCE((SELECT sum(drawn) FROM big) / NULLIF((SELECT all_drawn FROM tot), 0), 0) \
          FROM up, q, span s",
     )

@@ -757,7 +757,6 @@ mod plan_spec_tests {
     ///
     /// This landed once already, on all five plans at once, and would have taken down
     /// every paying account on deploy. The invariant is cheap to assert, so assert it.
-    #[test]
     /// 能不能发放，以**后台配置**为准，不是代码里写死的五元组。
     ///
     /// 两条发放路径必须给出同一个答案：Stripe 付款走 apply_plan → plan_spec 查表，查得到

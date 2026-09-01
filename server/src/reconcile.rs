@@ -628,10 +628,31 @@ pub async fn admin_reconciliation(
             targets.push((e.id, label, false, e.active, e.cost_ratio, e.base_url.clone()));
         }
 
-        // 收入折人民币用的是**线路自带地址那家**的汇率：`revenue_usd` 来自
-        // `compute_cost` 的「官方价 × 线路 rate」，而线路的 rate 是照着自带地址那家
-        // 的价目定的，所以它的量纲属于那一家。成本则各折各家。
-        let rev_rate = crate::relay_rates::usd_per_cny(&r.base_url);
+        // 收入折人民币用**钱包那把尺子**（全局 `usd_per_cny_bps`），成本才各折各家。
+        //
+        // 这两件事看着对称，其实问的是两个问题：
+        //   · 成本 = 我们在那家中转花掉的面值 ÷ 「¥1 在那家买到多少面值」。
+        //     `channel_rates.usd_per_cny` 正是后者，所以成本侧用它是对的。
+        //   · 收入 = 用户被扣了多少人民币。而扣款只走一条路：`bill_inner` 里的
+        //     `usd_cents_to_wallet_cents`，用的是**全局一个** usd_per_cny_bps。
+        //     供应商给我们的进货折扣和用户付多少钱毫无关系。
+        //
+        // 之前这里也取 `channel_rates`，理由是「revenue_usd 的量纲属于自带地址那家」——
+        // 那个说法在 c387e33（2026-08-28 给钱包加全局折算）之后就不成立了，但这段注释
+        // 和钉着它的那条测试没跟着改。后果按站分布，实测 7 天：
+        //     api.hao.ai              页面 ¥7891.29  实际 ¥7846.48   1.0×  ← 碰巧对
+        //     api.teamorouter.com     页面 ¥ 926.86  实际 ¥ 921.59   1.0×  ← 碰巧对
+        //     polly.modelbridge.cc    页面 ¥ 380.79  实际 ¥2704.48   7.1×
+        //     api.hanhegufei.online   页面 ¥ 335.69  实际 ¥2431.83   7.2×
+        //     api.maomaoai.pro        页面 ¥ 217.80  实际 ¥1546.88   7.1×
+        //     zyz.qingyanzhiying.top  页面 ¥  25.12  实际 ¥ 945.46  37.6×
+        //     合计                    页面 ¥9777.57  实际 ¥16396.86  低画 40%
+        // 那两个「碰巧对」是最坏的一种对：这几家的 usd_per_cny 填的 0.14 恰好 ≈ 1/7.1023
+        // （他们按面值卖），于是 Claude 那几条线路的数字一直准，没人怀疑过这一列。
+        //
+        // 折不出来的可能性也随之消失：全局汇率是后台设置，永远有值。所以下面的
+        // `fx_note` 只剩成本侧一种缺口。
+        let cny_per_usd = 10_000.0 / crate::settings::usd_per_cny_bps() as f64;
 
         for (id, label, is_own, active, ratio, base_url) in targets {
             let used = by_ep.get(&id).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -699,17 +720,15 @@ pub async fn admin_reconciliation(
 
             // 折人民币。两家的汇率缺一不可 —— 拿另一家顶上会得到一个看起来精确的错数字。
             let cost_rate = crate::relay_rates::usd_per_cny(&base_url);
-            let fx_note = match (rev_rate, cost_rate) {
-                (Some(_), Some(_)) => String::new(),
-                (None, Some(_)) => format!("线路自带地址那家（{}）还没填充值汇率，收入折不出人民币", host_of(&r.base_url)),
-                (Some(_), None) => format!("这个出口那家（{}）还没填充值汇率，成本折不出人民币", host_of(&base_url)),
-                (None, None) => format!(
-                    "两家都没填充值汇率（{} 和 {}），这一行折不出人民币",
-                    host_of(&r.base_url),
+            // 收入永远折得出来（全局汇率），只有成本侧还可能缺进货折扣。
+            let fx_note = match cost_rate {
+                Some(_) => String::new(),
+                None => format!(
+                    "这个出口那家（{}）还没填充值汇率，成本折不出人民币",
                     host_of(&base_url)
                 ),
             };
-            let rev_cny = rev_rate.filter(|v| *v > 0.0).map(|v| revenue / v);
+            let rev_cny = Some(revenue * cny_per_usd);
             let to_cny = |x: f64| cost_rate.filter(|v| *v > 0.0).map(|v| x / v);
             let cost_cny = row_cost.and_then(to_cny);
             let margin_cny = match (rev_cny, cost_cny) {
@@ -1597,19 +1616,31 @@ mod tests {
         // 每花掉一美元官方价只要 ¥0.65，比自带地址还便宜。同一条流水两个相反结论。
         let body = fn_body(&src(), "pub async fn admin_reconciliation(");
 
-        // 收入折的是**线路**那家，成本折的是**出口**那家 —— 两个基准必须分开取。
+        // 收入折**钱包那把尺子**，成本折**出口那家的进货折扣** —— 两个基准不同源。
+        //
+        // 这条断言 2026-08-31 反过来了。原来它钉的是「收入也用 channel_rates」，
+        // 理由写着「revenue_usd 的量纲属于线路自带地址那家」。那个理由在 c387e33
+        // （2026-08-28 给钱包加全局折算）之后就不成立了：扣用户钱只走
+        // `usd_cents_to_wallet_cents`，用的是全局一个 usd_per_cny_bps，和供应商给我们的
+        // 进货折扣毫无关系。实测 7 天两把尺子的差：zyz 那条线路 37.6 倍，合计低画 40%
+        // （详见 admin_reconciliation 里那张表）。而 api.hao.ai / teamorouter 一直是准的，
+        // 因为他们的 usd_per_cny 填的 0.14 恰好 ≈ 1/7.1023 —— 「碰巧对」正是这条错了
+        // 三个月没人发现的原因。
         assert!(
-            body.contains("let rev_rate = crate::relay_rates::usd_per_cny(&r.base_url);"),
-            "收入没按线路自带那家的汇率折 —— 它的量纲就是那一家的",
+            body.contains("let cny_per_usd = 10_000.0 / crate::settings::usd_per_cny_bps() as f64;"),
+            "收入没按钱包那把尺子折 —— 用户实付走的是全局汇率，不是某家中转的进货折扣",
+        );
+        assert!(
+            body.contains("let rev_cny = Some(revenue * cny_per_usd);"),
+            "收入折算没接上全局汇率",
+        );
+        assert!(
+            !body.contains("crate::relay_rates::usd_per_cny(&r.base_url)"),
+            "收入又回去取中转的进货折扣了 —— 那是「¥1 在那家能买多少面值」，不是汇率",
         );
         assert!(
             body.contains("let cost_rate = crate::relay_rates::usd_per_cny(&base_url);"),
             "成本没按这个出口那家的汇率折 —— 跨中转的行会整整错一个汇率的倍数",
-        );
-        assert!(
-            body.contains("crate::relay_rates::usd_per_cny(&r.base_url)")
-                && body.contains("crate::relay_rates::usd_per_cny(&base_url)"),
-            "两个基准取成同一家了 —— 那等于没折",
         );
 
         // 毛利率必须用折过的算。这是页面上最显眼、也最容易被信以为真的那个数。
@@ -1631,8 +1662,9 @@ mod tests {
         // 正面钉形状，不列禁用词：兜底的写法有无数种（unwrap_or / unwrap_or_default /
         // unwrap_or_else / 提前赋个默认值……），黑名单挡不住，而漏掉一种的后果是
         // 「没填汇率的站凭空显示成成本极低」——最该拦的恰好是这一种。
+        // 成本侧仍然可能「折不出来」（那家的进货折扣没填），这时必须如实变成 None。
+        // 收入侧不再有这个可能：全局汇率是后台设置，永远有值。
         for shape in [
-            "let rev_cny = rev_rate.filter(|v| *v > 0.0).map(|v| revenue / v);",
             "let to_cny = |x: f64| cost_rate.filter(|v| *v > 0.0).map(|v| x / v);",
         ] {
             assert!(

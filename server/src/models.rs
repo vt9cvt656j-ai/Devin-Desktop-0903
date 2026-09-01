@@ -5100,9 +5100,30 @@ fn compute_cost(
     // price. This lets each checked model be priced individually while keeping the catalog default.
     // 价格来自哪一层，决定了缓存价该跟谁：来自模型（每模型覆盖或官方目录）就按模型的输入价
     // 推导；只有当输入价本身就是连接级兜底时，连接级的缓存价才是同一层配置、才该生效。
-    let (off_in, off_out, price_is_per_model, _price_source) =
+    let (off_in, off_out, price_is_per_model, price_source) =
         effective_token_prices(model_id, admin_in, admin_out, model_over);
     if off_in <= 0.0 && off_out <= 0.0 {
+        // 「有意免费」和「没配价」在这里长得一模一样，可后果完全相反 —— 前者是运营的决定，
+        // 后者是白送，而上游的钱照付。判据是 `price_source`：
+        //   · "model_override"：后台**显式**为这个模型填了 0（deepseek-v4-pro 就是这样，
+        //     配的是 mode:free + {"in":0,"out":0}）—— 静默返回 0 正是要的行为。
+        //   · "backend"：每模型没填、官方目录也没有，退到连接级两列，而那两列也是 0。
+        //     这是漏，不是免费。
+        //
+        // 实测这条路上真的有钱在漏：deepseek-v4-flash-vision-exp 挂在 deepseek 线路上，
+        // 三样价都是 0 且没配 mode:free，2026-08-29 那天 57 次调用里 49 次收 0（155 万
+        // token），而它既不进免费池也不扣钱包 —— 完全不计量。同一形状 08-28 还吞掉过
+        // grok-4.6 的 717 次 / 3403 万 token。
+        //
+        // 只告警不改行为：这一层不该替运营决定「没配价的模型按多少收」。要看规模去
+        // 总览页，那里按 model_usage 现算（见 realtime::stats 的 zero_priced_24h）。
+        if price_source != "model_override" {
+            tracing::error!(
+                model = %model_id, prompt, completion,
+                event = "billing_zero_price",
+                "解析不出单价，这一次按 0 收 —— 上游的钱照付。去后台给这个模型补一条每模型价格"
+            );
+        }
         return 0; // no known price for this model → can't compute a real cost
     }
     let cache_read = u.get("cache_read_input_tokens").and_then(|v| v.as_f64()); // Anthropic
@@ -6528,6 +6549,9 @@ async fn record_usage_row(
     state: &AppState,
     uid: uuid::Uuid,
     conn_id: uuid::Uuid,
+    // 哪个出口服务的。对账页按出口分组，而这张表此前只有线路 id。
+    // 恢复重跑那条路没有这一位（队列行里没存），传 None。
+    endpoint_id: Option<uuid::Uuid>,
     cost_cents: i64,
     free_milli_points_spent: i64,
     tokens: &BillTokens,
@@ -6535,8 +6559,8 @@ async fn record_usage_row(
     // model_id 走子查询，理由同下面付费那条：线路被删之后直接绑 conn_id 会撞外键，
     // 这一行用量就永远记不进去。NULL 是这张表既有的「线路已删」表示法。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, free_milli_points_spent, prompt_includes_cached, endpoint_id, wallet_cents, quota_cents) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,0,0)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -6553,6 +6577,8 @@ async fn record_usage_row(
     .bind(tokens.emitted_tool.as_deref())
     .bind(free_milli_points_spent)
     .bind(tokens.prompt_includes_cached)
+    // 免费池全额付掉的这一路，钱包和套餐额度一分没动 —— 上面写死 0，是事实不是缺省。
+    .bind(endpoint_id)
     .execute(&state.db)
     .await
     {
@@ -7022,7 +7048,8 @@ async fn bill(
 ) {
     let settlement_id = uuid::Uuid::new_v4();
     let _ = bill_inner(
-        state, uid, conn_id, cost, use_quota, tokens, free_pool, free_micro_usd, settlement_id, false,
+        state, uid, conn_id, Some(health_id), cost, use_quota, tokens, free_pool, free_micro_usd,
+        settlement_id, false,
     )
     .await;
     // 模型名取 `tokens.model_name` —— 和写进 model_usage 的**同一个字段**。
@@ -7064,8 +7091,11 @@ pub(crate) async fn resettle(state: &AppState, row: &crate::settlement::Unsettle
         tool_turn: row.is_tool_turn,
         emitted_tool: row.emitted_tool.clone(),
     };
+    // 出口 id 队列行里没存（`unsettled_charges` 建表时还没有这一列），如实传 None ——
+    // 而不是拿线路 id 顶上：那会让一条补扣行在对账页上算到「线路自带地址」那个出口头上。
+    // 影响面已量过：线上 unsettled 只有 1 行 / 12 分。
     bill_inner(
-        state, row.user_id, row.conn_id, row.cost_cents, row.use_quota, &tokens, row.free_pool,
+        state, row.user_id, row.conn_id, None, row.cost_cents, row.use_quota, &tokens, row.free_pool,
         row.free_micro_usd, row.settlement_id, true,
     )
     .await
@@ -7075,6 +7105,9 @@ async fn bill_inner(
     state: &AppState,
     uid: uuid::Uuid,
     conn_id: uuid::Uuid,
+    // 服务这一次的出口（线路自带地址时就是线路 id，和 health_id 同一套命名空间）。
+    // 恢复重跑没有这一位 → None。
+    endpoint_id: Option<uuid::Uuid>,
     cost: i64,
     use_quota: bool,
     tokens: &BillTokens,
@@ -7098,7 +7131,16 @@ async fn bill_inner(
     //
     // **快照里存的必须是折算前的美元分。** 折算写在它前面的话，重放时会再折一次，
     // 7.1 × 7.1 ≈ 50 倍 —— 而重放路径平时不走，这种错要等到一次结算失败才暴露。
-    let queue_input = |stage: &'static str| crate::settlement::QueueInput {
+    //
+    // **金额存在一个 Cell 里，不是直接捕获 `cost`。** 免费池「部分覆盖」之后，池子已经
+    // 付掉的那一份必须从快照里减掉：恢复重跑时 `from_recovery=true` 会跳过免费分支，
+    // 拿到全额就向钱包再收一次池子付过的钱，而扣掉的毫点不回滚。抽干模式（
+    // `spend_free_points_draining`）上线之后部分覆盖是**常规路径**，不再是理论情形。
+    //
+    // 金额**作参数传进来**，不在闭包里捕获：`Cell` 会让这个 future 不再是 `Send`
+    // （axum 的 handler 要求 Send），而这个函数每一步都在 await。
+    let mut queued_usd_cents = cost;
+    let queue_input = |stage: &'static str, cost: i64| crate::settlement::QueueInput {
         settlement_id,
         uid,
         conn_id,
@@ -7191,10 +7233,17 @@ async fn bill_inner(
         if spent >= want {
             // cost_cents stays the REAL provider cost (so operator-side reporting is honest);
             // free_points_spent carries what the user actually paid, in 点.
-            record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
+            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, tokens).await;
             return BillOutcome::Settled;
         }
         // 部分覆盖：池子出了 `spent` 毫点，剩下的零头往下走付费路径。
+        //
+        // 先把队列快照改成**残额**。下面任何一步失败都会 `queue_input(...)` 入队，而入队
+        // 的金额是折算前的美元分 —— 池子付掉的 `spent` 毫点是人民币分口径，折回美元分
+        // 再减，两边才同口径。不减的话恢复重跑会把这一份再向钱包收一次（见 Cell 处注释）。
+        queued_usd_cents =
+            (cost - crate::settings::wallet_cents_to_usd_cents(spent / MILLI_POINTS_PER_CENT))
+                .max(0);
         // 记账两边都要说实话 —— model_usage 同时有 free_milli_points_spent 和 cost_cents，
         // 一次调用由两个池子分摊是能如实表达的（线上本来就有 2801 行两列同时非零）。
         pool_paid_milli = spent;
@@ -7202,7 +7251,7 @@ async fn bill_inner(
             // 开关关掉时保持老行为：池子空了也只走池子，扣不到就记 0。
             // 记的是**真扣掉的**那部分（抽干模式下可能是部分覆盖），不再写死 0 ——
             // 否则用量历史会说「一点没花」，而池子确实少了那么多。
-            record_usage_row(state, uid, conn_id, requested_cost, spent, tokens).await;
+            record_usage_row(state, uid, conn_id, endpoint_id, requested_cost, spent, tokens).await;
             return BillOutcome::Settled;
         }
         // 落下去，按普通付费调用结算（quota → 钱包）。
@@ -7230,7 +7279,7 @@ async fn bill_inner(
                 "failed to begin billing transaction (call served, NOT charged)"
             );
             if !from_recovery {
-                crate::settlement::queue(state, queue_input("begin_tx")).await;
+                crate::settlement::queue(state, queue_input("begin_tx", queued_usd_cents)).await;
             }
             return BillOutcome::Deferred { stage: "begin_tx", error: error.to_string() };
         }
@@ -7266,7 +7315,7 @@ async fn bill_inner(
                 "failed to claim settlement id (call served, NOT charged)"
             );
             if !from_recovery {
-                crate::settlement::queue(state, queue_input("claim")).await;
+                crate::settlement::queue(state, queue_input("claim", queued_usd_cents)).await;
             }
             return BillOutcome::Deferred { stage: "claim", error: error.to_string() };
         }
@@ -7337,7 +7386,7 @@ async fn bill_inner(
                     "failed to lock balances for billing (call served, NOT charged)"
                 );
                 if !from_recovery {
-                    crate::settlement::queue(state, queue_input("lock_balances")).await;
+                    crate::settlement::queue(state, queue_input("lock_balances", queued_usd_cents)).await;
                 }
                 return BillOutcome::Deferred { stage: "lock_balances", error: error.to_string() };
             }
@@ -7380,7 +7429,7 @@ async fn bill_inner(
                 "failed to deduct fused quota and credits (call served, NOT charged; tx rolled back)"
             );
             if !from_recovery {
-                crate::settlement::queue(state, queue_input("deduct")).await;
+                crate::settlement::queue(state, queue_input("deduct", queued_usd_cents)).await;
             }
             return BillOutcome::Deferred { stage: "deduct", error: error.to_string() };
         }
@@ -7396,8 +7445,8 @@ async fn bill_inner(
     // 线上已经有 20708 行是这样。model_name 是 NOT NULL 的独立列，所以是哪个模型照样查得到，
     // 账单和用量统计一个字都不少。
     if let Err(error) = sqlx::query(
-        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent) \
-         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+        "INSERT INTO model_usage (user_id, model_id, cost_cents, prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, model_name, estimated, request_id, ide_mode, is_tool_turn, emitted_tool, settlement_id, prompt_includes_cached, free_milli_points_spent, endpoint_id, wallet_cents, quota_cents) \
+         VALUES ($1,(SELECT id FROM models WHERE id = $2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
     )
     .bind(uid)
     .bind(conn_id)
@@ -7421,6 +7470,17 @@ async fn bill_inner(
     // 部分覆盖时池子出的那一份也要落在这一行上，否则「谁付的钱」只剩现金那一半，
     // 而池子确实少了这么多毫点 —— 对账两侧就此对不上。
     .bind(pool_paid_milli)
+    // ── 「这笔钱到底谁付的」，四个来源各记各的 ──────────────────────────
+    //
+    // cost_cents 上面记的是**这次调用的真实成本**，它把四份揉成一个数：钱包出的、
+    // 套餐额度出的、免费池出的，以及订阅超出配额时**运营方吸收**的那一段。揉在一起
+    // 之后，任何报表都答不出「我们实际收到多少钱」——对账页原来只好拿售价去反推，
+    // 再除以一个各家各样的「进货折扣」当汇率，于是一条线路能差 37.6 倍。
+    //
+    // 分开记之后就不用折算了：wallet + quota 就是真金白银，差额就是被吸收的部分。
+    .bind(endpoint_id)
+    .bind(charge.wallet_cents)
+    .bind(charge.quota_cents)
     .execute(&mut *tx)
     .await
     {
@@ -7432,7 +7492,7 @@ async fn bill_inner(
             "failed to insert billing settlement (tx rolled back; call served, NOT charged)"
         );
         if !from_recovery {
-            crate::settlement::queue(state, queue_input("insert_usage")).await;
+            crate::settlement::queue(state, queue_input("insert_usage", queued_usd_cents)).await;
         }
         return BillOutcome::Deferred { stage: "insert_usage", error: error.to_string() };
     }
@@ -7448,7 +7508,7 @@ async fn bill_inner(
             "failed to commit billing transaction (call served; queued for idempotent recovery)"
         );
         if !from_recovery {
-            crate::settlement::queue(state, queue_input("commit")).await;
+            crate::settlement::queue(state, queue_input("commit", queued_usd_cents)).await;
         }
         return BillOutcome::Deferred { stage: "commit", error: error.to_string() };
     }
@@ -13044,7 +13104,6 @@ mod billing_tests {
     /// 出口那侧的 clean_protocol 一直是 trim + 小写 + 400；线路这侧原来是大小写敏感
     /// 精确匹配、认不出就 `_ => m.protocol`。同一个字段两个表单行为相反：
     /// 出口填错当场红，线路填错**保存成功但一个字没变**，而运维以为切过去了。
-    #[test]
     /// 两侧白名单读的是同一份常量。
     ///
     /// 出口协议会覆盖线路协议，只放行一侧的话不会报任何错，只会安静地走错路。
@@ -14974,13 +15033,10 @@ mod billing_tests {
         assert_eq!(t(&previous_cycle), Some(false));
     }
 
-    #[test]
     /// 免费额度用完之后，免费模型改用付费余额/会员额度继续跑。
     ///
     /// 之前是硬 402：免费池见底那一刻，免费模型既扣不到钱也不再让用，而用户的钱包和
     /// 会员额度明明还有。开关关掉时回到老行为。
-    #[test]
-    #[test]
     /// 准入门问的问题，必须和结算答的问题是同一个。
     ///
     /// 结算全额扣或一点不扣；门却只看 `balance > 0`。于是按次计费的免费模型（60 毫点/次）
@@ -15159,7 +15215,6 @@ mod billing_tests {
         );
     }
 
-    #[test]
     /// 后台删掉一条线路，不能把那条线路上没结算完的钱一起弄没。
     ///
     /// `model_usage.model_id` 外键指向 models(id)。线路被删之后，指向它的那笔补扣每次
@@ -15293,16 +15348,27 @@ mod billing_tests {
 
         // 提交失败也入队（模糊提交由恢复端先查账本兜住，不会双扣）。
         assert!(
-            body.contains("queue_input(\"commit\")"),
+            body.contains("queue_input(\"commit\", "),
             "提交失败必须入队恢复",
         );
-        // 五个致命失败分支都要入队。
+        // 六个致命失败分支都要入队，**而且入队的必须是残额**。
+        //
+        // 金额那一位不是形式：免费池「部分覆盖」之后（抽干模式上线后这是常规路径），
+        // 池子已经付掉一部分，而恢复重跑 `from_recovery=true` 会跳过免费分支。入队的
+        // 若是原始全额，池子付过的那一份就被向钱包**再收一次**，且扣掉的毫点不回滚。
+        // 所以这里钉住实参名：谁把它改回 `cost`，这条就红。
         for stage in ["begin_tx", "claim", "lock_balances", "deduct", "insert_usage", "commit"] {
+            let call = format!("queue_input(\"{stage}\", queued_usd_cents)");
             assert!(
-                body.contains(&format!("queue_input(\"{stage}\")")),
-                "失败分支 {stage} 没有入队恢复",
+                body.contains(&call),
+                "失败分支 {stage} 没有入队恢复，或入队的不是扣除免费池之后的残额（应为 {call}）",
             );
         }
+        // 残额本身要在部分覆盖那一步被真的改小 —— 只传参不赋值等于什么都没做。
+        assert!(
+            body.contains("queued_usd_cents =\n            (cost - crate::settings::wallet_cents_to_usd_cents("),
+            "部分覆盖时没有把免费池已付的那一份从队列快照里减掉",
+        );
     }
 
     #[test]
@@ -15376,9 +15442,16 @@ mod billing_tests {
         // 加它是因为按量计费的免费模型现在会**部分覆盖**：池子出一部分、钱包出零头。
         // 不落这一列的话，这一行只剩现金那一半，而池子确实少了那么多毫点——
         // 「谁付的钱」在对账两侧就永远对不上。
-        assert_eq!(cols, 16, "model_usage 列数变了");
-        assert_eq!(max_ph, 16, "占位符和列数对不上");
-        assert_eq!(binds, 16, ".bind() 和列数对不上——结算会运行时报错");
+        // 19 = 上面 16 列 + endpoint_id + wallet_cents + quota_cents。
+        // 加这三列是因为 cost_cents 一个数答不了「这笔钱谁付的」：它把钱包出的、套餐
+        // 额度出的、免费池出的、以及订阅超配额时运营方吸收的那一段揉在一起。揉着的
+        // 后果是对账页只能拿**售价**去反推收入，再除以一个各家各样的「进货折扣」当
+        // 汇率 —— 实测同一批流水，zyz 那条线路两把尺子差 37.6 倍，合计低画 40%。
+        // 分开记之后收入不用折算，差额本身就是被吸收的那部分。
+        // endpoint_id 则是因为对账按**出口**分组，而这张表此前只有线路 id。
+        assert_eq!(cols, 19, "model_usage 列数变了");
+        assert_eq!(max_ph, 19, "占位符和列数对不上");
+        assert_eq!(binds, 19, ".bind() 和列数对不上——结算会运行时报错");
     }
 
     #[test]
@@ -15506,7 +15579,6 @@ mod billing_tests {
     ///
     /// 断的是**机制**，不是措辞：只要「池子扣不到时余数原样留着」这件事回来，
     /// 门就会永远说「免费池能付」，这条就红。
-    #[test]
     /// 抽干这件事**发生在 SQL 里**，单测跑不到——所以守调用点和 SQL 本身的形状。
     ///
     /// 上一条只证明了「假如池子被抽干，门就会拦」，它对「池子到底会不会被抽干」一无所知：
@@ -15557,6 +15629,13 @@ mod billing_tests {
         );
     }
 
+    /// 抽干之后那道门重新可达。
+    ///
+    /// **这条以前一次都没跑过。** 上一个函数头上误挂了两个 `#[test]`（一个在文档注释
+    /// 前面、一个在后面），两个都绑到了它身上，于是这条只是一个普通的私有函数：
+    /// `cargo test -- --list` 里它一次都不出现，而上一个出现两次。透支修复的
+    /// **行为**证据全在这条里，也就是说那个修复当时是没有守卫的。
+    #[test]
     fn drained_pool_makes_the_gate_reachable_again() {
         // 按量计费的免费模型：门只能退到地板 1。
         assert_eq!(super::free_points_needed(0), 1);
@@ -15874,13 +15953,11 @@ mod billing_tests {
     // REAL billing = (in·off_in + out·off_out)/1e6 · 100 · 倍率. Normal agent turn on
     // Claude Opus ($5/$25), 22k in + 2k out:
     //   (22000·5 + 2000·25)/1e6 = $0.16 = 16¢ real cost. × 倍率 3 → 48¢ billed.
-    #[test]
     /// 缓存价跟着模型走，不被连接级那一个数盖住。
     ///
     /// 线上 Claude 连接的 cache_create_price 填的是 3.75 —— 那是 Sonnet 的写入价（1.25×$3）。
     /// 同一条连接上还跑着 Opus（$5，应为 6.25）和 Fable（$10，应为 12.5）。缓存写入是单价最贵
     /// 的一类 token，30 天实测仅此一项少收约 $119。连接级两列只在这个模型压根没有输入价时兜底。
-    #[test]
     /// 免费模型的豁免必须每个模型调用入口都有，不能只有 chat_completions 有。
     ///
     /// 漏掉的那个接口上，同一份后台配置会给出相反的结果：IDE 走 /v1/chat/completions 能用，

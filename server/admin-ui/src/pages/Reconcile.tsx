@@ -95,7 +95,7 @@ type Row = {
   margin_cny: number | null;
   cost_by_balance_cny: number | null;
   derived_cost_cny: number | null;
-  /** 折不出来时说明是哪一家没填汇率。 */
+  /** 成本折不出来时说明是哪一家没填充值汇率。收入永远折得出来（走全局汇率）。 */
   fx_note: string;
   unpriced_models: string[];
   legacy_only: boolean;
@@ -147,9 +147,16 @@ const usd = (v: number | null | undefined) =>
 /**
  * 人民币。页面上的钱一律用它。
  *
- * 原来这一屏所有金额都打 `$`，而那两侧根本不是同一种「美元」：收入是按线路自带地址
- * 那家的口径算的，成本是**这个出口那家中转的余额面值**。两家充值汇率差多少，减出来的
- * 毛利就错多少倍。线上清衍那一行因此显示成「毛利 -144%」，而它实际是赚的。
+ * 原来这一屏所有金额都打 `$`，而那两侧根本不是同一种「美元」：成本是**这个出口那家
+ * 中转的余额面值**，收入是我们按售价算出来的美元。两边不折成人民币就没法相减，线上
+ * 清衍那一行因此显示成「毛利 -144%」，而它实际是赚的。
+ *
+ * 2026-08-31 又改了一次，改的是**收入**用哪把尺子。此前收入也除以 `channel_rates`
+ * 里那个站的 `usd_per_cny`，理由是「收入的量纲属于线路自带地址那家」——那个理由在
+ * 给钱包加全局折算（c387e33）之后就不成立了：扣用户钱只走一条路、用的是后台那个
+ * 全局汇率，供应商给我们的进货折扣跟用户付多少钱毫无关系。实测 7 天，同一批流水
+ * 两把尺子折出来的收入差 40%，单 zyz 那条线路差 37.6 倍；而 api.hao.ai 一直是准的，
+ * 因为它填的 0.14 恰好 ≈ 1/7.1023 —— 「碰巧对」正是这条错了没人发现的原因。
  * 折算在服务端做（`reconcile.rs`），这里只负责别再打错货币符号。
  */
 const cny = (v: number | null | undefined) =>
@@ -228,7 +235,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
         description={
           accountsView
             ? "按价目表算出来的消耗，和中转余额实际掉的钱，对不对得上。"
-            : "金额一律折成人民币再比——收入按线路自带那家的口径、成本按这个出口那家的充值汇率，两家不折就没法相减。真实 token × 真实单价；抓不到价目的按「OpenRouter 官方价 × 倍率」推算并标出来，仍然算不出的显示未知，不按 0 算。"
+            : "金额一律折成人民币再比。收入按**用户实际被扣钱的那把尺子**（后台的全局汇率），成本按**这个出口那家的充值汇率**（¥1 在那儿买到多少面值）——两者问的不是同一个问题，供应商给我们的进货折扣和用户付多少钱无关。真实 token × 真实单价；抓不到价目的按「OpenRouter 官方价 × 倍率」推算并标出来，仍然算不出的显示未知，不按 0 算。"
         }
         actions={
           <div className="flex items-center gap-2">
@@ -267,7 +274,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
             value={cny(t.revenue_cny)}
             hint={
               t.fx_missing_rows > 0
-                ? `最近 ${data?.days} 天 · 有 ${t.fx_missing_rows} 个出口因为汇率没填折不出来，没算进去`
+                ? `最近 ${data?.days} 天 · 有 ${t.fx_missing_rows} 个出口因为充值汇率没填，成本折不出来，没算进去`
                 : `最近 ${data?.days} 天 · ${t.fx_rows} 个出口`
             }
           />
@@ -287,7 +294,7 @@ export function Reconcile({ view }: { view: ReconcileView }) {
               totalPct === null
                 ? "没有可比的收入"
                 : t.fx_missing_rows > 0
-                  ? `${totalPct.toFixed(1)}% · ${t.fx_missing_rows} 个出口汇率没填，没算进去`
+                  ? `${totalPct.toFixed(1)}% · ${t.fx_missing_rows} 个出口充值汇率没填，没算进去`
                   : `${totalPct.toFixed(1)}%`
             }
           />

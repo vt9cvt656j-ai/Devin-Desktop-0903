@@ -1336,7 +1336,6 @@ mod tests {
     /// 实测：这几家中转的前端整个没有汇率常量（currency 分包只是格式化工具）。
     /// 每档充值各自定价，¥50 和 ¥200 两档的到账金额常常不成比例 —— 取平均会把
     /// 「哪一档划算」这件事整个抹平，而那正是这张表唯一的用途。
-    #[test]
     /// 拉不到充值套餐时，**必须说清是哪一条路径断的**。
     ///
     /// 五条失败路径原来一律 `return Vec::new()`，一行日志都不留，于是
@@ -1386,6 +1385,10 @@ mod tests {
         assert!(ui.contains("充值套餐没拉到："), "页面没把原因显示出来");
     }
 
+    /// 充值比例是**按档**的，不能取一个平均汇率。
+    ///
+    /// 少了 `#[test]`，这条从来没跑过（`cargo test -- --list` 里找不到它）。
+    #[test]
     fn the_topup_rate_is_per_plan_not_a_single_exchange_rate() {
         let cheap = TopupPlan {
             key: "a".into(), name: "小额".into(), price: 50.0, currency: "CNY".into(),

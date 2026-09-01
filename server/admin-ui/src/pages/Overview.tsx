@@ -52,6 +52,14 @@ type Stats = {
   paid_orders?: number;
   revenue_cents?: Record<string, number>;
   plan_mix?: Record<string, number>;
+  // 近 24 小时「有 token、没收钱、也没扣免费点」的调用：上游的钱我们照付，两头都没进账。
+  // 原因永远是这个模型在这条线路上三样价都没配（每模型价 / 官方目录 / 连接级），
+  // compute_cost 只好返回 0。服务端已排除 mode:"free" 的模型 —— 那些是有意免费的。
+  zero_priced_24h?: {
+    calls: number;
+    tokens: number;
+    models: { model: string; calls: number; tokens: number }[];
+  };
 };
 
 /** pay.rs Order（只取这一屏用得上的字段）。email / amount_cents / status 在库里都是非空。 */
@@ -270,6 +278,42 @@ export function Overview() {
         <Stat label="总用户" value={stats ? num(stats.total_users) : "—"} />
         <Stat label="今日新增" value={stats ? num(stats.today_users) : "—"} />
       </SectionReveal>
+
+      {/* 只在真的有漏的时候出现。
+          常驻一个写着 0 的卡片是噪音，看几天就没人看了；一条平时不在、一出现就意味着
+          正在漏钱的横幅才是信号。实测抓到过两笔：grok-4.6 在 2026-08-28 一天里 717 次 /
+          3403 万 token 收 0（新线路还没填每模型价），deepseek-v4-flash-vision-exp 在
+          08-29 是 49/57 次。这两笔当时在后台任何一页上都看不见。 */}
+      {!!stats?.zero_priced_24h?.calls && (
+        <SectionReveal as="section" delay={90}>
+          <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-5">
+            <div className="flex items-baseline justify-between gap-4">
+              <h2 className="text-sm font-semibold text-amber-600 dark:text-amber-400">
+                近 24 小时有 {num(stats.zero_priced_24h.calls)} 次调用没收到钱
+              </h2>
+              <span className="text-sm tabular-nums text-muted-foreground">
+                {num(stats.zero_priced_24h.tokens)} token
+              </span>
+            </div>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              这些模型在它所在的线路上没有可用单价（每模型价、官方目录、连接级三样都是空或 0），
+              于是按 0 收 —— 而上游的钱照付。去「模型」页给它们补一条每模型价格；
+              如果本来就想免费，把它配成 <code className="text-xs">mode: "free"</code>，
+              这样至少会走免费额度池，也不会再出现在这里。
+            </p>
+            <ul className="mt-3 space-y-1">
+              {stats.zero_priced_24h.models.map((m) => (
+                <li key={m.model} className="flex items-baseline justify-between text-sm">
+                  <span className="font-mono text-xs">{m.model}</span>
+                  <span className="tabular-nums text-muted-foreground">
+                    {num(m.calls)} 次 · {num(m.tokens)} token
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </SectionReveal>
+      )}
 
       {/* Two things the old dashboard could not answer: what SHAPE the customer base is, and
           whether signups are moving. Both come from the users list already being fetched. */}
