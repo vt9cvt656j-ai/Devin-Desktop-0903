@@ -20,6 +20,7 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde_json::json;
 
@@ -142,6 +143,58 @@ pub async fn liveness() -> Json<serde_json::Value> {
         "status": "ok",
         "response_cache": { "hit": hit, "miss": miss, "store": store },
     }))
+}
+
+/// `GET /health/reports` — 部署后真的把money报表的查询跑一遍。
+///
+/// 起因：`/api/admin/plan-health` 在 2026-08-31 整天返回 500，而每一次部署都打印
+/// 「deployment healthy」。因为探活只 `curl /health`，那个端点连数据库都不碰。
+///
+/// 这一类错**编译期和空表上都看不见**：sqlx 解码要求列的 PG 类型和 Rust 类型严格
+/// 匹配，而两边写在不同地方（SQL 在字符串里、类型在 `let x: (f64, …)` 上）。对不上
+/// 时唯一的表现是接口 500，**且只在查询真的返回了行的时候**。plan-health 那条就是
+/// 这样：余额探针 2026-08-25 才上线，在那之前它恒返回 0 行、走 `None` 分支，绿了几个月。
+///
+/// 所以这里跑的是**同一份代码**，不是抄一份 SQL —— 抄的副本对「被抄那边改了类型
+/// 转换」结构性地看不见，等于自检自己。
+///
+/// **只回名字和成败，不回任何数据**：这个端点和 `/health` 一样免鉴权（部署脚本要在
+/// 容器里 curl 它，那时还没有任何凭据）。真实报错写进日志，不进响应体 —— 报错文本
+/// 里会带列名和表名。
+pub async fn reports(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let mut checks = Vec::new();
+    let mut all_ok = true;
+    let mut note = |name: &str, err: Option<String>| {
+        if let Some(e) = &err {
+            tracing::error!(check = %name, error = %e, event = "health_report_failed",
+                "报表查询跑不通 —— 对应的后台页面现在就是 500");
+        }
+        all_ok &= err.is_none();
+        checks.push(json!({ "name": name, "ok": err.is_none() }));
+    };
+
+    // 套餐健康页最外层那条：五列里有一列是 EXTRACT(...)/3600.0，PG 14 起回 numeric。
+    note(
+        "plan_health.measured_upstream",
+        crate::plan_health::measured_upstream_per_visible_usd(&state)
+            .await
+            .err()
+            .map(|e| format!("{} {}", e.status, e.msg)),
+    );
+
+    // 总览页那条「白送出去的调用」。走的是 stats 用的同一个函数。
+    // 它内部 unwrap_or_default，查询炸了会静默变成空 —— 所以这里额外看一眼形状：
+    // 缺 key 就说明那条 SQL 没跑通，而页面上只会表现为「今天没有漏收」，
+    // 也就是**报表的失败和好消息长得一模一样**，这正是要拦的。
+    let zp = crate::realtime::zero_priced_24h(&state).await;
+    note(
+        "stats.zero_priced_24h",
+        (!zp.get("models").map(|m| m.is_array()).unwrap_or(false))
+            .then(|| "zero_priced_24h 没有返回 models 数组".to_string()),
+    );
+
+    let code = if all_ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR };
+    (code, Json(json!({ "ok": all_ok, "checks": checks })))
 }
 
 #[derive(serde::Deserialize)]

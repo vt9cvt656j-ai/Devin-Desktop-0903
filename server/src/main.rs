@@ -208,6 +208,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(root_redirect))
         .route("/api/logo.png", get(logo_png))
         .route("/health", get(health::liveness))
+        // 部署脚本在容器里 curl 它：跑一遍报表查询，跑不通就让这次发版红。
+        // 只回名字和成败，不回数据（和 /health 一样免鉴权）。
+        .route("/health/reports", get(health::reports))
         // 加密层的引导。这两条永远明文、永远不要求加密 —— 给它们加密是循环依赖。
         // 拿公钥不需要登录：公钥是公开的，而任何客户端在有会话之前就得先能加密。
         .route("/api/crypto/pubkey", get(mse::pubkey))

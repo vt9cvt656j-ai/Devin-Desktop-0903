@@ -298,7 +298,7 @@ pub async fn admin_plan_health(
 /// 分站的比值是**污染的**：额度按线路的 base_url 归属，而请求会 failover 到别的站的出口去，
 /// 于是「这个站掉的钱」和「归到这个站的额度」不是同一批请求。实测 mhapi 掉了 $21.84 却
 /// 一分额度都没归到它名下。总量上这些错配互相抵消，分站不行。
-async fn measured_upstream_per_visible_usd(
+pub(crate) async fn measured_upstream_per_visible_usd(
     state: &AppState,
 ) -> Result<Option<serde_json::Value>, AppError> {
     // 探针**串过台**：开头两轮（2026-08-25 22:13 和 22:24）里，hanhegufei 的 Claude 路由和

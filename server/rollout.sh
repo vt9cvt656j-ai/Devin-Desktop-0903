@@ -84,6 +84,25 @@ wait_health() { # $1=端口
   return 1
 }
 
+# 活着 ≠ 后台页面能打开。
+#
+# `/health` 连数据库都不碰，所以 2026-08-31 那天 `/api/admin/plan-health` 整天返回
+# 500，而每一次部署都照样打印「deployment healthy」。那一类错（SQL 的列类型和 Rust
+# 的解码类型对不上）编译期看不见、空表上也看不见，只在查询真的返回了行时炸。
+#
+# `/health/reports` 把那几条报表查询用**同一份代码**跑一遍，只回名字和成败。
+# 跑不通就不切流量 —— 旧容器还在服务，退出即回滚。
+check_reports() { # $1=端口
+  local out
+  if out=$(curl -fsS --max-time 20 "http://127.0.0.1:$1/health/reports" 2>&1); then
+    say "报表查询自检通过"
+    return 0
+  fi
+  say "报表查询自检没过，不切流量（旧容器继续服务）：$out"
+  say "具体哪一条、报什么错看容器日志里 event=health_report_failed"
+  return 1
+}
+
 established_on() { # $1=端口 —— 这个端口上还有多少条已建立的连接
   ss -tn state established "( sport = :$1 )" 2>/dev/null \
     | grep -c "127\.0\.0\.1:$1" || true
@@ -166,6 +185,13 @@ say "启动 $NEW_SVC"
 
 if ! wait_health "$NEW_PORT"; then
   say "新容器没能在 $((HEALTH_TRIES * 2)) 秒内变健康——拆掉它，保持旧版服务"
+  "${DC[@]}" logs --tail=100 "$NEW_SVC" || true
+  "${DC[@]}" rm -sf "$NEW_SVC" || true
+  exit 1
+fi
+
+# 健康之后、切流量之前。顺序是判据：切完再查等于用户已经吃到了坏版本。
+if ! check_reports "$NEW_PORT"; then
   "${DC[@]}" logs --tail=100 "$NEW_SVC" || true
   "${DC[@]}" rm -sf "$NEW_SVC" || true
   exit 1
