@@ -27,7 +27,7 @@
 
 use axum::extract::{Query, State};
 use axum::Json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::auth::Claims;
@@ -64,9 +64,57 @@ fn admin_only(claims: &Claims) -> ApiResult<()> {
     Ok(())
 }
 
+/// 抓来的价过多久就不算数。
+///
+/// **拉空时刻意不删库**（上面 `!prices.is_empty()` 那道闸：中转临时抽风回个空清单，
+/// 清库是我们自己制造的事故）。对一次抖动这是对的；对**永久失效**就不是了 ——
+/// 那批价会以最后一次抓到的数字永远留着，而且不报错。
+///
+/// 线上实拍 2026-09-01：Claude 自带地址那家换了牌子，适配器认不出来了
+/// （`family=未知`、`priced_models=0`），同步每几分钟仍在跑、每次都拉空，于是它那
+/// 40 条价停在一天前一动不动 —— 而对账正拿它们当真实进价算成本。
+///
+/// 24 小时的取法：同步每几分钟一轮，连着一天拉空就不是抖动了。过期不删、只是
+/// **不再当证据用** —— 删掉会连「它曾经是多少」都查不到，而那正是排查时要看的。
+/// 过期之后对账那边会明说「这个模型算不出成本」，那比一个冻结的旧价有用得多。
+pub const PRICE_FRESH_SECS: i64 = 24 * 3600;
+
 /// 每百万 token 的美元价（库里的单位）。适配器给的是每 token，这里统一乘上去。
 fn per_mtok(v: f64) -> f64 {
     v * 1_000_000.0
+}
+
+/// 把中转报的模型名对齐到**我们卖的那个拼写**。
+///
+/// 抓来的价按 `model_id` 存，而所有下游（对账的成本侧、比价屏、缺价提示）都是拿
+/// **我们的**模型名去 join —— 而 SQL 的 join 是大小写敏感的。实测智普那家报的是
+/// `GLM-5.2` / `GLM-5.3`，我们卖的是 `glm-5.2` / `glm-5.3`：价抓到了、一条都对不上，
+/// 表现是「这个模型算不出成本」，和「上游真的不给价」长得一模一样。
+///
+/// 只在**大小写不同**时改写，别做更聪明的模糊匹配：`deepseek-v4-pro` 和
+/// `deepseek-v4-flash` 差一个词就是两款货、两个价，猜错的代价是按错的价算钱。
+///
+/// `reported_set` 是这一轮上游报的**全部**名字。它只用来挡一种情况：上游同时报了
+/// 两种拼写（`GLM-5.2` 和 `glm-5.2` 都在），那我们那个拼写的那一条才是权威，
+/// 另一条别改写过去 —— 否则两条会挤进同一个主键，后写的盖掉先写的，而哪一条后写
+/// 取决于上游数组的顺序。
+///
+/// **第一版这里写反了**：判据是 `if reported_set.contains(reported) { return reported }`，
+/// 而 reported 必然在它自己的集合里 —— 于是这个函数恒等，改写一次都不会发生，
+/// 而它看起来完全正常。是下面那条行为测试当场抓出来的。
+fn canonicalise<'a>(
+    reported: &'a str,
+    ours: &'a HashMap<String, String>,
+    reported_set: &HashSet<String>,
+) -> &'a str {
+    match ours.get(&reported.to_ascii_lowercase()) {
+        // 拼写本来就一样，不用动。
+        Some(canon) if canon == reported => reported,
+        // 上游把我们那个拼写也报了 → 让那一条去占坑，这一条保持原样。
+        Some(canon) if reported_set.contains(canon.as_str()) => reported,
+        Some(canon) => canon.as_str(),
+        None => reported,
+    }
 }
 
 /// 一个出口同步一轮。
@@ -77,6 +125,8 @@ async fn sync_endpoint(
     base_url: &str,
     api_key: &str,
     console_token: &str,
+    // 小写 → 我们卖的那个拼写。见 [`canonicalise`]。
+    ours: &HashMap<String, String>,
 ) {
     let det = relay_adapter::detect(base_url).await;
     let (prices, price_why) = relay_adapter::fetch_pricing(&det, base_url, api_key, console_token).await;
@@ -144,7 +194,10 @@ async fn sync_endpoint(
     // 覆盖当前价。**拉到空就什么都不动** —— 中转临时抽风回了个空清单时，
     // 清库会让对账页突然全变未知，而那是我们自己造成的，不是中转涨价。
     if !prices.is_empty() {
+        // 这一轮上游报了哪些名字（原样）。对齐时用它判「已经有精确同名的就别改写」。
+        let reported_set: HashSet<String> = prices.iter().map(|p| p.model.clone()).collect();
         for p in &prices {
+            let model_id = canonicalise(&p.model, ours, &reported_set);
             let _ = sqlx::query(
                 "INSERT INTO endpoint_auto_price \
                    (endpoint_id, model_id, input_per_mtok, output_per_mtok, cached_per_mtok, \
@@ -161,7 +214,7 @@ async fn sync_endpoint(
                    source = EXCLUDED.source, fetched_at = now()",
             )
             .bind(endpoint_id)
-            .bind(&p.model)
+            .bind(model_id)
             .bind(per_mtok(p.prices.input))
             .bind(per_mtok(p.prices.output))
             .bind(p.prices.cache_read.map(per_mtok))
@@ -187,7 +240,13 @@ async fn sync_endpoint(
         //
         // 只在**这一轮真的拉到了东西**时才删（上面那个 `!prices.is_empty()`）：
         // 一次抽风回空清单就清库，是我们自己制造的事故，不是上游下架。
-        let seen: Vec<String> = prices.iter().map(|p| p.model.clone()).collect();
+        // **和上面写进去的用同一套名字。** 拿原始名字来删的话，刚刚对齐写入的
+        // `glm-5.2` 会因为「不在 seen（里面是 GLM-5.2）里」当场被删掉 —— 每一轮
+        // 同步都自己把自己的成果清空，而且不报错。
+        let seen: Vec<String> = prices
+            .iter()
+            .map(|p| canonicalise(&p.model, ours, &reported_set).to_string())
+            .collect();
         match sqlx::query(
             "DELETE FROM endpoint_auto_price \
              WHERE endpoint_id = $1 AND model_id <> ALL($2)",
@@ -495,6 +554,57 @@ async fn check_margin_after_change(
 }
 
 /// 同步一轮：所有在转线路 + 它们的出口。
+/// 每轮同步前清一次抓价表：**过期的**和**孤儿的**。
+///
+/// 两种都不是理论问题，线上各有一批：
+///
+/// · **过期**：拉空时刻意不删库（`!prices.is_empty()` 那道闸，防止上游抽风清库）。
+///   对一次抖动这是对的；对永久失效就不是了 —— 那批价会以最后一次抓到的数字永远留着。
+///   实拍 2026-09-01：Claude 自带地址那家换了牌子、适配器认不出了（family=未知、
+///   priced_models=0），同步每几分钟仍在跑、每次拉空，它那 40 条价停在一天前一动不动，
+///   而对账正拿它们当真实进价算成本。清掉之后那些模型会如实显示「算不出成本」——
+///   「不知道」比「一个冻结的旧价」有用得多，这和 ox-alpha 那次的教训是同一条。
+///
+/// · **孤儿**：出口或线路被删了，它的价还挂在那儿。实测 1082 条挂在 11 个已删对象下，
+///   最近一次更新是三天前。今天它们被各处的 JOIN 挡在外面，所以没造成错数 ——
+///   但那是靠每一处都记得 JOIN，而不是靠数据本身干净。
+///
+/// **清理只放在这一处**（唯一的写入方）。读这张表的有五个地方，五份手写的新鲜度
+/// 过滤器必然会漂，而漂掉的那一处会安静地继续拿旧价算钱。
+async fn sweep(state: &AppState) {
+    match sqlx::query(
+        "DELETE FROM endpoint_auto_price WHERE fetched_at < now() - make_interval(secs => $1)",
+    )
+    .bind(PRICE_FRESH_SECS as f64)
+    .execute(&state.db)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => tracing::info!(
+            removed = r.rows_affected(),
+            hours = PRICE_FRESH_SECS / 3600,
+            "抓价表：清掉过期的价（这些出口已经连着这么久拉不到价了，别再拿它们算成本）"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "抓价表：过期清理没跑成"),
+    }
+
+    match sqlx::query(
+        "DELETE FROM endpoint_auto_price p \
+         WHERE NOT EXISTS (SELECT 1 FROM models m WHERE m.id = p.endpoint_id) \
+           AND NOT EXISTS (SELECT 1 FROM route_endpoints e WHERE e.id = p.endpoint_id)",
+    )
+    .execute(&state.db)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => tracing::info!(
+            removed = r.rows_affected(),
+            "抓价表：清掉挂在已删线路/出口下的孤儿价"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "抓价表：孤儿清理没跑成"),
+    }
+}
+
 pub async fn sync_once(state: &AppState) {
     let routes: Vec<Model> =
         match sqlx::query_as("SELECT * FROM models WHERE active = true ORDER BY sort, created_at")
@@ -513,6 +623,35 @@ pub async fn sync_once(state: &AppState) {
     )
     .await;
 
+    // 我们**自己**卖的模型名，按小写索引。抓来的价要对齐到这个拼写，否则下游 join
+    // 不上（SQL 大小写敏感）。见 `canonicalise`。
+    //
+    // 小写形式重名的一律**不收**：真出现两条线路一个卖 `Foo`、一个卖 `foo` 时，
+    // 对齐到哪一个都是猜，而猜错就是按错的价算钱。宁可这两个继续按原样存。
+    let mut seen_lower: HashMap<String, Option<String>> = HashMap::new();
+    for name in routes
+        .iter()
+        .flat_map(|r| crate::models::allowed_ids(r))
+        .chain(eps.values().flatten().flat_map(|e| e.enabled_models.clone()))
+    {
+        let k = name.to_ascii_lowercase();
+        match seen_lower.get(&k) {
+            Some(Some(prev)) if *prev != name => {
+                seen_lower.insert(k, None); // 同名不同拼写 → 弃权
+            }
+            Some(_) => {}
+            None => {
+                seen_lower.insert(k, Some(name));
+            }
+        }
+    }
+    let ours: HashMap<String, String> = seen_lower
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|n| (k, n)))
+        .collect();
+
+    sweep(state).await;
+
     let mut n = 0usize;
     for r in &routes {
         sync_endpoint(
@@ -522,6 +661,7 @@ pub async fn sync_once(state: &AppState) {
             &r.base_url,
             &crate::models::model_key(&r.api_key),
             &crate::models::model_key(&r.balance_token),
+            &ours,
         )
         .await;
         n += 1;
@@ -539,6 +679,7 @@ pub async fn sync_once(state: &AppState) {
                 &e.base_url,
                 &crate::models::model_key(&key),
                 &crate::models::model_key(&tok),
+                &ours,
             )
             .await;
             n += 1;
@@ -819,6 +960,118 @@ pub async fn admin_sync(
 
 #[cfg(test)]
 mod tests {
+    /// 冻结的旧价不许继续被当成真实进价。
+    ///
+    /// 拉空时刻意不删库（防止上游抽风清库）。对一次抖动这是对的；对**永久失效**就不是：
+    /// 那批价会以最后一次抓到的数字永远留着，而且不报错。实拍 2026-09-01：Claude 自带
+    /// 地址那家换了牌子（family=未知、priced_models=0），同步每几分钟仍在跑、每次拉空，
+    /// 它那 40 条价停在一天前一动不动 —— 而对账正拿它们当真实进价算成本。
+    ///
+    /// 清理放在**唯一的写入方**，不是在五处读取各挂一个过滤器：五份手写的天数必然会漂，
+    /// 而漂掉的那一处会安静地继续拿旧价算钱。所以这条既钉「清了」也钉「在哪儿清」。
+    #[test]
+    fn frozen_prices_are_swept_at_the_one_writer_not_filtered_at_five_readers() {
+        let src = include_str!("relay_sync.rs");
+        let at = src.find("async fn sweep(").expect("sweep 不见了 —— 过期和孤儿价会永远留着");
+        let body = &src[at..];
+        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        assert!(
+            !body.contains("fn frozen_prices_are_swept"),
+            "切片把这条测试自己包进来了 —— 断言会读到自己写的字面量",
+        );
+        // 两件事各一条 DELETE：过期的、孤儿的。
+        assert!(
+            body.contains("WHERE fetched_at < now() - make_interval(secs => $1)")
+                && body.contains(".bind(PRICE_FRESH_SECS as f64)"),
+            "过期清理没了，或者新鲜度不再走那个共用常量（另写一个天数就会和别处漂）",
+        );
+        assert!(
+            body.contains("NOT EXISTS (SELECT 1 FROM models m WHERE m.id = p.endpoint_id)")
+                && body.contains("NOT EXISTS (SELECT 1 FROM route_endpoints e WHERE e.id = p.endpoint_id)"),
+            "孤儿清理没了 —— 出口一删，它的价还挂在表里（线上量到过 1082 条）",
+        );
+
+        // **必须在写新价之前跑。** 放在循环后面的话，这一轮里读价的人仍然读得到旧价；
+        // 而同步是每几分钟一轮，那等于永远慢一轮。
+        let once = src.find("pub async fn sync_once(").expect("sync_once 改名了");
+        let tail = &src[once..];
+        let sweep_at = tail.find("sweep(state).await;").expect("sync_once 里没调 sweep");
+        let loop_at = tail.find("for r in &routes {").expect("同步循环不见了");
+        assert!(sweep_at < loop_at, "sweep 跑在写新价之后了 —— 这一轮读到的还是旧价");
+
+        // 读取方**不该**再各写一份新鲜度过滤器，否则就是在重新制造那种漂移。
+        let rec = include_str!("reconcile.rs");
+        assert!(
+            !rec.contains("FROM endpoint_auto_price \\\n         WHERE fetched_at"),
+            "对账那边又挂了一个自己的新鲜度过滤器 —— 五份判据必然漂，清理只该有一处",
+        );
+    }
+
+    /// 抓来的价必须能按**我们卖的那个拼写**被 join 到，否则等于没抓。
+    ///
+    /// 所有下游（对账成本侧、比价屏、缺价提示）都是拿我们的模型名去 join
+    /// `endpoint_auto_price.model_id`，而 SQL 的 join 大小写敏感。线上实测：智普那家
+    /// 报的是 `GLM-5.2` / `GLM-5.3`，我们卖 `glm-5.2` / `glm-5.3` —— 价抓到了 40 条、
+    /// 一条都对不上，表现是「这个模型算不出成本」，和「上游根本不给价」长得一模一样。
+    #[test]
+    fn scraped_prices_are_stored_under_the_name_we_actually_sell() {
+        use std::collections::{HashMap, HashSet};
+        let ours: HashMap<String, String> = [
+            ("glm-5.2".to_string(), "glm-5.2".to_string()),
+            ("glm-5.3".to_string(), "glm-5.3".to_string()),
+            ("minimax-m3".to_string(), "minimax-m3".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // ① 只差大小写 → 对齐到我们的拼写。这是这个函数存在的理由。
+        let reported: HashSet<String> =
+            ["GLM-5.2".to_string(), "GLM-5.3".to_string(), "MiniMax-M3".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(super::canonicalise("GLM-5.2", &ours, &reported), "glm-5.2");
+        assert_eq!(super::canonicalise("MiniMax-M3", &ours, &reported), "minimax-m3");
+
+        // ② 我们不卖的模型原样存 —— 别乱猜。
+        assert_eq!(super::canonicalise("GLM-4.7-FlashX", &ours, &reported), "GLM-4.7-FlashX");
+
+        // ③ 上游**同时**报了两种拼写：我们那个拼写的那条才是权威，另一条别改写过去，
+        //    否则两条挤进同一个主键，谁赢取决于上游数组的顺序。
+        let both: HashSet<String> =
+            ["GLM-5.2".to_string(), "glm-5.2".to_string()].into_iter().collect();
+        assert_eq!(super::canonicalise("GLM-5.2", &ours, &both), "GLM-5.2");
+        assert_eq!(super::canonicalise("glm-5.2", &ours, &both), "glm-5.2");
+
+        // ④ 拼写本来就一样，原样返回。
+        assert_eq!(super::canonicalise("glm-5.3", &ours, &reported), "glm-5.3");
+
+        // ── 接线 ──────────────────────────────────────────────────────────
+        // 纯函数对了不等于写库用了它，**也不等于删除用的名单跟着换了**。
+        // 拿原始名字去删的话，刚刚对齐写入的那条会因为「不在 seen 里」当场被删掉 ——
+        // 每一轮同步自己清空自己的成果，而且不报错。
+        let src = include_str!("relay_sync.rs");
+        let from = src.find("async fn sync_endpoint(").expect("sync_endpoint 改名了");
+        let body = &src[from..];
+        let body = &body[..body.find("\npub async fn ").unwrap_or(body.len())];
+        assert!(
+            body.contains("INSERT INTO endpoint_auto_price"),
+            "切片没切到 sync_endpoint 的正文 —— 切坏了，下面的断言不作数",
+        );
+        assert!(
+            !body.contains("fn scraped_prices_are_stored_under"),
+            "切片把这条测试自己包进来了 —— 断言会读到自己写的字面量",
+        );
+        assert!(
+            body.contains("let model_id = canonicalise(&p.model, ours, &reported_set);")
+                && body.contains(".bind(model_id)"),
+            "写库没走对齐后的名字",
+        );
+        assert!(
+            body.contains(".map(|p| canonicalise(&p.model, ours, &reported_set).to_string())"),
+            "删除用的名单还是原始名字 —— 会把刚对齐写进去的那条当场删掉",
+        );
+    }
+
     use super::*;
 
     fn src() -> String {

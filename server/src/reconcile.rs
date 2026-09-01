@@ -537,6 +537,11 @@ pub async fn admin_reconciliation(
     for a in sqlx::query_as::<_, AutoPrice>(
         // cache_write_per_mtok 这一列在 endpoint_auto_price 里**一直有**，只是从来没被
         // 读出来过 —— 抓价的时候存了，算成本的时候没用。
+        // 过期的抓价由 `relay_sync::sweep` 在同步那一轮统一清掉，这里读到的就是新鲜的。
+        //
+        // **刻意不在每条查询上各挂一个新鲜度过滤器**：读这张表的地方有五处（这里、
+        // 覆盖率、推算成本、比价屏…），五份手写的天数必然会漂，而漂掉的那一处会
+        // 安静地继续拿冻结的旧价算成本。清理放在**唯一的写入方**那里，读的人不用知道。
         "SELECT endpoint_id, model_id, input_per_mtok, output_per_mtok, cached_per_mtok, \
                 cache_write_per_mtok, source \
          FROM endpoint_auto_price",
