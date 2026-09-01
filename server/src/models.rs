@@ -7135,6 +7135,24 @@ pub fn admit_billing(
     })
 }
 
+/// 入队快照里该存多少（**美元分**）：原始费用减去免费池已经付掉的那一份。
+///
+/// 两个入参故意不同口径，因为它们本来就是：`cost_usd_cents` 是折算**前**的美元分
+/// （队列存的就是这个，重放时会再折一次）；`pool_paid_wallet_cents` 是池子实际扣掉的
+/// 人民币分（毫点换算过来的）。要相减必须先把后者折回美元分。
+///
+/// **这个函数是从一行写错的表达式里抽出来的。** 原来写的是
+/// `(cost - wallet_cents_to_usd_cents(pool_paid))`，而那个 `cost` 在这一行的位置上
+/// 已经被 `let cost = usd_cents_to_wallet_cents(cost)` 遮蔽成**人民币分**了 ——
+/// 于是「人民币分 − 美元分」被当成美元分存进队列，重放时再折一次。
+/// bps=1408、原费用 100 美元分、池子付一半时：入队 661，重放后扣 4694 分，
+/// 正确值 362 分（≈13 倍）；池子一分没付时精确是 7.1 倍。
+///
+/// 守它的断言当时钉的是**那一行的源码文本**，等于把错误写法钉死了。现在钉行为。
+pub(crate) fn residual_usd_cents(cost_usd_cents: i64, pool_paid_wallet_cents: i64) -> i64 {
+    (cost_usd_cents - crate::settings::wallet_cents_to_usd_cents(pool_paid_wallet_cents)).max(0)
+}
+
 /// 一笔结算的结局。resettle/恢复 worker 据此决定队列行是了结还是累加 attempts。
 ///
 /// 不再是 Copy：Deferred 现在带着失败原因（String），而那正是死信行唯一的线索来源。
@@ -7384,9 +7402,10 @@ async fn bill_inner(
         // 先把队列快照改成**残额**。下面任何一步失败都会 `queue_input(...)` 入队，而入队
         // 的金额是折算前的美元分 —— 池子付掉的 `spent` 毫点是人民币分口径，折回美元分
         // 再减，两边才同口径。不减的话恢复重跑会把这一份再向钱包收一次（见 Cell 处注释）。
-        queued_usd_cents =
-            (cost - crate::settings::wallet_cents_to_usd_cents(spent / MILLI_POINTS_PER_CENT))
-                .max(0);
+        // **从 `queued_usd_cents` 减，不是从 `cost` 减。** 这一行的位置上 `cost` 已经被
+        // 上面 `let cost = usd_cents_to_wallet_cents(cost)` 遮蔽成人民币分了；
+        // `queued_usd_cents` 才是那个没被折算过的美元分。见 `residual_usd_cents`。
+        queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / MILLI_POINTS_PER_CENT);
         // 记账两边都要说实话 —— model_usage 同时有 free_milli_points_spent 和 cost_cents，
         // 一次调用由两个池子分摊是能如实表达的（线上本来就有 2801 行两列同时非零）。
         pool_paid_milli = spent;
@@ -15527,8 +15546,9 @@ mod billing_tests {
         }
         // 残额本身要在部分覆盖那一步被真的改小 —— 只传参不赋值等于什么都没做。
         assert!(
-            body.contains("queued_usd_cents =\n            (cost - crate::settings::wallet_cents_to_usd_cents("),
-            "部分覆盖时没有把免费池已付的那一份从队列快照里减掉",
+            body.contains("queued_usd_cents = residual_usd_cents(queued_usd_cents, spent / MILLI_POINTS_PER_CENT);"),
+            "部分覆盖时没有把免费池已付的那一份从队列快照里减掉，\
+             或者减错了变量 —— 这一行的位置上 `cost` 已经被遮蔽成人民币分了",
         );
     }
 
@@ -15784,6 +15804,52 @@ mod billing_tests {
             body.contains("event = \"wallet_overdraft\""),
             "透支事件名没了，日志上就搜不到这一类",
         );
+    }
+
+    /// 入队快照里的金额必须是**折算前的美元分**，减掉的那一份也要先折回美元分。
+    ///
+    /// 这条钉的是一个我自己写出来的错：那一行原来是
+    /// `(cost - wallet_cents_to_usd_cents(pool_paid))`，而 `cost` 在那个位置上已经被
+    /// `let cost = usd_cents_to_wallet_cents(cost)` 遮蔽成**人民币分**了。于是
+    /// 「人民币分 − 美元分」被当成美元分存进 `unsettled_charges`，恢复重跑时
+    /// `bill_inner` 会**再折一次**。
+    ///
+    /// 当时守它的断言钉的是那一行的**源码文本** —— 等于把错误写法钉死了，改对反而会红。
+    /// 这一条改成钉行为：给定汇率和池子付掉的钱，入队的数必须是那个数。
+    #[test]
+    fn the_queued_snapshot_stays_in_usd_cents() {
+        // **不要在外面再套一层 `settings_test_guard()`。** `swap_settings_for_test` 自己
+        // 就会取那把串行锁并一直持有到它离开作用域，而 std 的 Mutex 不可重入 ——
+        // 套一层就是死锁，而且是把**整个 settings 测试组**一起挂住（本轮踩过：四条
+        // settings::tests 一起卡在「running for over 60 seconds」，看起来像编译慢）。
+        // 这个契约就写在 `settings_test_guard` 的注释里：只读地看 CACHE 时才拿它。
+        //
+        // 基准用 `Settings::default()` 而不是 `current()`：不读环境状态，这条测试的
+        // 结果就只取决于它自己设的汇率。
+        let base = crate::settings::Settings::default();
+        let _swap = crate::settings::swap_settings_for_test(crate::settings::Settings {
+            usd_per_cny_bps: 1408, // ×7.1023，和线上一致
+            ..base
+        });
+
+        // 池子一分没付：残额就是原费用，一个字不动。
+        // 写成 `cost - …` 的那一版在这里会返回 100×7.1023 = 710（人民币分冒充美元分）。
+        assert_eq!(super::residual_usd_cents(100, 0), 100);
+
+        // 池子付了 50 人民币分 = 7 美元分（50 × 1408 / 10000 = 7.04 → 7）。
+        assert_eq!(super::residual_usd_cents(100, 50), 93);
+
+        // 池子付得比整笔还多（毫点换算的取整方向所致）→ 夹到 0，不能变成负数
+        // 再被当成一笔「欠用户的钱」。
+        assert_eq!(super::residual_usd_cents(10, 10_000), 0);
+
+        // 汇率是 1:1 时两边同数，减法退化成普通减法 —— 这一支保证换算方向没写反。
+        drop(_swap);
+        let _swap2 = crate::settings::swap_settings_for_test(crate::settings::Settings {
+            usd_per_cny_bps: 10_000,
+            ..base
+        });
+        assert_eq!(super::residual_usd_cents(100, 30), 70);
     }
 
     /// 参考成本必须**无视售价**，包括「显式配 0」。

@@ -165,10 +165,22 @@ async fn sync_endpoint(
     let old: HashMap<String, (f64, f64)> =
         old.into_iter().map(|(m, i, o)| (m, (i, o))).collect();
 
+    // **比对也要用对齐后的名字。**
+    //
+    // `old` 是从 `endpoint_auto_price` 读的，而那张表的 model_id 是写入时经
+    // `canonicalise` 改写过的（下面那个 upsert）。这里如果拿上游的**原始**名字去查，
+    // 恰恰是「需要改写大小写」的那批模型永远查不到旧价 → `continue` → 它们的涨价
+    // 一次都比不出来。而涨价比对是全系统唯一会自动停线路止血的那条链的入口
+    // （见 `check_margin_after_change`），对这些模型等于把它关掉了。
+    //
+    // 实测受影响的有真金额：hanhegufei 报的是 GLM-5.2 / GLM-5.3 / MiniMax-M3，
+    // 没有小写孪生，而我们卖的全是小写。
+    let reported_set: HashSet<String> = prices.iter().map(|p| p.model.clone()).collect();
     let mut worst: Option<(String, f64, f64, f64, f64, f64)> = None; // (model, oi, ni, oo, no, pct)
     for p in &prices {
+        let model_id = canonicalise(&p.model, ours, &reported_set);
         let (ni, no) = (per_mtok(p.prices.input), per_mtok(p.prices.output));
-        let Some(&(oi, oo)) = old.get(&p.model) else { continue };
+        let Some(&(oi, oo)) = old.get(model_id) else { continue };
         // 涨幅按输入输出里涨得更狠的那个算。只看其中一个的话，一家把输出价翻倍、
         // 输入价不动，就完全抓不到 —— 而输出恰恰是贵的那一半。
         let pct_of = |o: f64, n: f64| if o > 0.0 { (n - o) / o * 100.0 } else { 0.0 };
@@ -185,7 +197,9 @@ async fn sync_endpoint(
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(endpoint_id)
-        .bind(&p.model)
+        // 和查旧价、和写新价用**同一个**名字。只改查询不改这里的话，历史行会按上游
+        // 拼写落库、join 不上任何东西，控制台的涨价历史里会冒出一个我们不卖的模型名。
+        .bind(model_id)
         .bind(oi)
         .bind(ni)
         .bind(oo)
@@ -195,15 +209,13 @@ async fn sync_endpoint(
         .execute(&state.db)
         .await;
         if worst.as_ref().is_none_or(|w| pct > w.5) {
-            worst = Some((p.model.clone(), oi, ni, oo, no, pct));
+            worst = Some((model_id.to_string(), oi, ni, oo, no, pct));
         }
     }
 
     // 覆盖当前价。**拉到空就什么都不动** —— 中转临时抽风回了个空清单时，
     // 清库会让对账页突然全变未知，而那是我们自己造成的，不是中转涨价。
     if !prices.is_empty() {
-        // 这一轮上游报了哪些名字（原样）。对齐时用它判「已经有精确同名的就别改写」。
-        let reported_set: HashSet<String> = prices.iter().map(|p| p.model.clone()).collect();
         for p in &prices {
             let model_id = canonicalise(&p.model, ours, &reported_set);
             let _ = sqlx::query(
@@ -407,20 +419,42 @@ async fn check_margin_after_change(
         prompt_tokens: i64,
         completion_tokens: i64,
         cached_tokens: i64,
+        /// 写进缓存的 token。**单价最贵的一类**（输入价的 1.25 倍），而这道闸此前
+        /// 一条都没算 —— 缓存命中率越高，它越乐观地说「还在赚」。
+        cache_write_tokens: i64,
         input_per_mtok: f64,
         output_per_mtok: f64,
         cached_per_mtok: Option<f64>,
+        cache_write_per_mtok: Option<f64>,
     }
     // 只算**这个出口**过去 7 天真的跑过、而且现在有自动价的模型。
     // 没跑过的模型涨价不影响任何东西，把它算进来只会稀释判据。
     let rows: Vec<Row> = sqlx::query_as(
+        // **「新鲜输入」按天算好再求和，不要先把 token 加总再夹一刀。**
+        //
+        // prompt 含不含 cached 是**逐条回执**的属性（Anthropic 单列上报、prompt 不含它；
+        // OpenAI/DeepSeek/GLM 的 prompt 含）。原来的写法是先把整窗口的 token 加总，再在
+        // Rust 里 `cached.min(prompt)` 无条件按「含」处理 —— 对 Anthropic 形状那一刀会把
+        // 超出 prompt 的缓存读整段砍掉，成本被**低估**。
+        //
+        // 也**不能**照抄对账那边的 `bool_and(prompt_includes_cached)`：那个是刻意朝
+        // 「高估成本」偏的，对报表无害，挂到**自动停用线路**上就是误杀。实测有出口
+        // 六天里五天是 t、一天 f，bool_and 会把整窗判成 Anthropic 形状，算出 −1.7% 毛利，
+        // 而真实是 +68.2%。按天/按模型逐行判，再求和，两种形状都不吃亏。
+        //
+        // 老行没有这一位（NULL）时的兜底和对账同源：`cached > prompt` 就说明 prompt 不含它。
         "SELECT u.revenue_micro_usd AS revenue_micro, u.prompt_tokens, u.completion_tokens, \
-                u.cached_tokens, p.input_per_mtok, p.output_per_mtok, p.cached_per_mtok \
+                u.cached_tokens, u.cache_write_tokens, \
+                p.input_per_mtok, p.output_per_mtok, p.cached_per_mtok, p.cache_write_per_mtok \
          FROM ( \
              SELECT endpoint_id, model_id, SUM(revenue_micro_usd)::bigint AS revenue_micro_usd, \
-                    SUM(prompt_tokens)::bigint AS prompt_tokens, \
+                    SUM(CASE WHEN COALESCE(prompt_includes_cached, \
+                                           NOT (cached_tokens > prompt_tokens)) \
+                             THEN GREATEST(prompt_tokens - cached_tokens, 0) \
+                             ELSE GREATEST(prompt_tokens, 0) END)::bigint AS prompt_tokens, \
                     SUM(completion_tokens)::bigint AS completion_tokens, \
-                    SUM(cached_tokens)::bigint AS cached_tokens \
+                    SUM(cached_tokens)::bigint AS cached_tokens, \
+                    SUM(cache_creation_tokens)::bigint AS cache_write_tokens \
              FROM endpoint_model_usage WHERE day > current_date - $2::int GROUP BY endpoint_id, model_id \
          ) u \
          JOIN endpoint_auto_price p \
@@ -440,13 +474,19 @@ async fn check_margin_after_change(
     let mut cost = 0.0_f64;
     for r in &rows {
         revenue += r.revenue_micro as f64 / 1_000_000.0;
-        // 缓存 token 含在 prompt 里，要减出来单独按缓存价乘 —— 不减的话，
-        // 命中率高的模型成本被高估好几倍，会把赚钱的线路误判成亏损然后停掉。
-        let cached = r.cached_tokens.max(0).min(r.prompt_tokens.max(0));
-        let fresh = (r.prompt_tokens.max(0) - cached) as f64;
-        let cache_price = r.cached_per_mtok.unwrap_or(r.input_per_mtok);
+        // `prompt_tokens` 这一列**已经是「新鲜输入」**了（上面 SQL 里按天逐行减过），
+        // 所以这里不能再减一次。四项都要算，缺一项就是系统性地把成本往低了报，
+        // 而这道闸的后果是「要不要自动停掉这条线路」。
+        let fresh = r.prompt_tokens.max(0) as f64;
+        let cache_read_price = r.cached_per_mtok.unwrap_or(r.input_per_mtok);
+        // 缓存写入没单独录价时按输入价的 1.25 倍算 —— 和 20260864 那次迁移、
+        // 以及 reconcile 的成本公式同一个兜底倍数。
+        let cache_write_price = r
+            .cache_write_per_mtok
+            .unwrap_or(r.input_per_mtok * 1.25);
         cost += (fresh * r.input_per_mtok
-            + cached as f64 * cache_price
+            + r.cached_tokens.max(0) as f64 * cache_read_price
+            + r.cache_write_tokens.max(0) as f64 * cache_write_price
             + r.completion_tokens.max(0) as f64 * r.output_per_mtok)
             / 1_000_000.0;
     }
@@ -1078,6 +1118,24 @@ mod tests {
             body.contains(".map(|p| canonicalise(&p.model, ours, &reported_set).to_string())"),
             "删除用的名单还是原始名字 —— 会把刚对齐写进去的那条当场删掉",
         );
+        // **涨价比对也要用对齐后的名字。** `old` 是从库里读的（里面是对齐后的拼写），
+        // 拿上游原始名字去查的话，恰恰是需要改写大小写的那批模型永远查不到旧价 →
+        // continue → 它们的涨价一次都比不出来。而涨价比对是全系统唯一会自动停线路
+        // 止血的那条链的入口，对这些模型等于把它关掉了 —— 这个回归被引入过一次。
+        assert!(
+            body.contains("let Some(&(oi, oo)) = old.get(model_id) else { continue };"),
+            "涨价比对又拿上游原始名字去查旧价了 —— 需要改写大小写的模型从此比不出涨价",
+        );
+        // 历史表也要落对齐后的名字，否则历史行 join 不上任何东西，控制台的涨价历史里
+        // 会冒出一个我们不卖的模型名。
+        let ins = body
+            .find("INSERT INTO endpoint_price_change")
+            .expect("涨价历史那条 INSERT 不见了");
+        let ins: String = body[ins..].chars().take(700).collect();
+        assert!(
+            ins.contains(".bind(model_id)") && !ins.contains(".bind(&p.model)"),
+            "涨价历史落的还是上游原始名字 —— 和另外三处用的不是同一个名字",
+        );
     }
 
     use super::*;
@@ -1087,13 +1145,42 @@ mod tests {
         all.split("\n#[cfg(test)]").next().unwrap().to_string()
     }
 
+    /// 取一个函数的正文。**配平时要跳过字符串字面量和行注释里的花括号。**
+    ///
+    /// 不跳的话它会冲出函数末尾：`tracing::warn!("… {model} …")` 这种内联捕获在字面量里
+    /// 就有 `{`，只有开没有闭，配平永远回不到 0，于是切片一路吃到文件后面 ——
+    /// 包括**调用它的那条测试自己**。后果是断言在读自己写的字面量：
+    /// `assert!(body.contains("…"))` 恒真、`assert!(!body.contains("…"))` 恒假。
+    /// 本文件有 16 处用它，本轮实测被这个坑绊了一次（一条 `!contains(bool_and)` 的
+    /// 断言无故变红，因为 body 里有的是测试自己写的那个词）。
     fn fn_body(src: &str, sig: &str) -> String {
         let at = src.find(sig).unwrap_or_else(|| panic!("找不到 {sig}"));
         let open = at + src[at..].find('{').expect("函数没有花括号");
         let b = src.as_bytes();
         let (mut d, mut i) = (0i32, open);
+        // 只需要认三种会藏花括号的地方：普通字符串、原始字符串、行注释。
+        // 字符字面量 '{' 在本仓的 Rust 里不出现，不额外处理。
         while i < b.len() {
             match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == b'"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 b'{' => d += 1,
                 b'}' => {
                     d -= 1;
@@ -1132,17 +1219,69 @@ mod tests {
         );
     }
 
-    /// 缓存 token 必须先减出来再乘缓存价。
+    /// 停用线路那道闸的成本公式，四项都要算，而且形状要按天逐行判。
     ///
-    /// 不减的话，命中率高的模型成本被高估好几倍 —— 而这个判据的后果是**停用线路**，
-    /// 高估成本等于把一条赚钱的线路误杀掉。
+    /// **这条断言 2026-09-01 改写过，原来的写法把一个 bug 钉死了。**
+    /// 它原文钉的是 `let cached = r.cached_tokens.max(0).min(r.prompt_tokens.max(0));`，
+    /// 理由写着「不减的话成本被高估，会误杀赚钱的线路」。方向的顾虑是对的，
+    /// 但那个夹刀对 **Anthropic 形状**恰恰反了：那边 cached 是单列上报、prompt 不含它，
+    /// 而且可以远大于 prompt，一刀夹下去把超出的缓存读整段砍掉 —— 成本被**低估**。
+    ///
+    /// 更严重的是它压根没算**缓存写入**：单价是输入价的 1.25 倍，是最贵的一类 token，
+    /// 而这道闸一条都没算。方向固定：缓存命中率越高，它越乐观地说「还在赚」。
+    /// 实测 mhapi.net 的 claude-opus-5，7 天真实用量下这道闸算 $3.28、对账算 $32.90，
+    /// **差 10 倍**；整个出口它报 97.0% 毛利，实际 68.7%。
+    ///
+    /// 形状判定**不能**照抄对账那边的 `bool_and(prompt_includes_cached)`：那个是刻意朝
+    /// 「高估成本」偏的，对报表无害，挂到自动停用上就是误杀（实测有出口六天五天 t、
+    /// 一天 f，bool_and 会把整窗判成 Anthropic 形状，算出 −1.7% 而真实 +68.2%）。
     #[test]
-    fn cached_tokens_are_not_double_charged_before_a_shutdown_decision() {
-        let body = fn_body(&src(), "async fn check_margin_after_change(");
+    fn the_shutdown_guard_counts_all_four_cost_terms() {
+        let raw = fn_body(&src(), "async fn check_margin_after_change(");
+        // **先剥注释。** 下面几条是「不许出现某个词」的否定断言，而这个函数的注释里
+        // 正解释着「不能照抄对账那边的 bool_and」—— 不剥的话断言被自己的说明喂饱，
+        // 恒红。这是本仓反复出现的一种失效形状，只是这次方向反了（恒红而不是恒绿）。
+        let body: String = raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
+        // 阳性对照：剥完还得剩下要查的代码。
         assert!(
-            body.contains("let cached = r.cached_tokens.max(0).min(r.prompt_tokens.max(0));")
-                && body.contains("r.prompt_tokens.max(0) - cached"),
-            "缓存 token 没从输入里减出来 —— 成本被高估，会误杀赚钱的线路",
+            body.contains("FROM endpoint_model_usage"),
+            "剥注释之后把代码也剥没了 —— 下面的断言不作数",
+        );
+        // 缓存写入：取数和计价两处都要有。
+        assert!(
+            body.contains("SUM(cache_creation_tokens)::bigint AS cache_write_tokens"),
+            "取数里没有缓存写入 —— 最贵的那类 token 在停用判据里贡献 0",
+        );
+        assert!(
+            body.contains("r.cache_write_tokens.max(0) as f64 * cache_write_price"),
+            "成本公式里没算缓存写入",
+        );
+        assert!(
+            body.contains(".unwrap_or(r.input_per_mtok * 1.25)"),
+            "缓存写入没录价时的兜底倍数不见了 —— 要和 20260864 迁移、reconcile 同源",
+        );
+        // 形状按天逐行判，不是加总之后夹一刀，也不是 bool_and 整窗塌缩。
+        assert!(
+            body.contains("COALESCE(prompt_includes_cached, \\\n                                           NOT (cached_tokens > prompt_tokens))"),
+            "形状判定没有按行做（或者兜底判据变了）—— 加总后再夹一刀会低估 Anthropic 形状",
+        );
+        assert!(
+            !body.contains("bool_and(prompt_includes_cached)"),
+            "照抄了对账那边的 bool_and —— 它刻意朝高估成本偏，挂在自动停用上就是误杀",
+        );
+        assert!(
+            !body.contains("r.cached_tokens.max(0).min(r.prompt_tokens.max(0))"),
+            "那个无条件夹刀回来了 —— 它对 Anthropic 形状是低估，正是这条要防的",
+        );
+        // 减法只该发生一次（在 SQL 里）。Rust 侧再减一次就是把新鲜输入又砍一刀。
+        assert!(
+            body.contains("let fresh = r.prompt_tokens.max(0) as f64;"),
+            "Rust 侧又减了一次缓存 —— SQL 里已经减过，这里再减就是双重扣减",
         );
     }
 
