@@ -483,6 +483,14 @@ pub struct Offer {
     pub rank: Option<usize>,
     pub probe_ms: Option<i32>,
     pub probe_ok: Option<bool>,
+    /// **派单真正用的那个耗时**：这个 (出口, 模型) 有 5 个以上真实样本就用真实首字，
+    /// 否则退回探测。走 `route_endpoints::effective_ms`，和选路那边同一个函数、同一份输入。
+    ///
+    /// 这一屏原来只用 `probe_ms` 判快慢，而探测**系统性地**比真实首字低 3~8 倍
+    /// （2026-09-01 实测：GPT/令牌云 2215 vs 18474；GPT/hao.ai 747 vs 5843；
+    /// 智普/teamorouter 961 vs 7070），于是那只兔子经常指着另一家：智普屏上标
+    /// teamorouter、派单实际偏好 OHub；GPT 屏上标 hao.ai、实际是 teamorouter。
+    pub eff_ms: Option<i32>,
     /// 这个模型的候选里最快的那个。
     pub fastest: bool,
     /// 慢得离谱（判据和选路同一套：比最快的慢三倍以上且自己超过五秒）。
@@ -588,6 +596,30 @@ pub async fn admin_model_prices(
     .fetch_all(&state.db)
     .await?;
 
+    // 真实首字延迟，按 (出口, 模型) —— 和 route_attempt 的分行粒度、以及派单那侧同口径。
+    // 单独一次查询而不是并进上面那条四分支 UNION：那条已经够绕，而这一份是纯附加信息，
+    // 取不到就退回探测值（`effective_ms` 自己就是这么兜的）。
+    let ttfb: std::collections::HashMap<(uuid::Uuid, String), (Option<i64>, i64)> =
+        sqlx::query_as::<_, (uuid::Uuid, String, Option<i64>, Option<i64>)>(
+            "SELECT endpoint_id, model_id, \
+                    COALESCE(SUM(ttfb_ms_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint, \
+                    COALESCE(SUM(ttfb_ms_n)   FILTER (WHERE day >= current_date - 6), 0)::bigint \
+             FROM route_attempt GROUP BY endpoint_id, model_id",
+        )
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(eid, mid, sum, n)| {
+            // 均值只在成功那些里算（失败的耗时压根没累加），分母为 0 就是没有。
+            let ms = match (sum, n) {
+                (Some(sum), Some(n)) if n > 0 => Some(sum / n),
+                _ => None,
+            };
+            ((eid, mid), (ms, n.unwrap_or(0)))
+        })
+        .collect();
+
     // 手录的价。**只在没有抓来的价时才用** —— 和对账那边同一条优先级（自动覆盖手工），
     // 两处不一致的话，这一屏说的最便宜和账单算的最便宜会是两家。
     let manual: Vec<PriceRow> = sqlx::query_as(
@@ -642,6 +674,8 @@ pub async fn admin_model_prices(
 
     let mut by_model: HashMap<String, Vec<Offer>> = HashMap::new();
     for ((_, model_id), (row, source)) in by_key {
+        // 下面 by_model.entry(model_id) 会把它搬走，先留一份给 ttfb 查表用。
+        let model_id_for_ttfb = model_id.clone();
         let (
             eid,
             _,
@@ -686,6 +720,13 @@ pub async fn admin_model_prices(
             rank: None,
             probe_ms,
             probe_ok,
+            eff_ms: {
+                let (real_ms, real_n) = ttfb
+                    .get(&(eid, model_id_for_ttfb.clone()))
+                    .copied()
+                    .unwrap_or((None, 0));
+                crate::route_endpoints::effective_ms(real_ms, Some(real_n), probe_ms)
+            },
             fastest: false,
             slow: false,
         });
@@ -735,10 +776,23 @@ pub async fn admin_model_prices(
                         (Some(a), Some(b)) => Some(a.min(b)),
                         (a, b) => a.or(b),
                     };
-                    // 有一条测通就算通：探测是逐出口发的，同一家站的两条只是凭据不同。
-                    if o.probe_ok == Some(true) {
-                        m.probe_ok = Some(true);
-                    }
+                    m.eff_ms = match (m.eff_ms, o.eff_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    // **三值合流**：有一条测通就算通；都没通但有测出失败的，就是失败；
+                    // 全是 NULL（没测过，比如线路自带地址）才留 NULL。
+                    //
+                    // 原来只往上升（`if o.probe_ok == Some(true)`），`false` 永远传不过来。
+                    // 于是一条**探测失败**的记录能带着它那个很小的耗时进到下面的 best_ms
+                    // 里当基准（失败往往回得快），把同组其它家全比成「慢」。线上 166 个
+                    // 合并 offer 里 40 个中招，而选谁当基准取决于 HashMap 的迭代顺序 ——
+                    // 每次重启结果都可能翻过来。
+                    m.probe_ok = match (m.probe_ok, o.probe_ok) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        _ => None,
+                    };
                 }
                 None => merged.push(o),
             }
@@ -769,17 +823,18 @@ pub async fn admin_model_prices(
             _ => None,
         };
 
-        // 快慢。判据和选路那边同一个函数 —— 两处各写一份必然分叉，而这一屏
-        // 说的「流畅」就会和真正被优先敲门的那个对不上。
+        // 快慢。**函数和输入都要和选路那边同一套** —— 原来只有函数是同一个，喂进去的
+        // 是 `probe_ms`，而选路早已改用 `effective_ms`。探测系统性地低 3~8 倍，于是这一屏
+        // 的兔子经常指着另一家（见 `Offer::eff_ms` 上面那段实测）。
         let best_ms = offers
             .iter()
             .filter(|o| o.probe_ok != Some(false))
-            .filter_map(|o| o.probe_ms.map(|v| v as f64))
+            .filter_map(|o| o.eff_ms.map(|v| v as f64))
             .filter(|v| *v > 0.0)
             .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))));
         for o in offers.iter_mut() {
-            o.fastest = best_ms.is_some_and(|b| o.probe_ms.map(|v| v as f64) == Some(b));
-            o.slow = crate::route_endpoints::is_egregiously_slow(o.probe_ms, best_ms);
+            o.fastest = best_ms.is_some_and(|b| o.eff_ms.map(|v| v as f64) == Some(b));
+            o.slow = crate::route_endpoints::is_egregiously_slow(o.eff_ms, best_ms);
         }
 
         offers.sort_by(|a, b| match (a.rank, b.rank) {
@@ -955,6 +1010,76 @@ mod price_scan_tests {
 
 #[cfg(test)]
 mod mix_tests {
+    /// 比价屏的「最流畅」必须和派单看的是同一个耗时，且一次失败的探测不能当基准。
+    ///
+    /// 两个分开的毛病，都只影响这一屏的显示：
+    ///
+    /// 1. 判快慢原来喂的是 `probe_ms`，而选路早已改用 `effective_ms`（真实样本 ≥5 就用
+    ///    真实首字）。探测**系统性地**比真实首字低 3~8 倍，2026-09-01 实测：
+    ///      GPT/令牌云       探测 2215ms  真实 18474ms
+    ///      GPT/hao.ai       探测  747ms  真实  5843ms
+    ///      智普/teamorouter 探测  961ms  真实  7070ms
+    ///    于是屏上那只兔子经常指着另一家：智普屏上标 teamorouter、派单实际偏好 OHub。
+    ///
+    /// 2. 合并同价行时 `probe_ok` 只往上升（有 true 就 true），`false` 永远传不过来。
+    ///    而失败的探测往往回得很快 —— 它于是能进 best_ms 当基准，把同组其它家比成「慢」。
+    #[test]
+    fn the_compare_screen_judges_speed_with_the_same_number_routing_uses() {
+        let whole = include_str!("relay_rates.rs");
+        // 只取**比价屏那个处理函数**这一段。
+        //
+        // 这个文件有五个测试模块，最早一个在第 130 行 —— 比要检查的生产代码还靠前。
+        // 所以既不能 `find("\nmod tests")` 也不能 `find("\n#[cfg(test)]")` 从头切：
+        // 两种切法都会把 body 切成「代码还没出现」的一段，断言假红（本轮各踩过一次）。
+        // 从函数签名切到它后面第一个测试模块，位置和长度都不用猜。
+        // 锚点是**处理函数的真名**。上一版锚在一个根本不存在的名字上（`admin_relay_rates`），
+        // 于是 `find` 只能匹配到这条测试自己写的那个字面量，body 从测试中间开始，
+        // 下面每一条断言都在读自己 —— 变异之后照样全绿。由下面那对阳性对照抓出来的。
+        let from = whole
+            .find("pub async fn admin_model_prices")
+            .expect("比价屏那个处理函数改名了");
+        let body = &whole[from..];
+        let body = &body[..body.find("\n#[cfg(test)]").unwrap_or(body.len())];
+        // **阳性对照。** 下面每一条都是「在 body 里找一段代码字面量」，而这条测试自己
+        // 满篇都是那些字面量 —— 切片一旦把测试自己包进来，所有断言都会被自己喂饱，
+        // 变异之后照样全绿。本轮就踩了：这个文件的处理函数排在几个测试模块**之后**，
+        // 于是「切到下一个 #[cfg(test)]」什么也没切到。
+        assert!(
+            body.contains("let best_ms = offers"),
+            "切出来的这段里没有比价屏的代码 —— 切片坏了，下面的断言不作数",
+        );
+        assert!(
+            !body.contains("fn the_compare_screen_judges"),
+            "切片把这条测试自己包进去了 —— 断言会匹配到自己写的字面量，等于没测",
+        );
+
+        assert!(
+            body.contains(".filter_map(|o| o.eff_ms.map(|v| v as f64))")
+                && body.contains("o.fastest = best_ms.is_some_and(|b| o.eff_ms.map(|v| v as f64) == Some(b));")
+                && body.contains("is_egregiously_slow(o.eff_ms, best_ms)"),
+            "比价屏又拿探测耗时判快慢了 —— 它和真正被优先敲门的那个会对不上",
+        );
+        assert!(
+            body.contains("crate::route_endpoints::effective_ms(real_ms, Some(real_n), probe_ms)"),
+            "eff_ms 没走选路那边的 effective_ms —— 两份判据必然漂",
+        );
+        assert!(
+            body.contains("FROM route_attempt GROUP BY endpoint_id, model_id"),
+            "真实首字没按模型分 —— 又变回拿别的模型的耗时给这个模型定快慢",
+        );
+        assert!(
+            body.contains("(Some(true), _) | (_, Some(true)) => Some(true),")
+                && body.contains("(Some(false), _) | (_, Some(false)) => Some(false),"),
+            "probe_ok 合并又变成只往上升了 —— 一条失败的探测会带着它那个很小的耗时当基准",
+        );
+        // 界面显示的秒数要和判定同源，否则屏上「1.0s」旁边挂着「慢」，没人看得懂。
+        let ui = include_str!("../admin-ui/src/pages/RelayRates.tsx");
+        assert!(
+            ui.contains("{o.eff_ms != null && (") && ui.contains("{(o.eff_ms / 1000).toFixed(1)}s"),
+            "界面还在显示探测耗时，而判定用的是另一个数",
+        );
+    }
+
     use super::*;
 
     /// 配比必须来自真实用量，而且缓存要从普通输入里减出来。

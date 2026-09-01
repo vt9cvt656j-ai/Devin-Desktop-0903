@@ -10242,9 +10242,14 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     // 出口先取出来：候选匹配要认「出口带来的模型」，所以不能等到收窄之后再加载。
-    let endpoint_map = crate::route_endpoints::load_for_routes(
+    //
+    // **成败数按这一次要的模型统计**（`_for_model`）。合并全模型的那一版正在把便宜且
+    // 可用的出口挤掉：一个出口在别的模型上撞的 404 会让它在这个模型上被判「从来没成过」。
+    // 实测见 `route_endpoints::load_own_rates` 上面那段。
+    let endpoint_map = crate::route_endpoints::load_for_routes_for_model(
         &state.db,
         &conns.iter().map(|m| m.id).collect::<Vec<_>>(),
+        Some(&model_id),
     )
     .await;
     let mut candidates: Vec<Model> = conns
@@ -10450,6 +10455,8 @@ pub async fn chat_completions(
         let own_rates = crate::route_endpoints::load_own_rates(
             &state.db,
             &candidates.iter().map(|m| m.id).collect::<Vec<_>>(),
+            // 同上：只看这个模型的成败。自带地址在这件事上和出口一样会被别的模型带偏。
+            Some(&model_id),
         )
         .await;
         // 原来这里外面套着 `if !endpoint_map.is_empty()`，而 endpoint_map 是**全站**的：
@@ -13081,9 +13088,18 @@ mod route_pick_tests {
         // 客户端得先把线路 id 留下来才谈得上带 —— 它以前在解析目录时就被丢掉了。
         assert!(js.contains("connId: String(it.conn_id"), "目录解析又把线路 id 丢了");
         // 查目录要带分组，否则卡片上的价、上下文、思考档位仍然读的是第一条线路那份。
+        //
+        // 还要带 `connId`：后台的「分组」会把另一条线路的模型并进同一个标题下，
+        // 于是**同一个组里**也可能有两行同名（线上「智普」组里就有两行 glm-5.3-flash，
+        // 一行倍率 1、一行倍率 2）。只按 (id, 组名) 找的话，点哪一行都返回列表里靠前的
+        // 那条，而 gatewayRouteId → x-ide-route → 网关按被选中的**线路**计费。
         assert!(
-            js.contains("function _modelCatalogEntry(id = \"\", group = \"\")"),
-            "查目录不带分组 —— 显示的参数还是另一条线路的",
+            js.contains("function _modelCatalogEntry(id = \"\", group = \"\", connId = \"\")"),
+            "查目录不带分组或不带线路 id —— 同名两行时会解析到另一条线路上去",
+        );
+        assert!(
+            js.contains("selectModel(m.id, grpLabel, m.connId);"),
+            "模型菜单点击又把那一行的 connId 丢了 —— 下游只能回查，同名两行时必然选错",
         );
     }
 }
@@ -21801,6 +21817,22 @@ mod model_group_tests {
         let body = &src[..src
             .find("mod model_group_tests")
             .expect("这个测试模块自己得在文件里")];
+        // **先剥注释再扫。** 注释不可能「读」一个数据库列，扫它只会制造假红：本轮就撞了
+        // 一次 —— 另一个测试模块里一句解释性的注释提到了这个列名，被归到它前面那个顶层
+        // 函数（image_generations）名下，报出来的是一条和事实无关的越权告警。
+        // 用空格替换而不是删掉，保持字节位置不变，`owner()` 数行才不会错位。
+        let stripped: String = body
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    " ".repeat(l.len())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = stripped.as_str();
 
         let mut seen = 0;
         for (i, _) in body.match_indices("group_into") {

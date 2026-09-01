@@ -87,6 +87,8 @@ type Offer = {
   blended_cny: number | null;
   rank: number | null;
   probe_ms: number | null;
+  /** 快慢判定真正用的耗时：真实样本够就是真实首字，否则退回探测（带 * 号）。 */
+  eff_ms: number | null;
   probe_ok: boolean | null;
   fastest: boolean;
   slow: boolean;
@@ -720,9 +722,17 @@ export function RelayRates() {
 
                               <td className="px-4 py-2 text-right">
                                 <span className="inline-flex items-center gap-1.5">
-                                  {o.probe_ms != null && (
-                                    <span className="tabular-nums text-muted-foreground">
-                                      {(o.probe_ms / 1000).toFixed(1)}s
+                                  {o.eff_ms != null && (
+                                    <span
+                                      className="tabular-nums text-muted-foreground"
+                                      title={
+                                        o.eff_ms === o.probe_ms
+                                          ? "探测耗时（这个模型在这一家还没有足够的真实样本）。注意探测系统性地比真实首字快 3~8 倍。"
+                                          : "真实首字延迟（最近 7 天，成功那些的均值）。快慢判定用的就是这个数，和网关派单同源。"
+                                      }
+                                    >
+                                      {(o.eff_ms / 1000).toFixed(1)}s
+                                      {o.eff_ms !== o.probe_ms ? "" : "*"}
                                     </span>
                                   )}
                                   {o.fastest && !single && (

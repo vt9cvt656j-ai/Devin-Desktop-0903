@@ -796,6 +796,32 @@ pub fn hrw_pick(key: &[u8; 32], set: &[(uuid::Uuid, f64, f64)]) -> Option<usize>
 pub async fn load_own_rates(
     db: &sqlx::PgPool,
     route_ids: &[uuid::Uuid],
+    // 只统计这个模型的成败。`None` = 全模型合计（给没有单一模型语境的调用方）。
+    //
+    // **加这一位是在修一个正在花钱的 bug。** `route_attempt` 按
+    // (day, endpoint_id, model_id) 分行（写入见 route_health.rs 的 ON CONFLICT），
+    // 而这里原来 `GROUP BY endpoint_id` 把模型维整个丢掉了 —— 于是一个出口在**别的
+    // 模型**上的战绩，决定了它在**这个模型**上要不要被跳过、要不要被判不可靠、
+    // 要不要吃最多 5 倍的价格惩罚。
+    //
+    // 2026-09-01 线上实测 deepseek 线路（查的是 deepseek-v4-flash）：
+    //     出口        进价   合并口径   该模型真值
+    //     梦幻API     0.24   0/13       67/88  (76%)
+    //     OHub        0.6    0/12       98/112 (88%)
+    //     mixtoken    1.0    12/26      4/4
+    //     teamorouter 1.0    226/245    554/571
+    // 两个**最便宜且在这个模型上工作良好**的出口被判成「试过、从来没成过」，起因是
+    // deepseek-v4-pro 当天撞的 404。流量被推给贵 4 倍的那两个。
+    //
+    // 更隐蔽的一层：SQL 里「今天样本 >= 8 就只看今天」的那个总数原来也是跨模型合计的，
+    // 所以某个模型当天猛失败会把整个出口切成「只看今天」，把被查模型自己 7 天的成功
+    // 记录整段丢掉 —— 合并不只是掩盖，它还会**诬告**。
+    //
+    // 查不到这个模型的行时结果是**没有样本**（不是退回全模型合计）：本文件一以贯之的
+    // 规矩是「没有证据不构成降级理由」，而退回合计等于把要修的污染又请回来。代价是
+    // 冷门模型的降级会比现在迟钝一些 —— 那一侧的兜底是探测（探测是按出口的，
+    // 「这个出口还活着吗」照样答得出）。
+    model_id: Option<&str>,
 ) -> HashMap<uuid::Uuid, (i64, i64)> {
     if route_ids.is_empty() {
         return HashMap::new();
@@ -810,9 +836,11 @@ pub async fn load_own_rates(
                      THEN COALESCE(SUM(fail_calls) FILTER (WHERE day = current_date), 0)::bigint \
                      ELSE COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
                 END \
-         FROM route_attempt WHERE endpoint_id = ANY($1) GROUP BY endpoint_id",
+         FROM route_attempt WHERE endpoint_id = ANY($1) \
+           AND ($2::text IS NULL OR model_id = $2) GROUP BY endpoint_id",
     )
     .bind(route_ids)
+    .bind(model_id)
     .fetch_all(db)
     .await
     .unwrap_or_else(|e| {
@@ -824,17 +852,35 @@ pub async fn load_own_rates(
     rows.into_iter().map(|(id, ok, bad)| (id, (ok, bad))).collect()
 }
 
+/// 全模型合计。给没有单一模型语境的调用方（后台列表、对账、同步、清单核对）。
+///
+/// **派单路径别用这个** —— 用 [`load_for_routes_for_model`]，理由见 [`load_own_rates`]
+/// 的注释：合并跨模型的成败会让一个出口在别的模型上的战绩决定它在这个模型上的命运。
 pub async fn load_for_routes(
     db: &sqlx::PgPool,
     route_ids: &[uuid::Uuid],
+) -> HashMap<uuid::Uuid, Vec<Endpoint>> {
+    load_for_routes_for_model(db, route_ids, None).await
+}
+
+/// 同上，但成败数/首字延迟/最近成败时刻只统计 `model_id` 这一个模型。
+pub async fn load_for_routes_for_model(
+    db: &sqlx::PgPool,
+    route_ids: &[uuid::Uuid],
+    model_id: Option<&str>,
 ) -> HashMap<uuid::Uuid, Vec<Endpoint>> {
     if route_ids.is_empty() {
         return HashMap::new();
     }
     let rows: Vec<Endpoint> = sqlx::query_as(
         // 连 route_attempt 是为了把「最近一次真实成功／失败」带出来给排序用。
-        // 按出口聚合（那张表还按天和模型分行），LEFT JOIN 保证没有流量记录的
-        // 出口照样出现 —— 缺证据不构成排除理由。
+        // 那张表按 (天, 出口, 模型) 分行；`$2` 非空时只统计那一个模型 —— 派单必须走
+        // 这一支，理由见 `load_own_rates` 上面那段（跨模型合并会让一个出口在别的模型
+        // 上的战绩决定它在这个模型上的命运，实测正在把最便宜且可用的出口挤掉）。
+        // LEFT JOIN 保证没有流量记录的出口照样出现 —— 缺证据不构成排除理由。
+        //
+        // `MAX(last_ok_at)/MAX(last_fail_at)` 同样跟着 $2 收窄：它们喂的是排序**第一键**
+        // `availability_tier`，跨模型取最大等于拿别的模型的成败给这个模型定档。
         "SELECT e.*, a.last_ok_at, a.last_fail_at, a.real_sum, a.real_n, a.real_ok, a.real_bad FROM route_endpoints e \
          LEFT JOIN (SELECT endpoint_id, MAX(last_ok_at) AS last_ok_at, \
                            MAX(last_fail_at) AS last_fail_at, \
@@ -851,11 +897,14 @@ pub async fn load_for_routes(
                                 THEN COALESCE(SUM(fail_calls) FILTER (WHERE day = current_date), 0)::bigint \
                                 ELSE COALESCE(SUM(fail_calls) FILTER (WHERE day >= current_date - 6), 0)::bigint \
                            END AS real_bad \
-                    FROM route_attempt GROUP BY endpoint_id) a ON a.endpoint_id = e.id \
+                    FROM route_attempt \
+                    WHERE ($2::text IS NULL OR model_id = $2) \
+                    GROUP BY endpoint_id) a ON a.endpoint_id = e.id \
          WHERE e.route_id = ANY($1) AND e.active = true \
          ORDER BY e.cost_ratio, e.created_at",
     )
     .bind(route_ids)
+    .bind(model_id)
     .fetch_all(db)
     .await
     .unwrap_or_else(|e| {
@@ -2056,8 +2105,18 @@ pub struct RouteOut {
     pub own_cost_cny: Option<f64>,
     pub active: bool,
     pub model_count: usize,
-    /// 这条线路开放的模型 id。
+    /// 这条线路**自己**开放的模型 id（`allowed_ids`）。
     pub models: Vec<String>,
+    /// 派单真正拿来匹配的那一份：线路自己的 ∪ 各出口 `enabled_models` 的并集。
+    ///
+    /// 两者会不一样，而且不一样的时候正是要看的时候：一个出口可以带来线路本身没有的
+    /// 模型（`effective_models`，刻意设计）。屏上的模型选择器必须用这一份，否则那些
+    /// 「只由出口带进来」的模型在选择器里根本不存在，而它们恰恰是排序最容易出错的。
+    pub effective_models: Vec<String>,
+    /// 线路自带地址最近的成败（窗口和出口那边逐字一致）。前端排序要用 —— 它此前
+    /// 只能硬写 0/0，于是自带地址在屏上永远算靠谱。
+    pub own_rate_ok: i64,
+    pub own_rate_bad: i64,
     /// 这条线路怎么计费。出口窗口里**只读显示** —— 加一个出口时你要知道它的流量
     /// 会被按什么价计费，但计费是线路的属性，不能在出口这一层改。
     pub billing_mode: String,
@@ -2315,12 +2374,25 @@ pub async fn admin_health(
     })))
 }
 
-/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。
+/// `GET /api/admin/route-endpoints` —— 每条线路 + 它挂了哪些出口。
+///
+/// `?model=<模型 id>`：把成败数/首字延迟/最近成败时刻收窄到**这一个模型**，和派单
+/// 那一侧（`load_for_routes_for_model`）同口径。不带这个参数时是全模型合计。
+///
+/// **为什么需要这个参数。** 这一屏画的是「谁会先被派到」，而派单是**逐模型**决定的：
+/// 出口按 `enabled_models` 筛（`expand()` 里那两处 continue），成败数也按模型统计。
+/// 屏幕上只画一份「这条线路的顺序」，等于把所有模型的答案糊成一个 —— 实测 GPT 线路上
+/// 屏上第 1 名的出口对 `gpt-5.6-luna` 根本不是候选，近 7 天一次都没被派到过。
 pub async fn admin_list(
     State(state): State<AppState>,
     claims: Claims,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     admin_only(&claims)?;
+    let want_model: Option<String> = q
+        .get("model")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let routes: Vec<Model> =
         sqlx::query_as("SELECT * FROM models ORDER BY sort, created_at").fetch_all(&state.db).await?;
     let eps: Vec<Endpoint> = sqlx::query_as(
@@ -2350,8 +2422,11 @@ pub async fn admin_list(
                     COALESCE(SUM(ttfb_ms_sum) FILTER (WHERE day >= current_date - 6), 0)::bigint, \
                     COALESCE(SUM(ttfb_ms_n)   FILTER (WHERE day >= current_date - 6), 0)::bigint, \
                     MAX(last_ok_at), MAX(last_fail_at) \
-             FROM route_attempt GROUP BY endpoint_id",
+             FROM route_attempt \
+             WHERE ($1::text IS NULL OR model_id = $1) \
+             GROUP BY endpoint_id",
         )
+        .bind(want_model.as_deref())
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
@@ -2369,6 +2444,17 @@ pub async fn admin_list(
         })
         .collect();
 
+    // 线路自带地址的成败。**前端此前把它硬写成 (0, 0)**，旁边的注释还说「和服务端一致」——
+    // 那句是假的：服务端 `expand()` 从 `load_own_rates` 真读得到这一对数，并据此判它的
+    // 可靠性档（`route_endpoints.rs` 里 `rate_of.push(own_rates...)` 那一行）。
+    // 于是屏幕上自带地址永远算「没有样本 = 靠谱」，而派单可能正把它整档往后压。
+    let own_rates = load_own_rates(
+        &state.db,
+        &routes.iter().map(|r| r.id).collect::<Vec<_>>(),
+        want_model.as_deref(),
+    )
+    .await;
+
     let mut by_route: HashMap<uuid::Uuid, Vec<Endpoint>> = HashMap::new();
     for e in eps {
         by_route.entry(e.route_id).or_default().push(e);
@@ -2378,8 +2464,13 @@ pub async fn admin_list(
     for r in &routes {
         // 被分组到别处的线路仍然是独立线路（分组只动显示），所以照样列出来 ——
         // 它有自己的密钥和账单，也就该能挂自己的出口。
+        let outlets = by_route.remove(&r.id).unwrap_or_default();
+        // 先算并集再进循环：下面会把 `e` 的字段搬进 EndpointOut，之后就取不到了。
+        // 调**同一个** `effective_models`，不在这儿重抄一份并集逻辑 —— 抄一份就会和
+        // 派单那侧漂，而这一屏的全部意义就是「照实画出派单会怎么做」。
+        let eff = effective_models(r, &outlets);
         let mut list = Vec::new();
-        for e in by_route.remove(&r.id).unwrap_or_default() {
+        for e in outlets {
             let h = crate::route_health::snapshot(&state, e.id).await;
             let cost_cny = crate::relay_rates::usd_per_cny(&e.base_url)
                 .and_then(|r| crate::relay_rates::cny_per_official_usd(e.cost_ratio, r));
@@ -2426,6 +2517,9 @@ pub async fn admin_list(
             active: r.active,
             model_count: crate::models::allowed_ids(r).len(),
             models: crate::models::allowed_ids(r),
+            effective_models: eff,
+            own_rate_ok: own_rates.get(&r.id).map(|(ok, _)| *ok).unwrap_or(0),
+            own_rate_bad: own_rates.get(&r.id).map(|(_, bad)| *bad).unwrap_or(0),
             billing_mode: r.billing_mode.clone(),
             rate: r.rate,
             cache_disabled: r.cache_disabled,
@@ -3856,9 +3950,41 @@ mod tests {
             code.contains("        endpointScore(cost.of(e), e, bestMs),"),
             "前端排序键里的成本项没走换算或没进得分 —— 它画的顺序不是真正会发生的",
         );
+        // 自带地址：成本项要换算，可靠性档要用**真实成败**。
+        //
+        // 这条原来钉的是字面量 `{ k: [0, 0, cost.own], v: null }`。它的本意（看失败文案）
+        // 是「自带地址也要换算」，可它顺带把中间那个 0 一起锁死了 —— 而那个 0 是错的：
+        // 服务端 `expand()` 从 `load_own_rates` 真读得到自带地址的成败并据此判它的可靠性档
+        // （`rate_of.push(own_rates...)` 那一行），前端却只能硬写 0 = 永远算靠谱。
+        // 于是屏上自带地址满亮度排在前面，而派单可能正把它整档往后压。
+        // 现在服务端把 own_rate_ok/own_rate_bad 一起下发，前端按同一个 `isReliable` 判。
         assert!(
-            code.contains("{ k: [0, 0, cost.own], v: null },"),
+            code.contains("cost.own"),
             "线路自带地址还按常量 1 参与比价 —— 它也要换算，否则和出口不是一把尺",
+        );
+        assert!(
+            code.contains("isReliable({ rate_ok: r.own_rate_ok, rate_bad: r.own_rate_bad })"),
+            "自带地址的可靠性档还是硬写的 —— 它在屏上会永远算靠谱，而派单未必这么看",
+        );
+        // 服务端得真把这两个数下发出去，否则上面那一行只是读到两个 undefined。
+        // 这个测试模块里 `src` 是个辅助函数（取源码文本），不是变量。
+        let whole = src();
+        let prod = &whole[..whole.find("\nmod tests").unwrap_or(whole.len())];
+        assert!(
+            prod.contains("pub own_rate_ok: i64,") && prod.contains("pub own_rate_bad: i64,"),
+            "RouteOut 没下发自带地址的成败，前端那条判据会读到 undefined",
+        );
+        assert!(
+            prod.contains("pub effective_models: Vec<String>,"),
+            "RouteOut 没下发 effective_models —— 模型选择器里会缺掉「只由出口带进来」的那些，\
+             而它们恰恰是排序最容易出错的",
+        );
+        // 这一屏必须能按模型看：派单是逐模型决定的（出口按 enabled_models 筛），
+        // 只画一份「这条线路的顺序」等于把所有模型的答案糊成一个。
+        assert!(
+            code.contains("function ordered(r: Route, modelId = \"\")")
+                && code.contains("function servesModel(r: Route, e: Endpoint, modelId: string)"),
+            "前端排序不按模型筛 —— 屏上会混进对这个模型根本不是候选的出口，名次的分母也是错的",
         );
 
         // 「慢不慢」用哪个耗时也必须两边一致，否则这一屏画的降级和真正发生的对不上。
@@ -3990,6 +4116,80 @@ mod tests {
         map.insert(r.id, vec![ep(0.05, Some(false), "https://broken-but-cheap.example.com")]);
         let urls: Vec<String> = expand(&[r], &map, &HashMap::new(), "claude-opus-5").into_iter().map(|m| m.base_url).collect();
         assert_eq!(urls[0], "https://own.example.com", "一折但打不通的出口抢到了第一位");
+    }
+
+    /// 成败数必须按**模型**统计，不能按出口合并。
+    ///
+    /// 合并的后果不是「不够精确」，是**诬告**：一个出口在别的模型上撞的 404，会让它在
+    /// 这个模型上被判「试过、从来没成过」（`narrow_to_one_route` 据此跳过整条线路）、
+    /// 被 `is_reliable` 整档后置、再吃最多 5 倍的价格惩罚 —— 三处都读这一对数。
+    ///
+    /// 2026-09-01 线上实测 deepseek 线路，查 `deepseek-v4-flash`（进价从便宜到贵）：
+    ///
+    ///     出口          进价   合并口径            该模型真值
+    ///     (nvidia)      0.1    0/13               0/9      ← 真的坏
+    ///     梦幻API       0.24   0/13               67/88   (76.1%)
+    ///     OHub          0.6    0/12               98/112  (87.5%)
+    ///     mixtoken      1.0    12/26              4/4
+    ///     teamorouter   1.0    226/245            35/36   (97.2%)
+    ///
+    /// 修好之后的**准确**效果（不是「全都放行」）：
+    ///   · OHub 从不可靠档升进可靠档 —— 它是第二便宜的，此前排在两个 1.0 倍的后面；
+    ///   · 梦幻API 仍然判不可靠（76% 确实低于 90% 底线，那是产品判断，不是这条要改的），
+    ///     但它不再是 `never_worked`，于是不会再让整条线路被跳过；
+    ///   · 真的坏的那个（该模型 0/9）两项都照旧按住。
+    /// 只断言「不再判死」会被一个「一律返回 true」的改动骗过去，所以三种方向都钉。
+    #[test]
+    fn success_rates_must_be_counted_per_model_not_merged_across_models() {
+        // 合并口径：两个能用的出口都被判死。
+        for (ok, bad) in [(0i64, 13i64), (0, 12)] {
+            assert!(!super::is_reliable(ok, bad), "合并口径下 {ok}/{} 被判不可靠", ok + bad);
+            assert!(ok == 0 && bad > 0, "合并口径下它还是 never_worked");
+        }
+        // 按模型统计之后。
+        assert!(super::is_reliable(98, 14), "OHub 在 v4-flash 上 98/112(87.5%) 必须升进可靠档");
+        assert!(
+            !super::is_reliable(67, 21),
+            "梦幻API 76% 确实低于 90% 底线 —— 这一条**故意**保持不可靠。\
+             它要是变成可靠了，说明有人把可靠性判据一起改松了，而那是另一件事",
+        );
+        assert!(!super::is_reliable(0, 9), "该模型上 0 成 9 败的出口必须仍然判不可靠");
+
+        // never_worked（narrow_to_one_route 的判据）：两个能用的不再是死的，坏的还是死的。
+        let never_worked = |ok: i64, bad: i64| ok == 0 && bad > 0;
+        assert!(!never_worked(67, 21) && !never_worked(98, 14), "按模型看它们都成功过");
+        assert!(never_worked(0, 9), "真的坏的那个仍然是 never_worked");
+
+        // ── 接线：纯函数对了不等于查询用了它 ──────────────────────────────
+        // 两条 SQL 各要带模型闸，两个派单调用点各要把模型传下去。缺一处 bug 原样回来。
+        let src = include_str!("route_endpoints.rs");
+        let prod = &src[..src.find("\nmod tests").unwrap_or(src.len())];
+        for (f, what) in [
+            ("pub async fn load_own_rates(", "自带地址"),
+            ("pub async fn load_for_routes_for_model(", "出口"),
+        ] {
+            let at = prod.find(f).unwrap_or_else(|| panic!("{f} 改名了"));
+            let rest = &prod[at..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            assert!(
+                rest[..end].contains("($2::text IS NULL OR model_id = $2)"),
+                "{what}那条查询丢了模型闸 —— 又变回跨模型合并了",
+            );
+        }
+        let m = include_str!("models.rs");
+        let mprod = &m[..m.find("\nmod billing_tests").unwrap_or(m.len())];
+        assert!(
+            mprod.contains("crate::route_endpoints::load_for_routes_for_model("),
+            "派单没走 _for_model：查询修好了但调用点还在用全模型合计的那一版",
+        );
+        assert_eq!(
+            mprod.matches("Some(&model_id),").count(),
+            2,
+            "派单路径上应当恰好有两处把模型传进成败统计（出口一处、自带地址一处）",
+        );
     }
 
     #[test]

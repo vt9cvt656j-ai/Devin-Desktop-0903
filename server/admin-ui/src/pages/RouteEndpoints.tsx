@@ -107,7 +107,15 @@ type Route = {
   own_cost_cny: number | null;
   active: boolean;
   model_count: number;
+  /** 这条线路**自己**开放的模型。 */
   models: string[];
+  /** 派单真正拿来匹配的那一份：线路自己的 ∪ 各活跃出口 enabled_models 的并集。
+   *  模型选择器必须用这一份 —— 「只由出口带进来」的模型不在 models 里，而它们恰恰
+   *  是最容易排错的（服务端 expand() 会按模型把不承载它的出口整个 continue 掉）。 */
+  effective_models: string[];
+  /** 线路自带地址的成败（派单窗口口径）。此前前端只能硬写 0/0，于是它在屏上永远算靠谱。 */
+  own_rate_ok: number;
+  own_rate_bad: number;
   billing_mode: string;
   rate: number;
   cache_disabled: boolean;
@@ -310,9 +318,28 @@ function costKeys(r: Route, live: Endpoint[]): { own: number; of: (e: Endpoint) 
  * 这里重算一遍而不是让服务端回排好的：这一屏要的是「**如果**我把这个改成 0.3 倍，
  * 它会排到第几」，而那要在保存之前就看得到。判据和服务端是同一套。
  */
-function ordered(r: Route): Array<Endpoint | null> {
+function servesModel(r: Route, e: Endpoint, modelId: string): boolean {
+  // 复刻服务端 `expand()`：出口 enabled_models 为空 = 承载**线路自己**开放的那些
+  // （不是并集 —— 别的出口带来的货这个出口未必有）；非空 = 就这几款。
+  return e.enabled_models.length === 0
+    ? r.models.includes(modelId)
+    : e.enabled_models.includes(modelId);
+}
+
+/**
+ * `modelId` 为空 = 不按模型筛（全线路视角，老行为）。
+ *
+ * **派单是逐模型决定的，这一屏原来只画一份「这条线路的顺序」。** 服务端两处按模型筛：
+ * 自带地址只在线路自己有这款货时才进候选，出口按 enabled_models 承载与否直接 continue。
+ * 不筛的后果不是「略有出入」——线上 GPT 线路上屏幕排第 1 的出口对 gpt-5.6-luna 根本不是
+ * 候选，近 7 天一次都没被派到过，而它占着第 1 名的位置，第 2、5 名同样不是候选。
+ * 名次的分母也因此是错的。
+ */
+function ordered(r: Route, modelId = ""): Array<Endpoint | null> {
   const now = Date.now();
-  const live = r.endpoints.filter((e) => e.active);
+  const live = r.endpoints
+    .filter((e) => e.active)
+    .filter((e) => !modelId || servesModel(r, e, modelId));
   // 「慢不慢」是**相对同线路最快的那个**说的，一个出口自己看不出来。基准只取还活着的
   // 候选：一个已知打不通的出口耗时没有意义，拿它当基准会让所有人显得「不慢」。
   const bestMs = live
@@ -330,7 +357,16 @@ function ordered(r: Route): Array<Endpoint | null> {
     // 线路自带地址在 route_attempt 里的成败记在**线路 id** 下，这一屏拿不到，
     // 所以它按「没有样本」算 —— 也就是算靠谱、不罚。和服务端一致（那边同样
     // 给自带地址塞的是 (0, 0)）。宁可不罚，不猜。
-    { k: [0, 0, cost.own], v: null },
+    // 自带地址。**成败数现在从服务端读**（own_rate_ok/own_rate_bad）——
+    // 原来这里硬写 (0, 0)，旁边注释说「和服务端一致」，那句是假的：服务端
+    // `expand()` 从 `load_own_rates` 真读得到这一对数并据此判它的可靠性档。
+    // 于是屏上自带地址永远算靠谱，而派单可能正把它整档往后压。
+    ...(modelId && !r.models.includes(modelId)
+      ? [] // 线路自己没这款货 → 自带地址根本不是候选（服务端 own_has 那一处）
+      : [{
+          k: [0, isReliable({ rate_ok: r.own_rate_ok, rate_bad: r.own_rate_bad }) ? 0 : 1, cost.own],
+          v: null,
+        } as { k: [number, number, number]; v: Endpoint | null }]),
     ...live.map((e) => ({
       k: [
         tier(e, now),
@@ -344,11 +380,38 @@ function ordered(r: Route): Array<Endpoint | null> {
   return rows.map((x) => x.v);
 }
 
+/**
+ * 这一行**为什么**排在后面。`null` = 没被往后排。
+ *
+ * 压暗此前的判据是「被判了慢」，旁边注释还写着「那才是这一屏上唯一还会让一个出口
+ * 往后靠的东西」—— 那句话已经不成立：排序的前两档（可用档 `tier`、可靠性档
+ * `isReliable`）都排在得分之前，而「慢」只是得分里的一个 √倍数因子。
+ *
+ * 后果是方向反的：线上 Claude 线路重放，被压暗的第 2、3 行排在没压暗的第 4 行**前面**，
+ * 而真正被整档踢到最后的第 5/6/7 行（探测打不通）全部满亮度。
+ */
+function demotedReason(r: Route, e: Endpoint | null, modelId = ""): string | null {
+  const now = Date.now();
+  if (e) {
+    const t = tier(e, now);
+    if (t === 2) return "测下来不通，整档排到最后";
+    if (!isReliable(e)) return "成功率低于 90%，整档排在靠谱的那批之后";
+    if (t === 1) return "探测结论过期/没测过，排在测通的之后";
+  } else if (!isReliable({ rate_ok: r.own_rate_ok, rate_bad: r.own_rate_bad })) {
+    return "线路自带地址成功率低于 90%，整档排在靠谱的那批之后";
+  }
+  return slowOnThisRoute(r, e, modelId) ? "比同线路最快的慢 3 倍以上且超过 5 秒" : null;
+}
+
 /** 这个出口在这一屏上是不是被判了「慢」。渲染徽章用，判据和 ordered() 同一处。 */
-function slowOnThisRoute(r: Route, e: Endpoint | null): boolean {
+function slowOnThisRoute(r: Route, e: Endpoint | null, modelId = ""): boolean {
   if (!e) return false;
   const now = Date.now();
-  const live = r.endpoints.filter((x) => x.active);
+  // 基准必须取**和排序同一批**候选：选了模型之后不承载它的出口根本不参与排序，
+  // 拿它们的耗时当基准会得出一个屏上任何一行都对不上的「最快」。
+  const live = r.endpoints
+    .filter((x) => x.active)
+    .filter((x) => !modelId || servesModel(r, x, modelId));
   const bestMs = live
     .filter((x) => tier(x, now) < 2)
     .map((x) => effectiveMs(x))
@@ -443,7 +506,7 @@ function RealBadge({ ok, fail, ms }: { ok: number; fail: number; ms: number | nu
     <Badge
       variant="outline"
       className={good ? "shrink-0 border-success/40 text-success" : "shrink-0 border-warning/40 text-warning"}
-      title={`最近 7 天真实请求：成功 ${ok} 次、失败 ${fail} 次${ms != null ? `，成功那些平均首字 ${ms}ms` : "，没有可用的耗时样本"}。排序用的就是这一栏，探测只在没有真实流量时才作数。`}
+      title={`最近 7 天真实请求：成功 ${ok} 次、失败 ${fail} 次${ms != null ? `，成功那些平均首字 ${ms}ms` : "，没有可用的耗时样本"}。这是 7 天成绩单；排序读的是另一对数（今天，样本不够才退回 7 天），两者常常不同。耗时上，有 5 个以上真实样本时用真实首字，否则退回探测。`}
     >
       真实 {rate.toFixed(rate >= 99.95 || rate === 0 ? 0 : 1)}% · {total}次
       {ms != null ? ` · ${ms}ms` : ""}
@@ -481,6 +544,12 @@ function ProbeBadge({ ok, ms, note }: { ok: boolean | null; ms: number | null; n
 
 export function RouteEndpoints() {
   const [routes, setRoutes] = useState<Route[] | null>(null);
+  // 「按哪个模型看」。空 = 全部模型合计（老行为）。
+  //
+  // 这一屏画的是「谁会先被派到」，而**派单是逐模型决定的**：出口按 enabled_models 筛，
+  // 成败数也按模型统计。选了模型之后前端按同一套判据筛，服务端也用 ?model= 把成败数
+  // 收窄到这一个模型 —— 两侧同口径，画出来的才是真的会发生的顺序。
+  const [modelFilter, setModelFilter] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -498,15 +567,19 @@ export function RouteEndpoints() {
   } | null>(null);
   const [fetching, setFetching] = useState(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (model = modelFilter) => {
     setErr(null);
     try {
-      const body = await api.get<{ routes: Route[] }>("/api/admin/route-endpoints");
+      // 成败数按这个模型取。不带的话屏上是全模型合计，而派单看的是这个模型自己的
+      // 战绩 —— 两者能差到判定翻转（实测 deepseek 线路：合并 0/13「从没成过」，
+      // 按 deepseek-v4-flash 看是 67/88）。
+      const qs = model ? `?model=${encodeURIComponent(model)}` : "";
+      const body = await api.get<{ routes: Route[] }>(`/api/admin/route-endpoints${qs}`);
       setRoutes(body.routes ?? []);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "读取失败");
     }
-  }, []);
+  }, [modelFilter]);
 
   useEffect(() => {
     void load();
@@ -665,6 +738,39 @@ export function RouteEndpoints() {
         }
       />
 
+      {/* 按模型看。**默认是「全部模型」= 老行为**，选一个模型才切到「派单真正会怎么排」。
+          默认不自动选，是因为「全部」这一档回答的是另一个有用的问题（这条线路整体如何）；
+          但那一档下的顺序**不代表任何一次真实派单** —— 下面那句提示把这件事说出来。 */}
+      {routes && (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-muted-foreground">按模型看：</span>
+          <select
+            className="h-8 rounded-md border border-border bg-background px-2 text-sm"
+            value={modelFilter}
+            onChange={(e) => {
+              setModelFilter(e.target.value);
+              void load(e.target.value);
+            }}
+          >
+            <option value="">全部模型（合计，不代表任何一次真实派单）</option>
+            {[...new Set(list.flatMap((r) => r.effective_models))].sort().map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+          {modelFilter ? (
+            <span className="text-[12px] text-muted-foreground">
+              下面每条线路只列**承载这个模型**的出口，成败数也只算这个模型 —— 和网关派单同口径。
+            </span>
+          ) : (
+            <span className="text-[12px] text-warning">
+              合计视角：不承载某个模型的出口也列在里面，名次的分母因此偏大。要看真实派单顺序请选一个模型。
+            </span>
+          )}
+        </div>
+      )}
+
       <ErrorState message={err} />
 
       {note ? (
@@ -689,15 +795,16 @@ export function RouteEndpoints() {
           <SectionReveal as="section" delay={140} className="space-y-4">
             <p className="text-xs leading-relaxed text-muted-foreground">
               同一条线路下按{" "}
-              <b className="text-foreground">「能用的在前 → 不慢的在前 → 便宜的在前」</b>{" "}
-              自动排序。<b className="text-foreground">挂多少个就能用多少个</b>——
+              <b className="text-foreground">「能用的在前 → 稳的在前 → 便宜的在前」</b>{" "}
+              自动排序（第二档是<b className="text-foreground">可靠性</b>，不是快慢——
+              快慢已经并进第三档的得分里，按 √倍数计、最多罚 3 倍）。<b className="text-foreground">挂多少个就能用多少个</b>——
               一个请求能换几个出口由<b className="text-foreground">时间</b>决定，不由次数决定：
               换线只发生在上游明确回了错误的时候，而那类失败（401 / 404 / 429）两三百毫秒就回来，
               十个加起来还不到三秒。总时长由客户端自己的耐心封顶，多试几个不会让人多等。
             </p>
 
             {list.map((r) => {
-              const rows = ordered(r);
+              const rows = ordered(r, modelFilter);
               const vname = vendorName(r.vendor);
               return (
                 <Card key={r.id} className={cn(!r.active && "opacity-60")}>
@@ -744,11 +851,12 @@ export function RouteEndpoints() {
 
                   <ol className="divide-y divide-border">
                     {rows.map((e, i) => {
-                      // 「前两个之后就躺着」那条分割线删了 —— 它描述的那道闸已经不存在。
-                      // 现在压暗的判据换成「被判了慢」：那才是这一屏上唯一还会让一个
-                      // 出口往后靠的东西，而且它是可解释的（比最快的慢三倍且超过五秒）。
-                      const slow = slowOnThisRoute(r, e);
-                      const beyond = slow;
+                      // 压暗的判据是「**这一行确实被往后排了**」，不再只看「慢」。
+                      // 只看慢的话方向是反的：慢只是得分里的一个因子，而可用档和可靠性档
+                      // 排在得分之前 —— 被整档踢到最后的那几行反而满亮度。
+                      const slow = slowOnThisRoute(r, e, modelFilter);
+                      const why = demotedReason(r, e, modelFilter);
+                      const beyond = why !== null;
                       const id = e?.id ?? r.id;
                       return (
                         <li key={id}>
@@ -871,7 +979,7 @@ export function RouteEndpoints() {
                                 <Badge
                                   variant="outline"
                                   className="border-warning/40 text-warning"
-                                  title={`比这条线路最快的出口慢 ${SLOW_FACTOR} 倍以上，而且自己超过 ${SLOW_FLOOR_MS / 1000} 秒 —— 已排到同档的便宜出口之后。两个条件必须同时成立才会降级。`}
+                                  title={`比这条线路最快的出口慢 ${SLOW_FACTOR} 倍以上，而且自己超过 ${SLOW_FLOOR_MS / 1000} 秒（两个条件必须同时成立）。注意「慢」**不单独占一档**：它按 √倍数计进第三档的得分、最多罚 3 倍，所以一个又慢又便宜的出口仍然可能排在前面。真正会整档往后压的是可用档和可靠性档。`}
                                 >
                                   <Turtle className="size-3" /> 慢
                                 </Badge>
@@ -879,6 +987,20 @@ export function RouteEndpoints() {
                               </>
                             ) : (
                               <Badge variant="outline">直连</Badge>
+                            )}
+                            {/*
+                              **归因**。数字前端一直都有（成功率、耗时、进价），缺的是
+                              「所以它为什么排在这儿」。压暗本身不说明原因，运维看到一行
+                              灰的只会猜；而排序的前两档是整档后置的，一句话就能说清。
+                            */}
+                            {why && (
+                              <Badge
+                                variant="outline"
+                                className="border-muted-foreground/30 text-muted-foreground"
+                                title={why}
+                              >
+                                {why.length > 16 ? `${why.slice(0, 16)}…` : why}
+                              </Badge>
                             )}
                             <div className="flex shrink-0 items-center gap-1">
                               <Button
