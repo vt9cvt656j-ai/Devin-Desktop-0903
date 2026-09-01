@@ -625,7 +625,7 @@ pub async fn admin_model_prices(
     let manual: Vec<PriceRow> = sqlx::query_as(
         "SELECT e.id, p.model_id, e.base_url, m.label, e.label, \
                 p.input_per_mtok, p.output_per_mtok, p.cached_per_mtok, \
-                '', 1.0, e.probe_ms, e.probe_ok \
+                '', 1.0::float8, e.probe_ms, e.probe_ok \
          FROM endpoint_model_price p \
          JOIN route_endpoints e ON e.id = p.endpoint_id \
          JOIN models m ON m.id = e.route_id \
