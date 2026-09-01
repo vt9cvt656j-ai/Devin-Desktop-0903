@@ -938,8 +938,14 @@ type Caps = {
   max_output?: number | null;
   efforts?: string[];
   default_effort?: string | null;
+  /** **计费用的官方价**（锚定过的：窗口内最高，不跟上游的活动降价）。美元/百万 token。 */
   input_price?: number | null;
   output_price?: number | null;
+  /** 上游此刻挂牌的价。和上面不同 = 它正在打折，而我们按官方价计费。 */
+  spot_input_price?: number | null;
+  spot_output_price?: number | null;
+  /** 1 美元折多少人民币（后台设置的全局汇率）。价目全是美元，这里给出换算。 */
+  cny_per_usd?: number | null;
   cache_read_price?: number | null;
   cache_write_price?: number | null;
   accepts_image?: boolean | null;
@@ -976,7 +982,23 @@ function CapsLine({ caps }: { caps?: Caps }) {
   }
   if (caps.max_output) bits.push(`出 ${fmtCtx(caps.max_output)}`);
   if (caps.input_price != null && caps.output_price != null) {
-    bits.push(`$${caps.input_price}/$${caps.output_price}`);
+    // 美元和人民币一起给。价目全是「美元/百万 token」，而运营脑子里的数是人民币，
+    // 两者差 7 倍 —— 不摆出来，填错一位数没有任何地方会提醒。
+    const cny = caps.cny_per_usd
+      ? ` ≈ ¥${(caps.input_price * caps.cny_per_usd).toFixed(2)}/¥${(caps.output_price * caps.cny_per_usd).toFixed(2)}`
+      : "";
+    bits.push(`$${caps.input_price}/$${caps.output_price}${cny} 每百万 token`);
+  }
+  // **上游在打折时说出来。** 计费走的是官方价（窗口内最高），挂牌价只是此刻的报价。
+  // 不提示的话，运营看到的价和他去 OpenRouter 页面上看到的对不上，而两边都没错。
+  const promoIn = caps.spot_input_price != null && caps.input_price != null
+    && caps.spot_input_price < caps.input_price;
+  const promoOut = caps.spot_output_price != null && caps.output_price != null
+    && caps.spot_output_price < caps.output_price;
+  if (promoIn || promoOut) {
+    bits.push(
+      `上游在打折（现挂 $${caps.spot_input_price}/$${caps.spot_output_price}），仍按官方价计费`,
+    );
   }
   if (caps.cache_read_price != null) bits.push(`缓存读 $${caps.cache_read_price}`);
   // 空数组是有意义的答案：这个模型不吃思考档位（实测 glm-5 就是），不是"没查到"。
@@ -1466,7 +1488,15 @@ function ConnectionDialog({
                       step="0.01"
                       value={r.pin}
                       placeholder={r.caps?.input_price != null ? String(r.caps.input_price) : "入价"}
-                      title={r.caps?.input_price != null ? `留空即用实时价 $${r.caps.input_price}/1M` : undefined}
+                      title={
+                        r.caps?.input_price != null
+                          ? `留空即用官方价 $${r.caps.input_price}/1M` +
+                            (r.caps.cny_per_usd
+                              ? `（≈ ¥${(r.caps.input_price * r.caps.cny_per_usd).toFixed(2)}/1M）`
+                              : "") +
+                            `。这一栏的单位是**美元**每百万 token。`
+                          : undefined
+                      }
                       aria-label={`${r.id} 输入价`}
                       onChange={(e) => patch(r.id, { pin: e.target.value })}
                     />
@@ -1477,7 +1507,15 @@ function ConnectionDialog({
                       step="0.01"
                       value={r.pout}
                       placeholder={r.caps?.output_price != null ? String(r.caps.output_price) : "出价"}
-                      title={r.caps?.output_price != null ? `留空即用实时价 $${r.caps.output_price}/1M` : undefined}
+                      title={
+                        r.caps?.output_price != null
+                          ? `留空即用官方价 $${r.caps.output_price}/1M` +
+                            (r.caps.cny_per_usd
+                              ? `（≈ ¥${(r.caps.output_price * r.caps.cny_per_usd).toFixed(2)}/1M）`
+                              : "") +
+                            `。这一栏的单位是**美元**每百万 token。`
+                          : undefined
+                      }
                       aria-label={`${r.id} 输出价`}
                       onChange={(e) => patch(r.id, { pout: e.target.value })}
                     />

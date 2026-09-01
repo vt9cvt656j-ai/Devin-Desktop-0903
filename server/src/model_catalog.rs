@@ -82,6 +82,12 @@ pub struct Entry {
     /// 所以换算只在 `price_per_million` 一处发生。
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
+    /// 上游**此刻挂牌**的价（可能是活动价）。计费不用它 —— 计费用上面那两个（官方价）。
+    ///
+    /// 分开存是为了让「现在在打折」在后台看得见：合成一个数的话，运营只会看到一个数字，
+    /// 看不出它是不是被活动价拉下来的，也就无从判断该不该跟。
+    pub spot_input_price: Option<f64>,
+    pub spot_output_price: Option<f64>,
     /// 缓存**读**的真实价。以前是 `input_price * 0.1` 推算的，实测偏得很远：
     /// deepseek-v4-flash 真实 0.0123 而推算 0.0061，glm-5 真实 0.12 而推算 0.06——
     /// 都少算一半，也就是按更便宜的价算成本、实际多付。
@@ -269,11 +275,14 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
         Option<f64>,
         serde_json::Value,
         serde_json::Value,
+        Option<f64>,
+        Option<f64>,
     );
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT norm_id, source_id, contexts, efforts, default_effort, max_output,
                 input_price, output_price, cache_read_price, cache_write_price,
-                input_modalities, output_modalities
+                input_modalities, output_modalities,
+                spot_input_price, spot_output_price
          FROM model_catalog",
     )
     .fetch_all(&state.db)
@@ -292,6 +301,8 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
         cache_write_price,
         input_modalities,
         output_modalities,
+        spot_input_price,
+        spot_output_price,
     ) in rows
     {
         map.insert(
@@ -304,6 +315,8 @@ async fn warm_from_db(state: &AppState) -> anyhow::Result<()> {
                 max_output,
                 input_price,
                 output_price,
+                spot_input_price,
+                spot_output_price,
                 cache_read_price,
                 cache_write_price,
                 input_modalities: serde_json::from_value(input_modalities).unwrap_or_default(),
@@ -648,7 +661,7 @@ async fn refresh(state: &AppState) -> anyhow::Result<usize> {
         tracing::info!(probed, "模型目录：为目录未收录的模型探到了真实窗口");
     }
 
-    persist(state, &map, &source_ids).await?;
+    persist(state, &mut map, &source_ids).await?;
     let n = map.len();
     if let Ok(mut c) = CATALOG.write() {
         *c = map;
@@ -656,12 +669,33 @@ async fn refresh(state: &AppState) -> anyhow::Result<usize> {
     Ok(n)
 }
 
+/// 官方价 = 当天挂牌价 和 窗口内最高价 里的**较大者**。
+///
+/// 只抬不降，因为这个函数的全部意义就是「不跟着上游搞活动往下走」。
+/// 三种边界都要答对：
+///   · 挂牌价缺失、窗口有价 → 用窗口价（目录临时不回价，不该让计费退到「没有价」，
+///     那会一路掉到 `compute_cost` 返回 0，也就是白送）；
+///   · 窗口没有价（第一次见这个模型）→ 用挂牌价；
+///   · 挂牌价更高（真涨价了）→ 用挂牌价，立刻生效。涨价没有理由拖。
+pub(crate) fn anchor_price(spot: Option<f64>, window_high: Option<f64>) -> Option<f64> {
+    match (spot, window_high) {
+        (Some(c), Some(h)) if h > c => Some(h),
+        (None, Some(h)) => Some(h),
+        (c, _) => c,
+    }
+}
+
+/// 落库，并把**官方价锚定**应用到 `map`（就地抬价）。
+///
+/// 锚定要同时作用在库和内存上：`refresh` 收尾是 `*CATALOG.write() = map` 整表替换，
+/// 只更新库的话，这一轮进程里 `official_price()` 读到的仍然是当天的活动价，要等到
+/// 下次重启才对 —— 而计费每一秒都在读它。
 async fn persist(
     state: &AppState,
-    map: &HashMap<String, Entry>,
+    map: &mut HashMap<String, Entry>,
     source_ids: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    for (key, entry) in map {
+    for (key, entry) in map.iter() {
         // 只落有内容的行。整份目录 400+ 条里大多数这个网关根本不卖，落库只是噪音。
         if entry.contexts.is_empty() && entry.efforts.is_empty() && entry.input_price.is_none() {
             continue;
@@ -695,6 +729,80 @@ async fn persist(
         .bind(serde_json::to_value(&entry.output_modalities).unwrap_or_default())
         .execute(&state.db)
         .await?;
+
+        // 今天观测到的价，记一笔。一天一行（同一天刷新多次就覆盖），锚定从这张表取。
+        let _ = sqlx::query(
+            "INSERT INTO model_catalog_price_log (day, norm_id, input_price, output_price) \
+             VALUES (current_date, $1, $2, $3) \
+             ON CONFLICT (day, norm_id) DO UPDATE SET \
+               input_price = EXCLUDED.input_price, output_price = EXCLUDED.output_price",
+        )
+        .bind(key)
+        .bind(entry.input_price)
+        .bind(entry.output_price)
+        .execute(&state.db)
+        .await;
+    }
+
+    // ── 官方价锚定 ────────────────────────────────────────────────────────
+    //
+    // 取窗口内观测到的**最高**价当官方价。活动期的低价进不了账（窗口里还压着活动前的
+    // 高价），而真正的永久降价会在窗口走完之后自动生效 —— 没有任何人需要记得去改。
+    //
+    // 只抬不降（`max`）：这一步的全部意义就是不跟着活动价往下走。
+    // 窗口填 0 = 关掉锚定，行为逐字回到加这个功能之前。
+    let window = crate::settings::official_price_window_days();
+    if window > 0 {
+        let anchors: Vec<(String, Option<f64>, Option<f64>)> = sqlx::query_as(
+            "SELECT norm_id, max(input_price), max(output_price) \
+             FROM model_catalog_price_log \
+             WHERE day >= current_date - $1::int \
+             GROUP BY norm_id",
+        )
+        .bind(window as i32)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        let mut raised = 0usize;
+        for (norm_id, hi_in, hi_out) in &anchors {
+            let Some(entry) = map.get_mut(norm_id) else { continue };
+            // 抬价**之前**先把此刻的挂牌价留下来，否则抬完就分不出哪个是哪个了。
+            entry.spot_input_price = entry.input_price;
+            entry.spot_output_price = entry.output_price;
+            let ni = anchor_price(entry.input_price, *hi_in);
+            let no = anchor_price(entry.output_price, *hi_out);
+            if ni != entry.input_price || no != entry.output_price {
+                raised += 1;
+                tracing::info!(
+                    model = %norm_id,
+                    spot_in = ?entry.input_price, spot_out = ?entry.output_price,
+                    official_in = ?ni, official_out = ?no,
+                    "目录价低于窗口内最高价，按官方价计费（多半是上游在搞活动）"
+                );
+            }
+            entry.input_price = ni;
+            entry.output_price = no;
+        }
+        if raised > 0 {
+            tracing::info!(raised, window, "模型目录：这些模型的挂牌价当前低于官方价");
+        }
+
+        // 库里也抬一次，并把当天挂牌价单独存进 spot_*（后台要能看出「现在在打折」）。
+        let _ = sqlx::query(
+            "UPDATE model_catalog c SET \
+               spot_input_price = c.input_price, \
+               spot_output_price = c.output_price, \
+               input_price = GREATEST(c.input_price, a.hi_in), \
+               output_price = GREATEST(c.output_price, a.hi_out) \
+             FROM (SELECT norm_id, max(input_price) AS hi_in, max(output_price) AS hi_out \
+                   FROM model_catalog_price_log WHERE day >= current_date - $1::int \
+                   GROUP BY norm_id) a \
+             WHERE a.norm_id = c.norm_id",
+        )
+        .bind(window as i32)
+        .execute(&state.db)
+        .await;
     }
     Ok(())
 }
@@ -1176,6 +1284,73 @@ mod tests {
 
 #[cfg(test)]
 mod carry_forward_tests {
+    /// 计费的兜底价不许跟着上游搞活动往下走。
+    ///
+    /// `official_price()` 读的就是目录里这一列，而每模型没单独配价时 `compute_cost` 用的
+    /// 就是它。OpenRouter 的挂牌价会因为活动、促销、某家承载商临时降价而下调 ——
+    /// 目录一降，我们对用户的收费当场跟着降，而付给上游的钱没降。
+    ///
+    /// 锚定 = 取窗口内观测到的最高价。四种情形分别是四种不同的错误后果，逐条钉：
+    #[test]
+    fn the_billing_fallback_price_never_follows_a_promo_down() {
+        use super::anchor_price;
+
+        // ① 上游在搞活动（挂牌 1.0，窗口里有过 5.0）→ 按 5.0 收。这是这个功能本体。
+        assert_eq!(anchor_price(Some(1.0), Some(5.0)), Some(5.0));
+
+        // ② 真涨价了（挂牌 8.0 高于窗口最高 5.0）→ 立刻按 8.0。涨价没有理由拖 ——
+        //    拖着就是我们自己吃掉差价。
+        assert_eq!(anchor_price(Some(8.0), Some(5.0)), Some(8.0));
+
+        // ③ 目录临时不回价了（挂牌 None，窗口有 5.0）→ 仍按 5.0。
+        //    退回「没有价」的话 compute_cost 会返回 0 —— 那是白送，不是保守。
+        assert_eq!(anchor_price(None, Some(5.0)), Some(5.0));
+
+        // ④ 第一次见这个模型（窗口里什么都没有）→ 用挂牌价，不许凭空造一个。
+        assert_eq!(anchor_price(Some(2.0), None), Some(2.0));
+        assert_eq!(anchor_price(None, None), None);
+
+        // 相等时不抖：返回哪一个都一样，但不能返回 None。
+        assert_eq!(anchor_price(Some(3.0), Some(3.0)), Some(3.0));
+
+        // ── 接线 ──────────────────────────────────────────────────────────
+        // 纯函数对了不等于刷新用了它，也不等于**内存**目录跟着抬了。
+        // `refresh` 收尾是 `*CATALOG.write() = map` 整表替换，只更新库的话这一轮进程里
+        // official_price() 读到的仍是活动价，要等下次重启才对 —— 而计费每秒都在读它。
+        let src = include_str!("model_catalog.rs");
+        // 从 `refresh` 切到它后面第一个测试模块。**不能**从文件头切到第一个
+        // `#[cfg(test)]` —— 这个文件第一个 `#[cfg(test)]` 在第 206 行，比要检查的代码
+        // 还靠前，那样切出来的 prod 里什么都没有，四条断言全部假红（刚踩过）。
+        let from = src.find("async fn refresh(").expect("refresh 改名了");
+        let prod = &src[from..];
+        let prod = &prod[..prod.find("\n#[cfg(test)]").unwrap_or(prod.len())];
+        // 阳性对照：切片必须真的含着要查的代码，且不能把这条测试自己包进来 ——
+        // 包进来的话下面每一条都在读自己写的字面量，变异之后照样全绿。
+        assert!(prod.contains("async fn persist("), "切片里没有 persist —— 切坏了，下面不作数");
+        assert!(
+            !prod.contains("fn the_billing_fallback_price"),
+            "切片把这条测试自己包进去了 —— 断言会匹配到自己写的字面量",
+        );
+        assert!(
+            prod.contains("persist(state, &mut map, &source_ids).await?;"),
+            "persist 拿的不再是 &mut map —— 锚定只能落到库里，这一轮进程仍按活动价计费",
+        );
+        assert!(
+            prod.contains("let ni = anchor_price(entry.input_price, *hi_in);")
+                && prod.contains("let no = anchor_price(entry.output_price, *hi_out);"),
+            "内存目录没有按锚定价抬上去",
+        );
+        assert!(
+            prod.contains("INSERT INTO model_catalog_price_log"),
+            "没有记录每天的挂牌价 —— 没有历史就算不出窗口内最高价，锚定恒等于当天价",
+        );
+        assert!(
+            prod.contains("let window = crate::settings::official_price_window_days();")
+                && prod.contains("if window > 0 {"),
+            "窗口天数没走设置，或者关不掉 —— 运营要能把它调回「跟着挂牌价走」",
+        );
+    }
+
     /// 探到的窗口必须**跨刷新存活**。
     ///
     /// 刷新一轮结束时是 `*c = map` 整表替换。「上一轮探到过就跳过重探」如果只是 continue，

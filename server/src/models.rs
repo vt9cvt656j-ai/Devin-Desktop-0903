@@ -3469,8 +3469,16 @@ pub async fn admin_available(
                     "max_output": e.max_output,
                     "efforts": e.efforts,
                     "default_effort": e.default_effort,
+                    // **计费用的官方价**（锚定过的，见 model_catalog::anchor_price）。
                     "input_price": e.input_price,
                     "output_price": e.output_price,
+                    // 上游此刻挂牌的价。和上面不一样就说明它在打折 —— 后台据此提示，
+                    // 而计费不跟。合成一个数的话这件事在界面上就不存在了。
+                    "spot_input_price": e.spot_input_price,
+                    "spot_output_price": e.spot_output_price,
+                    // 人民币口径。价目全是「美元/百万 token」，而运营脑子里的数是人民币，
+                    // 两者差 7 倍 —— 不摆出来，填错一位数没有任何地方会提醒。
+                    "cny_per_usd": 10_000.0 / crate::settings::usd_per_cny_bps() as f64,
                     "cache_read_price": e.cache_read_price,
                     "cache_write_price": e.cache_write_price,
                     "accepts_image": crate::model_catalog::accepts_image(id),

@@ -25,6 +25,35 @@ import re, os, json, sys, glob
 
 SRC = os.environ.get("SQLCHECK_SRC") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 
+
+def _strip_cfg_test(src):
+    """把每个 `#[cfg(test)]` 条目替换成等长空白，保留其余生产代码和字节位置。"""
+    out = list(src)
+    i = 0
+    while True:
+        at = src.find("#[cfg(test)]", i)
+        if at < 0:
+            break
+        # 找这个条目的第一个 `{`，再按花括号配平找到它的结尾。
+        j = src.find("{", at)
+        if j < 0:
+            break
+        d, k = 0, j
+        while k < len(src):
+            if src[k] == "{":
+                d += 1
+            elif src[k] == "}":
+                d -= 1
+                if d == 0:
+                    break
+            k += 1
+        for n in range(at, min(k + 1, len(src))):
+            if out[n] != "\n":
+                out[n] = " "
+        i = k + 1
+    return "".join(out)
+
+
 def read_string_literal(s, i):
     """i 指向起始引号。返回 (内容, 结束下标+1)。处理 \\ 续行与转义。"""
     assert s[i] == '"'
@@ -106,9 +135,15 @@ def main():
     for f in sorted(glob.glob(os.path.join(SRC,"*.rs"))):
         base=os.path.basename(f)
         src=open(f,encoding="utf8").read()
-        # 去掉 #[cfg(test)] 之后的内容（测试里有大量假 SQL）
-        ti = src.find("\n#[cfg(test)]")
-        body = src[:ti] if ti>0 else src
+        # 剥掉每一个 #[cfg(test)] 条目（测试里有大量假 SQL），**但只剥那一个条目**。
+        #
+        # 原来是 `src[:src.find("\\n#[cfg(test)]")]` —— 从文件头切到第一个测试属性为止。
+        # 那等于把它后面的所有生产代码一起扔掉：model_catalog.rs 的第一个 #[cfg(test)]
+        # 在第 206 行，而它读目录的那条查询在 274 行，于是那条查询**一次都没被检查过**，
+        # 而工具照样打印「没有对不上的」。这正是这个工具要防的那种失效形状。
+        #
+        # 用空格填回被剥掉的部分，保持字节位置不变 —— 行号是报给人看的。
+        body = _strip_cfg_test(src)
         def line_of(pos): return body.count("\n",0,pos)+1
         for pat in PATTERNS:
             for m in pat.finditer(body):
@@ -166,11 +201,38 @@ def unwrap(t):
     return t
 
 
+def emit(items):
+    """产出 PREPARE 脚本，以及「psql 行号 → 第几条查询」的区间表。
+
+    **不能靠 `\\echo` 标记来归属错误**：psql 的 stdout 是块缓冲、stderr 不缓冲，
+    两者合流之后顺序不保证，标记和它的错误可能隔着几十行。而 `psql:<stdin>:N:` 里的
+    行号是可靠的 —— 只要发射端自己记住每条语句占了哪几行就行。一条 PREPARE 常常横跨
+    很多行（SQL 字面量里有真换行，也有 `--` 注释，压不成一行）。
+    """
+    lines = ["\\set ON_ERROR_STOP off"]
+    ranges = []  # (起始行, 结束行, 第几条)，行号从 1 开始
+    for i, it in enumerate(items):
+        stmt = f"PREPARE p{i} AS {it['sql'].strip().rstrip(';')};"
+        start = len(lines) + 1
+        lines.extend(stmt.split("\n"))
+        ranges.append((start, len(lines), i))
+    lines.append("SELECT name, result_types FROM pg_prepared_statements ORDER BY length(name), name;")
+    return lines, ranges
+
+
 def compare(items, out_path):
     res = {}
     # PREPARE 失败的行长这样：`psql:<stdin>:50: ERROR:  column "x" does not exist`
     # 行号对应 emit-prepare 的输出，第 1 行是 \set，所以 PREPARE pN 在第 N+2 行。
     errs = {}
+    _, ranges = emit(items)
+
+    def owner_of(line_no):
+        for a, b, idx in ranges:
+            if a <= line_no <= b:
+                return idx
+        return None
+
     # **两个都用 search 而不是 match，也不锚定行尾。** psql 把 stderr 插进 stdout 时
     # 不保证换行：实测出现过 `p54  | {text,...}psql:<stdin>:8: ERROR: …` 挤在同一行，
     # 于是锚定行尾的结果正则漏掉 p54、锚定行首的错误正则漏掉那条 ERROR ——
@@ -178,8 +240,13 @@ def compare(items, out_path):
     for line in open(out_path, encoding="utf8", errors="replace"):
         for m in re.finditer(r'(p\d+)\s*\|\s*\{([^}]*)\}', line):
             res[m.group(1)] = [t.strip().strip('"') for t in m.group(2).split(",")] if m.group(2) else []
+        # 按**行号区间**归属。行号减二那种固定偏移是错的 —— 一条 PREPARE 常常横跨很多行，
+        # 实测把 `spot_input_price 不存在` 挂到了一条查 group_into 的语句名下，
+        # 指错地方比不报还糟。
         for m in re.finditer(r'psql:[^:]*:(\d+): ERROR:\s*([^\n]*)', line):
-            errs[int(m.group(1)) - 2] = m.group(2).strip()
+            idx = owner_of(int(m.group(1)))
+            if idx is not None:
+                errs[idx] = m.group(2).strip()
     bad = []
     cols = 0
     for i, it in enumerate(items):
@@ -245,10 +312,8 @@ def compare(items, out_path):
 if __name__ == "__main__":
     items = main()
     if "--emit-prepare" in sys.argv:
-        print("\\set ON_ERROR_STOP off")
-        for i, it in enumerate(items):
-            print(f"PREPARE p{i} AS {it['sql'].strip().rstrip(';')};")
-        print("SELECT name, result_types FROM pg_prepared_statements ORDER BY length(name), name;")
+        lines, _ = emit(items)
+        print("\n".join(lines))
         sys.exit(0)
     if "--compare" in sys.argv:
         sys.exit(compare(items, sys.argv[sys.argv.index("--compare") + 1]))

@@ -55,6 +55,13 @@ pub struct Settings {
     pub free_points_daily_member: Option<i64>,
     /// 1 人民币分 折合多少美元分，万分比。佣金账本以美元计量，人民币销售在记账时折一次。
     pub usd_per_cny_bps: i64,
+    /// 官方价锚定的窗口天数。`None` = 没配，用默认 30。`Some(0)` = 关掉锚定。
+    ///
+    /// OpenRouter 的挂牌价会因为活动、促销、某家承载商临时降价而下调，而它是计费的
+    /// **兜底价**（每模型没单独配价时就用它）。目录一降，我们对用户的收费当场跟着降，
+    /// 而付给上游的钱没降。锚定的做法是取窗口内观测到的最高价：活动期的低价进不了账，
+    /// 真正的永久降价在窗口走完之后自动生效，不需要任何人记得去改。
+    pub official_price_window_days: Option<i64>,
 }
 
 impl Default for Settings {
@@ -66,6 +73,7 @@ impl Default for Settings {
             // 只会多一份会和它漂开的真相。
             free_points_daily_member: None,
             usd_per_cny_bps: DEFAULT_USD_PER_CNY_BPS,
+            official_price_window_days: None,
         }
     }
 }
@@ -269,6 +277,14 @@ pub fn wallet_cents_to_usd_cents(wallet_cents: i64) -> i64 {
     ((wallet_cents as i128 * bps as i128) / 10_000) as i64
 }
 
+/// 官方价锚定的窗口天数。默认 30，`0` = 关掉锚定（直接用当天目录价）。
+///
+/// 30 天是这么定的：比任何一次常见促销都长，而比「厂商真降价了」的容忍期短。
+/// 想跟着活动价走就填 0，那时行为逐字回到加这个功能之前。
+pub fn official_price_window_days() -> i64 {
+    current().official_price_window_days.unwrap_or(30).clamp(0, 365)
+}
+
 /// 同一个数的浮点形式，供利润测算用（`models.rs` 原先的 6.63）。
 pub fn raw_usd_per_visible_usd() -> f64 {
     raw_cents_per_credit_usd() as f64 / 100.0
@@ -379,6 +395,22 @@ pub async fn load(db: &sqlx::PgPool) {
         }
     };
 
+    // 和上面那一格同样的理由，单独读：这一列是后加的，老库还没跑迁移时并进下面那条
+    // SELECT 会让**整条**报错，于是汇率和赠送额度一起退回默认值。
+    let price_window: Option<i64> = match sqlx::query_as::<_, (Option<i32>,)>(
+        "SELECT official_price_window_days FROM app_settings WHERE id = 1",
+    )
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some((v,))) => v.map(|n| (n as i64).clamp(0, 365)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("official_price_window_days 读取失败，用默认窗口: {e}");
+            None
+        }
+    };
+
     match sqlx::query_as::<_, (i32, i32, i32)>(
         "SELECT raw_cents_per_credit_usd, free_points_daily, usd_per_cny_bps \
          FROM app_settings WHERE id = 1",
@@ -394,6 +426,7 @@ pub async fn load(db: &sqlx::PgPool) {
                     .clamp(MIN_FREE_POINTS_DAILY, MAX_FREE_POINTS_DAILY),
                 free_points_daily_member: member_daily,
                 usd_per_cny_bps: (fx as i64).clamp(MIN_USD_PER_CNY_BPS, MAX_USD_PER_CNY_BPS),
+                official_price_window_days: price_window,
                 };
             if let Ok(mut g) = CACHE.write() {
                 *g = next;
@@ -772,6 +805,8 @@ mod tests {
                 // 会员档：测试里显式给 None = 「跟随普通档」，也就是今天的行为。
                 free_points_daily_member: None,
                 usd_per_cny_bps: MAX_USD_PER_CNY_BPS,
+                // 官方价窗口：None = 用默认 30 天，也就是加这个功能之后的常规行为。
+                official_price_window_days: None,
             });
             assert_eq!(
                 current().raw_cents_per_credit_usd,

@@ -712,7 +712,9 @@ export function RouteEndpoints() {
   const list = routes ?? [];
   /// 编辑出口时要知道它属于哪条线路 —— 那条线路开放的模型就是这个出口的可选范围。
   const routeOf = (id: string) => list.find((r) => r.id === id);
-  const extra = list.reduce((n, r) => n + r.endpoints.length, 0);
+  // 只数**在轮转里**的。停用的单独说 —— 把它们混进「额外出口」会让人以为有那么多在接流量。
+  const extra = list.reduce((n, r) => n + r.endpoints.filter((e) => e.active).length, 0);
+  const parked = list.reduce((n, r) => n + r.endpoints.filter((e) => !e.active).length, 0);
   // 数的是**生效判据**的档，不是探测原始结论：一个探测超时但今天真实成功过的出口
   // 排序里是好的，这里再把它记成「打不通」，两处就会对不上，运维照着去修一个
   // 根本没坏的出口。判据统一在 tier()。
@@ -787,7 +789,11 @@ export function RouteEndpoints() {
         <>
           <SectionReveal as="section" delay={70} className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <Stat label="线路" value={num(list.length)} hint="每条各自计价" />
-            <Stat label="额外出口" value={num(extra)} hint="线路自带的那个不算在内" />
+            <Stat
+              label="额外出口"
+              value={num(extra)}
+              hint={parked ? `线路自带的那个不算在内 · 另有 ${parked} 个已停用` : "线路自带的那个不算在内"}
+            />
             <Stat label="测下来不通" value={num(broken)} hint={broken ? "已自动排到最后" : "都通"} />
             <Stat label="还没测过" value={num(untested)} hint="排在通过的之后" />
           </SectionReveal>
@@ -819,7 +825,12 @@ export function RouteEndpoints() {
                       <p className="mt-0.5 text-xs text-muted-foreground">
                         {vname ? `${vname} · ` : ""}
                         {r.model_count} 个模型 · {r.protocol} 协议
-                        {r.endpoints.length ? ` · ${r.endpoints.length} 个额外出口` : ""}
+                        {r.endpoints.filter((e) => e.active).length
+                          ? ` · ${r.endpoints.filter((e) => e.active).length} 个额外出口`
+                          : ""}
+                        {r.endpoints.some((e) => !e.active)
+                          ? ` · ${r.endpoints.filter((e) => !e.active).length} 个已停用`
+                          : ""}
                       </p>
                     </div>
                     <Button
@@ -1062,6 +1073,78 @@ export function RouteEndpoints() {
                       );
                     })}
                   </ol>
+                  {/*
+                    **停用的出口也要看得见。**
+
+                    开关的文案是「投入轮转（取消勾选 = 留着配置但不接任何请求）」——
+                    可它此前一停用就从这一屏彻底消失：不可见、不可编辑、不可删除。
+                    而且**重建不回来**：唯一索引 (route_id, lower(base_url), key_fp) 没有
+                    `WHERE active`，同址同密钥再加一个会撞 23505，报「这条线路下已经有一个
+                    地址和密钥都相同的出口了」，指着一行屏幕上不存在的记录。
+
+                    **故意不并进上面那个 `<ol>`**：那串序号的意思是「第几个被派到」，
+                    把不接流量的行编进去等于谎报轮转位次；而且 `costKeys()` 的「全有全无」
+                    是对活跃候选求的，一个没填汇率的停用出口会把整条线路的比价单位翻掉。
+                  */}
+                  {r.endpoints.some((e) => !e.active) && (
+                    <div className="border-t border-border px-5 py-3">
+                      <p className="type-eyebrow mb-2 text-muted-foreground">
+                        已停用（留着配置，不接任何请求）
+                      </p>
+                      <ul className="space-y-1.5">
+                        {r.endpoints
+                          .filter((e) => !e.active)
+                          .map((e) => (
+                            <li key={e.id} className="flex flex-wrap items-center gap-2 text-sm opacity-70">
+                              <span className="font-medium">{e.label || "未命名出口"}</span>
+                              <span className="font-mono text-[12px] text-muted-foreground">
+                                {e.base_url}
+                              </span>
+                              <Badge variant="outline">{ratioText(e.cost_ratio)}</Badge>
+                              {e.enabled_models.length > 0 && (
+                                <span className="text-[12px] text-muted-foreground">
+                                  只承载 {e.enabled_models.join("、")}
+                                </span>
+                              )}
+                              <span className="ml-auto flex items-center gap-1">
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() =>
+                                    setDraft({
+                                      id: e.id,
+                                      route_id: e.route_id,
+                                      label: e.label,
+                                      base_url: e.base_url,
+                                      api_key: "",
+                                      balance_token: "",
+                                      cost_ratio: String(e.cost_ratio),
+                                      note: e.note,
+                                      protocol: e.protocol,
+                                      active: e.active,
+                                      enabled_models: e.enabled_models,
+                                      capacity: e.capacity == null ? "" : String(e.capacity),
+                                      prices: {},
+                                      names: {},
+                                    })
+                                  }
+                                >
+                                  编辑
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  aria-label="删掉这个出口"
+                                  onClick={() => void remove(e)}
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </span>
+                            </li>
+                          ))}
+                      </ul>
+                    </div>
+                  )}
                 </Card>
               );
             })}
