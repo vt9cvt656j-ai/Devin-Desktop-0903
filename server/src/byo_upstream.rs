@@ -168,6 +168,34 @@ impl ByoUpstream {
     ///
     /// **密钥按明文放**：`model_key()` 对 `fc1:` 密文解密、对明文原样透传，所以这里直接
     /// 放用户的 key 是对的。它来自请求头，不落库、不进日志。
+    /// 这条自带上游的**最终请求 URL**。
+    ///
+    /// 不能直接用普通线路那句 `api_base(base) + wire.path()`：用户粘进来的地址有三种形状，
+    /// 而第三种（**某个协议的完整端点**，比如 `https://api.openai.com/v1/chat/completions`）
+    /// 会被那句拼成 `.../v1/chat/completions/chat/completions` —— 必然 404，而报错是上游给的，
+    /// 看着像他自己的中转坏了。复制粘贴时贴完整调用地址恰恰是最常见的形状。
+    ///
+    /// 判据从客户端直连那条路（ide/src-tauri/src/protocol.rs 的 `endpoint_url`）**逐字搬来**，
+    /// 一个分支都没动：两条路上同一个地址必须解析成同一个 URL，否则「切到代发之后就 404」
+    /// 会变成一类无法归因的报障。注意带后缀时是**原样用**、不再过 api_base ——
+    /// 像 `https://open.bigmodel.cn/api/paas/v4/chat/completions` 这种非 /v1 的 base，
+    /// 过一遍 api_base 会被插进一段 `/v1`，同样 404。
+    pub fn endpoint_url(&self, wire: crate::models::Wire) -> String {
+        let base = self.base.as_str().trim_end_matches('/');
+        if wire == crate::models::Wire::OpenAi {
+            if base.ends_with("/chat/completions") {
+                return base.to_string();
+            }
+            return format!("{}{}", crate::models::api_base(base), wire.path());
+        }
+        for suffix in ["/chat/completions", "/messages", "/responses"] {
+            if let Some(stripped) = base.strip_suffix(suffix) {
+                return format!("{stripped}{}", wire.path());
+            }
+        }
+        format!("{}{}", crate::models::api_base(base), wire.path())
+    }
+
     pub fn as_candidate(&self, model_id: &str) -> crate::models::Model {
         crate::models::Model {
             id: BYO_ROUTE_ID,
@@ -398,5 +426,88 @@ mod tests {
         // 而实现里那个 for 循环是唯一的写法。这里守的是「有这一步」。
         let _ = pinned_client(&byo);
         assert!(!byo.resolved.is_empty(), "没有解析结果就等于没钉");
+    }
+
+
+    /// 用户粘进来的地址有三种形状，三种都必须解析成和**客户端直连那条路**同一个 URL。
+    ///
+    /// 第三种（完整端点地址）是这条测试的本体：切到代发之前它一直是能用的，
+    /// 切过来之后 `api_base(base) + wire.path()` 会把它拼成两段、必然 404，
+    /// 而报错是上游给的，用户只会以为自己的中转坏了。
+    #[test]
+    fn a_pasted_full_endpoint_does_not_get_a_doubled_path() {
+        use crate::models::Wire;
+        let byo = |base: &str, proto: &str| ByoUpstream {
+            base: reqwest::Url::parse(base).unwrap(),
+            key: String::new(),
+            protocol: proto.to_string(),
+            resolved: vec![],
+        };
+        // 厂商根 / 带 /v1 的 base：和以前逐字相同，不许变。
+        assert_eq!(byo("https://api.openai.com", "openai").endpoint_url(Wire::OpenAi),
+                   "https://api.openai.com/v1/chat/completions");
+        assert_eq!(byo("https://api.openai.com/v1", "openai").endpoint_url(Wire::OpenAi),
+                   "https://api.openai.com/v1/chat/completions");
+        // 完整端点地址：原样用，不再拼第二段。
+        assert_eq!(byo("https://api.openai.com/v1/chat/completions", "openai").endpoint_url(Wire::OpenAi),
+                   "https://api.openai.com/v1/chat/completions");
+        assert_eq!(byo("https://api.anthropic.com/v1/messages", "anthropic").endpoint_url(Wire::Anthropic),
+                   "https://api.anthropic.com/v1/messages");
+        assert_eq!(byo("https://api.x.ai/v1/responses", "xai_responses").endpoint_url(Wire::XaiResponses),
+                   "https://api.x.ai/v1/responses");
+        // 非 /v1 的完整端点（智谱那种）：原样用。过一遍 api_base 会被插进 /v1，同样 404。
+        assert_eq!(byo("https://open.bigmodel.cn/api/paas/v4/chat/completions", "openai").endpoint_url(Wire::OpenAi),
+                   "https://open.bigmodel.cn/api/paas/v4/chat/completions");
+        // 贴的是一个协议的端点、却选了另一个协议：剥掉再按选中的协议拼。
+        assert_eq!(byo("https://relay.test/v1/chat/completions", "anthropic").endpoint_url(Wire::Anthropic),
+                   "https://relay.test/v1/messages");
+        // 末尾斜杠不影响。
+        assert_eq!(byo("https://api.openai.com/v1/chat/completions/", "openai").endpoint_url(Wire::OpenAi),
+                   "https://api.openai.com/v1/chat/completions");
+    }
+
+    /// 反向：**判据必须和客户端那条路同源**。两边算出不同的 URL，就会出现
+    /// 「同一个地址，直连能用、切到代发就 404」这类无法归因的报障。
+    #[test]
+    fn the_gateway_and_the_desktop_client_agree_on_every_shape() {
+        use crate::models::Wire;
+        // 客户端 ide/src-tauri/src/protocol.rs::endpoint_url 的算法，逐字重述一遍。
+        fn client(wire: Wire, base_url: &str) -> String {
+            let base = base_url.trim().trim_end_matches('/');
+            if wire == Wire::OpenAi {
+                if base.ends_with("/chat/completions") {
+                    return base.to_string();
+                }
+                return format!("{}{}", crate::models::api_base(base), wire.path());
+            }
+            for suffix in ["/chat/completions", "/messages", "/responses"] {
+                if let Some(stripped) = base.strip_suffix(suffix) {
+                    return format!("{stripped}{}", wire.path());
+                }
+            }
+            format!("{}{}", crate::models::api_base(base), wire.path())
+        }
+        let bases = [
+            "https://api.openai.com",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.anthropic.com/v1/messages",
+            "https://api.x.ai/v1/responses",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "https://relay.test/openai/v1",
+        ];
+        for base in bases {
+            for (proto, wire) in [("openai", Wire::OpenAi), ("anthropic", Wire::Anthropic), ("xai_responses", Wire::XaiResponses)] {
+                let b = ByoUpstream {
+                    base: reqwest::Url::parse(base).unwrap(),
+                    key: String::new(),
+                    protocol: proto.to_string(),
+                    resolved: vec![],
+                };
+                assert_eq!(b.endpoint_url(wire), client(wire, base),
+                    "网关和客户端对 {base} + {proto} 算出了不同的 URL —— \
+                     同一个地址会「直连能用、代发 404」，而报障时没人查得出为什么");
+            }
+        }
     }
 }

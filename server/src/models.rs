@@ -1589,7 +1589,7 @@ fn chat_upstream_attempt_suffix(
 }
 
 /// 把上游错误映射成对用户有用的中文。模块级函数，测试可直接调用。
-fn upstream_friendly_message(status: u16, low: &str) -> String {
+fn upstream_friendly_message(status: u16, low: &str, byo: bool) -> String {
     // 余额不足。**中英文都要认**：这里原来只匹配 insufficient_balance /
     // insufficient account balance 两个英文串，而国内中转普遍用中文报这件事。
     //
@@ -1634,8 +1634,17 @@ fn upstream_friendly_message(status: u16, low: &str) -> String {
         // 而控制台要求 role=admin、nginx 还有一层 auth_request，普通用户点进去只会看到 404。
         // 把运维指令当成用户指引群发出去，等于告诉大部分人"去一个你打不开的页面"。
         // 所以两句话都给：管理员知道去哪改，普通用户知道自己现在能做什么。
-        "上游密钥无效（这条线路的 key 不对，重发多少次都一样）。换个模型可以继续用；管理员请到控制台「模型线路 → 线路」更新该连接的 API Key。"
-            .into()
+        if byo {
+            // 自带端点：那把 key 是**用户自己填的**，他自己就能改。把他指向管理员控制台
+            // 是双重错误——既不是我们的配置问题，那个页面他也打不开（要 role=admin，
+            // 外面还有一层 auth_request）。所以这条路给他能自己做的事。
+            "你填的那把密钥被上游拒了（401，重发多少次都一样）。到「自定义模型」里检查密钥和地址：\
+             常见的是 key 复制时多了空格、或者这把 key 在你那家中转上没开通这个模型。"
+                .into()
+        } else {
+            "上游密钥无效（这条线路的 key 不对，重发多少次都一样）。换个模型可以继续用；管理员请到控制台「模型线路 → 线路」更新该连接的 API Key。"
+                .into()
+        }
     } else if status == 400 {
         let detail = safe_upstream_error_excerpt(low);
         if detail.is_empty() {
@@ -1664,7 +1673,14 @@ fn upstream_friendly_message(status: u16, low: &str) -> String {
 
 #[cfg(test)]
 fn friendly_upstream_for_test(status: u16, raw: &str) -> String {
-    upstream_friendly_message(status, &raw.to_lowercase())
+    upstream_friendly_message(status, &raw.to_lowercase(), false)
+}
+
+/// 自带端点那一侧的同一条路。401 的话术在两边**必须不同**：普通线路是运维的事，
+/// 自带端点是用户自己的 key。
+#[cfg(test)]
+fn friendly_upstream_byo_for_test(status: u16, raw: &str) -> String {
+    upstream_friendly_message(status, &raw.to_lowercase(), true)
 }
 
 /// 把上游报错整理成可以给用户看的一句话。
@@ -9191,10 +9207,33 @@ struct XaiRespSse {
     thinking_telemetry: ThinkingStreamTelemetry,
     started_at: Option<std::time::Instant>,
     stop_reason: String,
+    /// 按 OpenAI 下标累积每个工具调用的**名字和参数原文**，收尾时逐个校验。
+    ///
+    /// 不累积就无从校验：delta 是逐段来的，逐段转发之后手上什么都不剩。
+    /// 源码里曾经写着「工具参数完整性 → 由 XaiRespSse 在响应侧做，同 AnthSse」——
+    /// 那句是假的：这个结构体里一个累积字段都没有，`new` 的签名也不收规则表，
+    /// 而 OpenAiSseValidator 在这条协议上被显式关掉。三道门一道不剩。
+    /// 实测：截断的 `{"path":"a.ts","content":"hel` 原样转发、finish() 返回 Ok，
+    /// 客户端照着去写文件 —— 静默写出一个空文件，不报错。
+    tool_streams: std::collections::BTreeMap<usize, XaiToolStream>,
+    tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+}
+
+/// 一个工具调用在流上的累积状态。和 AnthToolStream 同形，少一个 `stopped` ——
+/// Responses 的 `.done` 事件不是每家中转都发，拿它当必要条件会误伤。
+/// 判据改成「累积出来的 JSON 完不完整」，那个判据不依赖任何一方的礼貌。
+#[derive(Default)]
+struct XaiToolStream {
+    name: String,
+    arguments: String,
 }
 
 impl XaiRespSse {
-    fn new(model: &str, started_at: Option<std::time::Instant>) -> Self {
+    fn new(
+        model: &str,
+        tool_argument_rules: std::collections::HashMap<String, ToolArgumentRules>,
+        started_at: Option<std::time::Instant>,
+    ) -> Self {
         Self {
             model: model.to_string(),
             buf: Vec::new(),
@@ -9212,6 +9251,8 @@ impl XaiRespSse {
             thinking_telemetry: ThinkingStreamTelemetry::default(),
             started_at,
             stop_reason: String::new(),
+            tool_streams: std::collections::BTreeMap::new(),
+            tool_argument_rules,
         }
     }
 
@@ -9314,6 +9355,8 @@ impl XaiRespSse {
                 }
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                // 名字要留住：收尾校验按名字查这个工具的必填项和最小长度。
+                self.tool_streams.entry(slot).or_default().name = name.to_string();
                 self.ensure_role(out);
                 out.extend(self.chunk(
                     json!({"tool_calls":[{"index": slot, "id": call_id, "type": "function",
@@ -9341,6 +9384,8 @@ impl XaiRespSse {
                 if self.thinking_telemetry.first_nonempty_tool_delta_ms.is_none() {
                     self.thinking_telemetry.first_nonempty_tool_delta_ms = self.elapsed_ms();
                 }
+                // 边转发边累积：转发是为了客户端能流式看到，累积是为了收尾能校验完整性。
+                self.tool_streams.entry(slot).or_default().arguments.push_str(t);
                 self.ensure_role(out);
                 out.extend(self.chunk(
                     json!({"tool_calls":[{"index": slot, "function": {"arguments": t}}]}),
@@ -9348,6 +9393,18 @@ impl XaiRespSse {
                 ));
             }
             // ── 收尾：usage 只在这里 ────────────────────────────────────────
+            // `.done` 带一份**权威的完整 arguments**（Responses 规范里有）。中转不一定发，
+            // 发了就用它覆盖累积值：逐段累积可能因为中转丢包而缺一截，而这一份是它自己
+            // 声明的最终态。**不拿它当必要条件** —— 不发的中转照样要能过，判据留给
+            // 「累积出来的 JSON 完不完整」，那个不依赖任何一方的礼貌。
+            "response.function_call_arguments.done" => {
+                let idx = ev.get("output_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(slot) = self.tool_slots.get(&idx).copied() {
+                    if let Some(full) = ev.get("arguments").and_then(|v| v.as_str()) {
+                        self.tool_streams.entry(slot).or_default().arguments = full.to_string();
+                    }
+                }
+            }
             "response.completed" | "response.incomplete" | "response.failed" => {
                 if let Some(u) = ev.pointer("/response/usage") {
                     self.harvest_usage(u);
@@ -9415,6 +9472,17 @@ impl XaiRespSse {
     fn finish(&self) -> Result<Vec<u8>, String> {
         if !self.buf.iter().all(u8::is_ascii_whitespace) {
             return Err("xAI Responses upstream stream ended with an incomplete SSE frame".into());
+        }
+        // **工具参数完整性。** 和 AnthSse 走同一个校验器，判据因此在两条协议上同源。
+        // 少了这一步，被截断的 `{"path":"a.ts","content":"hel` 会原样送到客户端去写文件 ——
+        // 表现是静默的错误结果（空文件 / 参数缺字段），不是报错，用户只会觉得模型变蠢。
+        for stream in self.tool_streams.values() {
+            validate_streamed_tool_arguments(
+                "xAI Responses",
+                &stream.name,
+                &stream.arguments,
+                self.tool_argument_rules.get(&stream.name),
+            )?;
         }
         let mut out = Vec::new();
         let reason = if self.saw_tool_call { "tool_calls" } else { "stop" };
@@ -11158,7 +11226,13 @@ pub async fn chat_completions(
             // beta 头 / 请求构造），它们的语义全都是「是不是 anthropic」而不是「是不是
             // 非 openai」，跟着改类型只会把两条既有协议的 diff 撑大、把风险带到它们身上。
             let candidate_anthropic = candidate_wire == Wire::Anthropic;
-            let candidate_url = format!("{}{}", api_base(&candidate.base_url), candidate_wire.path());
+            // 自带上游按客户端那套算 URL（见 byo_upstream::endpoint_url）：用户粘的可能是
+            // **完整端点地址**，`api_base(base) + wire.path()` 会把它拼成两段、必然 404。
+            // 只对 BYO 分叉，普通线路的 base_url 是运维填的、形状受控，一个字节都不变。
+            let candidate_url = match byo.as_ref().filter(|_| candidate.id == crate::byo_upstream::BYO_ROUTE_ID) {
+                Some(b) => b.endpoint_url(candidate_wire),
+                None => format!("{}{}", api_base(&candidate.base_url), candidate_wire.path()),
+            };
             let mut candidate_upstream_body = if candidate_wire == Wire::XaiResponses {
                 match oai_to_xai_responses(&body, candidate.effort_passthrough) {
                     Ok(v) => v,
@@ -11350,6 +11424,9 @@ pub async fn chat_completions(
                     //   ② prompt_cache_key（提示缓存的粘性键）→ 下面这段
                     //   ③ x-grok-conv-id（会话粒度的机器亲和）→ 下面这段
                     //   ④ 工具参数完整性 → 由 XaiRespSse 在响应侧做，同 AnthSse
+                    //      （这句一度是假的：XaiRespSse 当时既不累积参数、构造也不收规则表，
+                    //       而 OpenAiSseValidator 在这条协议上被显式关掉，三道门一道不剩。
+                    //       2026-09-02 补上累积 + finish() 校验，这句才成立。）
                     // 会话优先、run id 兜底。判据只此一处（`affinity_scope`）——
                     // 两条协议分支各写一遍的话，改一处漏一处的表现就是「某个协议的
                     // 缓存突然不命中了」，而且没有任何地方会报错。
@@ -11937,7 +12014,7 @@ pub async fn chat_completions(
                 );
                 let msg = format!(
                     "【{model_name}】{}{}{}",
-                    friendly_upstream(err_status, &err_low),
+                    friendly_upstream(err_status, &err_low, byo.is_some()),
                     chat_upstream_attempt_suffix(
                         route_count,
                         attempted_sends,
@@ -12092,8 +12169,11 @@ pub async fn chat_completions(
                         gateway_request_started_at_task,
                     ),
                 )),
+                // 规则表和 Anthropic 那支传的是**同一份**：两条协议对「工具参数完不完整」
+                // 必须给出同一个判断，否则同一个截断在一条协议上被拦、在另一条上放行。
                 Wire::XaiResponses => Some(SseBridge::XaiResponses(XaiRespSse::new(
                     &req_model,
+                    tool_argument_rules.clone(),
                     Some(gateway_request_started_at_task),
                 ))),
                 Wire::OpenAi => None,
@@ -14482,6 +14562,32 @@ mod billing_tests {
         assert!(msg.contains("重发"), "要说明重发解决不了配置问题：{msg}");
     }
 
+    /// 自带端点上的 401 说的是**用户自己那把 key**，不能把他指去管理员控制台。
+    ///
+    /// 那个页面要 role=admin、外面还有一层 auth_request，普通用户点进去只有 404；
+    /// 而且这根本不是我们的配置问题——他自己在「自定义模型」里就能改。
+    /// 把运维指令当用户指引发出去，等于让他去一个打不开的页面修一个不归他修的东西。
+    #[test]
+    fn a_byo_key_rejection_tells_the_user_what_he_can_actually_do() {
+        let byo = super::friendly_upstream_byo_for_test(401, "invalid api key");
+        assert!(byo.contains("自定义模型"), "没告诉用户去哪改：{byo}");
+        assert!(!byo.contains("管理员") && !byo.contains("控制台"),
+            "自带端点的 401 还在指向管理员控制台，而那是他打不开的页面：{byo}");
+
+        // 普通线路那句一个字都不许变：它对着运维说话是对的。
+        let ours = super::friendly_upstream_for_test(401, "invalid api key");
+        assert!(ours.contains("管理员") && ours.contains("控制台"),
+            "普通线路的 401 丢了运维指引：{ours}");
+        assert_ne!(byo, ours, "两条路给了同一句话——那说明分岔没接上");
+
+        // 其余状态码不受影响：分岔只在 401。
+        for st in [429u16, 400, 500] {
+            assert_eq!(super::friendly_upstream_byo_for_test(st, "boom"),
+                       super::friendly_upstream_for_test(st, "boom"),
+                       "状态 {st} 上两条路不该有区别");
+        }
+    }
+
     /// 「已请求 1 次 / 2 条同模型线路」读起来是"两条都不行"，而实际上另一条一次都没碰过。
     /// 用户据此以为线路全废了，其实重发一次就会自动换线。
     #[test]
@@ -14665,10 +14771,63 @@ mod billing_tests {
     /// （写着「只有 grok-4.3 支持、没有 xhigh」，和能力页直接矛盾）。手写的话，
     /// 测的是「我以为 xAI 长这样」。AnthSse 那条同款测试的注释写的是
     /// `Event shapes copied verbatim from a real zyz streaming response`，同一个道理。
+    /// **被截断的工具参数不许放行。**
+    ///
+    /// 这条协议上曾经三道门一道不剩：XaiRespSse 不累积参数（逐 delta 转发完就什么都不剩）、
+    /// 构造不收规则表，而 OpenAiSseValidator 被 `if conv.is_some() { None }` 显式关掉。
+    /// 源码注释却写着「工具参数完整性 → 由 XaiRespSse 在响应侧做，同 AnthSse」——那句是假的。
+    ///
+    /// 后果不是报错，是**静默的错误结果**：`{"path":"a.ts","content":"hel` 原样送到客户端，
+    /// 它照着去 write_file，写出一个空文件。用户只会觉得这个模型很蠢。
+    #[test]
+    fn a_truncated_tool_argument_is_refused_instead_of_forwarded() {
+        let frame = |t: &str, body: serde_json::Value| {
+            format!("event: {t}\ndata: {}\n\n", serde_json::json!(body))
+        };
+        // 一段正常开头、参数流到一半就断掉的 Responses 流。
+        let stream = frame("response.output_item.added", serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "c1", "name": "write_file"}
+        })) + &frame("response.function_call_arguments.delta", serde_json::json!({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "delta": "{\"path\":\"a.ts\",\"content\":\"hel"
+        }));
+
+        let mut sse = super::XaiRespSse::new("grok-4.6", Default::default(), None);
+        for b in stream.as_bytes().chunks(11) {
+            sse.push(b).expect("push 不该失败——半截 JSON 不是帧的问题");
+        }
+        let err = sse.finish().expect_err(
+            "被截断的工具参数被放行了 —— 客户端会照着 `{\"path\":\"a.ts\",\"content\":\"hel` \
+             去写文件，写出一个空文件，而且不报错",
+        );
+        assert!(err.contains("write_file"), "报错里没说是哪个工具：{err}");
+        assert!(err.contains("xAI Responses"), "报错里没说是哪条协议：{err}");
+
+        // 阳性对照：同样的形状、参数是完整的，必须放行。
+        // 少了这一条，上面那个断言可以靠「finish 永远报错」来满足。
+        let ok_stream = frame("response.output_item.added", serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {"type": "function_call", "call_id": "c1", "name": "write_file"}
+        })) + &frame("response.function_call_arguments.delta", serde_json::json!({
+            "type": "response.function_call_arguments.delta", "output_index": 0,
+            "delta": "{\"path\":\"a.ts\",\"content\":\"hello\"}"
+        }));
+        let mut ok = super::XaiRespSse::new("grok-4.6", Default::default(), None);
+        for b in ok_stream.as_bytes().chunks(11) {
+            ok.push(b).expect("push 不该失败");
+        }
+        ok.finish().expect("完整的参数被误拦了 —— 这道门会把正常调用也打掉");
+
+        // 一个工具都没有时也要放行：纯文本回合不该被这道门碰到。
+        let mut plain = super::XaiRespSse::new("grok-4.6", Default::default(), None);
+        plain.finish().expect("没有工具调用的流被拦了");
+    }
+
     #[test]
     fn xai_responses_stream_becomes_openai_chunks() {
         let raw = include_str!("../testdata/xai_responses_b.sse");
-        let mut sse = super::XaiRespSse::new("grok-4.6", None);
+        let mut sse = super::XaiRespSse::new("grok-4.6", Default::default(), None);
         // 逐字节喂，模拟 TCP 把 SSE 帧切在任意位置。半行必须留在 buf 里等下一片，
         // 一次性喂整份是测不出这个的。
         let mut out = Vec::new();
@@ -14777,7 +14936,7 @@ mod billing_tests {
     #[test]
     fn xai_responses_plain_turn_has_text_and_no_phantom_thinking() {
         let raw = include_str!("../testdata/xai_responses_a.sse");
-        let mut sse = super::XaiRespSse::new("grok-4.6", None);
+        let mut sse = super::XaiRespSse::new("grok-4.6", Default::default(), None);
         let mut out = sse.push(raw.as_bytes()).expect("push");
         out.extend(sse.finish().expect("finish"));
         let text = String::from_utf8(out).unwrap();
@@ -19229,6 +19388,7 @@ mod michael_compression_wiring_tests {
         );
     }
 
+
     /// 没有摘要就没有失忆，也就不该白背这个块 —— 否则它会在短会话里凭空多出一条
     /// system，把前缀缓存打碎。
     #[test]
@@ -22168,6 +22328,7 @@ mod upstream_message_tests {
         assert!(!msg.contains("sk-proj-AAAA"), "密钥不能进用户可见的报错：{msg}");
         assert!(msg.contains("[redacted-key]"), "应留下脱敏标记：{msg}");
     }
+
 }
 
 #[cfg(test)]
@@ -24038,3 +24199,4 @@ mod code_corpus_leg_tests {
             "判据又变回按「有没有传 domain」开关了——那和它自己的理由分叉");
     }
 }
+
