@@ -19181,6 +19181,54 @@ mod michael_compression_wiring_tests {
         assert_eq!(arr.len(), 5);
     }
 
+    /// 检索块坐在逐字尾部**前面**时，一个 agent 回合每走一步就让整条尾部退出缓存。
+    ///
+    /// 线上实测的形状：请求 56k→缓存 24k、105k→缓存 42k、165k→缓存 36k —— 缓存量恒定、
+    /// 不随请求增长；且命中率与请求间隔无关（<1 分 26.9% / 1–5 分 26.6%），所以不是 TTL。
+    /// = 只有静态头进了缓存。真因就是这块每步都变、又排在前面。
+    ///
+    /// 判据量的是「上一步那条请求里，还有多少条消息逐字节地仍是公共前缀」——不是「变没变」。
+    /// 变没变是二值的，两种排法下都恒为「变了」，量不出好坏。
+    #[test]
+    fn 检索块必须排在逐字尾部之后() {
+        let build = |steps: usize, retrieved: &str| {
+            let mut msgs = vec![json!({ "role": "system", "content": "系统提示词" })];
+            for i in 0..steps {
+                msgs.push(json!({ "role": "user", "content": format!("第 {i} 步的工具结果，很长的一段内容") }));
+            }
+            let mut body = json!({ "messages": msgs });
+            compression_write_back(
+                &mut body, 1, 1, &["早期摘要".to_string()], Some(retrieved), Some("做一个多租户 SaaS"),
+            );
+            body["messages"].as_array().expect("messages 必须还在").clone()
+        };
+
+        // 连着两步：尾部纯追加，而检索块因为查询取「最后 4 条 + 最新 user 尾部」必然变。
+        let prev = build(8, "检索命中：第 8 步查到的那几段");
+        let next = build(9, "检索命中：第 9 步查到的完全是另外几段");
+
+        let common = prev.iter().zip(next.iter()).take_while(|(a, b)| a == b).count();
+        assert!(
+            common + 2 >= prev.len(),
+            "上一步 {} 条消息里只有前 {} 条还是公共前缀 —— 检索块排在了逐字尾部前面，\n\
+             它一变，后面整条历史（线上是八万多 token）每一步都按全价重算。",
+            prev.len(),
+            common,
+        );
+
+        // 挪位置不等于可以把它弄丢：内容必须还在，模型照样读得到。
+        assert!(
+            next.iter().any(|m| m["content"].as_str().is_some_and(|t| t.contains("第 9 步查到的"))),
+            "检索块被挪没了",
+        );
+        // 最后一条仍是原来那条：多家上游把「最后一条」当本轮请求做门控。
+        assert_eq!(
+            next.last().unwrap()["content"],
+            prev.last().map(|_| json!("第 8 步的工具结果，很长的一段内容")).unwrap(),
+            "最后一条被检索块顶掉了",
+        );
+    }
+
     /// 没有摘要就没有失忆，也就不该白背这个块 —— 否则它会在短会话里凭空多出一条
     /// system，把前缀缓存打碎。
     #[test]
@@ -20132,11 +20180,25 @@ fn compression_write_back(
     if let Some(text) = crate::compression::summary_system_text(summaries) {
         out.push(json!({ "role": "system", "content": text }));
     }
-    if let Some(text) = retrieved_history.filter(|text| !text.trim().is_empty()) {
-        out.push(json!({ "role": "system", "content": text }));
-    }
     let tail_start = pinned.saturating_add(verbatim_from).min(arr.len());
     out.extend(arr[tail_start..].iter().cloned());
+    // **检索块必须排在逐字尾部之后，不能排在它前面。**
+    //
+    // 它的内容由 `compression_retrieval_query` 现算，而那个查询取的是「最后 4 条消息 +
+    // 最新用户消息的尾部 12,000 字」—— 一个 agent 回合每走一步就追加 assistant 和工具
+    // 结果，`msgs.len()` 一变，`recent_from` 就变，查询变、检索回来的文本也变。
+    //
+    // 它原本被 push 在这一行**之前**，也就是坐在整条逐字尾部的前面。上游（OpenAI / xAI）
+    // 认的是严格前缀：前面第 3 条一变，后面八万多 token 全部按全价重算。线上实测的形状
+    // 正是这个 —— 请求 56k→缓存 24k、105k→缓存 42k、165k→缓存 36k，**缓存量恒定、
+    // 不随请求增长**，且与请求间隔无关（<1 分 26.9% / 1–5 分 26.6%，不是 TTL 到期）。
+    //
+    // 挪到尾部末条之前：文本一个字不改，模型照样读得到，而每步只作废最后一两条。
+    // 留最后一条在最末尾是有意的——多家上游把「最后一条 user」当本轮请求来做门控。
+    if let Some(text) = retrieved_history.filter(|text| !text.trim().is_empty()) {
+        let at = out.len().saturating_sub(1);
+        out.insert(at, json!({ "role": "system", "content": text }));
+    }
     if let Some(slot) = body.get_mut("messages") {
         *slot = serde_json::Value::Array(out);
     }
