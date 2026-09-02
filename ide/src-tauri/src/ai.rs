@@ -1380,6 +1380,10 @@ mod ide_header_tests {
 
     fn config() -> AiConfig {
         AiConfig {
+            // BYO 网关三件套：测试构造器补齐，否则 --tests 编译报 E0063
+            byo_base: None,
+            byo_key: None,
+            byo_proto: None,
             base_url: "https://example.invalid/v1".into(),
             api_key: "test".into(),
             model: "test-model".into(),
@@ -1763,6 +1767,10 @@ mod stream_timeout_tests {
 
     fn config(reasoning_effort: Option<&str>, thinking_budget: Option<u32>) -> AiConfig {
         AiConfig {
+            // BYO 网关三件套：测试构造器补齐，否则 --tests 编译报 E0063
+            byo_base: None,
+            byo_key: None,
+            byo_proto: None,
             base_url: "https://example.invalid/v1".into(),
             api_key: "test".into(),
             model: "test-model".into(),
