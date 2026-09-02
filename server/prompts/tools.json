@@ -30,7 +30,7 @@
     "type": "function",
     "function": {
       "name": "list_dir",
-      "description": "List the direct children of a directory on demand; use \".\" for the workspace root. When the IDE has already provided a project tree or symbol map, use that instead of re-scanning level by level; list a directory once only when the target location is unknown or the directory genuinely may have changed. Results include the resolved absolute path.",
+      "description": "List the direct children of a directory on demand; use \".\" for the workspace root. When the IDE has already provided a project tree or symbol map, use that instead of re-scanning level by level; list a directory once only when the target location is unknown or the directory genuinely may have changed. Results include the resolved absolute path. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -53,7 +53,7 @@
     "type": "function",
     "function": {
       "name": "search",
-      "description": "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching.",
+      "description": "Locate text inside a single file or directory when the position is unknown, returning matching lines with context. When the target file is known, read_file directly; after a hit, read the target source to confirm the full context — never edit from a fragment alone. Defaults to literal; use regex only when you genuinely need pattern matching. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -88,7 +88,7 @@
     "type": "function",
     "function": {
       "name": "find_files",
-      "description": "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly.",
+      "description": "Find files by name or glob pattern — *.rs, main.js, src/**/*.ts — or just a substring of the filename. 【vs alternatives】Search by content with search; find a symbol's definition with find_symbol; when you know the exact path, read_file directly. Independent calls go in one reply: when several of these have arguments that do not depend on each other's results, send them together in one response rather than one per turn.",
       "parameters": {
         "type": "object",
         "properties": {
