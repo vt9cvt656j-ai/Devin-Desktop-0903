@@ -561,17 +561,75 @@ fn anthropic_is_first_party(base_url: &str) -> bool {
 /// 出站 `anthropic-beta` 的最终取值：基础集合 + 这一次要不要 1M。
 ///
 /// 返回 `String` 而不是 `Option`：基础集合永远非空，所以这个头恒发。
+/// 哪些三方中转也发 `extended-cache-ttl`（从而拿到 1 小时缓存）。
+///
+/// # 为什么是名单而不是一律发
+///
+/// 三方那份 beta 集合是**照着 Claude Code 的 Tv9 集合**挑的（有测试钉着项数），
+/// 一批中转正是靠这个指纹认 Claude Code 流量。多发一项有被拒的风险，所以不一律开，
+/// 而是逐个中转灰度 —— 而且这个名单是**环境变量**，加一条不用重新部署，出问题清空即可。
+///
+/// # 为什么必须开
+///
+/// 线上实测（2026-09-02，24 小时）：`claude-opus-5` 走 api.hao.ai 这条线，
+/// 缓存写 3,595,468 token、缓存读 3,071,267 —— **写比读还多**，48 轮平均每轮写 7.5 万，
+/// 等于整条前缀每轮重写一遍。读确实在发生，说明前缀本身是稳的，是 5 分钟 TTL 到期了。
+/// 写按 1.25× 计、读按 0.1×，这一条线的账因此是本该的好几倍。
+fn anthropic_extended_ttl_hosts() -> Vec<String> {
+    std::env::var("MICHAEL_CACHE_TTL_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// 这条线路能不能拿 1 小时缓存：一方永远可以，三方看名单。
+///
+/// 名单从参数进、不在这里读环境变量 —— 读环境变量的版本没法测：Rust 的测试是并行跑的，
+/// 一条测试 set_var 会被同进程里别的测试看到，表现是**偶发失败**。实测撞到过一次。
+fn allows_extended_ttl_with(base_url: &str, hosts: &[String]) -> bool {
+    if anthropic_is_first_party(base_url) {
+        return true;
+    }
+    let raw = base_url.trim();
+    let with_scheme = if raw.contains("://") { raw.to_string() } else { format!("https://{raw}") };
+    let host = reqwest::Url::parse(&with_scheme)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+    match host {
+        // 按**主机名整体**比，不是子串：子串会让 api.hao.ai.evil.test 也命中。
+        Some(h) => hosts.iter().any(|allowed| *allowed == h),
+        None => false,
+    }
+}
+
+fn anthropic_allows_extended_ttl(base_url: &str) -> bool {
+    allows_extended_ttl_with(base_url, &anthropic_extended_ttl_hosts())
+}
+
 fn anthropic_beta_header(first_party: bool, wants_1m: bool) -> String {
+    anthropic_beta_header_for(first_party, wants_1m, false)
+}
+
+/// `extended_ttl` = 这条线路要拿 1 小时缓存。三方基础集合里没有那一项，要单独补上，
+/// 否则块上的 `"ttl":"1h"` 是个不生效的字段。
+fn anthropic_beta_header_for(first_party: bool, wants_1m: bool, extended_ttl: bool) -> String {
     let base = if first_party {
         ANTHROPIC_BETA_HEADER_FIRST_PARTY
     } else {
         ANTHROPIC_BETA_HEADER_THIRD_PARTY
     };
-    if wants_1m {
-        format!("{base},{ANTHROPIC_CONTEXT_1M_BETA}")
-    } else {
-        base.to_string()
+    let mut out = base.to_string();
+    if extended_ttl && !out.contains("extended-cache-ttl") {
+        out.push(',');
+        out.push_str("extended-cache-ttl-2025-04-11");
     }
+    if wants_1m {
+        out.push(',');
+        out.push_str(ANTHROPIC_CONTEXT_1M_BETA);
+    }
+    out
 }
 
 const ANTHROPIC_SDK_VERSION: &str = "0.94.0";
@@ -11115,10 +11173,10 @@ pub async fn chat_completions(
                             .get("reasoning_effort")
                             .and_then(|v| v.as_str())
                             .is_some_and(|e| crate::model_catalog::supports_effort(&model_id, e)),
-                    // 只有一方线路会真的发 extended-cache-ttl 那个 beta —— 中转商那份
-                    // 集合是照 Claude Code 的 Tv9 挑的，往里加项会改请求指纹。没有 beta 时
-                    // 发 ttl 是无效字段，所以判据和发头的判据用同一个。
-                    anthropic_is_first_party(&candidate.base_url)
+                    // 判据和"发不发那个 beta"用同一个函数：没有 beta 时发 ttl 是无效字段。
+                    // 一方永远可以；三方按 MICHAEL_CACHE_TTL_HOSTS 逐个灰度（改环境变量即可，
+                    // 不用重新部署）。
+                    anthropic_allows_extended_ttl(&candidate.base_url)
                 ) {
                     Ok(v) => v,
                     Err(err) => {
@@ -11252,7 +11310,11 @@ pub async fn chat_completions(
                 let candidate_first_party = anthropic_is_first_party(&candidate.base_url);
                 let candidate_wants_1m = candidate_anthropic && wants_1m_context(&candidate_upstream_body);
                 let candidate_beta_header = if candidate_anthropic {
-                    anthropic_beta_header(candidate_first_party, candidate_wants_1m)
+                    anthropic_beta_header_for(
+                        candidate_first_party,
+                        candidate_wants_1m,
+                        anthropic_allows_extended_ttl(&candidate.base_url),
+                    )
                 } else {
                     String::new()
                 };
@@ -17907,9 +17969,20 @@ mod billing_tests {
             .nth(1)
             .and_then(|t| t.split_once(") {").map(|(a, _)| a))
             .expect("生产调用点没找到，锚点漂了");
+        // 同源判据：ttl 用的那个函数，必须**也是**决定 beta 头的那个。名字换了没关系，
+        // 两处指向同一个函数就行；分成两个判据的那一刻，就会发出不生效的 ttl。
         assert!(
-            call.contains("anthropic_is_first_party(&candidate.base_url)"),
+            call.contains("anthropic_allows_extended_ttl(&candidate.base_url)"),
             "ttl 的判据和发 beta 的判据脱钩了——那会发出一个不生效的字段"
+        );
+        let beta_call = src
+            .split("let candidate_beta_header = if candidate_anthropic {")
+            .nth(1)
+            .and_then(|t| t.split_once("} else {").map(|(a, _)| a))
+            .expect("beta 头的构造点没找到，锚点漂了");
+        assert!(
+            beta_call.contains("anthropic_allows_extended_ttl(&candidate.base_url)"),
+            "beta 头没跟着同一个判据走"
         );
         assert!(
             call.contains("route_supports_prompt_cache(candidate)"),
@@ -17924,6 +17997,46 @@ mod billing_tests {
         // 这行代码本身）。旁边 openai_prompt_cache_key 那条测试躲的是同一个坑。
         let needle = format!("anthropic_cache_{}(extended_ttl)", "control");
         assert_eq!(src.matches(&needle).count(), 4, "有断点没走统一的构造器");
+    }
+
+    /// 三方中转按名单灰度拿 1 小时缓存 —— 而且 beta 头必须跟着补上。
+    ///
+    /// 线上实测（2026-09-02，24h）：claude-opus-5 走 api.hao.ai，缓存写 3,595,468 token、
+    /// 缓存读 3,071,267 —— **写比读还多**，48 轮平均每轮写 7.5 万，等于整条前缀每轮重写。
+    /// 读确实在发生说明前缀是稳的，那就是 5 分钟 TTL 到期了。写 1.25× / 读 0.1×，
+    /// 这条线的账因此是本该的好几倍。
+    #[test]
+    fn third_party_relays_can_be_allowlisted_for_the_one_hour_cache() {
+        // 名单从参数进，不碰进程环境变量 —— set_var 会被同进程里并行跑的别的测试看到，
+        // 表现是偶发失败（实测撞到过一次）。
+        let none: Vec<String> = vec![];
+        assert!(!super::allows_extended_ttl_with("https://api.hao.ai", &none));
+        assert!(
+            super::allows_extended_ttl_with("https://api.anthropic.com", &none),
+            "一方永远该拿到"
+        );
+
+        let list = vec!["api.hao.ai".to_string(), "other.example".to_string()];
+        assert!(super::allows_extended_ttl_with("https://api.hao.ai/v1", &list));
+        assert!(super::allows_extended_ttl_with("api.hao.ai", &list), "没带协议也要认");
+        // 只按**主机名**匹配：子串匹配会让 api.hao.ai.evil.test 也命中。
+        assert!(!super::allows_extended_ttl_with("https://api.hao.ai.evil.test/v1", &list));
+        assert!(!super::allows_extended_ttl_with("https://relay.example/v1", &list));
+        // 真正读环境变量的那层也要有人走一遍，否则解析（逗号、空格、大小写）没被守住。
+        assert!(super::anthropic_extended_ttl_hosts().iter().all(|h| h == &h.to_ascii_lowercase()));
+
+        // beta 头必须跟着补：没有那一项，块上的 ttl 是个不生效的字段。
+        let third = super::anthropic_beta_header_for(false, false, true);
+        assert!(third.contains("extended-cache-ttl"), "三方开了 ttl 却没补 beta");
+        // 不开时三方那份要一个字不差 —— 指纹对齐是它存在的理由。
+        assert_eq!(
+            super::anthropic_beta_header_for(false, false, false),
+            super::ANTHROPIC_BETA_HEADER_THIRD_PARTY,
+            "没开扩展 TTL 时三方的 beta 集合被改动了"
+        );
+        // 一方本来就有，不许重复追加。
+        let first = super::anthropic_beta_header_for(true, false, true);
+        assert_eq!(first.matches("extended-cache-ttl").count(), 1, "beta 被追加了两次");
     }
 
     /// 体积闸：判据只看正文字节，不问模型目录。
