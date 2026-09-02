@@ -1,0 +1,7 @@
+node_modules
+# Tailwind v4 auto-detects sources and skips anything git ignores. Without this line it
+# scans dist/ — the previous build — and harvests class names out of it, so a rebuild
+# over an existing dist ships ~13 KB of CSS for utilities nothing uses (41 KB clean vs
+# 54 KB dirty). Ignoring dist keeps every build identical to a clean one.
+dist
+*.tsbuildinfo

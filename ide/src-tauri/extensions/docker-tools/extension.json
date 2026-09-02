@@ -1,0 +1,10 @@
+{
+  "id": "michael.docker-tools",
+  "name": "Docker Tools",
+  "version": "1.0.0",
+  "description": "Insert common Dockerfile and docker-compose templates.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "docker.dockerfile", "title": "Docker: Insert Dockerfile Template" }, { "id": "docker.compose", "title": "Docker: Insert docker-compose Template" } ] }
+}

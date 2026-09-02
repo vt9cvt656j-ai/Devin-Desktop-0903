@@ -1,0 +1,10 @@
+{
+  "id": "michael.translate-helper",
+  "name": "Translate Helper",
+  "version": "1.0.0",
+  "description": "Analyze CJK vs Latin content and mark selected text for translation.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "translate.analyze", "title": "Translate: Analyze File" }, { "id": "translate.mark", "title": "Translate: Mark Selection" } ] }
+}

@@ -1,0 +1,50 @@
+{
+  "note": "冻结的 MSE-1 测试向量：固定服务端私钥、固定客户端临时私钥、固定 nonce。server/src/mse.rs 和 server/web-shared/mse.ts 都必须逐字节复现这里的每一个值。这个文件出现 diff = 线路格式变了 = 所有已经发布出去的客户端全部解不开，而且桌面端装好的版本没法自动更新。要改协议，先改版本号，不要改这份向量。",
+  "suite": "MSE1-P384-HKDF-SHA384-AES256GCM",
+  "format_version": 1,
+  "encoding": "二进制一律 base64url 无填充；server_pkcs8_b64 / client_epk_pkcs8_b64 是标准 base64（MSE_SERVER_KEY 就是这个格式）",
+  "keys": {
+    "server_pkcs8_b64": "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBTnJisZ8bjXkhM6BrYMDR2D280kIlUEY6tbgUsBK7FCdW8YhSoZcy71Od1YvYZny2hZANiAATmlDwzrEAxtyf5pORuL8rpPgPEfLFWJzwIq3ygc8yG6lM2IxLQMJtBV5hDsdnthxDEd+MYHKb45lZjHNYUARsETSePggZMNC0BZ8gj50/+0aJ5MKzNXf3GYHfGRLd4unY=",
+    "server_spki_b64u": "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE5pQ8M6xAMbcn-aTkbi_K6T4DxHyxVic8CKt8oHPMhupTNiMS0DCbQVeYQ7HZ7YcQxHfjGBym-OZWYxzWFAEbBE0nj4IGTDQtAWfII-dP_tGieTCszV39xmB3xkS3eLp2",
+    "client_epk_pkcs8_b64": "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBBjAbQpm/a8GH2QE9jSvaQnMuPda5RDtbrFi/gm1Vcg5tjYgLXpBo0U/9kLbCgVHWhZANiAATQE5UXSnjXGy2B1vNW3Cww8pmzp2MCzVBOzmOy/ATbECWzUgJkjeZ6pg9H3u3p1yb80FIQkCblbgFclsA5C8TgjtlYstNmz4rOac3PxDee6jZ5/oVNdcLfQiZFgUHk5iI=",
+    "client_epk_spki_b64u": "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE0BOVF0p41xstgdbzVtwsMPKZs6djAs1QTs5jsvwE2xAls1ICZI3meqYPR97t6dcm_NBSEJAm5W4BXJbAOQvE4I7ZWLLTZs-KzmnNz8Q3nuo2ef6FTXXC30ImRYFB5OYi"
+  },
+  "derived": {
+    "z_b64u": "tMzqLqMFHNOZLuJlAlnR8xyiEp7vVVOK81yYVvJpFNmVm9gpmoduLN-9nDhjUzWn",
+    "tx_b64u": "9hf1OVYgaJX4iDEWkEF9HiNVHL8ew24c2lXsrIndnHdX2yCGobIFzZcJbfHQPZwy",
+    "kid": "beFsMb96Mw-DoKRI1jDMi7kj",
+    "sid": "QI4nscMPwpdSILgl4pgJe9QQ",
+    "info_c2s_b64u": "TVNFMS92MXxjMnN8YmVGc01iOTZNdy1Eb0tSSTFqRE1pN2tqfPYX9TlWIGiV-IgxFpBBfR4jVRy_HsNuHNpV7KyJ3Zx3V9sghqGyBc2XCW3x0D2cMg",
+    "info_s2c_b64u": "TVNFMS92MXxzMmN8YmVGc01iOTZNdy1Eb0tSSTFqRE1pN2tqfPYX9TlWIGiV-IgxFpBBfR4jVRy_HsNuHNpV7KyJ3Zx3V9sghqGyBc2XCW3x0D2cMg",
+    "k_c2s_b64u": "n9jojITdiGw-Jn7qfdbvOvx7nnHj9bOzyqzWpHle9sc",
+    "k_s2c_b64u": "5FR94e0mnBYE02-NfRLc_drBT-q3qhHKptZnlhFRdn4"
+  },
+  "request": {
+    "aad": {
+      "label": "MSE1/req",
+      "sid": "QI4nscMPwpdSILgl4pgJe9QQ",
+      "seq": 7,
+      "ts": 1755100000000,
+      "method": "POST",
+      "path": "/api/redeem"
+    },
+    "aad_b64u": "TVNFMS9yZXEAUUk0bnNjTVB3cGRTSUxnbDRwZ0plOVFRADcAMTc1NTEwMDAwMDAwMABQT1NUAC9hcGkvcmVkZWVt",
+    "plaintext_utf8": "{\"q\":\"page=2&sort=desc\",\"b\":{\"code\":\"WELCOME-2026\",\"amount\":10,\"note\":\"兑换码\"},\"h\":{\"authorization\":\"Bearer mse-test-token\"}}",
+    "plaintext_b64u": "eyJxIjoicGFnZT0yJnNvcnQ9ZGVzYyIsImIiOnsiY29kZSI6IldFTENPTUUtMjAyNiIsImFtb3VudCI6MTAsIm5vdGUiOiLlhZHmjaLnoIEifSwiaCI6eyJhdXRob3JpemF0aW9uIjoiQmVhcmVyIG1zZS10ZXN0LXRva2VuIn19",
+    "nonce_b64u": "obLD1OX2BxgpOktc",
+    "envelope_b64u": "AaGyw9Tl9gcYKTpLXO2fsnmSoIyt6-HkzssY92Wk5UrfXlwe0rigoBiufEYQbpBzy-sqd_C670gwu1VvLIBgMtW0lt08e3LCIrpZaauZkAhn3MtAI8B8OzLxVe5jSLklSsKs6BwkCgfbagSU0vOZw88oa3JMW2CYZmWsIwSUxD75AgMUqOg1gOmgwX4S3JqjpPT5AoqBkQVfKkBi2VI"
+  },
+  "response": {
+    "aad": {
+      "label": "MSE1/res",
+      "sid": "QI4nscMPwpdSILgl4pgJe9QQ",
+      "seq": 7,
+      "path": "/api/redeem"
+    },
+    "aad_b64u": "TVNFMS9yZXMAUUk0bnNjTVB3cGRTSUxnbDRwZ0plOVFRADcAL2FwaS9yZWRlZW0",
+    "plaintext_utf8": "{\"s\":200,\"b\":{\"ok\":true,\"balance\":42,\"msg\":\"已到账\"},\"ct\":\"application/json\",\"h\":{\"x-request-id\":\"req-7f3a2b19\"}}",
+    "plaintext_b64u": "eyJzIjoyMDAsImIiOnsib2siOnRydWUsImJhbGFuY2UiOjQyLCJtc2ciOiLlt7LliLDotKYifSwiY3QiOiJhcHBsaWNhdGlvbi9qc29uIiwiaCI6eyJ4LXJlcXVlc3QtaWQiOiJyZXEtN2YzYTJiMTkifX0",
+    "nonce_b64u": "XEs6KRj25dTDsqHw",
+    "envelope_b64u": "AVxLOikY9uXUw7Kh8IVlhxoaLMdwbw0_57SM_ZbKnexb-P_Xx9sCyjbXFU_dr1JmkAZeYdNw8lhILgVbN22QnRHUrzD-iufTwgSedkrIEb50XEVrt01rZ7MIW8wB9DV6_yZenO87llViVqUKNqPets85C-Ena-5K9tUBkP_DyzqmengCAV2-RXFmRI8Nc73E0w"
+  }
+}

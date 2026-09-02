@@ -1,0 +1,12 @@
+name: Build IDE (macOS + Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    uses: ./.github/workflows/ide-package.yml
+    secrets: inherit

@@ -1,0 +1,143 @@
+name: server
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    # postgres:17-alpine + pgvector，自己编（见 Dockerfile.postgres 顶部：
+    # 官方 pgvector 镜像是 Debian/glibc，换过去会让这个库 352 个 btree 索引
+    # 按错误的排序规则排列——不报错，只是查询悄悄漏行）。
+    # 打了 tag：compose 认 image 名，下次 up 不会因为没找到而去 Docker Hub 拉一个同名的。
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    image: michael-postgres:17-alpine-pgvector
+    restart: unless-stopped
+    # CIS Docker: block in-container privilege escalation (setuid binaries can't
+    # gain new caps) — a defense-in-depth blast-radius limiter if a service is RCE'd.
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  # 蓝绿部署：两种颜色共用这份定义，只有发布端口不同。
+  #
+  # 绿色挂在 profile 后面，平时**不启动**——`docker compose up -d` 不带 --profile 时
+  # 它根本不存在，所以这份改动对现有部署方式是完全惰性的。deploy.sh 在切换时才把它拉起来。
+  #
+  # 共用 image 标签：两个服务的 `build:` 上下文相同，指同一个标签能让镜像只构建一次，
+  # 也保证切换前后跑的是**同一个**镜像，而不是两次构建出的两个。
+  backend: &backend
+    build: .
+    restart: unless-stopped
+    # 收到 SIGTERM 之后要给它时间把手里的活干完，见 src/shutdown.rs。
+    #
+    # 原来是 2 秒，配的是「没有优雅退出」那个前提：既然一秒都等不到，不如早点杀掉、
+    # 把 nginx 那边的 502 窗口压短。现在进程会先停止接新连接、再等最多 20 秒让还没结算完
+    # 的请求把 bill(...) 跑完——2 秒会在它刚开始等的时候就 SIGKILL，等于优雅退出白写。
+    #
+    # 25 > 20，留一点余量给收尾日志。而部署本身早就不靠这个窗口了：蓝绿会先把流量切走、
+    # 等旧端口排空，再来停这个容器，所以这几十秒不对用户可见。
+    stop_grace_period: 25s
+    # Hardest containment on the only public-facing service: no privilege escalation,
+    # and drop ALL Linux capabilities (a Rust/axum HTTP server on :8080 needs none —
+    # no <1024 bind, no chown/setuid). If this is ever RCE'd, the shell is unprivileged
+    # and capability-less. Revert cap_drop if a future feature needs a capability.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 文件描述符上限。不写的话继承 Docker 默认的**软**上限 1024（实测容器内
+    # /proc/1/limits 就是 1024），而这是一个网关：每个在途请求同时占着一条下行连接和
+    # 一条到上游的连接，再加数据库连接池、Redis、日志。1024 在当前量级（峰值 45 次/分钟）
+    # 远远够用，但它是这台机器上**第一个**会在真实高并发下撞到的天花板，而撞上时的表现
+    # 是 accept 失败、请求被拒，不是优雅降级。
+    #
+    # 硬上限保持 1048576（Docker 默认），只把软上限抬到和 nginx 同一量级。
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 1048576
+    # 走变量而不是让测试环境用覆盖文件改：Compose 合并 `env_file` 这类**列表**字段
+    # 同样是**拼接**，覆盖里写 `.env.test` 的结果是它同时去读 `.env` 和 `.env.test`，
+    # 而测试目录里没有 `.env` → "env file not found" 直接失败。（和 ports 一个坑。）
+    env_file: ${ENV_FILE_NAME:-.env}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      # 默认是 true —— 每个注册用户都会自动拿到往宿主机磁盘写文件、并占一个二级域名的
+      # 权限。关掉，改成按名单发放（DEPLOY_ALLOWLIST）。
+      DEPLOY_AUTO_GRANT: "0"
+      BIND_ADDR: 0.0.0.0:8080
+      DEPLOY_MAX_MB: "30"
+      # DEPLOY_ALLOWLIST: 逗号分隔的账号 id；admin 永远可部署，其他账号须在此白名单里（在 .env 配）。
+    volumes:
+      # 部署上传的静态站落到这里（按账号隔离），host 上 nginx 的 /s/ 服务它。
+      # 同样走变量：测试环境必须指到别的目录，否则会往生产的静态站目录里写。
+      - ${SITES_DIR:-/var/www/michael-sites}:/var/www/michael-sites
+      # MusicGen weights are downloaded once on first use and survive image rebuilds.
+      - musiccache:/var/cache/michael/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging: *default-logging
+    image: ${BACKEND_IMAGE:-server-backend:latest}
+    ports:
+      # Loopback-only: nginx (on the host) proxies to 127.0.0.1:8080. Publishing on
+      # 0.0.0.0 exposed the backend to the public internet, bypassing the 8443 TLS
+      # vhost — close that. Bind to 127.0.0.1 so only the local nginx can reach it.
+      #
+      # 端口和静态站目录走变量，而不是让测试环境用覆盖文件去改：Compose 对
+      # **列表**字段（ports 就是）的合并语义是**拼接**，不是替换。测试那份写
+      # `- "127.0.0.1:8081:8080"` 的话，最终配置会同时发布 8080 和 8081 ——
+      # 直接和生产抢 8080，两套环境一起崩。用变量就完全绕开合并语义。
+      - "127.0.0.1:${BACKEND_PORT:-8080}:8080"
+
+  # 绿色。除了端口和 profile，一切继承蓝色。
+  backend-green:
+    <<: *backend
+    profiles: ["green"]
+    ports:
+      - "127.0.0.1:${BACKEND_GREEN_PORT:-8090}:8080"
+
+volumes:
+  pgdata:
+  redisdata:
+  musiccache:

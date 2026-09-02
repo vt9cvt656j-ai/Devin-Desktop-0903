@@ -1,0 +1,147 @@
+/* ============================================================================
+ * Tailwind v4 + shadcn 主题桥接
+ *
+ * 两件事，都关系到"不改配色"这条约束：
+ *
+ * ## 1. 不导入 preflight
+ *
+ * Tailwind 默认的 preflight 会重置 *、html、body、h1-h6、button、input、ul、img……
+ * 这个前端有 14,111 行手写 CSS 和 1,473 个类，preflight 一进来就会把标题栏、文件树、
+ * 编辑器外壳全部重排一遍。v4 里 preflight 属于 base 层，所以这里只按层导入 theme 和
+ * utilities，跳过 base —— 官方支持的做法，不需要 hack。
+ *
+ * ## 2. `@theme inline` 把 shadcn 的语义槽接到现有 token 上
+ *
+ * shadcn 组件用的是 bg-card / text-muted-foreground / border-border 这类工具类，背后是
+ * --color-* 变量。这里把每一个都指到项目已有的 token 上，于是：
+ *
+ *   · shadcn 组件直接长成现在这套配色，一个色值都不用新配；
+ *   · 深色模式自动跟随 —— `:root[data-theme="dark"]` 一改 --panel-2 / --text，
+ *     组件跟着变，不需要给 Tailwind 再配一套 dark: 变体。
+ *
+ * `inline` 是关键：不加的话 Tailwind 会在构建时把 var() 求值快照下来，深色切换就死了。
+ * 加了 inline，生成的工具类里保留 var(--panel-2)，运行时才解析。
+ *
+ * 深色下这套 token 本来就是 zinc 系（--panel-solid 是 #18181b，正是 zinc-900），
+ * 和 shadcn 默认深色主题同源，所以接上去观感是原生的，不是硬凑的。
+ * ========================================================================== */
+
+@layer theme, base, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+@theme inline {
+  /* 表面 */
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --color-card: var(--panel-2);
+  --color-card-foreground: var(--text);
+  /* 弹层**不能**用 --panel-solid：助手栏、侧栏、面板本身就是那个色，弹层压在上面就
+     和背景同色，只剩一圈边框 —— 同一个毛病在工具卡上已经犯过一次。
+     --popover-surface 在两套主题里都比 --panel-solid 高一档（见 app.css 的定义）。 */
+  --color-popover: var(--popover-surface);
+  --color-popover-foreground: var(--text);
+
+  /* 强调色 —— 项目自己的蓝，浅色 #0a84ff / 深色 #4daafc */
+  --color-primary: var(--accent);
+  --color-primary-foreground: #ffffff;
+
+  /* shadcn 的 secondary / muted / accent 在这套体系里都是"更弱一层的表面" */
+  --color-secondary: var(--hover);
+  --color-secondary-foreground: var(--text);
+  --color-muted: var(--hover);
+  --color-muted-foreground: var(--text-dim);
+  --color-accent: var(--hover);
+  --color-accent-foreground: var(--text);
+
+  /* 边框 / 输入框 / focus ring */
+  --color-border: var(--line);
+  --color-input: var(--line-strong);
+  --color-ring: var(--accent);
+
+  /* 语义色。项目里已经在用的那几个，直接沿用，不新配。 */
+  --color-destructive: #d93025;
+  --color-destructive-foreground: #ffffff;
+
+  /* 圆角比例：以现有 --radius(10px) 为基准派生，和 shadcn 默认主题同构 */
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 4px);
+  --radius-lg: calc(var(--radius) - 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* 字体沿用系统栈，保住 macOS 原生观感 */
+  --font-sans: var(--font);
+  --font-mono: var(--mono);
+}
+
+/* React 岛的挂载点。
+ *
+ * 这些节点由 vanilla 侧创建，React 在里面渲染。给一个显式的作用域类，方便日后需要时
+ * 把样式限制在岛内 —— 现在没有 preflight，所以其实不加也不会外溢，但边界写出来比
+ * 靠"碰巧没冲突"可靠。 */
+.ui-island {
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Radix 的 Portal 会把 Dialog / Tooltip 挂到 <body> 下，跑出 .ui-island 之外。
+   给 portal 容器同样的字体与颜色基线。 */
+[data-radix-popper-content-wrapper],
+[data-slot="dialog-overlay"],
+[data-slot="dialog-content"] {
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scoped element reset for islands.
+ *
+ * Preflight is deliberately not imported (see the top of this file), which is right for the
+ * 14,111 lines of hand-written CSS outside the islands — but it also means a bare <button> or
+ * <input> inside an island keeps the browser's own chrome. shadcn components assume preflight
+ * already stripped that, so they never set background/border/padding themselves. It showed:
+ * the dialog's close button rendered as a grey UA square, and every row in the session picker
+ * looked like a raised push-button.
+ *
+ * Two things make this behave like preflight rather than fighting it:
+ *
+ *   1. **@layer base.** Unlayered CSS beats every layer, so outside a layer this would win
+ *      against `@layer utilities` regardless of specificity. The first attempt did exactly
+ *      that and flattened rounded-lg / px-3 on the very rows it was meant to fix.
+ *   2. **:where() around the scope.** Keeps the whole rule at the specificity of a bare
+ *      `button` (0,0,1), as preflight has. `.ui-island button` would be (0,1,1) and would
+ *      again outrank utilities.
+ *
+ * The portal slots are listed because Radix renders Dialog/Tooltip content into <body>,
+ * outside .ui-island. Nothing here can reach the rest of the app. */
+@layer base {
+  :where(.ui-island, [data-radix-popper-content-wrapper], [data-slot="dialog-content"]) button {
+    appearance: none;
+    background: none;
+    border: 0;
+    margin: 0;
+    padding: 0;
+    color: inherit;
+    font: inherit;
+    text-align: inherit;
+    border-radius: 0;
+  }
+
+  :where(.ui-island, [data-radix-popper-content-wrapper], [data-slot="dialog-content"]) input {
+    appearance: none;
+    font: inherit;
+    color: inherit;
+  }
+
+  /* Focus is the border going accent-coloured and nothing else. shadcn ships a translucent
+     3px ring; replacing it with a 1px ring of the same colour just made a thinner glow. On a
+     light surface Google marks focus by recolouring the existing border, so there is no added
+     halo to read as a highlight. */
+  :where(.ui-island, [data-slot="dialog-content"]) input:focus,
+  :where(.ui-island, [data-slot="dialog-content"]) input:focus-visible {
+    border-color: var(--accent);
+    box-shadow: none;
+    outline: none;
+  }
+}

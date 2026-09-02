@@ -1,0 +1,247 @@
+{"_": "平台知识库检索的评测集。每行一条查询 + 人工标注的相关小节。"}
+{"_": ""}
+{"_": "为什么需要它：换检索器（同义表 / 查询改写 / 向量）之前，得先有一把能重复跑的尺，"}
+{"_": "否则「效果提升多少」只能靠感觉。判据落在 @2，因为无域注入门只有 2 个名额"}
+{"_": "（AUTO_KNOWLEDGE_MAX_HITS = 2）——排第 3 名的命中对用户是不存在的。"}
+{"_": ""}
+{"_": "## 这把尺换过一次，原因值得记下来"}
+{"_": ""}
+{"_": "最初只有 30 条，检索器在上面跑出 Recall@2 = 84.6%。但那 30 条正是当初写"}
+{"_": "CN_EN_ENGINEERING 那张手写对照表时**照着改的**——表是照着它们的失败案例补的，"}
+{"_": "所以 84.6% 量的是拟合程度，不是泛化能力。"}
+{"_": ""}
+{"_": "扩到 219 条之后（新增 189 条：逐文件读原文出题 → 打乱后盲标 → 审核裁决，"}
+{"_": "删掉直译小节标题和近义重复的 17 条），同一个检索器在没见过的 189 条上只有 48.0%。"}
+{"_": "置信区间 41~55 vs 66~94，不重叠——37 个点的落差就是过拟合。"}
+{"_": ""}
+{"_": "**教训**：评测集要在改检索器**之前**定好，或者由不看检索器的人来出。"}
+{"_": "任何「照着失败案例补规则」的循环，都会把尺子和被量的东西绑在一起。"}
+{"_": ""}
+{"_": "## 标注口径"}
+{"_": ""}
+{"_": "relevant 里写「域/主题」，只要检索命中该文件的任一小节即算命中。"}
+{"_": "粒度取到文件而不是小节，是因为同一文件内的小节对模型都有参考价值。"}
+{"_": "relevant 为空 = 语料里确实没有对应内容，这类查询用来量「该说不知道时有没有乱给」。"}
+{"_": "batch 字段：orig = 最初那 30 条（短口语，中位 8 字符），new = 新增 189 条"}
+{"_": "（偏长偏具体，中位 27 字符）。两批的**查询长度分布差很多**，任何按「命中词绝对个数」"}
+{"_": "设的闸门都会偏袒长的那批——试过一版就是这么塌的，别再走一遍。"}
+{"_": ""}
+{"q": "做个网站", "batch": "orig", "relevant": [], "note": "太泛，语料里没有「怎么做一个网站」这种总纲；正确行为是不给（给了必然是噪音）"}
+{"q": "帮我写个命令行工具", "batch": "orig", "relevant": [], "note": "语料没有 CLI 工程内容；现在命中 reverse-engineering 是纯误伤"}
+{"q": "做一个会员系统", "batch": "orig", "relevant": ["saas/multi-tenancy-and-billing", "backend-api/auth-patterns"], "note": "会员=订阅+鉴权"}
+{"q": "写个后台管理", "batch": "orig", "relevant": ["database/schema-and-queries", "backend-api/auth-patterns"], "note": "后台管理的工程面是 CRUD 建模 + 权限"}
+{"q": "做个博客", "batch": "orig", "relevant": ["marketing/seo-analytics-crm"], "note": "工程侧能给的只有 SEO；内容型站点的其余部分在设计蓝本里（本路径已排除）"}
+{"q": "帮我搭个 API 服务", "batch": "orig", "relevant": ["backend-api/api-design", "backend-api/error-handling"], "note": "最直接的一条"}
+{"q": "做个小程序后端", "batch": "orig", "relevant": ["backend-api/api-design", "backend-api/auth-patterns"], "note": "小程序后端就是普通 API 服务 + 鉴权"}
+{"q": "写个数据同步脚本", "batch": "orig", "relevant": ["data-ml/pipelines-and-features", "database/schema-and-queries"], "note": "同步=管道+幂等写入"}
+{"q": "做个多租户的排班系统", "batch": "orig", "relevant": ["saas/multi-tenancy-and-billing"], "note": "现在就命中，作为对照锚点"}
+{"q": "帮我做个电商下单流程", "batch": "orig", "relevant": ["ecommerce/catalog-and-orders", "database/schema-and-queries"], "note": "下单=订单建模+库存事务"}
+{"q": "做个能扛高并发的实时聊天", "batch": "orig", "relevant": ["backend-api/api-design", "backend-api/microservices", "web-frontend/performance"], "note": "现在命中 api-design，其余两个也该进"}
+{"q": "我要做个记账的", "batch": "orig", "relevant": ["finance/payments-and-banking", "saas/multi-tenancy-and-billing"], "note": "记账的工程面是复式账本；语料里在 finance"}
+{"q": "帮我弄个能上传图片的相册", "batch": "orig", "relevant": ["web-frontend/performance", "security/appsec"], "note": "图片性能 + 上传的安全面（类型校验/存储）"}
+{"q": "做个抢票的", "batch": "orig", "relevant": ["database/schema-and-queries", "ecommerce/catalog-and-orders"], "note": "抢票=超卖控制+库存锁，语料里有"}
+{"q": "写个爬虫", "batch": "orig", "relevant": ["backend-api/api-design"], "note": "限流/重试/礼貌抓取在 api-design"}
+{"q": "做个内部用的审批流", "batch": "orig", "relevant": ["gaming/game-architecture", "database/schema-and-queries"], "note": "状态机在 game-architecture（唯一讲状态机的地方），持久化在 database"}
+{"q": "帮我做个直播弹幕", "batch": "orig", "relevant": [], "note": "语料真的没有；正确行为是不给"}
+{"q": "搞个论坛", "batch": "orig", "relevant": [], "note": "语料真的没有"}
+{"q": "做个在线考试", "batch": "orig", "relevant": ["education/lms-and-assessment"], "note": "现在就命中，对照锚点"}
+{"q": "帮我做个 IM", "batch": "orig", "relevant": ["web-frontend/component-patterns", "backend-api/api-design"], "note": "WebSocket 在 web-frontend；后端面在 api-design"}
+{"q": "接口怎么设计版本", "batch": "orig", "relevant": ["backend-api/api-design", "saas/multi-tenancy-and-billing"], "note": "术语式中文对照组"}
+{"q": "数据库索引怎么建", "batch": "orig", "relevant": ["database/optimization", "database/schema-and-queries"], "note": "术语式中文对照组"}
+{"q": "登录怎么做才安全", "batch": "orig", "relevant": ["backend-api/auth-patterns", "security/secure-coding"], "note": "术语式中文对照组"}
+{"q": "怎么防 SQL 注入", "batch": "orig", "relevant": ["security/secure-coding", "security/appsec"], "note": "术语式中文对照组"}
+{"q": "怎么做灰度发布", "batch": "orig", "relevant": ["devops/deploy-and-ops", "devops/cicd-iac"], "note": "术语式中文对照组"}
+{"q": "database index optimization", "batch": "orig", "relevant": ["database/optimization"], "note": "英文术语对照组"}
+{"q": "connection pool sizing", "batch": "orig", "relevant": ["database/optimization", "database/selection-and-patterns"], "note": "英文术语对照组"}
+{"q": "JWT refresh token rotation", "batch": "orig", "relevant": ["backend-api/auth-patterns"], "note": "英文术语对照组"}
+{"q": "service decomposition boundaries", "batch": "orig", "relevant": ["backend-api/microservices"], "note": "英文术语对照组"}
+{"q": "rate limiting strategies", "batch": "orig", "relevant": ["backend-api/api-design"], "note": "英文术语对照组"}
+{"q": "做个能一直往下滑自动加载更多的列表接口，后端该怎么写", "batch": "new", "relevant": ["backend-api/api-design"], "note": "命中 api-design 的 Pagination（游标/keyset 分页），无限滚动的标准后端写法"}
+{"q": "订单列表打开要十几秒，看日志好像每一行都单独去查了一次数据库", "batch": "new", "relevant": ["database/schema-and-queries"], "note": "命中 schema-and-queries 的 N+1 Query Problem"}
+{"q": "帮我写个 iPhone 上的用户列表页，点一条能进详情", "batch": "new", "relevant": ["mobile/ios-android"], "note": "命中 ios-android 的 SwiftUI（List + 导航详情）"}
+{"q": "拿到个 js 文件全是数组下标和乱七八糟的变量名，想还原成能看懂的", "batch": "new", "relevant": ["reverse-engineering/python-js-unpack", "reverse-engineering/deobfuscation"], "note": "python-js-unpack 的 JS 反混淆（字符串数组旋转/十六进制变量名）+ deobfuscation 通用去混淆"}
+{"q": "想让用户直接用谷歌账号登录我的网页", "batch": "new", "relevant": ["backend-api/auth-patterns"], "note": "命中 auth-patterns 的 OAuth2 Flows（第三方/谷歌登录）"}
+{"q": "想写个策略回测，拿历史行情跑一遍看到底赚不赚", "batch": "new", "relevant": ["finance/trading-and-quant"], "note": "命中 trading-and-quant 的 Backtesting Framework"}
+{"q": "打靶机老是找不到突破口卡在那，有啥思路吗", "batch": "new", "relevant": ["penetration-testing/methodology-and-scope", "penetration-testing/recon-and-enumeration"], "note": "methodology 的 Working principles（没进去=枚举不够）+ recon 给具体下手方向"}
+{"q": "扫描器报了一大堆漏洞，大半是误报，怎么只留真的", "batch": "new", "relevant": ["security/vulnerability-detection"], "note": "命中 vulnerability-detection 的 Hybrid LLM+Static（94-98% 误报消除）"}
+{"q": "整个项目要把一个旧写法批量换成新的，怎么搞不出乱子", "batch": "new", "relevant": ["web-frontend/documentation"], "note": "命中 documentation 的 Code Migration at Scale"}
+{"q": "我想代码一推上去就自动帮我跑测试、跑 lint，没问题再自动部署", "batch": "new", "relevant": ["devops/cicd-iac", "devops/deploy-and-ops"], "note": "cicd-iac 的 CI/CD Pipeline Patterns + deploy-and-ops 的 CI/CD Pipelines（推送触发测试/lint/部署）"}
+{"q": "我用 Three.js 做网页小游戏，来回切场景、切页面的时候内存一直往上涨", "batch": "new", "relevant": ["gaming/game-architecture"], "note": "命中 game-architecture 的 Web Games（Three.js dispose 清理防泄漏）"}
+{"q": "我有个安卓 apk，想把里面代码扒出来看看它到底请求了哪些接口", "batch": "new", "relevant": ["reverse-engineering/managed-bytecode"], "note": "命中 managed-bytecode 的 Android APK（jadx 反编+找 OkHttp/URL 端点）"}
+{"q": "我想把一段 C 代码一点点改写成 Rust，有没有靠谱的步骤", "batch": "new", "relevant": ["systems-programming/rust"], "note": "命中 rust 的 C-to-Rust Migration (Skeleton-First)"}
+{"q": "接口查数据库太慢了，想加个缓存扛一下，缓存该怎么设计", "batch": "new", "relevant": ["backend-api/microservices", "database/optimization"], "note": "microservices 的 Caching Architecture（cache-aside/TTL/失效/惊群）+ optimization 的 Redis cache-aside"}
+{"q": "服务线上出了问题老是查不到原因，日志和监控该怎么搞", "batch": "new", "relevant": ["devops/deploy-and-ops", "devops/cicd-iac", "backend-api/api-design"], "note": "deploy-and-ops 的 Observability + cicd-iac 的 Monitoring + api-design 的 Logging（三篇都实打实覆盖日志/监控）"}
+{"q": "搞到一堆密码哈希，想离线把明文跑出来", "batch": "new", "relevant": ["penetration-testing/passwords-and-postexploit"], "note": "命中 passwords-and-postexploit 的 Identify the hash then crack OFFLINE（hashcat/john）"}
+{"q": "一个 Go 写的二进制被 strip 了，函数名还能还原吗", "batch": "new", "relevant": ["reverse-engineering/native-binaries", "reverse-engineering/deobfuscation"], "note": "native-binaries 与 deobfuscation 的 Go/Rust/Swift stripped 恢复（runtime 元数据还原函数名）"}
+{"q": "React 里数据请求老写在 useEffect 里，有没有更靠谱的做法", "batch": "new", "relevant": ["web-frontend/react-nextjs"], "note": "命中 react-nextjs 的 Data fetching patterns / When NOT to use useEffect"}
+{"q": "想搞个能自动换币的兑换池，价格根据池子里的存量自己算出来", "batch": "new", "relevant": ["blockchain/smart-contracts-and-defi"], "note": "命中 smart-contracts-and-defi 的 DeFi Patterns → AMM（x*y=k 按储备定价）"}
+{"q": "我有一批传感器要往云端传数据，该选哪种通信协议好", "batch": "new", "relevant": ["iot-embedded/devices-and-protocols"], "note": "命中 devices-and-protocols 的 Device Communication Protocols（MQTT/CoAP 选型）"}
+{"q": "想找出一个网站上没公开出来的目录和管理后台页面", "batch": "new", "relevant": ["penetration-testing/recon-and-enumeration"], "note": "命中 recon-and-enumeration 的 Web content & vhost enumeration"}
+{"q": "我的网站现在只能用鼠标点，想让它光用键盘也能操作", "batch": "new", "relevant": ["web-frontend/accessibility", "ui-ux/design-principles"], "note": "accessibility 的 Mandatory Rules/ARIA（键盘可操作）+ design-principles 的 Accessibility Basics"}
+{"q": "提交成功以后想弹一个打对勾的动画", "batch": "new", "relevant": ["web-frontend/svg", "web-frontend/animations"], "note": "svg 的 Success checkmark 线描动画 + animations 的可粘贴 keyframes"}
+{"q": "做个购物车，没登录也能先加东西，登录后把之前加的合并进来", "batch": "new", "relevant": ["ecommerce/catalog-and-orders"], "note": "命中 catalog-and-orders 的 Shopping Cart → merge_guest_to_user"}
+{"q": "做个电子签名的功能，要留下谁在什么时候、什么 IP 签的证据", "batch": "new", "relevant": ["legal/contracts-and-compliance"], "note": "命中 contracts-and-compliance 的 E-Signature（时间戳/IP/UA/文档哈希审计）"}
+{"q": "做个 SaaS 好几个公司共用一套系统，各家的数据要互相看不到", "batch": "new", "relevant": ["saas/multi-tenancy-and-billing"], "note": "命中 multi-tenancy-and-billing 的 Multi-Tenancy Patterns（租户隔离）"}
+{"q": "鼠标放到卡片上浮起来、按钮按下去有回弹，这些小交互怎么写", "batch": "new", "relevant": ["web-frontend/animations", "ui-ux/design-principles"], "note": "animations 的 Micro-interactions（卡片浮起/按钮回弹）+ design-principles 的 Microinteractions"}
+{"q": "学生交上来的代码有的是互相抄的，改改变量名就交了，这种能查出来吗", "batch": "new", "relevant": ["education/lms-and-assessment"], "note": "命中 lms-and-assessment 的 Plagiarism Detection（AST 归一化+winnowing）"}
+{"q": "同事发我一个 exe，我怕直接双击中招，能不能不运行就先看出来它是干什么的", "batch": "new", "relevant": ["reverse-engineering/binary-triage"], "note": "命中 binary-triage 的 Safety when binary may be malware + strings/元数据静态分诊"}
+{"q": "有个功能是用户填一个链接，我们服务器去把那个网页抓回来做预览，这样会不会有风险", "batch": "new", "relevant": ["security/appsec"], "note": "命中 appsec 的 Input Validation & SSRF（URL 预览抓取即举例）"}
+{"q": "有个表单十几个字段，填错的要在旁边标红提示，提交中不能被点第二次", "batch": "new", "relevant": ["web-frontend/react-nextjs", "web-frontend/vue-nuxt"], "note": "vue-nuxt 的 VeeValidate+zod（逐字段内联报错+isSubmitting 禁用）+ react-nextjs 同款"}
+{"q": "我接口出错的时候也是返回成功，把错误写在返回内容里，同事说这样不行", "batch": "new", "relevant": ["backend-api/api-design", "backend-api/error-handling"], "note": "api-design 的 HTTP status codes 点名「200 带 error body」为头号错误；error-handling 给正确错误信封"}
+{"q": "SELECT FOR UPDATE 和版本号乐观锁怎么选", "batch": "new", "relevant": ["database/schema-and-queries", "ecommerce/catalog-and-orders"], "note": "schema-and-queries 的 Read-Modify-Write Race（悲观 FOR UPDATE vs 乐观 version）；ecommerce 的库存乐观锁示例"}
+{"q": "安卓这个页面往下滑就一卡一卡的", "batch": "new", "relevant": ["mobile/ios-android"], "note": "命中 ios-android 的 Jetpack Compose LazyColumn + 性能清单（滚动 60fps）"}
+{"q": "怎么识别 UPX、Themida 这类壳", "batch": "new", "relevant": ["reverse-engineering/deobfuscation", "reverse-engineering/binary-triage"], "note": "deobfuscation 的 Detect the protector（die 识别）+ binary-triage 的高熵/段名识别"}
+{"q": "想要那种半透明磨砂的卡片，能看到后面模糊的背景", "batch": "new", "relevant": ["web-frontend/css-effects"], "note": "命中 css-effects 的 Glassmorphism"}
+{"q": "自建鉴权还是用托管身份服务（Auth0/Cognito 那种）", "batch": "new", "relevant": ["backend-api/auth-patterns"], "note": "命中 auth-patterns 的 Managed Auth (Preferred)"}
+{"q": "我程序里算钱老是差那么几分，怎么弄才准", "batch": "new", "relevant": ["finance/payments-and-banking", "finance/trading-and-quant"], "note": "payments 的 Money Representation（整数分/Decimal）+ trading 的 Precision Rules"}
+{"q": "渗透测试常用的工具链有哪些", "batch": "new", "relevant": ["penetration-testing/methodology-and-scope"], "note": "命中 methodology-and-scope 的 Standard toolkit"}
+{"q": "让 AI 生成的代码老有安全漏洞，怎么让它写时就更安全", "batch": "new", "relevant": ["security/vulnerability-detection", "security/secure-coding"], "note": "vulnerability-detection 的 CWE-Guided Secure Generation/RCI + secure-coding 的实践"}
+{"q": "重构时代码坏味道该按什么顺序处理，长函数和重复代码先修哪个", "batch": "new", "relevant": ["web-frontend/documentation"], "note": "命中 documentation 的 Code Smell Priority（长方法→重复代码）"}
+{"q": "服务器、数据库这些环境我不想每次都手动去控制台点来点去，想用代码统一管起来", "batch": "new", "relevant": ["devops/cicd-iac"], "note": "命中 cicd-iac 的 Infrastructure as Code / Terraform"}
+{"q": "对象池怎么做，避免频繁 new 和销毁对象导致的 GC 卡顿", "batch": "new", "relevant": ["gaming/game-architecture"], "note": "命中 game-architecture 的 Object Pooling"}
+{"q": "有个 exe 是 C# 写的，想把它还原成源码看看里面的逻辑", "batch": "new", "relevant": ["reverse-engineering/managed-bytecode"], "note": "命中 managed-bytecode 的 .NET CIL（ILSpy/dnSpy 反编）"}
+{"q": "Rust 里错误处理是该用 thiserror 还是 anyhow", "batch": "new", "relevant": ["systems-programming/rust"], "note": "命中 rust 的 Error Handling（thiserror 库 vs anyhow 应用）"}
+{"q": "拿到一个 Linux 的低权限 shell，怎么提权到 root", "batch": "new", "relevant": ["penetration-testing/passwords-and-postexploit"], "note": "命中 passwords-and-postexploit 的 Linux privilege escalation"}
+{"q": "Next.js 的组件到底什么时候要加 use client", "batch": "new", "relevant": ["web-frontend/react-nextjs"], "note": "命中 react-nextjs 的 App Router: Server vs Client Components"}
+{"q": "怎么给 solidity 智能合约省 gas", "batch": "new", "relevant": ["blockchain/smart-contracts-and-defi"], "note": "命中 smart-contracts-and-defi 的 Gas Optimization"}
+{"q": "做个靠电池供电的小设备，想让它撑很久不用老换电池", "batch": "new", "relevant": ["iot-embedded/devices-and-protocols"], "note": "命中 devices-and-protocols 的 Firmware（sleep modes + 电池续航估算）"}
+{"q": "查到服务的版本号之后，怎么找有没有对应的现成漏洞利用", "batch": "new", "relevant": ["penetration-testing/recon-and-enumeration", "penetration-testing/network-and-services"], "note": "合并了 2 条同义查询；recon 的 Triage→vuln mapping（searchsploit 按版本）+ network 的 Service exploitation；已裁掉较弱的 methodology 标签"}
+{"q": "我做的弹窗用键盘关不掉、焦点还会跑到后面的内容去，怎么弄对", "batch": "new", "relevant": ["web-frontend/accessibility", "ui-ux/design-principles"], "note": "命中 accessibility 的 Modals（trap focus/ESC/归还焦点/role=dialog）"}
+{"q": "svg 的 viewBox 到底是干嘛用的", "batch": "new", "relevant": ["web-frontend/svg"], "note": "命中 svg 的 viewBox — the coordinate system"}
+{"q": "商品有尺码颜色好几种，库存怎么存、下单怎么防止超卖", "batch": "new", "relevant": ["ecommerce/catalog-and-orders", "database/schema-and-queries"], "note": "catalog-and-orders 的 product_variants + 乐观锁防超卖；schema-and-queries 的原子扣减"}
+{"q": "怎么记录用户对每个用途的同意、以及处理数据的合法性依据", "batch": "new", "relevant": ["legal/contracts-and-compliance"], "note": "命中 contracts-and-compliance 的 GDPR Lawful Basis Tracking（consent_records）"}
+{"q": "接 Stripe 收订阅费，付款失败重试几次还不行就把账号停掉", "batch": "new", "relevant": ["saas/multi-tenancy-and-billing", "finance/payments-and-banking"], "note": "saas 的 webhook invoice.payment_failed→suspend + payments 的 Stripe 订阅 webhook"}
+{"q": "做动画到底该用纯 CSS 还是上 Framer Motion、GSAP 这些库", "batch": "new", "relevant": ["web-frontend/animations"], "note": "命中 animations 的 When to Use a Library vs Platform CSS"}
+{"q": "想每天定时把另一个系统的数据搬到我们库里，怎么保证不会重复也不会漏", "batch": "new", "relevant": ["database/optimization", "data-ml/pipelines-and-features"], "note": "optimization 的 Data Pipeline Patterns（增量抽取+upsert 幂等）；data-ml 的 Pipeline Design 同主题"}
+{"q": "LTI 1.3 对接学校教学系统，学生做完题的分数怎么回传回去", "batch": "new", "relevant": ["education/lms-and-assessment"], "note": "命中 lms-and-assessment 的 LTI Integration（AGS submitGrade 回传成绩）"}
+{"q": "有个老工具源码丢了，想知道它把数据发到哪个服务器地址", "batch": "new", "relevant": ["reverse-engineering/binary-triage", "reverse-engineering/native-binaries"], "note": "binary-triage 的 strings|grep http 捞 URL；native-binaries 的 izz~http/strace 定位（若原生程序）"}
+{"q": "cookie 已经设了 SameSite，还需要再做 CSRF token 吗", "batch": "new", "relevant": ["security/appsec"], "note": "命中 appsec 的 CSRF（SameSite 首选但仍建议 token 纵深防御）"}
+{"q": "Vue 项目一打开首页就转半天圈，好像把所有页面的东西都一起加载了", "batch": "new", "relevant": ["web-frontend/vue-nuxt", "web-frontend/performance"], "note": "vue-nuxt 的 Vue Router lazy loading（()=>import 路由懒加载）+ performance 的 code splitting"}
+{"q": "用户点完支付、前端说成功了我就发货，这样会不会出问题", "batch": "new", "relevant": ["finance/payments-and-banking", "ecommerce/catalog-and-orders"], "note": "payments 的 Stripe Pattern（webhook 才是权威，不能信客户端回调）+ ecommerce Checkout"}
+{"q": "想做个不联网也能帮我总结一段文字的 App", "batch": "new", "relevant": ["mobile/ios-android"], "note": "命中 ios-android 的 On-Device AI（本地 Foundation Models 做 Summarize）——全语料唯一的离线总结内容"}
+{"q": "我做的助手让模型自己拼一条命令然后在服务器上跑，这样安全吗", "batch": "new", "relevant": ["security/secure-coding", "security/appsec"], "note": "secure-coding 的 Command Injection（把 LLM 输出当不可信）+ appsec 的 OS Command Injection"}
+{"q": "给站点加个一键切换的深色模式", "batch": "new", "relevant": ["web-frontend/css-effects", "web-frontend/react-nextjs"], "note": "css-effects 的 Theming with custom properties（[data-theme]）+ react-nextjs 的 dark mode 切换"}
+{"q": "我这个新项目该选哪个数据库啊，有点纠结", "batch": "new", "relevant": ["database/selection-and-patterns"], "note": "命中 selection-and-patterns 的 Database Selection Decision Tree"}
+{"q": "帮我做个算房贷每月还多少的", "batch": "new", "relevant": ["finance/trading-and-quant"], "note": "命中 trading-and-quant 的 Financial Calculations → amortization_schedule"}
+{"q": "有个安装包 exe，想把里面文件掏出来又不想运行它", "batch": "new", "relevant": ["reverse-engineering/installers-archives"], "note": "合并了 2 条同义查询；命中 installers-archives 的静态解包（NSIS/Inno/MSI）"}
+{"q": "看到一段做加密的代码，想知道有没有安全隐患", "batch": "new", "relevant": ["security/vulnerability-detection"], "note": "命中 vulnerability-detection 的 Cryptographic Security（ECB/硬编码密钥/弱哈希审查）"}
+{"q": "我调第三方接口老是超时失败，想让它自己等一会儿再重试几次，别一失败就一股脑全冲上去", "batch": "new", "relevant": ["backend-api/error-handling", "backend-api/api-design"], "note": "error-handling 的 Retry Strategy（指数退避+jitter 防惊群）；api-design 的外呼超时重试补充"}
+{"q": "接口一变慢或者报错变多，我想第一时间收到通知，最好能带上排查步骤", "batch": "new", "relevant": ["devops/cicd-iac", "devops/deploy-and-ops"], "note": "cicd-iac 的 Monitoring & Alerting（告警带 diagnostic_steps/runbook）+ deploy-and-ops 的 Observability"}
+{"q": "打靶机拿到一个低权限的域账号，接下来怎么摸清这个域、找往上提权的路", "batch": "new", "relevant": ["penetration-testing/network-and-services", "penetration-testing/passwords-and-postexploit"], "note": "network-and-services 的 Active Directory（netexec/BloodHound 枚举提权路径）+ passwords 的 Windows 提权"}
+{"q": "下了个 jar 包，想反编译成 Java 看看它是怎么算签名的", "batch": "new", "relevant": ["reverse-engineering/managed-bytecode"], "note": "命中 managed-bytecode 的 Java .class/.jar 反编译"}
+{"q": "我首页那个 js 包太大加载好慢，想按需加载，别一进来就把整个都下载了", "batch": "new", "relevant": ["web-frontend/performance", "web-frontend/react-nextjs"], "note": "performance 的 JS route-level code splitting + react-nextjs 的 dynamic import"}
+{"q": "系统拆成好几个服务了，它们之间该怎么互相调用", "batch": "new", "relevant": ["backend-api/microservices"], "note": "命中 microservices 的 Inter-Service Communication"}
+{"q": "做个医院用的系统，病人的隐私数据怎么存怎么用才不违规", "batch": "new", "relevant": ["healthcare/hipaa-and-fhir"], "note": "命中 hipaa-and-fhir 的 HIPAA Technical Safeguards；已裁掉盲标里较弱的 legal/GDPR（EU 个人数据≠PHI）"}
+{"q": "渗透把靶机打下来之后，收尾清理和报告要写啥", "batch": "new", "relevant": ["penetration-testing/passwords-and-postexploit", "penetration-testing/methodology-and-scope"], "note": "passwords 的 Cleanup & reporting + methodology 的 PTES 报告阶段"}
+{"q": "我做出来的界面看着特别廉价、像没做完，怎么弄得专业点", "batch": "new", "relevant": ["ui-ux/design-principles", "web-frontend/css-effects"], "note": "合并了 2 条同义「界面廉价」查询；design-principles 的 Amateur Tells/Components That Look Pro + css-effects 的 amateur CSS tells"}
+{"q": "React 改了 state 页面却不刷新，是哪儿错了", "batch": "new", "relevant": ["web-frontend/react-nextjs"], "note": "命中 react-nextjs 的 state（别 mutate/别重复 state）"}
+{"q": "设备装在外面了，怎么远程给它升级固件，还得保证升坏了不会变砖", "batch": "new", "relevant": ["iot-embedded/devices-and-protocols"], "note": "命中 devices-and-protocols 的 OTA Updates（远程升级+防砖回滚）"}
+{"q": "有个 exe 其实是 python 打包出来的，我想把里面的源码弄回来", "batch": "new", "relevant": ["reverse-engineering/python-js-unpack"], "note": "命中 python-js-unpack 的 PyInstaller（exe→Python 源码）"}
+{"q": "表单填错了，想让用读屏软件的人也能知道到底哪里错了", "batch": "new", "relevant": ["web-frontend/accessibility"], "note": "命中 accessibility 的 aria-describedby+aria-invalid+aria-live；已裁掉较弱的 react-nextjs"}
+{"q": "想做个自动把数据清洗、转换这些步骤按顺序排好定时跑的东西", "batch": "new", "relevant": ["data-ml/pipelines-and-features", "database/optimization"], "note": "data-ml 的 Data Pipeline Design（带依赖 DAG 编排）+ optimization 的 ETL 清洗顺序"}
+{"q": "结账时优惠券怎么算，多张券能不能一起叠加用", "batch": "new", "relevant": ["ecommerce/catalog-and-orders"], "note": "命中 catalog-and-orders 的 Pricing & Promotions（DiscountEngine + stacking_rules）"}
+{"q": "在做授权测试，想看看这个登录接口能不能爆破或者有没有限流", "batch": "new", "relevant": ["penetration-testing/web-exploitation", "penetration-testing/network-and-services"], "note": "「测试」框架→web-exploitation 的 Broken auth（hydra 爆破）+ network 的 Credential attacks；已裁掉防守面的 appsec"}
+{"q": "想邀请同事加入团队，还要分管理员、普通成员这些不同权限", "batch": "new", "relevant": ["saas/multi-tenancy-and-billing", "backend-api/auth-patterns"], "note": "saas 的 User Management & RBAC（memberships/invited_by）+ auth-patterns 的 RBAC"}
+{"q": "帮这个函数写点测试，要能真抓出改一行代码引入的 bug 那种", "batch": "new", "relevant": ["web-frontend/testing"], "note": "命中 testing 的 Unit Tests — Mutation-Guided Approach"}
+{"q": "要做个页面显示每个用户每个月花了多少，还得跟上个月比多了少了，SQL 写得又长又绕", "batch": "new", "relevant": ["database/optimization", "data-ml/pipelines-and-features"], "note": "命中 optimization 的 Window Functions（LAG 做月环比）；data-ml 的 SQL Optimization 只一句带过属弱标"}
+{"q": "我们的商品页在谷歌上搜出来光秃秃的，想让它直接显示价格、有没有货和评分", "batch": "new", "relevant": ["marketing/seo-analytics-crm"], "note": "命中 seo-analytics-crm 的 Technical SEO（JSON-LD price/availability/rating 富媒体）"}
+{"q": "手上有一份设计稿，想把它变成真能跑的页面，怎么做返工少一点", "batch": "new", "relevant": ["web-frontend/component-patterns"], "note": "命中 component-patterns 的 Design-to-Code Pipeline"}
+{"q": "登录状态想让很多个页面都能读到，没登录的直接踢回登录页", "batch": "new", "relevant": ["web-frontend/vue-nuxt", "web-frontend/react-nextjs"], "note": "vue-nuxt 的 Router guards + Pinia authStore + react-nextjs 的全局登录态"}
+{"q": "argon2 和 bcrypt 该选哪个", "batch": "new", "relevant": ["backend-api/api-design", "security/appsec"], "note": "api-design 的 Password hashing 明说 argon2id 最佳、bcrypt 亦可；appsec 同样对比二者"}
+{"q": "想做个能收美元欧元日元的站，价格和汇率换算该怎么存", "batch": "new", "relevant": ["finance/payments-and-banking", "database/schema-and-queries"], "note": "payments 的 Money Representation + Multi-Currency；schema-and-queries 的钱用整数分/DECIMAL+currency 列"}
+{"q": "SwiftUI 里状态该用 @State 还是 @Observable", "batch": "new", "relevant": ["mobile/ios-android"], "note": "命中 ios-android 的 SwiftUI（@State 本地视图态 vs @Observable 模型类）"}
+{"q": "评论区允许用户贴 html，直接显示出来会不会有事", "batch": "new", "relevant": ["security/appsec", "security/secure-coding"], "note": "appsec 的 XSS（DOMPurify）+ secure-coding 的 XSS Prevention（innerHTML 危险）"}
+{"q": "backdrop-filter 加了没效果", "batch": "new", "relevant": ["web-frontend/css-effects"], "note": "命中 css-effects 的 Glassmorphism（backdrop-filter 无效排查 + @supports 回退）"}
+{"q": "投资组合怎么分配权重才能让夏普比率最高", "batch": "new", "relevant": ["finance/trading-and-quant"], "note": "命中 trading-and-quant 的 Portfolio Optimization（按夏普求权重）"}
+{"q": "一个 Electron 做的桌面软件，想看它的源码", "batch": "new", "relevant": ["reverse-engineering/python-js-unpack", "reverse-engineering/installers-archives"], "note": "合并了 2 条同义查询；python-js-unpack 与 installers-archives 的 Electron asar extract"}
+{"q": "检测漏洞、自动修复、再跑回归验证的闭环怎么搭", "batch": "new", "relevant": ["security/vulnerability-detection"], "note": "命中 vulnerability-detection 的 Detect-Repair-Verify Pipeline (DRV)"}
+{"q": "用户手一抖点了两下提交，结果重复下单、重复扣了钱，怎么弄才不会重复执行", "batch": "new", "relevant": ["backend-api/api-design", "backend-api/error-handling", "ecommerce/catalog-and-orders"], "note": "幂等键防重复扣款：error-handling 的 Idempotency、api-design 的 Idempotency-Key、ecommerce 的 Checkout 都覆盖"}
+{"q": "terraform 的 state 文件应该放哪，多人一起改怎么加锁", "batch": "new", "relevant": ["devops/cicd-iac"], "note": "命中 cicd-iac 的 Terraform Rules（remote backend + 锁）"}
+{"q": ".NET 程序被 ConfuserEx 之类的加了混淆，怎么先去混淆再反编译", "batch": "new", "relevant": ["reverse-engineering/deobfuscation", "reverse-engineering/managed-bytecode"], "note": "deobfuscation 的 de4dot 去 ConfuserEx + managed-bytecode 的 .NET 反编"}
+{"q": "页面加载的时候内容老往下跳、乱抖，很影响体验，怎么治", "batch": "new", "relevant": ["web-frontend/performance"], "note": "命中 performance 的 CLS（图片显式宽高 + font-display）"}
+{"q": "电子病历里医生、收费和前台能看到的东西得不一样，权限怎么分", "batch": "new", "relevant": ["healthcare/hipaa-and-fhir", "backend-api/auth-patterns"], "note": "hipaa-and-fhir 的 Access Controls（分角色可见）+ auth-patterns 的 RBAC 实现"}
+{"q": "配的颜色老是显得很土，界面颜色到底该怎么搭", "batch": "new", "relevant": ["ui-ux/design-principles"], "note": "命中 design-principles 的 Color"}
+{"q": "useMemo、useCallback、React.memo 到底什么时候用才有用", "batch": "new", "relevant": ["web-frontend/react-nextjs"], "note": "合并了 2 条同义查询；命中 react-nextjs 的 memo/useMemo/useCallback — when they help vs cargo-cult"}
+{"q": "容器部到 k8s 上老是自己不停重启、进都进不去，怎么查是啥毛病", "batch": "new", "relevant": ["devops/docker-k8s"], "note": "命中 docker-k8s 的 Kubernetes Troubleshooting（CrashLoopBackOff）"}
+{"q": "时序数据库怎么存传感器读数", "batch": "new", "relevant": ["iot-embedded/devices-and-protocols"], "note": "命中 devices-and-protocols 的 Time-Series Data Pipeline（TimescaleDB）"}
+{"q": "网页文字和背景的对比度要达到多少才算合规", "batch": "new", "relevant": ["web-frontend/accessibility", "ui-ux/design-principles"], "note": "accessibility 的 WCAG AA 对比度 + design-principles 的同比值"}
+{"q": "模型训练完准确率一直上不去，帮我调调超参数", "batch": "new", "relevant": ["data-ml/pipelines-and-features"], "note": "命中 pipelines-and-features 的 Model Training → Hyperparameter Tuning"}
+{"q": "把请求里的 id 换成别人的，看能不能读到或改到别人的数据，这个怎么测", "batch": "new", "relevant": ["penetration-testing/web-exploitation", "security/appsec"], "note": "web-exploitation 的 IDOR/BOLA 测法 + appsec 的 Authorization(IDOR) 同场景"}
+{"q": "想给网站做那种自动开浏览器、模拟用户点来点去跑一遍的测试", "batch": "new", "relevant": ["web-frontend/testing"], "note": "命中 testing 的 E2E Testing — Playwright"}
+{"q": "分布式锁释放的时候怎么保证不会把别人的锁删掉", "batch": "new", "relevant": ["database/optimization"], "note": "命中 optimization 的 Redis Distributed lock（释放用 Lua 校验 unique_id 再 DEL）"}
+{"q": "想看看用户从进站到最后付钱，中间是在哪一步跑掉的", "batch": "new", "relevant": ["marketing/seo-analytics-crm"], "note": "命中 seo-analytics-crm 的 Funnel Analysis"}
+{"q": "看 PE 的导入表能判断出这个程序会不会联网或者写注册表吗", "batch": "new", "relevant": ["reverse-engineering/binary-triage", "reverse-engineering/native-binaries"], "note": "binary-triage 读导入表（WININET/RegSetValue）+ native-binaries 的 r2 ii 列导入"}
+{"q": "React 项目里数据到处传，接口拿回来的也一股脑塞在全局，该怎么理", "batch": "new", "relevant": ["web-frontend/react-nextjs", "web-frontend/component-patterns"], "note": "react-nextjs 的 Lift state up/avoid prop drilling + component-patterns 的 prop-drilling 规则（已核实两篇都覆盖）"}
+{"q": "Nuxt 里 useFetch 和 $fetch 各什么时候用，写在 onMounted 里为什么不行", "batch": "new", "relevant": ["web-frontend/vue-nuxt"], "note": "命中 vue-nuxt 的 Nuxt 3: data fetching（useFetch vs $fetch）"}
+{"q": "做个学生选课的，一个学生能选好几门课、一门课也有很多学生，表怎么建", "batch": "new", "relevant": ["database/schema-and-queries", "education/lms-and-assessment"], "note": "schema-and-queries 的 Normalization（多对多联结表）+ lms 的 enrollments 是同模式实体版"}
+{"q": "用户要填银行账号，怎么判断他填的是不是瞎写的", "batch": "new", "relevant": ["finance/payments-and-banking"], "note": "命中 payments 的 IBAN/BIC Validation（mod-97 校验）"}
+{"q": "一个程序里的文字全是乱的，strings 跑出来什么有用的都没有", "batch": "new", "relevant": ["reverse-engineering/binary-triage", "reverse-engineering/deobfuscation"], "note": "binary-triage 的 packed/obfuscated 诊断 + deobfuscation 的 String decryption/Detect protector"}
+{"q": "扫描报告说我站点缺一堆安全响应头，要补哪些", "batch": "new", "relevant": ["security/appsec", "security/secure-coding"], "note": "appsec 的 Security headers（helmet 全清单）+ secure-coding 的 Headers；已裁掉更窄的 auth-patterns"}
+{"q": "想给不同的人不同权限，管理员啥都能干、普通员工只能看看", "batch": "new", "relevant": ["backend-api/auth-patterns", "saas/multi-tenancy-and-billing"], "note": "auth-patterns 的 RBAC Pattern + saas 的 User Management & RBAC 都是角色权限方案"}
+{"q": "想给站内的文章做个搜关键词的功能", "batch": "new", "relevant": ["database/selection-and-patterns"], "note": "命中 selection-and-patterns 的 PostgreSQL Full-Text Search（tsvector/GIN/ts_rank）"}
+{"q": "我想入门渗透测试，整个流程大概分哪几步", "batch": "new", "relevant": ["penetration-testing/methodology-and-scope"], "note": "命中 methodology-and-scope 的 The phases (PTES)"}
+{"q": "拿到个 Inno Setup 打的 setup.exe，怎么把里面东西解出来", "batch": "new", "relevant": ["reverse-engineering/installers-archives"], "note": "命中 installers-archives 的 Inno Setup 小节"}
+{"q": "帮我给这一堆函数自动补上文档和说明", "batch": "new", "relevant": ["web-frontend/documentation"], "note": "命中 documentation 的 Documentation Generation (DocAgent)"}
+{"q": "我那个处理流程好几步，跑到一半某步挂了，想从断掉的地方接着跑，而不是整个从头再来一遍", "batch": "new", "relevant": ["backend-api/error-handling"], "note": "命中 error-handling 的 Fault-Tolerant Pipeline（每步 checkpoint、从断点续跑）"}
+{"q": "我想做个多人联机的游戏，玩家位置同步那块怎么搞才不卡、又不让人作弊", "batch": "new", "relevant": ["gaming/game-architecture"], "note": "命中 game-architecture 的 Multiplayer Networking（客户端预测/服务器权威）"}
+{"q": "我想拿一批账号去试密码，但特别怕把人家账号给锁了", "batch": "new", "relevant": ["penetration-testing/network-and-services", "penetration-testing/web-exploitation"], "note": "network-and-services 的 Credential attacks → password spray（避免锁定）；web-exploitation 的 broken auth 补充"}
+{"q": "写 Rust 老被借用检查器卡，到底什么时候该传引用、什么时候得 clone", "batch": "new", "relevant": ["systems-programming/rust"], "note": "命中 rust 的 Ownership & Borrowing Quick Reference"}
+{"q": "我那个列表几千上万条数据，一渲染就卡死，怎么优化", "batch": "new", "relevant": ["web-frontend/performance"], "note": "命中 performance 的 Lists & Virtual Scrolling"}
+{"q": "我的 docker 镜像一个多 G，太大了怎么给它瘦下来", "batch": "new", "relevant": ["devops/docker-k8s", "devops/deploy-and-ops"], "note": "合并了 2 条「缩小镜像」查询；deploy-and-ops 的 Production Images（多阶段 1.2G→150M）+ docker-k8s 的 Dockerfile Rules"}
+{"q": "做开处方的功能，想在医生签单前提醒会不会有药物冲突", "batch": "new", "relevant": ["healthcare/hipaa-and-fhir"], "note": "命中 hipaa-and-fhir 的 Medication Interaction Check（签单前提醒）"}
+{"q": "手上一个编译好的程序，想把它反编译成能看懂的 C 代码", "batch": "new", "relevant": ["reverse-engineering/native-binaries"], "note": "命中 native-binaries 的 Ghidra headless（反编成类 C 伪代码）"}
+{"q": "页面里全是灰色占位方块和 lorem ipsum，怎么换成看着像真的", "batch": "new", "relevant": ["ui-ux/design-principles"], "note": "命中 design-principles 的 Real Content, Never Placeholder Gray Boxes"}
+{"q": "我想发个自己的代币，还想让别人把币存进来放着能拿利息", "batch": "new", "relevant": ["blockchain/smart-contracts-and-defi"], "note": "命中 smart-contracts-and-defi 的 Solidity Fundamentals（发币）+ DeFi Patterns（质押生息）"}
+{"q": "怎么让服务挂了能自动重启，而且没起好之前先别往它上面发请求", "batch": "new", "relevant": ["devops/deploy-and-ops", "devops/docker-k8s"], "note": "docker-k8s 的 Probes（readiness）+ deploy-and-ops 的 Restart policies；两篇都直答"}
+{"q": "接了个有授权的渗透测试，想先把目标开了哪些端口、跑的什么服务摸清楚", "batch": "new", "relevant": ["penetration-testing/recon-and-enumeration"], "note": "命中 recon-and-enumeration 的 Host discovery & port scanning + Service enumeration"}
+{"q": "想搞清楚一个网站请求里那串签名参数到底是怎么算出来的", "batch": "new", "relevant": ["reverse-engineering/python-js-unpack"], "note": "命中 python-js-unpack 的 JS 反混淆后 grep sign/hmac 定位签名算法"}
+{"q": "想做个一直转圈的「加载中」小动画", "batch": "new", "relevant": ["web-frontend/animations", "web-frontend/svg"], "note": "animations 的 SPIN loading spinner + svg 的 spin 示例"}
+{"q": "怎么让它自动给数据集想几个新特征出来试，没用的还能筛掉", "batch": "new", "relevant": ["data-ml/pipelines-and-features"], "note": "命中 pipelines-and-features 的 Feature Engineering（迭代造特征+按重要度筛）"}
+{"q": "做个合同模板，能把甲方乙方名字、金额这些自动填进去", "batch": "new", "relevant": ["legal/contracts-and-compliance"], "note": "命中 contracts-and-compliance 的 Contract Document Structure（{{变量}}占位符）"}
+{"q": "想验证能不能让服务器去请求它内网地址或者云的元数据接口", "batch": "new", "relevant": ["security/appsec", "penetration-testing/web-exploitation"], "note": "「想验证」=测试框架→web-exploitation 的 SSRF + appsec 的 Input Validation & SSRF（含 169.254.169.254）"}
+{"q": "网页上的动画一顿一顿的不流畅，怎么才能做到丝滑不卡", "batch": "new", "relevant": ["web-frontend/animations"], "note": "命中 animations 的 Golden Rule（只动 transform/opacity）+ Performance"}
+{"q": "React 里表单填完点提交，怎么测它有没有正确调用回调", "batch": "new", "relevant": ["web-frontend/testing", "web-frontend/component-patterns"], "note": "命中 testing 的 Component Testing (React)（onSubmit=vi.fn()+toHaveBeenCalledWith）"}
+{"q": "想做个网课的网站，学生看到第几节课要能记住，还得显示这门课学了百分之多少", "batch": "new", "relevant": ["education/lms-and-assessment"], "note": "命中 lms-and-assessment 的 LMS Core（lesson_progress + progress_pct）"}
+{"q": "新注册的用户想隔几天自动发一封引导邮件，退订过的和已经发过的别再发", "batch": "new", "relevant": ["marketing/seo-analytics-crm"], "note": "命中 seo-analytics-crm 的 Email Campaigns（onboarding drip + 退订/去重抑制）"}
+{"q": "我们订单页面，把网址里的单号改一下就能看到别人的订单，这个要怎么堵", "batch": "new", "relevant": ["security/appsec", "backend-api/api-design"], "note": "合并了 2 条同义 IDOR-防守查询；appsec 的 Authorization: IDOR + api-design 的每请求校验归属（已确认 api-design 实打实覆盖 IDOR）"}
+{"q": "页面里一个小模块报错，整页就白屏了，想让它只坏那一块", "batch": "new", "relevant": ["web-frontend/react-nextjs", "web-frontend/component-patterns"], "note": "react-nextjs 的 error.tsx/Error Boundary + component-patterns 的 ErrorBoundary 示例（已核实）"}
+{"q": "线上正跑着的服务，要给表加个字段、还要改个字段名，怎么改才不出事", "batch": "new", "relevant": ["database/schema-and-queries", "database/optimization", "devops/deploy-and-ops"], "note": "合并了 4 条同义的「在线改表」查询为此一条；命中 schema-and-queries 的 Expand/Contract、optimization 的 Migration Safety、deploy-and-ops 的迁移策略（同话题另有 microservices/selection 也覆盖，故这题是弱区分项）"}
+{"q": "PCI 合规下卡号和 CVV 到底能不能存", "batch": "new", "relevant": ["finance/payments-and-banking"], "note": "命中 payments 的 PCI-DSS Checklist（CVV 授权后绝不存、PAN 打码）"}
+{"q": "这个软件一挂上调试器就自己退出了", "batch": "new", "relevant": ["reverse-engineering/deobfuscation"], "note": "命中 deobfuscation 的 Anti-debug（IsDebuggerPresent 等，patch 掉分支）"}
+{"q": "prompt injection 怎么防", "batch": "new", "relevant": ["security/secure-coding"], "note": "命中 secure-coding 的 OWASP LLM Top 10 → Prompt Injection"}
+{"q": "给外部对接的人发个密钥来调我的接口，还得能定期换掉旧的", "batch": "new", "relevant": ["backend-api/auth-patterns"], "note": "命中 auth-patterns 的 API Key Security（前缀+hash 存储+轮换）"}
+{"q": "MongoDB 建模到底该内嵌文档还是用引用", "batch": "new", "relevant": ["database/selection-and-patterns"], "note": "命中 selection-and-patterns 的 MongoDB Patterns → Embed vs Reference"}
+{"q": "帮别人做安全测试之前要先确认啥，别不小心违法了", "batch": "new", "relevant": ["penetration-testing/methodology-and-scope"], "note": "命中 methodology-and-scope 的 Step 0 — authorization & scope"}
+{"q": "怎么先判断安装包是 NSIS、Inno 还是 MSI，再对应解包", "batch": "new", "relevant": ["reverse-engineering/installers-archives", "reverse-engineering/binary-triage"], "note": "installers-archives 用 file 输出区分并各给解包法 + binary-triage 的 Step 0 先识别"}
+{"q": "有段又长又乱的老代码想重构，又怕越改越崩", "batch": "new", "relevant": ["web-frontend/documentation", "web-frontend/testing"], "note": "documentation 的 Refactoring Strategy (Conservative)（先加测试）+ testing 的 Refactoring Validation"}
+{"q": "某个下游服务老是挂，我想先快速失败别一直干等，过阵子再试探它恢复没有", "batch": "new", "relevant": ["backend-api/error-handling"], "note": "命中 error-handling 的 Circuit Breaker (Three-State)（fail-fast + half-open 探恢复）；已把盲标的第二/三个弱标签裁掉，只留最直接的一篇"}
+{"q": "游戏里的敌人 AI，想让它平时巡逻、看到玩家就追、血少了就逃，这套逻辑该怎么组织", "batch": "new", "relevant": ["gaming/game-architecture"], "note": "命中 game-architecture 的 Finite State Machine (Game AI)"}
+{"q": "Kerberoasting 具体怎么打，拿到的票据在哪破解", "batch": "new", "relevant": ["penetration-testing/network-and-services", "penetration-testing/passwords-and-postexploit"], "note": "network-and-services 的 AD → Kerberoasting + passwords 的离线破解票据 hash"}
+{"q": "用 tokio 写异步，想同时跑一堆任务、还能优雅地取消和关停", "batch": "new", "relevant": ["systems-programming/rust"], "note": "命中 rust 的 Async Concurrency (Tokio)（JoinSet + CancellationToken/select!）"}
+{"q": "网页字体加载时文字先空一下、然后才刷出来，font-display 该怎么配", "batch": "new", "relevant": ["web-frontend/performance"], "note": "命中 performance 的 Fonts（font-display: swap + preconnect）"}
+{"q": "每次发版上线都会断掉一些正在处理的请求，怎么做到不断线", "batch": "new", "relevant": ["devops/deploy-and-ops"], "note": "命中 deploy-and-ops 的 Deployment Strategies（rolling/blue-green + SIGTERM 优雅 drain）"}
+{"q": "想找出程序里校验注册码/密码的那段逻辑在哪", "batch": "new", "relevant": ["reverse-engineering/native-binaries", "reverse-engineering/managed-bytecode"], "note": "native-binaries 的 Finding a check（strcmp/license）+ managed-bytecode 的 grep 校验点"}
+{"q": "按钮的 hover、focus、disabled、loading 各种状态怎么补齐", "batch": "new", "relevant": ["ui-ux/design-principles"], "note": "命中 design-principles 的 Components → Buttons（各状态）"}
+{"q": "做个网页能连小狐狸钱包，能显示余额，再点个按钮就能操作合约", "batch": "new", "relevant": ["blockchain/smart-contracts-and-defi"], "note": "命中 smart-contracts-and-defi 的 Web3 Frontend Integration（wagmi+viem 连钱包/读余额/调合约）"}
+{"q": "怎么让容器不用 root 用户来跑", "batch": "new", "relevant": ["devops/docker-k8s", "devops/deploy-and-ops"], "note": "docker-k8s 的 Dockerfile USER + deploy-and-ops 的 Run as non-root"}
+{"q": "怎么把一个域名下面的子域名尽量都挖出来", "batch": "new", "relevant": ["penetration-testing/recon-and-enumeration"], "note": "命中 recon-and-enumeration 的 Passive recon（subfinder/amass/crt.sh）"}
+{"q": "压缩混淆过的 js 怎么还原成能看懂的代码", "batch": "new", "relevant": ["reverse-engineering/python-js-unpack", "reverse-engineering/deobfuscation"], "note": "python-js-unpack 的 JS minified/obfuscated（prettier/webcrack）+ deobfuscation 同列"}
+{"q": "想让我的图标颜色自动跟着文字的颜色变，不用一个个去改", "batch": "new", "relevant": ["web-frontend/svg"], "note": "命中 svg 的 currentColor（fill=currentColor）"}
+{"q": "什么时候该微调模型而不是用 RAG，QLoRA 那几个参数怎么设", "batch": "new", "relevant": ["data-ml/pipelines-and-features"], "note": "命中 pipelines-and-features 的 Fine-Tuning Decision Tree + QLoRA defaults"}
+{"q": "用户要求把他所有个人数据都删掉，这个功能后端要怎么做", "batch": "new", "relevant": ["legal/contracts-and-compliance"], "note": "命中 contracts-and-compliance 的 GDPR right_to_erasure (Art.17)"}
+{"q": "JWT 的 alg:none 和弱 HMAC 密钥怎么利用", "batch": "new", "relevant": ["penetration-testing/web-exploitation"], "note": "命中 web-exploitation 的 Auth（JWT alg:none / 弱 HMAC / jwt_tool）"}
+{"q": "想做那种页面往下滚，内容才一个个淡入、轻轻往上飘出来的效果", "batch": "new", "relevant": ["web-frontend/animations"], "note": "命中 animations 的 Entrance & Scroll Animations（IntersectionObserver）"}
+{"q": "重构完怎么用差分测试确认行为跟原来完全一致", "batch": "new", "relevant": ["web-frontend/testing", "web-frontend/documentation"], "note": "testing 的 Refactoring Validation（differential tests）+ documentation 的 golden test set"}
+{"q": "做个背单词的小应用，想让它自己判断什么时候该提醒我复习哪个词", "batch": "new", "relevant": ["education/lms-and-assessment"], "note": "命中 lms-and-assessment 的 Spaced Repetition"}
+{"q": "灰度实验怎么保证同一个用户每次刷新都进同一组，跑到多少量才能看结果", "batch": "new", "relevant": ["marketing/seo-analytics-crm", "saas/multi-tenancy-and-billing"], "note": "marketing 的 A/B Testing（murmurhash 分组+样本量）+ saas 的 Feature Flags 同款 hash 桶"}
+{"q": "论坛让用户发带格式的内容，怕有人塞脚本进去，这块怎么弄才安全", "batch": "new", "relevant": ["security/appsec", "security/secure-coding"], "note": "appsec 的 XSS（富文本 DOMPurify 白名单）+ secure-coding 的 XSS Prevention"}
+{"q": "帮我做个 Chrome 插件，划词就能翻译", "batch": "new", "relevant": [], "note": "负例：语料无 MV3/manifest.json/content script/service worker（唯一 extension 是 Postgres CREATE EXTENSION）；前端两篇讲组件与路由，python-js-unpack 是拆 JS 方向相反"}
+{"q": "做个桌面软件，Windows 和 Mac 都能装，还得能自动升级", "batch": "new", "relevant": [], "note": "负例：无 Tauri/代码签名/公证/桌面自动更新；deploy-and-ops 是服务端容器，installers-archives 是拆别人安装包（反向），iot OTA 是嵌入式固件"}
+{"q": "做个网页版的视频通话，两个人能直接连麦", "batch": "new", "relevant": [], "note": "负例：语料无 WebRTC/SDP/ICE/TURN/SFU（michael-design 不在索引内）；gaming 多人同步是状态包非媒体流，iot 只把 WebSocket 列成看板通道"}
+{"q": "做个多人能同时编辑的在线文档", "batch": "new", "relevant": [], "note": "负例：无 CRDT/OT/协同编辑；schema-and-queries 的事务讲数据库并发死锁，解决不了文本并发合并；react 讲本地 state"}
+{"q": "做个客服聊天，用户不在线的时候消息要能推到手机上", "batch": "new", "relevant": [], "note": "负例：无 APNs/FCM/device token/静默推送；mobile 是 UI/性能，WebSocket 仅顺带出现，无长连保活/离线补拉/推送证书"}
+{"q": "做个可视化编辑器，运营拖拖拽拽就能拼出一个页面", "batch": "new", "relevant": [], "note": "负例：无画布编辑器架构（图层树/命中测试/吸附/撤销栈/schema 出码）；lms 的 drag-drop 是 Parsons 代码排序题，是词面陷阱非同类"}
+{"q": "做个语音记事本，说完话自动转成文字", "batch": "new", "relevant": [], "note": "负例：无 ASR/speech-to-text/流式识别/端点检测（michael-design 不在索引内）；data-ml 是表格特征+LLM 微调，mobile 只讲 UI/电量"}
+{"q": "拍张发票照片，自动把上面的金额和日期读出来填进表单", "batch": "new", "relevant": [], "note": "负例：无 OCR/版面还原/字段抽取；data-ml 是 LLM 微调不解析文档，payments 前提是数字已在手，legal 讲条款结构不解析扫描件"}
+{"q": "用户发的帖子和图片得先过一遍审核，脏话、广告、乱七八糟的图别放出来，还要能让人举报", "batch": "new", "relevant": [], "note": "负例：无内容审核/敏感词/图片机审/举报队列；appsec 是注入防护，secure-coding 针对 LLM 输出，lms 抄袭比对是代码相似非违规识别"}
+{"q": "我的 App 功能写完了，帮我打包发到 App Store 和安卓商店，先给一小部分人用，有崩溃我要能看到", "batch": "new", "relevant": [], "note": "负例：无 fastlane/TestFlight/代码签名/描述文件/分阶段放量/崩溃符号化；mobile 到测试命令为止，devops 两篇是服务端流水线不碰移动端产物"}

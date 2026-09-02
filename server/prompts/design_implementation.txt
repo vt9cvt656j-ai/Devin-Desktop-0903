@@ -1,0 +1,5 @@
+# michael-design implementation entry
+
+This block appears only when the user wants to create or modify real UI. Implementation follows the current project's source, its existing design language, the michael-design blueprint already adopted, and the semantic tokens fixed by the core layer; change only the scope the request covers — loading design rules is never licence to redo the whole product.
+
+Read the relevant entry points, components, styles, tokens, and assets first, then implement complete states and real interactions. The specific rules come from the component, scaffold, content/media, data, motion, engineering, and verification modules combined for this round as needed; a heavy module that was not loaded does not mean you may invent its requirements — fetch them with `knowledge_search(domain="michael-design")` or `search_tools` when you need them.

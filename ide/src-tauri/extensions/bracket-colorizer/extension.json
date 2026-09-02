@@ -1,0 +1,15 @@
+{
+  "id": "michael.bracket-colorizer",
+  "name": "Bracket Colorizer",
+  "version": "1.0.0",
+  "description": "Colorize matching brackets and parentheses with different colors for each nesting level.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": {
+    "commands": [
+      { "id": "brackets.colorize", "title": "Brackets: Colorize Brackets" },
+      { "id": "brackets.clear", "title": "Brackets: Clear Colors" }
+    ]
+  }
+}

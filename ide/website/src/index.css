@@ -1,0 +1,647 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  语义 token 层 —— 唯一允许出现 hex 的地方。
+  配色来源：michael-design / enterprise-standard #sections/curated-palette-library
+  + 本轮运行时锁定方向 design-judgment #Category Palette Harmony（route: neutral-brand，
+  "Monochrome is a complete design"）。
+  每个值都已折算成最接近的 Tailwind 族+档，业务组件只消费语义类。
+*/
+:root {
+  --background: #fafafa; /* zinc-50  — 根画布 */
+  --foreground: #09090b; /* zinc-950 — 主文字 */
+  --card: #ffffff; /* white    — 卡片/浮层表面 */
+  --card-foreground: #09090b; /* zinc-950 */
+  --popover: #ffffff; /* white */
+  --popover-foreground: #09090b; /* zinc-950 */
+  --primary: #18181b; /* zinc-900 — 主 CTA / 强调块 */
+  --primary-foreground: #fafafa; /* zinc-50 */
+  --secondary: #f4f4f5; /* zinc-100 — 次级按钮底 */
+  --secondary-foreground: #18181b; /* zinc-900 */
+  --muted: #f4f4f5; /* zinc-100 — 交替 section 底 */
+  --muted-foreground: #52525b; /* zinc-600 — 辅助文字，对 zinc-50 达 AA */
+  --accent: #e4e4e7; /* zinc-200 — hover 面 */
+  --accent-foreground: #18181b; /* zinc-900 */
+  --border: #e4e4e7; /* zinc-200 */
+  --input: #d4d4d8; /* zinc-300 */
+  --ring: #18181b; /* zinc-900 — 焦点环 */
+  --success: #059669; /* emerald-600 — 真实成功态专用 */
+  --success-foreground: #ffffff; /* white */
+  --destructive: #dc2626; /* red-600 — 真实错误态专用 */
+  --destructive-foreground: #ffffff; /* white */
+  --code-surface: #18181b; /* zinc-900 — 代码/编辑器拟真面 */
+  --code-foreground: #e4e4e7; /* zinc-200 */
+  --radius: 0.75rem;
+  --ease-reveal: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /*
+    品牌强调色 = 产品本身的强调色。
+    来源：ide/src/styles/app.css :root --accent/--accent-2（Apple 蓝 + 紫）。
+  */
+  --brand: #0a84ff;
+  --brand-2: #7c5cff;
+
+  /*
+    IDE 拟真层 —— 逐值取自 ide/src/styles/app.css，:root 与 [data-theme=dark]。
+    mockup 只消费这些 token，网站换主题时 IDE 窗口跟着换。
+  */
+  --ide-bg: #e9e9ec;
+  --ide-panel: rgba(255, 255, 255, 0.7);
+  --ide-panel-solid: #f5f5f7;
+  --ide-panel-2: #fbfbfd;
+  --ide-editor: #ffffff;
+  --ide-text: #1c1c1e;
+  --ide-text-dim: #6e6e73;
+  --ide-line: rgba(0, 0, 0, 0.09);
+  --ide-line-strong: rgba(0, 0, 0, 0.14);
+  --ide-accent: #0a84ff;
+  --ide-sel: rgba(10, 132, 255, 0.14);
+  --ide-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 12px 32px rgba(0, 0, 0, 0.12);
+
+  /* Monaco 默认主题语法色（vs / vs-dark），与真实编辑器一致 */
+  --syn-kw: #af00db;
+  --syn-kw2: #0000ff;
+  --syn-fn: #795e26;
+  --syn-type: #267f99;
+  --syn-comment: #008000;
+
+  /* IDE 文件类型点色，取自 app.css --c-* */
+  --c-ts: #3a8fe0;
+  --c-rust: #cf8050;
+  --c-py: #4b8bbe;
+  --c-go: #1fb6d4;
+  --c-shell: #46a64e;
+  --c-html: #e0673b;
+  --c-swift: #f0683b;
+  --c-kotlin: #b46cf0;
+  --c-ruby: #d24b43;
+  --c-c: #6c95c9;
+}
+
+/* 暗色层：同一 zinc 语义梯完全反转，业务组件零改动 */
+.dark {
+  --background: #09090b; /* zinc-950 — 根画布 */
+  --foreground: #fafafa; /* zinc-50  — 主文字 */
+  --card: #18181b; /* zinc-900 — 卡片/浮层表面 */
+  --card-foreground: #fafafa; /* zinc-50 */
+  --popover: #18181b; /* zinc-900 */
+  --popover-foreground: #fafafa; /* zinc-50 */
+  --primary: #fafafa; /* zinc-50 — 主 CTA 反转 */
+  --primary-foreground: #18181b; /* zinc-900 */
+  --secondary: #27272a; /* zinc-800 — 次级按钮底 */
+  --secondary-foreground: #fafafa; /* zinc-50 */
+  --muted: #131316; /* zinc-950/900 之间 — 交替 section 底 */
+  --muted-foreground: #a1a1aa; /* zinc-400 — 对 zinc-950 达 AA */
+  --accent: #27272a; /* zinc-800 — hover 面 */
+  --accent-foreground: #fafafa; /* zinc-50 */
+  --border: #27272a; /* zinc-800 */
+  --input: #3f3f46; /* zinc-700 */
+  --ring: #d4d4d8; /* zinc-300 — 焦点环 */
+  --success: #10b981; /* emerald-500 */
+  --success-foreground: #09090b; /* zinc-950 */
+  --destructive: #ef4444; /* red-500 */
+  --destructive-foreground: #09090b; /* zinc-950 */
+  --code-surface: #18181b; /* zinc-900 — 两种模式共用同一拟真面 */
+  --code-foreground: #e4e4e7; /* zinc-200 */
+
+  /* 品牌强调色暗色档，来源 app.css [data-theme=dark] */
+  --brand: #4daafc;
+  --brand-2: #8b7cf6;
+
+  /* IDE 拟真层暗色档，逐值取自 app.css [data-theme=dark] */
+  --ide-bg: #0f0f10;
+  --ide-panel: rgba(24, 24, 27, 0.86);
+  --ide-panel-solid: #18181b;
+  --ide-panel-2: #1f1f23;
+  --ide-editor: #101011;
+  --ide-text: #d6d6d6;
+  --ide-text-dim: #8a8a8d;
+  --ide-line: rgba(255, 255, 255, 0.08);
+  --ide-line-strong: rgba(255, 255, 255, 0.14);
+  --ide-accent: #4daafc;
+  --ide-sel: rgba(77, 170, 252, 0.22);
+  --ide-shadow: 0 1px 2px rgba(0, 0, 0, 0.65), 0 18px 48px rgba(0, 0, 0, 0.58);
+
+  /* Monaco vs-dark 语法色 */
+  --syn-kw: #c586c0;
+  --syn-kw2: #569cd6;
+  --syn-fn: #dcdcaa;
+  --syn-type: #4ec9b0;
+  --syn-comment: #6a9955;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-code-surface: var(--code-surface);
+  --color-code-foreground: var(--code-foreground);
+  --color-brand: var(--brand);
+  --color-brand-2: var(--brand-2);
+  --color-ide-bg: var(--ide-bg);
+  --color-ide-panel: var(--ide-panel);
+  --color-ide-panel-solid: var(--ide-panel-solid);
+  --color-ide-panel-2: var(--ide-panel-2);
+  --color-ide-editor: var(--ide-editor);
+  --color-ide-text: var(--ide-text);
+  --color-ide-text-dim: var(--ide-text-dim);
+  --color-ide-line: var(--ide-line);
+  --color-ide-line-strong: var(--ide-line-strong);
+  --color-ide-accent: var(--ide-accent);
+  --color-ide-sel: var(--ide-sel);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 12px);
+
+  --font-display: "Space Grotesk", "PingFang SC", "Noto Sans SC", sans-serif;
+  --font-sans: "Inter", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --animate-marquee: marquee 30s linear infinite;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+}
+
+/* 排版层级契约：全站复用这三个类，避免每个 section 自造字号 */
+@layer components {
+  /*
+    文档正文的排版。
+    这些选择器作用在 renderMarkdown 生成的 HTML 上 —— 它只产出这一小组标签，所以穷举就够。
+
+    两条规则决定了写法：
+    1. **全部用后代选择器，不用 `>`。** 正文被切成若干 .doc-seg（代码块要单独交给 React
+       渲染），段落不再是 .doc-body 的直接子元素。
+    2. **纵向节奏只写 margin-top。** 不写 bottom 就没有外边距合并的问题，改一个值只动一处。
+       节奏规则用 :where() 压到 0 特异性，标题相邻规则自然稳赢，顺序永远正确。
+  */
+  .doc-body {
+    font-size: 1rem;
+    line-height: 1.75;
+    max-width: 40rem;
+    color: color-mix(in srgb, var(--foreground) 92%, var(--background));
+    overflow-wrap: break-word;
+    /* 合成粗体/斜体在中文上是把字形拉粗拉斜，很脏 —— 宁可不加粗。 */
+    font-synthesis-weight: none;
+    font-synthesis-style: none;
+  }
+  .dark .doc-body { color: color-mix(in srgb, var(--foreground) 86%, var(--background)); }
+  /* 这层包装不参与布局，纵向节奏仍由下面的后代选择器统一管。 */
+  .doc-seg { display: contents; }
+
+  .doc-body :where(p, ul, ol, blockquote) { margin-top: 1.25rem; }
+  .doc-body :where(.doc-code, .doc-table)  { margin-top: 1.75rem; }
+  .doc-body :where(hr)                     { margin-top: 3rem; }
+  .doc-body :where(h2)                     { margin-top: 3.5rem; }
+  .doc-body :where(h3)                     { margin-top: 2.5rem; }
+  .doc-body :where(h4)                     { margin-top: 2rem; }
+  .doc-body > :first-child,
+  .doc-body > .doc-seg:first-child > :first-child { margin-top: 0; }
+
+  .doc-body :is(h2, h3, h4) {
+    position: relative;
+    font-weight: 600;
+    color: var(--foreground);
+    text-wrap: balance;
+    /* 锚点跳转后标题不会被贴在视口最上沿。 */
+    scroll-margin-top: 5.5rem;
+  }
+  .doc-body h2 { font-size: 1.5rem;    line-height: 1.3; letter-spacing: -0.011em; }
+  .doc-body h3 { font-size: 1.1875rem; line-height: 1.4; letter-spacing: -0.006em; }
+  .doc-body h4 { font-size: 1rem;      line-height: 1.5; }
+
+  /* 标题和它后面第一个元素靠紧 —— 标题的 margin-top 已经把上一段分开了。 */
+  .doc-body h2 + * { margin-top: 1rem; }
+  .doc-body h3 + * { margin-top: 0.75rem; }
+  .doc-body h4 + * { margin-top: 0.5rem; }
+  .doc-body h2 + h3 { margin-top: 1.5rem; }
+  .doc-body h3 + h4 { margin-top: 1.25rem; }
+  /* 标题落在一个 seg 的末尾、代码块是它的兄弟时，上面那条匹配不到。 */
+  .doc-body .doc-seg:has(> :last-child:is(h2, h3, h4)) + .doc-code { margin-top: 0.9rem; }
+
+  /* 段落链接：悬停才出现，不打扰阅读，但需要时能复制到。 */
+  .doc-body .doc-anchor {
+    position: absolute; left: -1.05em; width: 1.05em;
+    color: var(--muted-foreground); text-decoration: none;
+    opacity: 0; transition: opacity 0.12s;
+  }
+  .doc-body :is(h2, h3, h4):hover .doc-anchor,
+  .doc-body .doc-anchor:focus-visible { opacity: 1; }
+
+  .doc-body ul { padding-left: 1.35em; list-style: disc; }
+  .doc-body ol { padding-left: 1.85em; list-style: decimal; }
+  .doc-body li + li { margin-top: 0.5em; }
+  .doc-body li::marker {
+    color: color-mix(in srgb, var(--foreground) 45%, transparent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .doc-body a {
+    color: color-mix(in srgb, var(--brand) 78%, var(--foreground));
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+    text-underline-offset: 0.18em;
+    transition: color 0.15s, text-decoration-color 0.15s;
+  }
+  .doc-body a:hover { color: var(--brand); text-decoration-color: currentColor; }
+  .doc-body strong { font-weight: 650; color: var(--foreground); }
+
+  /* 行内代码。中文段落里 padding 给太多会把行高撑开，所以竖直方向留得很少。 */
+  .doc-body code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.875em;
+    background: color-mix(in srgb, var(--foreground) 7%, transparent);
+    border-radius: 4px;
+    padding: 0.1em 0.36em;
+    word-break: break-word;
+  }
+
+  .doc-body blockquote {
+    border-left: 3px solid color-mix(in srgb, var(--brand) 45%, var(--border));
+    padding-left: 1em;
+    color: var(--muted-foreground);
+  }
+  .doc-body hr { border: 0; border-top: 1px solid var(--border); }
+
+  /* 表格。宽表格自己横向滚，不撑破整页。 */
+  .doc-table { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  .doc-body table { width: 100%; border-collapse: collapse; font-size: 0.94em; }
+  .doc-body :is(th, td) {
+    padding: 0.6em 0.9em;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .doc-body th { font-weight: 600; background: color-mix(in srgb, var(--foreground) 4%, transparent); }
+  .doc-body tbody tr:last-child :is(th, td) { border-bottom: 0; }
+
+  /* 侧栏与目录的分组标题。字距不用 .type-eyebrow 的 0.2em —— 那会把汉字掰散。 */
+  .doc-nav-group {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--foreground);
+  }
+
+  /*
+    代码块。两个主题都用深色面 —— 代码在文档里是"另一种材质"，跟着主题翻色会让浅色模式下
+    的代码块和普通卡片糊在一起。所以这些令牌只写一次，.dark 不覆盖。
+  */
+  .doc-code {
+    --code-surface: #0d1117;
+    --code-foreground: #e6edf3;
+    --code-border: rgb(255 255 255 / 0.09);
+    --code-bar: rgb(255 255 255 / 0.045);
+    --code-muted: #9a9aa2;
+    background: var(--code-surface);
+    color: var(--code-foreground);
+    border: 1px solid var(--code-border);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 6px 20px rgb(0 0 0 / 0.07);
+  }
+  .dark .doc-code { box-shadow: none; }
+  .doc-code__bar {
+    height: 36px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 8px 0 14px; background: var(--code-bar);
+    border-bottom: 1px solid var(--code-border); user-select: none;
+  }
+  .doc-code__lang {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--code-muted);
+  }
+  .doc-code__file {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px; color: var(--code-muted);
+  }
+  .doc-code__copy {
+    display: inline-flex; align-items: center; gap: 6px;
+    height: 26px; padding: 0 8px; min-width: 72px; border-radius: 6px;
+    background: transparent; border: 0; cursor: pointer;
+    font-size: 11.5px; color: var(--code-muted);
+    transition: color 0.15s, background 0.15s;
+  }
+  .doc-code:hover .doc-code__copy { color: var(--code-foreground); }
+  .doc-code__copy:hover { background: rgb(255 255 255 / 0.08); color: var(--code-foreground); }
+  .doc-code pre {
+    margin: 0; padding: 14px 16px 16px; background: none; border: 0;
+    overflow-x: auto; overscroll-behavior-x: contain;
+    scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 0.22) transparent;
+  }
+  .doc-code pre::-webkit-scrollbar { height: 8px; }
+  .doc-code pre::-webkit-scrollbar-thumb { background: rgb(255 255 255 / 0.18); border-radius: 4px; }
+  .doc-code code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 13.5px; line-height: 1.65; tab-size: 2;
+    background: none; padding: 0; border-radius: 0;
+  }
+  /* 亮色主题的选中色和 focus 环是深色的，落在暗面上完全看不见。 */
+  .doc-code ::selection { background: color-mix(in srgb, var(--brand) 42%, transparent); color: inherit; }
+  .doc-code :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  .type-eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--color-muted-foreground);
+  }
+
+  .type-metric {
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+
+  .type-measure {
+    max-width: 42rem;
+  }
+
+  /* 渐变标题字：css-effects #gradient-text，色相取品牌对 */
+  .gradient-text {
+    background: linear-gradient(135deg, var(--brand), var(--brand-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /*
+    Hero 氛围层：css-effects #mesh-gradient 的 radial 叠加 + 慢速漂移。
+    两个 blob（上限 4），alpha ≤ 0.30，同相邻色相（蓝/紫）。
+  */
+  .aurora {
+    position: absolute;
+    border-radius: 9999px;
+    filter: blur(80px);
+    pointer-events: none;
+    will-change: transform;
+  }
+
+  .aurora--one {
+    background: radial-gradient(
+      closest-side,
+      color-mix(in srgb, var(--brand) 28%, transparent),
+      hsla(211, 100%, 60%, 0)
+    );
+    animation: aurora-drift 21s ease-in-out infinite alternate;
+  }
+
+  .aurora--two {
+    background: radial-gradient(
+      closest-side,
+      color-mix(in srgb, var(--brand-2) 24%, transparent),
+      hsla(253, 70%, 60%, 0)
+    );
+    animation: aurora-drift 24s ease-in-out -8s infinite alternate-reverse;
+  }
+
+  /*
+    IDE 窗口的品牌描边 + 彩色投影：
+    css-effects #gradient-borders 技法 C（mask 打孔）+ #colored-shadows。
+  */
+  .brand-ring {
+    position: relative;
+  }
+
+  .brand-ring::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--brand) 55%, transparent),
+      color-mix(in srgb, var(--brand-2) 40%, transparent) 45%,
+      transparent 75%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* 聚光卡片：composition-repertoire #motion-effects，光斑跟随指针，仅 hover 设备 */
+  .spotlight-card {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .spotlight-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    transition: opacity 0.3s var(--ease-reveal);
+    background: radial-gradient(
+      280px circle at var(--spot-x, 50%) var(--spot-y, 50%),
+      color-mix(in srgb, var(--brand) 9%, transparent),
+      transparent 70%
+    );
+    pointer-events: none;
+  }
+
+  @media (hover: hover) {
+    .spotlight-card:hover::before {
+      opacity: 1;
+    }
+  }
+
+  /* 走马灯遮罩：两侧渐隐（css-effects #mask） */
+  .marquee-mask {
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      transparent,
+      #000 8%,
+      #000 92%,
+      transparent
+    );
+    mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+  }
+}
+
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* 悬停暂停（composition-repertoire：marquee pause on hover） */
+.marquee-track:hover {
+  animation-play-state: paused;
+}
+
+/*
+ * 顶部阅读进度条：animations.md #scroll-driven（scroll() 时间线，@supports 渐进增强，
+ * 不支持的浏览器直接没有进度条，无 JS 滚动监听）。
+ */
+.scroll-progress {
+  display: none;
+}
+
+@supports (animation-timeline: scroll()) {
+  .scroll-progress {
+    display: block;
+    position: fixed;
+    inset: 0 0 auto 0;
+    height: 2px;
+    z-index: 60;
+    background: linear-gradient(90deg, var(--brand), var(--brand-2));
+    transform-origin: 0 50%;
+    animation: scroll-progress-grow linear both;
+    animation-timeline: scroll();
+  }
+}
+
+@keyframes scroll-progress-grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* Agent loop：步骤自动前进的进度条 + 终端逐行揭示（60–80ms 内的行距 stagger 规则放宽到终端节奏） */
+@keyframes loop-progress {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+.loop-line {
+  opacity: 0;
+  transform: translateY(6px);
+  animation: loop-line-in 0.35s var(--ease-reveal) forwards;
+  animation-delay: var(--line-delay, 0ms);
+}
+
+@keyframes loop-line-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loop-line {
+    animation-duration: 1ms;
+    animation-delay: 0ms;
+    transform: none;
+  }
+}
+
+@keyframes aurora-drift {
+  from {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(6%, 5%, 0) scale(1.08);
+  }
+}
+
+/* 可复用分区入场：SectionReveal 只切换 data-state，参数集中在这里 */
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(24px);
+  transition:
+    opacity 0.7s var(--ease-reveal),
+    transform 0.7s var(--ease-reveal);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+
+[data-reveal="visible"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@media (max-width: 767px) {
+  /* 移动端缩短位移：24px → 12px */
+  [data-reveal] {
+    transform: translateY(12px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  [data-reveal] {
+    transform: none;
+    transition-duration: 300ms;
+    transition-property: opacity;
+  }
+
+  .marquee-track {
+    animation: none !important;
+  }
+
+  .aurora {
+    animation: none !important;
+  }
+}

@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mr. Day One</title>
+  </head>
+  <body>
+    <!--
+      UI markup 已经搬进 React（src/app/Shell.jsx），这里只留三样东西：
+
+        1. #root —— React 的挂载点。必须 height:100%：.layout 的
+           `height: calc(100% - var(--titlebar-h) - var(--statusbar-h))`
+           是按父元素算的，少了这一条整个三栏布局会塌成 0 高。
+        2. 图标 sprite —— 77 个 <symbol> 的静态 defs，被 <use href="#i-x"/> 引用。
+           搬进 React 只会让首屏多解析一遍，没有好处。
+        3. boot 入口 —— 它保证 React 先 commit、main.js 后加载，见 src/boot.jsx。
+    -->
+    <div id="root"></div>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <defs>
+        <linearGradient id="g-logo" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
+        <linearGradient id="g-accent" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#0a84ff" />
+          <stop offset="1" stop-color="#7c5cff" />
+        </linearGradient>
+      </defs>
+
+      <!-- UI glyphs (inherit currentColor) -->
+      <symbol id="i-folder" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
+      </symbol>
+      <symbol id="i-folder-open" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.1c.7 0 1.36.29 1.83.8l.94 1.2H18.5A2.5 2.5 0 0 1 21 8.5V10H7.7a2 2 0 0 0-1.9 1.37L3 19.5z" opacity=".5" />
+        <path fill="currentColor" d="M6.2 11.5A1.5 1.5 0 0 1 7.62 10.5H22l-2.2 6.6A2 2 0 0 1 17.9 18.5H3.4z" />
+      </symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9 6 6 6-6 6" />
+      </symbol>
+      <symbol id="i-save" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M5 4h11l3 3v13H5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" d="M8 4v5h7V4M9 13h6v7H9z" />
+      </symbol>
+      <symbol id="i-play" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6.1 3.55v16.9c0 .95 1.04 1.53 1.84 1.03l13.35-8.45a1.22 1.22 0 0 0 0-2.06L7.94 2.52A1.22 1.22 0 0 0 6.1 3.55Z" />
+      </symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.4 13.5a7.5 7.5 0 0 0 0-3l1.8-1.4-1.8-3.1-2.1.8a7.5 7.5 0 0 0-2.6-1.5L14.2 2H9.8l-.3 2.3a7.5 7.5 0 0 0-2.6 1.5l-2.1-.8-1.8 3.1L4.6 10.5a7.5 7.5 0 0 0 0 3l-1.8 1.4 1.8 3.1 2.1-.8a7.5 7.5 0 0 0 2.6 1.5l.3 2.3h4.4l.3-2.3a7.5 7.5 0 0 0 2.6-1.5l2.1.8 1.8-3.1z" />
+      </symbol>
+      <symbol id="i-send" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M4.6 3.4 20.5 11.1a1 1 0 0 1 0 1.8L4.6 20.6a1 1 0 0 1-1.42-1.16L5 12.9h6.5a.9.9 0 0 0 0-1.8H5L3.18 4.56A1 1 0 0 1 4.6 3.4" />
+      </symbol>
+      <symbol id="i-arrow-up" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 19V6m0 0-6 6m6-6 6 6" />
+      </symbol>
+      <symbol id="i-arrow-down" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M12 5v13m0 0 6-6m-6 6-6-6" />
+      </symbol>
+      <symbol id="i-download-tray" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M12 3.5v10.75m0 0 4-4m-4 4-4-4M5 15.75v2.5A2.25 2.25 0 0 0 7.25 20.5h9.5A2.25 2.25 0 0 0 19 18.25v-2.5" />
+      </symbol>
+      <symbol id="i-cpu" viewBox="0 0 24 24">
+        <rect x="7" y="7" width="10" height="10" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <rect x="10" y="10" width="4" height="4" rx="1" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10 4v2m4-2v2m-4 12v2m4-2v2M4 10h2m-2 4h2m12-4h2m-2 4h2" />
+      </symbol>
+      <!-- Real marks, not a generic branch glyph: a user scanning the @ menu recognises the
+           Octocat and the fox long before they read the label beside it. -->
+      <!-- 模型厂商的品牌标不在这里了。
+           它们是 149 家的官方 logo（两百多 KB），放在 src/brand-sprite.js 里、
+           启动时注进 DOM —— 塞在这个骨架文件里会让它没法看。
+           **千万别在这里重新加 i-brand-<厂商>**：同名 id 在文档里先出现的赢，
+           而这段 HTML 比脚本先解析，于是那个旧的会静默盖掉真 logo，
+           症状是「图标换了但界面没变」。github / gitlab 留在下面，它们不是模型厂商。 -->
+      <symbol id="i-brand-github" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M12 .5C5.73.5.5 5.73.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.07.78 2.15 0 1.55-.01 2.8-.01 3.18 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.73 18.27.5 12 .5Z"/>
+      </symbol>
+      <symbol id="i-brand-gitlab" viewBox="0 0 24 24">
+        <path fill="currentColor" d="m23.55 9.8-.03-.08-3.26-8.51a.85.85 0 0 0-.34-.4.87.87 0 0 0-1 .05.87.87 0 0 0-.29.44l-2.2 6.73H7.58l-2.2-6.73a.86.86 0 0 0-.29-.44.87.87 0 0 0-1-.06.86.86 0 0 0-.34.4L.48 9.71l-.03.09a6.06 6.06 0 0 0 2.01 7l.01.01.03.02 4.97 3.72 2.46 1.86 1.5 1.13a1.01 1.01 0 0 0 1.22 0l1.5-1.13 2.46-1.86 5-3.74.02-.02a6.06 6.06 0 0 0 2-6.99Z"/>
+      </symbol>
+      <symbol id="i-caret" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6" />
+      </symbol>
+      <symbol id="i-check" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="m5 12.5 4.5 4.5L19 7" />
+      </symbol>
+      <!-- The model mark.
+           A sparkle was the wrong idea, not the wrong size: it means "AI magic" and says nothing
+           about a model. Redrawing it bigger twice was fixing the wrong axis.
+
+           What a model IS, drawn: inputs converging through a core to an output — a network with
+           a centre of mass. That is why the hub is r2.9 while the peripheral nodes are r1.9; the
+           weight sits where the computation does, and at 16px the eye reads that hierarchy before
+           it resolves any individual node. Edges are 1.5 stroke with round caps so they stay
+           visible when the glyph is scaled down and antialiased.
+
+           The spark at the top right is the one borrowed idea, and it earns its place: a bare
+           graph reads as "network" or "share". The spark is what makes it generative. It sits off
+           the axis of symmetry so it reads as an accent rather than a fifth node.
+
+           Three nodes, not five: at menu size every extra circle is mud. -->
+      <symbol id="i-sparkle" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+              d="M6.4 7.6 11 11.4M6.4 16.4 11 12.6M13.4 12h4"/>
+        <circle cx="4.6" cy="6.6" r="1.9" fill="currentColor"/>
+        <circle cx="4.6" cy="17.4" r="1.9" fill="currentColor"/>
+        <circle cx="19.4" cy="12" r="1.9" fill="currentColor"/>
+        <circle cx="12" cy="12" r="2.9" fill="currentColor"/>
+        <path fill="currentColor" d="M17.9 3.1c.28 1.46.86 2.04 2.32 2.32-1.46.28-2.04.86-2.32 2.32-.28-1.46-.86-2.04-2.32-2.32 1.46-.28 2.04-.86 2.32-2.32Z"/>
+      </symbol>
+      <symbol id="i-close" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6 6 18" />
+      </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 5v14M5 12h14" />
+      </symbol>
+      <symbol id="i-minus" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M5 12h14" />
+      </symbol>
+      <symbol id="i-code" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m9 8-5 4 5 4m6-8 5 4-5 4" />
+      </symbol>
+      <symbol id="i-skills" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
+      </symbol>
+      <symbol id="i-mcp" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M12 22v-5M9 8V2M15 8V2" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M18 8v3a6 6 0 0 1-12 0V8z" />
+      </symbol>
+      <symbol id="i-premiumdb" viewBox="0 0 24 24">
+        <ellipse cx="10.8" cy="5.9" rx="6.9" ry="2.7" fill="none" stroke="currentColor" stroke-width="1.9" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M3.9 5.9v11.4c0 1.5 3.1 2.7 6.9 2.7.63 0 1.24-.03 1.83-.1" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M17.7 5.9v4.2" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M3.9 11.6c0 1.5 3.1 2.7 6.9 2.7.84 0 1.65-.06 2.4-.17" />
+        <path fill="currentColor" stroke="none" d="M17.95 12.1h2.9l1.9 2.4-3.35 4.1-3.35-4.1 1.9-2.4Z" />
+      </symbol>
+      <symbol id="i-bug" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" d="M8.5 7.3h7m-5.9-3.2 1.4 3.2m3.4-3.2L13 7.3M12 7.4v13.4" />
+        <rect x="6.9" y="7.1" width="10.2" height="12.9" rx="5.1" fill="none" stroke="currentColor" stroke-width="1.95" />
+        <path fill="none" stroke="currentColor" stroke-width="1.95" stroke-linecap="round" stroke-linejoin="round" d="M6.9 10.7h-4M17.1 10.7h4M6.9 15.4h-4M17.1 15.4h4M5.1 20.7l2.7-2.6M18.9 20.7l-2.7-2.6" />
+      </symbol>
+      <symbol id="i-braces" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M8.5 4C6.7 4 6.2 5 6.2 6.8v2c0 1.4-.6 2.4-1.9 2.9 1.3.5 1.9 1.5 1.9 2.9v2c0 1.8.5 2.8 2.3 2.8M15.5 4c1.8 0 2.3 1 2.3 2.8v2c0 1.4.6 2.4 1.9 2.9-1.3.5-1.9 1.5-1.9 2.9v2c0 1.8-.5 2.8-2.3 2.8" />
+      </symbol>
+      <symbol id="i-growth" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3.5 16.5 9 11l3.5 3.5L20 7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M15.5 7H20v4.5" />
+      </symbol>
+      <symbol id="i-adaptive" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d="M12 4.5a7.5 7.5 0 0 1 6.65 4.02M19 4.8v4.1h-4.1M12 19.5a7.5 7.5 0 0 1-6.65-4.02M5 19.2v-4.1h4.1" />
+        <path fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" d="m12 8.25.82 1.92 1.93.83-1.93.83L12 13.75l-.82-1.92L9.25 11l1.93-.83z" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect x="9" y="9" width="11" height="11" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M15 5.5A2.5 2.5 0 0 0 12.5 4H6.5A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 5.5 15" />
+      </symbol>
+      <symbol id="i-ext" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z" />
+      </symbol>
+      <symbol id="i-command" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
+      </symbol>
+      <symbol id="i-logo" viewBox="0 0 64 64">
+        <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#g-logo)" />
+        <rect x="4.5" y="4.5" width="55" height="55" rx="15.5" fill="none" stroke="#fff" stroke-opacity=".24" />
+        <path fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" d="M17 45V21l15 15 15-15v24" />
+      </symbol>
+      <symbol id="i-monogram" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" d="M5 18V7l7 7 7-7v11" />
+      </symbol>
+
+      <!-- menu glyphs -->
+      <symbol id="i-undo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H8" />
+      </symbol>
+      <symbol id="i-redo" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="m15 14 5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H16" />
+      </symbol>
+      <symbol id="i-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="m20 20-3.7-3.7" />
+      </symbol>
+      <symbol id="i-replace" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4 8h12l-3-3m3 3-3 3M20 16H8l3-3m-3 3 3 3" />
+      </symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24">
+        <rect x="2.8" y="4.6" width="18.4" height="14.8" rx="3" fill="none" stroke="currentColor" stroke-width="2.05" />
+        <path fill="none" stroke="currentColor" stroke-width="2.05" stroke-linecap="round" stroke-linejoin="round" d="m7.1 9.2 3.25 2.8-3.25 2.8M12.6 15h4.8" />
+      </symbol>
+      <!-- 实时预览页签 / 视图菜单：浏览器窗口 + 播放三角 =「把它跑起来看」。
+           第一版在窗口正中画了同心圆点（想表达"直播中"），16px 下整体读成一台相机——
+           矩形加中央同心圆就是镜头。三角形没有这个歧义。 -->
+      <symbol id="i-live-preview" viewBox="0 0 24 24">
+        <rect x="2.6" y="4.3" width="18.8" height="15.4" rx="3" fill="none" stroke="currentColor" stroke-width="1.8" />
+        <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M2.6 8.5h18.8" />
+        <circle cx="5.7" cy="6.4" r=".95" fill="currentColor" />
+        <circle cx="8.5" cy="6.4" r=".95" fill="currentColor" />
+        <path fill="currentColor" d="M10.05 11.15 15.6 14.4l-5.55 3.25z" />
+      </symbol>
+      <symbol id="i-sidebar-left" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M9 5v14" />
+      </symbol>
+      <!-- 右侧面板开关的两个状态，同一副几何、只差右段填不填 —— VS Code 那套惯例：
+           实心 = 面板在，空框 = 面板收起。两个状态用同一个图标只换颜色的话，光看图标
+           根本判断不出当前是开是关。 -->
+      <symbol id="i-sidebar-right" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+      </symbol>
+      <symbol id="i-sidebar-right-on" viewBox="0 0 24 24">
+        <rect x="3.5" y="5" width="17" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" d="M15 5v14" />
+        <path fill="currentColor" stroke="none" d="M15.9 5.9h2.7a1.9 1.9 0 0 1 1.9 1.9v8.4a1.9 1.9 0 0 1-1.9 1.9h-2.7z" />
+      </symbol>
+      <symbol id="i-book" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M12 6.5C10.5 5.3 8.6 5 6.5 5H3v12.5h4c1.9 0 3.6.4 5 1.5 1.4-1.1 3.1-1.5 5-1.5h4V5h-3.5c-2.1 0-4 .3-5.5 1.5zM12 6.5V19" />
+      </symbol>
+      <symbol id="i-info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 11.2v4.6" />
+        <circle cx="12" cy="8" r="1.05" fill="currentColor" />
+      </symbol>
+      <symbol id="i-error" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M9 9l6 6M15 9l-6 6" />
+      </symbol>
+      <symbol id="i-warn" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 3.5 21 19H3z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M12 9.5v4.2" />
+        <circle cx="12" cy="16.4" r="1.05" fill="currentColor" />
+      </symbol>
+
+      <!-- explorer action glyphs -->
+      <symbol id="i-files" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M9 3h6l4 4v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14 3v5h5M7 7H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h8" opacity=".5" />
+      </symbol>
+      <symbol id="i-new-file" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M13 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M13 3v6h6M12 12v6M9 15h6" />
+      </symbol>
+      <symbol id="i-new-folder" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.1c.6 0 1.2.25 1.6.7l1 1.3H18A2 2 0 0 1 20 9v8.5A2.5 2.5 0 0 1 17.5 20h-12A2.5 2.5 0 0 1 3 17.5z" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M11.5 14h4M13.5 12v4" />
+      </symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M20 6.5v5h-5M4 17.5v-5h5" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M19 11.5a7 7 0 0 0-12.3-3.4L4 11.5m0 1a7 7 0 0 0 12.3 3.4L20 12.5" />
+      </symbol>
+      <symbol id="i-rename" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M14.5 6.5l3 3M4 20l1-4L16 5a1.8 1.8 0 0 1 2.6 0l.4.4a1.8 1.8 0 0 1 0 2.6L8 19z" />
+      </symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 7h14M10 7V5h4v2M6.5 7l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9L17.5 7M10 11v6M14 11v6" />
+      </symbol>
+      <symbol id="i-git" viewBox="0 0 24 24">
+        <circle cx="6" cy="6" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="6" cy="18" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <circle cx="18" cy="8.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7" />
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M6 8.4v7.2M18 11v.5a4 4 0 0 1-4 4H8.4" />
+      </symbol>
+      <symbol id="i-archive" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 7.5h16M5.5 7.5V18a1.6 1.6 0 0 0 1.6 1.6h9.8A1.6 1.6 0 0 0 18.5 18V7.5M4.5 4.5h15a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1v-1a1 1 0 0 1 1-1ZM10 11.5h4" />
+      </symbol>
+      <symbol id="i-history" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1M3.5 5v3.5H7M12 7.5V12l3 2" />
+      </symbol>
+
+      <!-- File-type glyphs (tinted via .ic--<type> color) -->
+      <symbol id="i-file" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" />
+      </symbol>
+      <symbol id="i-file-code" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="m10 12-2 2 2 2m4-4 2 2-2 2" />
+      </symbol>
+      <symbol id="i-file-style" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8.5 13h3m1.5 0h2M8.5 16.5h2m1.5 0h3" />
+      </symbol>
+      <symbol id="i-file-data" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11 11.5c-1.3 0-1.3 1.2-1.3 2.5S9.7 16.5 8.4 16.5m4.6-5c1.3 0 1.3 1.2 1.3 2.5s0 2.5 1.3 2.5" />
+      </symbol>
+      <symbol id="i-file-doc" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M8 12.5h8M8 15.5h5" />
+      </symbol>
+      <symbol id="i-file-image" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M6 3h7l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m7 1.5V8h3.5z" opacity=".28" />
+        <circle cx="10" cy="13" r="1.2" fill="currentColor" />
+        <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="m8 18 2.5-2.6 1.6 1.4 2-2.2L17 18z" />
+      </symbol>
+
+      <symbol id="i-outline" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M4 6h16M4 10h12M8 14h10M8 18h8"/>
+      </symbol>
+      <symbol id="i-beaker" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 2h6m-5 0v6.5L4 20a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1l-6-11.5V2"/>
+        <circle cx="10" cy="16" r="1" fill="currentColor"/><circle cx="14" cy="18" r="1" fill="currentColor"/>
+      </symbol>
+      <symbol id="i-remote" viewBox="0 0 24 24">
+        <rect x="3" y="6.2" width="14.2" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.9" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M8.2 20h7.8M10.1 16.2V20M14.1 16.2V20" />
+        <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M18.6 6.4a4.9 4.9 0 0 1 2.6 2.6M17.9 9.3a2.4 2.4 0 0 1 1.4 1.4" />
+        <circle cx="17.4" cy="12.4" r="1.05" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="i-output" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 10h10M4 14h12M4 18h8"/>
+      </symbol>
+      <symbol id="i-bookmark" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M6 4h12a1 1 0 0 1 1 1v16l-7-4-7 4V5a1 1 0 0 1 1-1z"/>
+      </symbol>
+      <symbol id="i-bell" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/>
+      </symbol>
+      <symbol id="i-split-h" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="18" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <line x1="12" y1="3" x2="12" y2="21" stroke="currentColor" stroke-width="1.7"/>
+      </symbol>
+      <!-- Appearance (advanced-settings rail). Its own symbol rather than borrowing
+           i-theme-light: that one is the light-THEME preview card, and its hardcoded
+           #f2c94c/#ffd166 fills made this the only rail icon that ignored the tab's
+           dim → text → blue colour states. Pure currentColor, 1.7 stroke to match the
+           rest of the family. The filled semicircle sits 1.15 inside the ring so the
+           mass and the stroke stay legibly separate at the 21px it actually renders at. -->
+      <symbol id="i-appearance" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/>
+        <path d="M12 5.4a6.6 6.6 0 0 1 0 13.2z" fill="currentColor"/>
+      </symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24">
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M12 2l8 4v5c0 5.5-3.8 10.7-8 12-4.2-1.3-8-6.5-8-12V6l8-4z"/>
+        <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4"/>
+      </symbol>
+
+      <!-- Illustrations -->
+      <symbol id="art-folder" viewBox="0 0 120 96">
+        <path fill="currentColor" opacity=".12" d="M18 26a8 8 0 0 1 8-8h18a8 8 0 0 1 5.6 2.3l4.4 4.4H94a8 8 0 0 1 8 8V42H18z" />
+        <path fill="currentColor" opacity=".22" d="M22 40a7 7 0 0 1 6.8-5.4H100a7 7 0 0 1 6.8 8.6l-7 28A8 8 0 0 1 92 78H22a8 8 0 0 1-8-8V36a7 7 0 0 1 8 4z" />
+        <g transform="translate(78 12)">
+          <path fill="url(#g-accent)" d="M11 0c.4 3.2 2.4 5.2 5.6 5.6-3.2.4-5.2 2.4-5.6 5.6-.4-3.2-2.4-5.2-5.6-5.6C8.6 5.2 10.6 3.2 11 0" />
+        </g>
+      </symbol>
+    </svg>
+
+    <script type="module" src="/src/boot.jsx"></script>
+  </body>
+</html>

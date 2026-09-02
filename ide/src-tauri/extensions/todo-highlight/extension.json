@@ -1,0 +1,16 @@
+{
+  "id": "michael.todo-highlight",
+  "name": "TODO Highlight",
+  "version": "1.0.0",
+  "description": "Highlights TODO, FIXME, HACK, BUG, and NOTE comments in your code with distinct colors.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": {
+    "commands": [
+      { "id": "todo.highlight", "title": "TODO: Highlight All Markers" },
+      { "id": "todo.clear", "title": "TODO: Clear Highlights" },
+      { "id": "todo.list", "title": "TODO: List All TODOs" }
+    ]
+  }
+}

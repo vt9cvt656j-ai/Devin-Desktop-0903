@@ -1,0 +1,12 @@
+{
+  "id": "devin.insert-date",
+  "name": "Insert Date",
+  "version": "0.1.0",
+  "description": "Adds a command that inserts the current date and time at the cursor.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": {
+    "commands": [{ "id": "insertDate.iso", "title": "Insert: Current Date (ISO)" }]
+  }
+}

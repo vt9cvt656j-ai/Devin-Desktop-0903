@@ -1,0 +1,102 @@
+[package]
+name = "michael-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Michael IDE: a macOS-style code editor with an AI assistant sidebar."
+default-run = "michael-ide"
+
+[lib]
+name = "michael_ide_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# NOTE: no "devtools" in the default feature set — debug builds get the inspector
+# automatically, but RELEASE builds must not ship one (it exposed the app's code and
+# live network traffic to anyone). Re-enable for a one-off release diagnosis with
+# `cargo tauri build -- --features devtools`.
+tauri = { version = "2", features = ["macos-private-api", "protocol-asset"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-store = "2"
+tauri-plugin-notification = "2"
+# 深链：网页登录页用 mrday:// 唤起本 App 完成登录交接（见 lib.rs / handoff.rs）。
+tauri-plugin-deep-link = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "socks", "gzip", "http2", "blocking"] }
+chrono = "0.4"
+chrono-tz = "0.10"
+quick-xml = "0.39"
+scraper = { version = "0.27", default-features = false }
+futures-util = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+portable-pty = "0.9.0"
+# .gitignore 语义（否定 !、锚定 /、目录限定 xx/、**、嵌套 .gitignore、全局 excludes）
+# 自己手写极易把用户**自己的源码**误藏——那比显示 node_modules 严重得多。用 ripgrep
+# 同款实现，别赌手搓正则。
+ignore = "0.4"
+notify = "7"
+notify-debouncer-mini = "0.5"
+once_cell = "1"
+regex = "1"
+encoding_rs = "0.8"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "json", "mysql", "postgres", "any", "tls-rustls-ring", "chrono"] }
+bcrypt = "0.19.2"
+# /health 挑战应答用（和 automation-framework 侧同一套构造）
+sha2 = "0.10"
+uuid = { version = "1.23.3", features = ["v4"] }
+rand = "0.10.1"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
+headless_chrome = { version = "1.0", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rqrr = "0.9"
+redis = { version = "1.2.4", features = ["tokio-comp"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+mongodb = "3"
+url = "2"
+pdf-extract = "0.7"
+libc = "0.2"
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+lzma-rs = "0.3"
+ruzstd = "0.8"
+sevenz-rust2 = "0.21.4"
+csv = "1"
+chardetng = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# 读 HKLM/HKCU 的 Environment 键。Windows 从不改写运行中进程的环境块，只广播
+# WM_SETTINGCHANGE；注册表是唯一能拿到"用户刚刚改的那个变量"的地方。
+# 0.55 已经作为传递依赖在 Cargo.lock 里，对齐版本不引入新的解析。
+winreg = "0.55"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-plugin-macos-fps = "0.1.0"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDate", "NSError", "NSObject", "NSString"] }
+objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLError", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+
+[features]
+# 覆盖层（“正在控制电脑”红光框）要透明窗口，而 tauri 的透明窗口在 macOS 上走私有 API。
+# 不显式开这个 feature 的话，transparent:true 会被静默忽略，覆盖层变成一块不透明的全屏白窗。
+default = ["macos-private-api"]
+macos-private-api = ["tauri/macos-private-api"]
+custom-protocol = ["tauri/custom-protocol"]
+devtools = ["tauri/devtools"]
+
+[dev-dependencies]
+# 仅测试用：直接构造 reqwest::Response（reqwest 实现了 From<http::Response<T>>），
+# 这样 read_capped 的上限逻辑可以不起网络就测到。
+http = "1"

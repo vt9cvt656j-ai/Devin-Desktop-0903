@@ -1,0 +1,470 @@
+/* ============================================================================
+ * 自定义模型弹窗 —— .cm-*
+ *
+ * 从 main.js 里那段字符串拼出来的 <style id="cm-style"> 搬过来，同时把它从
+ * **Google Material 的语汇**（#1a73e8 = Google Blue 600、#f1f3f4 = Grey 100、
+ * #5f6368、18px 卡片圆角、20px 胶囊徽章、rgba(60,64,67,.28) 的 Google 阴影配方）
+ * 翻译成这个 IDE 自己的语汇。仓库已经选好了取向，只是这个房间没跟上：
+ * shadcn.css 写着「把 shadcn 的组件观感搬到 IDE 上」，refine.css 把 .chip 的
+ * 999px 胶囊收成 6px 并直说「全圆胶囊是最"玩具"的一个信号」。
+ *
+ * 服从的六条规则（都是从已有组件归纳的，不是新发明）：
+ *   R1 圆角：控件 md(6) / 行·分组 lg(8) / 卡片 xl(14) / 微件 sm(4)。没有 999px、没有 18px。
+ *   R2 边界：先用表面明度分层，1px --line 只是收口。
+ *   R3 高度：静息 --elev-1 或 --ui-shadow-xs，hover 升一档，浮层 --elev-3。
+ *   R4 节奏：间距只用 --sp-*（4 的倍数）；控件高度只用 24 / 28 / 32。
+ *   R5 字阶：只用 --t-title/body/small/label，不发明新档位。
+ *   R6 反馈：hover 换表面；focus-visible = **实心 accent 边**（承 3:1）+ 半透明 ring（只负责好看）；
+ *            disabled = opacity .5；一律 --ui-transition。
+ *
+ * ## 三条硬约束
+ *
+ * 1) **一个颜色字面量都没有。** 全部来自 app.css 的两套 :root，所以这个文件里
+ *    一条 [data-theme] 规则都不用写 —— 暗色是「令牌换值」自动成立的。
+ *
+ * 2) **keyframes 的名字不能改。** close() 里有一行
+ *      ov.style.animation = "cm-fade .15s ease reverse both"
+ *    关闭动画是**按名字**引用下面那条 @keyframes 的。改名 = 关闭时瞬移。
+ *
+ * 3) --elev-* / --t-* / --sp-* / --tracking-label 来自 refine.css，而 main.js 自己
+ *    只 import 了 app.css + shadcn.css（refine.css 由 boot.jsx 引入）。运行时一定
+ *    在，但这里一律带兜底，任何加载路径下都不会塌。
+ * ========================================================================== */
+
+@keyframes cm-fade { from { opacity: 0 } to { opacity: 1 } }
+/* 位移 16px → 8px、缩放 .96 → .985、时长 .32s → .24s。
+   配置弹窗不该「弹」出来，该「浮」出来。进场一次，无循环动画。 */
+@keyframes cm-pop {
+  from { opacity: 0; transform: translateY(8px) scale(0.985) }
+  to   { opacity: 1; transform: none }
+}
+
+/* ---- L1 遮罩：把身后整屋压暗，卡片成为全屏唯一亮处 ---------------------- */
+.cm-ov {
+  position: fixed; inset: 0; z-index: 99999;
+  display: grid; place-items: center;
+  padding: var(--sp-6, 24px);
+  font-family: var(--font);
+  background: var(--scrim);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  animation: cm-fade .16s ease both;
+}
+
+/* ---- L2 卡片：两个主题下最亮的面板 + 发丝边 + 最高一档阴影 -------------- */
+.cm-card {
+  display: flex; flex-direction: column; overflow: hidden;
+  width: 520px; max-width: 100%; max-height: min(86vh, 720px);
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--ui-radius-xl, 14px);
+  box-shadow: var(--elev-3, var(--shadow));
+  animation: cm-pop .24s cubic-bezier(.2, .9, .3, 1) both;
+}
+/* 打开时 focus() 落在本体（读屏要先播报「对话框 自定义模型」）。用 :focus-visible
+   而不是 :focus —— 浏览器按「上一次交互来源」判定，鼠标点开的不匹配，所以不会
+   甩出一圈看着像「卡住了」的蓝环。同 .about-dialog 的做法。 */
+.cm-card:focus { outline: none }
+.cm-card:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px }
+
+/* ---- 头部 ---------------------------------------------------------------- */
+/* 标题水平居中：关掉按钮**绝对定位**在右上角，不再参与排版 —— 否则标题会被它挤得
+   偏左半个按钮宽，那种"差一点"比明显不居中更难看。左右内边距因此对称。 */
+.cm-head {
+  flex: none; position: relative; display: flex; align-items: center;
+  padding: var(--sp-4, 16px) var(--sp-6, 24px) var(--sp-3, 12px);
+  border-bottom: 1px solid var(--line);
+}
+/* 15px 是 refine.css 字阶里「面板标题、对话框标题」那一档。不发明 16/17px：
+   这个尺寸上层级靠字重和字距拉，不靠多两个像素。 */
+.cm-title {
+  flex: 1 1 auto; min-width: 0; margin: 0; text-align: center;
+  font-size: var(--t-title, 15px); font-weight: 650;
+  letter-spacing: -.01em; line-height: 1.3; color: var(--text);
+}
+.cm-close {
+  position: absolute; top: var(--sp-3, 12px); right: var(--sp-3, 12px);
+  flex: none; width: 28px; height: 28px;
+  display: grid; place-items: center; padding: 0;
+  border: 1px solid transparent; border-radius: var(--ui-radius-md, 6px);
+  background: transparent; color: var(--text-dim);
+  font-family: inherit; cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition);
+}
+.cm-close:hover { background: var(--hover); color: var(--text) }
+.cm-close:active { background: var(--active) }
+
+/* ---- 正文 ---------------------------------------------------------------- */
+.cm-body {
+  min-height: 0;
+  padding: var(--sp-4, 16px) var(--sp-6, 24px) var(--sp-6, 24px);
+  overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable;
+}
+.cm-hint {
+  margin: 0 0 var(--sp-4, 16px);
+  font-size: var(--t-small, 12px); line-height: 1.6; color: var(--text-dim);
+}
+
+/* ---- L3 分区：已有模型列表 ---------------------------------------------
+ * 空态刻意什么都不加：renderList 里有 `if (!items.length) return;` 和一段注释说明
+ * 空态文案是刻意删的（下面紧接着就是标题为「新增自定义模型」的表单，再写一句
+ * 「去下面添加」是复读）。原来那条 .cm-empty 是**死规则**，一并删掉。
+ * 多的时候列表自己滚，不让外层滚 —— 上限 64 条，外层滚会把表单推到天边。
+ * ------------------------------------------------------------------------- */
+/* 已添加的那一列本来没有标题，两行模型悬在说明和「新增」之间，用户看不出那就是
+   编辑/删除的地方。给它一个和「新增自定义模型」同一档的小标题。 */
+.cm-list-title { margin-top: 0; }
+.cm-list {
+  display: flex; flex-direction: column; gap: var(--sp-2, 8px);
+  max-height: 268px; overflow-y: auto;
+  overscroll-behavior: contain; scrollbar-gutter: stable;
+}
+.cm-list:not(:empty) { margin-bottom: var(--sp-4, 16px) }
+
+.cm-row {
+  display: flex; align-items: center; gap: var(--sp-1, 4px);
+  padding: var(--sp-2, 8px) var(--sp-2, 8px) var(--sp-2, 8px) var(--sp-3, 12px);
+  background: var(--panel-solid);
+  border: 1px solid var(--line); border-radius: var(--ui-radius-lg, 8px);
+  box-shadow: var(--elev-1);
+  transition: border-color var(--ui-transition);
+}
+/* 行本身不是点击目标（只有那两颗按钮是），所以 hover 只把边框提一档，
+   **不换底色也不抬阴影** —— 那两样会让人以为整行可点。 */
+.cm-row:hover { border-color: var(--line-strong) }
+
+.cm-row__main { flex: 1 1 auto; min-width: 0; margin-right: var(--sp-2, 8px) }
+.cm-row__name {
+  font-size: var(--t-body, 13px); font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* 地址和掩码后的密钥是**机器数据**，用等宽栈 —— 这一条比任何装饰都更像「大厂那套」。 */
+.cm-row__meta {
+  margin-top: 2px; font-family: var(--mono);
+  font-size: var(--t-label, 11px); color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 第三级按钮（ghost）：静息几乎不存在，hover 才浮出表面。 */
+.cm-row .cm-edit,
+.cm-row .cm-del {
+  flex: none; display: inline-flex; align-items: center;
+  height: 24px; padding: 0 var(--sp-2, 8px);
+  border: 1px solid transparent; border-radius: var(--ui-radius-md, 6px);
+  background: transparent; color: var(--text-dim);
+  font-family: inherit; font-size: var(--t-small, 12px); font-weight: 500; line-height: 1;
+  cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition),
+              border-color var(--ui-transition);
+}
+.cm-row .cm-edit:hover { background: var(--hover); color: var(--text); border-color: var(--line) }
+.cm-row .cm-edit:active { background: var(--active) }
+/* 危险操作：**静息保持中性，hover/focus 才转红**。列表里常驻的红色是噪音；
+   红色应该出现在「意图那一刻」，那时它才是警告。 */
+.cm-row .cm-del:hover,
+.cm-row .cm-del:focus-visible {
+  background: color-mix(in srgb, var(--destructive) 14%, transparent);
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 35%, transparent);
+}
+.cm-row .cm-del:active { background: color-mix(in srgb, var(--destructive) 20%, transparent) }
+
+/* ---- L3 分区：表单 ------------------------------------------------------ */
+.cm-form { border-top: 1px solid var(--line); padding-top: var(--sp-4, 16px) }
+/* 这一行会在「新增自定义模型」和「编辑自定义模型」之间切换，是**模式指示器**，
+   所以不能压成 --text-dim 的微标签（那样切换就看不见了）。留在 --text 上。 */
+.cm-form-title {
+  margin: 0 0 var(--sp-3, 12px);
+  font-size: var(--t-body, 13px); font-weight: 650; color: var(--text);
+}
+.cm-field { margin-bottom: var(--sp-3, 12px) }
+.cm-field > label {
+  display: block; margin-bottom: 5px;
+  font-size: var(--t-small, 12px); font-weight: 500; color: var(--text-dim);
+  transition: color var(--ui-transition);
+}
+/* 聚焦时标签跟着亮起来。一处极小的反馈，但它把「我现在在填哪一格」变成看得见的事。 */
+.cm-field:focus-within > label { color: var(--text) }
+.cm-input-wrap { position: relative; display: block }
+
+/* ---- L4 控件：输入框，这个弹窗的主体 ------------------------------------
+ * 底色用 --editor-bg：浅色 #ffffff（比卡片 #fbfbfd 更亮）、暗色 #101011（比卡片
+ * #1f1f23 更暗）。方向相反是**对的** —— 输入框永远朝着本主题的「纸面极值」走，
+ * 所以两边都读作一口凹下去的井。
+ * 原来这里**连 background 和 color 都没声明**，吃的是 UA 的白底黑字 —— 这就是
+ * 暗色下四块刺眼白板的来源，也是这次最该验的一处回归。
+ * ------------------------------------------------------------------------- */
+.cm-field input {
+  display: block; width: 100%; box-sizing: border-box;
+  height: 32px; padding: 0 var(--sp-3, 12px);
+  font-family: inherit; font-size: var(--t-body, 13px);
+  color: var(--text); background: var(--editor-bg);
+  border: 1px solid var(--field-line); border-radius: var(--ui-radius-md, 6px);
+  box-shadow: var(--ui-shadow-xs); outline: none;
+  transition: border-color var(--ui-transition), box-shadow var(--ui-transition);
+}
+/* 不给 placeholder 降透明度：--text-dim 原色对 --editor-bg 是 5.07:1(浅)/5.52:1(暗)，
+   乘个 .75 就掉到 3.4 左右。Firefox 默认会叠 opacity，所以要显式写 1。 */
+.cm-field input::placeholder { color: var(--text-dim); opacity: 1 }
+.cm-field input:hover:not(:focus) {
+  border-color: color-mix(in srgb, var(--text) 26%, var(--field-line));
+}
+/* 文本框用 :focus 而不是 :focus-visible —— 鼠标点进去也该显形，这是正确的例外。
+   **合规靠这圈 1px 实心 --accent 描边**（对输入底 浅 3.65:1 / 暗 7.67:1，过 1.4.11
+   的 3:1）；外面那圈 50% 的光晕实测只有 1.86(浅)/2.68(暗)，纯装饰，不承担 3:1。
+   这是三族方案里唯一有分歧、而我必须拍板的一处：单靠 shadcn 那圈半透明 ring 是
+   不合格的，但它是全 IDE 的语汇，所以保留 ring、另加实边，两者都要。 */
+.cm-field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 var(--ui-ring-width, 3px)
+    color-mix(in srgb, var(--accent) var(--ui-ring-alpha, 50%), transparent);
+}
+.cm-field input[aria-invalid="true"] { border-color: var(--destructive) }
+.cm-field input[aria-invalid="true"]:focus {
+  box-shadow: 0 0 0 var(--ui-ring-width, 3px)
+    color-mix(in srgb, var(--destructive) var(--ui-ring-alpha, 50%), transparent);
+}
+.cm-field input:disabled { opacity: .5; cursor: not-allowed }
+
+/* ---- 协议分段控件 + 能力缺口清单 -----------------------------------------
+ * 不复用 refine.css 的 .seg：那个类已经不是通用分段控件，它是侧栏专用的下划线页签，
+ * 还挂着 #sideTabs.seg 的宽度规则、.explorer 的容器查询和一条按 #tabDebug 命中的媒体
+ * 查询。放进表单是视觉错 + 耦合错。
+ *
+ * 底层是原生 radio（键盘方向键、读屏语义全都自带），这里只把它画成分段样式。
+ * 颜色全部走令牌，和同一个弹窗里的输入框同一套。
+ * ------------------------------------------------------------------------- */
+.cm-field__label {
+  display: block; margin-bottom: 5px;
+  font-size: var(--t-small, 12px); font-weight: 500; color: var(--text-dim);
+}
+.cm-seg {
+  display: flex; gap: 0; padding: 2px;
+  background: var(--editor-bg);
+  border: 1px solid var(--field-line); border-radius: var(--ui-radius-md, 6px);
+  box-shadow: var(--ui-shadow-xs);
+}
+.cm-seg__opt { flex: 1 1 0; min-width: 0; position: relative; }
+/* 不能 display:none —— 那会让它从 Tab 序里消失。压到 1px 并保留可聚焦。 */
+.cm-seg__opt input {
+  position: absolute; width: 1px; height: 1px; opacity: 0; margin: 0; pointer-events: none;
+}
+.cm-seg__opt span {
+  display: block; height: 28px; line-height: 28px; text-align: center;
+  font-size: var(--t-body, 13px); color: var(--text-dim);
+  border-radius: var(--ui-radius-sm, 4px); cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-seg__opt:hover input:not(:checked):not(:disabled) + span { color: var(--text); background: var(--hover); }
+.cm-seg__opt input:checked + span { color: var(--accent-on); background: var(--accent-solid); font-weight: 600; }
+.cm-seg__opt input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 网页构建上桌面专属协议不可选 —— 看得出来是「这里不能用」，而不是「点了没反应」。 */
+.cm-seg__opt--off span { opacity: .42; cursor: not-allowed; text-decoration: line-through; }
+
+/* 能力缺口：不许假装支持的唯一界面落点。灰但不能灰到看不见。 */
+
+/* 只给读屏的播报位。没有这条规则它就是一段普通可见文字，会在弹窗底部凭空多出一行
+ * 「已添加 3 个自定义模型」——上一版就是这样：markup 写了、样式没写、JS 也没写。
+ * 不用 display:none / visibility:hidden：那两个会让 aria-live 不再播报。 */
+.cm-sr {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+.cm-field__hint { margin: 5px 0 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--text-dim) }
+.cm-field__err  { margin: 0; font-size: var(--t-label, 11px); line-height: 1.5; color: var(--destructive); font-weight: 500 }
+.cm-field__err:not(:empty) { margin-top: 5px }
+
+/* 密钥「显示 / 隐藏」。30×30 过 SC 2.5.8 的 24×24 目标尺寸。 */
+.cm-reveal {
+  position: absolute; top: 50%; right: 1px; transform: translateY(-50%);
+  width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid transparent; border-radius: var(--ui-radius-sm, 4px);
+  background: transparent; color: var(--text-dim);
+  font-family: inherit; cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition);
+}
+.cm-reveal:hover { background: var(--hover); color: var(--text) }
+.cm-field--key input { padding-right: 40px }
+
+/* ---- 操作区：主 / 次两级按钮 --------------------------------------------
+ * 高度 32px，和输入框**同高** —— 这一条让表单读起来像一套东西而不是拼的。
+ * 变体选择器写成 .cm-actions .cm-save（0,2,0），高于基类 .cm-actions button（0,1,1），
+ * 否则变体里的 border-color 会被基类的 `border:1px solid transparent` 简写盖掉
+ * —— 那是本轮复验里 tokens 族踩到的一个死声明。
+ * ------------------------------------------------------------------------- */
+.cm-actions {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: var(--sp-2, 8px); margin-top: var(--sp-4, 16px);
+}
+.cm-actions button {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 32px; padding: 0 var(--sp-4, 16px);
+  border: 1px solid transparent; border-radius: var(--ui-radius-md, 6px);
+  font-family: inherit; font-size: var(--t-body, 13px); font-weight: 600; line-height: 1;
+  cursor: pointer;
+  transition: background var(--ui-transition), color var(--ui-transition),
+              border-color var(--ui-transition), box-shadow var(--ui-transition);
+}
+/* 刻意不写 pointer-events:none —— 写了连 title 提示都没了，而禁用态最需要的恰恰是
+   「告诉我为什么按不了」。禁用控件本身豁免 1.4.3 的对比度要求。 */
+.cm-actions button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none }
+.cm-actions button:disabled:hover { background: inherit }
+
+/* 主按钮：实心。用 --accent-solid 而不是 --accent —— 白字压 --accent 浅色只有
+   3.65:1、暗色只有 2.48:1。 */
+.cm-actions .cm-save {
+  background: var(--accent-solid); color: var(--accent-on);
+  box-shadow: var(--ui-shadow-xs);
+}
+/* 往 --text 方向混：浅色 --text 近黑 → 压深（白字 6.35 → 7.29）；
+   暗色 --text 近白 → 提亮（深字 7.73 → 8.16）。两个方向都让前景对比变高，
+   一条规则同时管住两套主题。原来的 filter:brightness(1.08) 两边都往亮走，
+   暗色下 hover 会把按钮糊进背景、并把前景对比往下压。 */
+.cm-actions .cm-save:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-solid) 88%, var(--text));
+  box-shadow: var(--ui-shadow-sm);
+}
+.cm-actions .cm-save:active:not(:disabled) { box-shadow: none }
+
+/* 次按钮：shadcn 的 outline 变体。 */
+.cm-actions .cm-cancel {
+  background: transparent; color: var(--text); border-color: var(--line-strong);
+}
+.cm-actions .cm-cancel:hover { background: var(--hover) }
+.cm-actions .cm-cancel:active { background: var(--active) }
+
+/* ---- 焦点环：所有按钮走同一条 -------------------------------------------
+ * 用 outline 而不是 box-shadow ring，是因为实心主按钮上同色边框看不见，而
+ * outline 画在盒子**外面**，对卡片 浅 3.35:1 / 暗 7.15:1，两个主题都过 3:1。
+ * 这是仓内既有写法：app.css:5647 .msg__act:focus-visible 就是这一条。
+ * .cm-row .cm-del:focus-visible 特异度 (0,3,0) 高于下面这组 (0,2,1)/(0,1,1)，
+ * 所以删除键聚焦时是红环不是蓝环，配色不会混。
+ * ------------------------------------------------------------------------- */
+.cm-close:focus-visible,
+.cm-reveal:focus-visible,
+.cm-row button:focus-visible,
+.cm-actions button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+.cm-row .cm-del:focus-visible { outline-color: var(--destructive) }
+
+/* ---- 窄窗口。IDE 窗口可以拖到 600px 以下。 ------------------------------- */
+@media (max-width: 560px) {
+  .cm-ov { padding: var(--sp-3, 12px) }
+  .cm-head { padding-left: var(--sp-4, 16px) }
+  .cm-body { padding-left: var(--sp-4, 16px); padding-right: var(--sp-4, 16px) }
+  .cm-actions > * { flex: 1 1 auto }
+}
+
+/* ---- 跟随系统「减少动态效果」--------------------------------------------
+ * !important 是必需的：close() 会写行内 ov.style.animation，行内样式的普通声明
+ * 斗不过样式表里的 !important。JS 那个 140ms 的 setTimeout 照常移除元素，
+ * 所以关闭链路不受影响，只是退化成瞬时消失。
+ * ------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .cm-ov, .cm-card { animation: none !important }
+  .cm-ov *, .cm-card * { transition-duration: 1ms !important }
+}
+
+/* ---- 强制高对比（Windows 高对比 / macOS 增强对比）------------------------
+ * 这个模式下 box-shadow 整个被丢弃，自定义色被系统整体替换 —— 卡片边界和所有
+ * 焦点提示会一起消失。CanvasText / Highlight 是系统色关键字，不是硬编码颜色。
+ * ------------------------------------------------------------------------- */
+@media (forced-colors: active) {
+  .cm-card, .cm-row, .cm-field input { border-color: CanvasText }
+  .cm-field input:focus { outline: 2px solid Highlight; outline-offset: 1px }
+  .cm-close:focus-visible, .cm-reveal:focus-visible,
+  .cm-row button:focus-visible, .cm-actions button:focus-visible {
+    outline: 2px solid Highlight;
+  }
+}
+
+
+/* ── 拉取模型 ──────────────────────────────────────────────────────────────
+   「模型名称」原来排在最上面、要用户手打并记住逗号分隔。挪到地址和密钥**之后**，
+   因为拉取要先有那两样；顺序即前提。 */
+.cm-pull { display: flex; align-items: center; gap: var(--sp-2, 8px); }
+.cm-pull .cm-input-wrap { flex: 1 1 auto; min-width: 0; }
+.cm-pull__btn {
+  flex: none;
+  padding: 0 var(--sp-3, 12px);
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .13s ease, border-color .13s ease;
+}
+.cm-pull__btn:hover:not(:disabled) { background: var(--hover); border-color: var(--accent); }
+.cm-pull__btn:disabled { opacity: .6; cursor: default; }
+/* 拉回来的名字画成一排可点的胶囊。列表可能有上百条（中转站全家桶），所以封高度、
+   自己滚，不然整个弹窗被撑到屏幕外。 */
+.cm-models {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: var(--sp-2, 8px);
+  max-height: 148px; overflow-y: auto;
+  padding: var(--sp-2, 8px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-solid);
+}
+.cm-model {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.cm-model:hover { background: var(--hover); color: var(--text); }
+/* 选中：实心主色。这一格的意思是"它已经进上面的输入框了"，要一眼分得出来。
+   用 --accent-solid / --accent-on 这一对，和同文件里选中的协议段（.cm-seg__opt）同源——
+   写死 #fff 在暗色下是白斑，而且这个文件有测试专门守着不许出现硬编码色。 */
+.cm-model.is-on {
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  color: var(--accent-on);
+}
+
+/* 协议限制：默认折叠，展开前只占一行。 */
+.cm-gapsbox { margin-top: var(--sp-2, 8px); }
+.cm-gapsbox[hidden] { display: none; }
+.cm-gapsbox__sum {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--t-small, 12px);
+  color: var(--text-dim);
+  user-select: none;
+}
+.cm-gapsbox__sum::-webkit-details-marker { display: none; }
+.cm-gapsbox__sum::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3.5px solid transparent;
+  border-bottom: 3.5px solid transparent;
+  transition: transform .13s ease;
+}
+.cm-gapsbox[open] .cm-gapsbox__sum::before { transform: rotate(90deg); }
+.cm-gapsbox__sum:hover { color: var(--text); }
+.cm-gaps {
+  margin: var(--sp-2, 8px) 0 0;
+  padding-left: 18px;
+  font-size: var(--t-small, 12px);
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.cm-gaps li { margin: 2px 0; }

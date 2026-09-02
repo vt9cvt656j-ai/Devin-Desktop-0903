@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="csvSheet" x1="7" y1="3" x2="25" y2="29" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34A853"/>
+      <stop offset="1" stop-color="#188038"/>
+    </linearGradient>
+    <linearGradient id="csvFold" x1="19" y1="3" x2="26" y2="10" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A8DAB5"/>
+      <stop offset="1" stop-color="#5BB974"/>
+    </linearGradient>
+  </defs>
+  <path d="M7 5.4A2.4 2.4 0 0 1 9.4 3h9.9L26 9.7v16.9a2.4 2.4 0 0 1-2.4 2.4H9.4A2.4 2.4 0 0 1 7 26.6V5.4Z" fill="url(#csvSheet)"/>
+  <path d="M19.3 3 26 9.7h-4.3a2.4 2.4 0 0 1-2.4-2.4V3Z" fill="url(#csvFold)"/>
+  <rect x="10.2" y="13" width="12.6" height="11.4" rx="1.1" fill="#E6F4EA"/>
+  <path d="M10.2 16.8h12.6M10.2 20.6h12.6M14.4 13v11.4M18.6 13v11.4" stroke="#188038" stroke-width="1.1" stroke-linecap="round"/>
+  <rect x="10.2" y="13" width="12.6" height="3.8" rx="1.1" fill="#188038" opacity=".22"/>
+</svg>

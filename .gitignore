@@ -20,16 +20,29 @@ yarn-error.log*
 # Env / secrets
 .env
 .env.*
+!server/.env.test.example  # 模板，无密钥
 .mcp.local.json
+**/.mcp.local.json
 
 # Editor / OS
 .DS_Store
+__pycache__/
+*.py[cod]
 .idea/
-.vscode/
 
-# 构建产物不进版本库。
-#
-# dist-web/ 曾经被提交进来（17MB，113 个文件），再手工 rsync 上线 —— 结果产物比源码落后
-# 了 11 天而没人察觉，生产上跑的就是那份陈旧代码。构建产物一旦进 git，它和源码就会各走
-# 各的。现在统一走 scripts/deploy-web.sh：每次从当前源码重新构建、校验、才允许发布。
-/dist-web
+# Ignore personal VS Code state, but keep the shared workspace config below.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# build artifacts + editor backups (added for CI packaging, 2026-07-04)
+*.bak
+*.bak.*
+*.pre-*
+server/src/src/
+/*.dmg
+.michael-images/
+ide/src/_serve.mjs
+ide/src/*-test.html

@@ -1,0 +1,11 @@
+-- 充值套餐拉不到时，把**为什么**记下来。
+--
+-- 在这之前 fetch_topup_plans 有五条失败路径（不是 sub2api / 没有控制台令牌 / 接口非 200 /
+-- 回的不是 JSON / JSON 里找不到套餐数组），全部一律 `return Vec::new()`，一行日志都不留。
+-- 于是 endpoint_topup_plan 是空表，而空表有五种完全不同的原因，每种的处置也不一样：
+-- 没令牌是运营去配一下就好，接口变了是我们要改代码。
+--
+-- 这一列直接决定成本能不能算准：没有充值套餐就没有「花了多少人民币买到多少上游额度」，
+-- 于是人民币那一侧只能靠手填的 channel_rates —— 而那正是今天让整盘账在
+-- +65% 和 -250% 之间摆动的那个输入。
+ALTER TABLE endpoint_adapter ADD COLUMN IF NOT EXISTS topup_reason TEXT NOT NULL DEFAULT '';

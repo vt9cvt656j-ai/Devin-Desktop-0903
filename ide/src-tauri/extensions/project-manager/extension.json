@@ -1,0 +1,10 @@
+{
+  "id": "michael.project-manager",
+  "name": "Project Manager",
+  "version": "1.0.0",
+  "description": "Shows the current project in the status bar.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "project.info", "title": "Project Manager: Show Current Project" } ] }
+}

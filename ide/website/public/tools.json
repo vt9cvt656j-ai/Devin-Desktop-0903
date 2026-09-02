@@ -1,0 +1,731 @@
+{
+  "generatedFrom": "ide/src/main.js · _buildAgentToolSchemas",
+  "generatedAt": null,
+  "count": 142,
+  "groups": [
+    "Agents",
+    "Code intelligence",
+    "Code search",
+    "Data",
+    "Deploy",
+    "Design & media",
+    "Files",
+    "Git & GitHub",
+    "Knowledge",
+    "Research",
+    "Terminal & system",
+    "Web & browser"
+  ],
+  "tools": [
+    {
+      "name": "read_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "list_dir",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "search",
+      "group": "Code search",
+      "desktopOnly": false
+    },
+    {
+      "name": "find_files",
+      "group": "Code search",
+      "desktopOnly": false
+    },
+    {
+      "name": "web_search",
+      "group": "Web & browser",
+      "desktopOnly": false
+    },
+    {
+      "name": "web_fetch",
+      "group": "Web & browser",
+      "desktopOnly": false
+    },
+    {
+      "name": "local_discovery",
+      "group": "Data",
+      "desktopOnly": true
+    },
+    {
+      "name": "live_environment",
+      "group": "Data",
+      "desktopOnly": true
+    },
+    {
+      "name": "performance_profile",
+      "group": "Data",
+      "desktopOnly": true
+    },
+    {
+      "name": "openapi_parser",
+      "group": "Data",
+      "desktopOnly": false
+    },
+    {
+      "name": "read_screen",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "ui_click",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "update_plan",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "create_project",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "current_time",
+      "group": "Data",
+      "desktopOnly": false
+    },
+    {
+      "name": "think",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "schedule",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "ask_user",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_subagent",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "await_subagent",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "spawn_multiple_agents",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "research_project",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "design_research",
+      "group": "Design & media",
+      "desktopOnly": false
+    },
+    {
+      "name": "learn_design",
+      "group": "Design & media",
+      "desktopOnly": false
+    },
+    {
+      "name": "generate_wiki",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_worker",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "worktree",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "recall_conversation",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "remember",
+      "group": "Agents",
+      "desktopOnly": false
+    },
+    {
+      "name": "read_skill",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "save_skill",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "mcp_server",
+      "group": "Knowledge",
+      "desktopOnly": true
+    },
+    {
+      "name": "get_diagnostics",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "read_logs",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_status",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_diff",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_show",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_log",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_blame",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_stash_list",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_conflicts",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_pr_create",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_pr_view",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_pr_checks",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_actions_log",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_pr_review_comments",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gh_pr_reply",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "read_terminal",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "list_terminals",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "lsp_symbols",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "find_symbol",
+      "group": "Code search",
+      "desktopOnly": false
+    },
+    {
+      "name": "semantic_search",
+      "group": "Code search",
+      "desktopOnly": false
+    },
+    {
+      "name": "knowledge_search",
+      "group": "Research",
+      "desktopOnly": false
+    },
+    {
+      "name": "lsp_definition",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "lsp_hover",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "lsp_references",
+      "group": "Code intelligence",
+      "desktopOnly": false
+    },
+    {
+      "name": "probe_env",
+      "group": "Knowledge",
+      "desktopOnly": true
+    },
+    {
+      "name": "ui_extract",
+      "group": "Knowledge",
+      "desktopOnly": true
+    },
+    {
+      "name": "view_image",
+      "group": "Knowledge",
+      "desktopOnly": true
+    },
+    {
+      "name": "screenshot",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "visual_compare",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "debate",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "package_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "github_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "github_repo",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "gitlab_repo",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "gitee_repo",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "codeberg_repo",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "cve_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "wiki_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "stackoverflow_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "hackernews_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "developer_community_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "pubmed_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "arxiv_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "crossref_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "openalex_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "pubchem_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "clinical_trials_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "mdn_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "bundlephobia_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "steam_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "iconify_search",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "codrops_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "smashingmag_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "awwwards_search",
+      "group": "Research",
+      "desktopOnly": true
+    },
+    {
+      "name": "search_game_assets",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "edit_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "multi_edit",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "write_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_cmd",
+      "group": "Terminal & system",
+      "desktopOnly": false
+    },
+    {
+      "name": "deploy_site",
+      "group": "Deploy",
+      "desktopOnly": false
+    },
+    {
+      "name": "delete_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "move_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "git_commit",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_branch",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_push",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_clone",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_pull",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "create_dir",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "copy_path",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "format_file",
+      "group": "Files",
+      "desktopOnly": false
+    },
+    {
+      "name": "run_in_terminal",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "system",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "browser",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_stash",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "git_stash_pop",
+      "group": "Git & GitHub",
+      "desktopOnly": true
+    },
+    {
+      "name": "debug_control",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "stop_terminal",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "http_request",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "tor_request",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "package_source",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "download_file",
+      "group": "Files",
+      "desktopOnly": true
+    },
+    {
+      "name": "realtime_news_feed",
+      "group": "Data",
+      "desktopOnly": false
+    },
+    {
+      "name": "capture_start",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "automation",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "computer",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "capture_flows",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "capture_stop",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "capture_replay",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "decode_qr",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "remote",
+      "group": "Web & browser",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_image",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "game_scaffold",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "web_scaffold",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_3d",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_sound",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_music",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_voice",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "auto_rig",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_motion",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "generate_texture",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "download_asset",
+      "group": "Design & media",
+      "desktopOnly": true
+    },
+    {
+      "name": "docker_compose_up",
+      "group": "Terminal & system",
+      "desktopOnly": false
+    },
+    {
+      "name": "design_board",
+      "group": "Design & media",
+      "desktopOnly": false
+    },
+    {
+      "name": "db_query",
+      "group": "Data",
+      "desktopOnly": true
+    },
+    {
+      "name": "figma",
+      "group": "Knowledge",
+      "desktopOnly": false
+    },
+    {
+      "name": "background_monitor",
+      "group": "Terminal & system",
+      "desktopOnly": true
+    },
+    {
+      "name": "start_demo",
+      "group": "Web & browser",
+      "desktopOnly": false
+    },
+    {
+      "name": "stop_demo",
+      "group": "Web & browser",
+      "desktopOnly": false
+    },
+    {
+      "name": "preview_choices",
+      "group": "Design & media",
+      "desktopOnly": false
+    },
+    {
+      "name": "visual_explain",
+      "group": "Code intelligence",
+      "desktopOnly": true
+    }
+  ]
+}

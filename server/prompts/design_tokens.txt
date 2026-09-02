@@ -1,0 +1,80 @@
+# michael-design 数值层（字号阶 / 间距网格 / 圆角 / 阴影 / 时长）
+
+这些是知识库里没有的具体数字，直接用。**颜色不在这里**——本轮配色来自
+`knowledge_search(domain="michael-design")` 命中的蓝图，决策链见 design core。
+项目已有 spacing / radius / shadow token 就沿用项目的，别另起一套。
+
+```css
+:root {
+  /* 字体：别默认 Inter（满屏 AI 味）。正文选中性现代体，标题选有性格的展示体，从 Google Fonts 真加载 */
+  --font-sans: 'Manrope', system-ui, -apple-system, sans-serif;   /* 可换 Plus Jakarta Sans / Geist / Instrument Sans */
+  --font-display: 'Space Grotesk', var(--font-sans);              /* 可换 Fraunces / Sora / Clash Display / Bricolage Grotesque */
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --text-xs: .75rem; --text-sm: .875rem; --text-base: 1rem;
+  --text-lg: 1.125rem; --text-xl: 1.25rem; --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem; --text-4xl: 2.25rem; --text-5xl: 3rem; --text-6xl: 3.75rem; --text-7xl: 4.5rem;
+  --leading-tight: 1.05; --leading-snug: 1.2; --leading-normal: 1.55;
+  --tracking-display: -.03em; --tracking-heading: -.015em; --tracking-body: 0; --tracking-eyebrow: .16em;
+  /* 间距：4px 网格。优先用这些阶，光学对齐等确有理由的偏离说明一句即可，别整页编 px */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-6: 24px; --sp-8: 32px; --sp-12: 48px; --sp-16: 64px;
+  --sp-24: 96px; --sp-32: 128px; --sp-40: 160px;
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / .05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / .07), 0 2px 4px -2px rgb(0 0 0 / .05);
+  --duration: 150ms; --ease: cubic-bezier(.16, 1, .3, 1);
+}
+```
+
+**层级靠跨度**：同屏最大字号与正文差 2.5 倍起，hero 可到 4 倍，中间档不必用满；标题配 display 字体+负字距+紧行高。
+**留白三档嵌套**：区块间 96/128/160（移动端 64/96）＞ 组间 32/48 ＞ 元素间 8/12/16。**整页同一个 24px 是 AI 味最明显的来源。**
+
+## 配色：近黑白是默认；要上色，只能从知识库取
+
+**默认就是近黑白 + 一个利落的主色 CTA。** 中性打底是**默认值，不是配额**（面积怎么用见 core 层的配色条）。
+**说不出依据的彩色底才是缺陷，颜色本身不是。**
+
+要偏离近黑白，配色**必须来自知识库命中**，不许自己编，也不许照搬任何品牌的固定色：
+
+```
+knowledge_search(domain 传 michael-design, query 传 "<品类> palette")
+```
+
+取用顺序：① 本品类的站点蓝本命中了配色 → 成套采用；② 没有品类蓝本 → 用
+enterprise-standard 的 **Curated Palette Library** 里最接近的一套，并说明取的是哪一条；
+③ 已有项目 → 沿用项目自己的色板与 token 命名。**品类没列出来不是编色的许可。**
+
+配色词汇表是「Tailwind 族+档」+「语义 token」两层：叙述与业务代码里禁止裸 hex，
+蓝本给的 hex 要先贴到最近的 Tailwind 族+档（如 #17130d → stone-950）再用。
+
+## 默认栈：React + Tailwind + shadcn/ui + 知识库配色，四样合起来用
+
+空工作区/没有可沿用的栈时走默认分支。组件库是**装出来的，不是照着样子写的**。
+下面五步实测跑通过（缺任何一步 init 都会失败或卡住，然后你就只能回去手写组件）：
+
+```bash
+npm install -D tailwindcss @tailwindcss/vite        # ① 先装
+```
+② `vite.config.ts`：`plugins: [react(), tailwindcss()]`，并加
+   `resolve: { alias: { "@": path.resolve(__dirname, "./src") } }`
+③ `tsconfig.json` 与 `tsconfig.app.json` 各加 `"paths": { "@/*": ["./src/*"] }`。
+   **别加 `baseUrl`**（当前 TypeScript 报 TS5101 构建失败）；这两个文件带注释，
+   当纯 JSON 解析会炸，用文本方式改。
+④ `src/index.css` 第一行 `@import "tailwindcss";`
+```bash
+npx shadcn@latest init -b radix -p vega -y          # ⑤ -b/-p 不能省
+npx shadcn@latest add button card input -y          # 只加本页真正用到的
+```
+
+**②③ 少了 init 会直接报 `Could not find valid path aliases` 退出**；裸跑 `init`（不带
+`-b`/`-p`）会弹交互菜单，非交互环境里等于什么都没装。`-d/--defaults` 也不能用，
+它等于 `--template=next`。装完立刻 `npm run build` 验一次再往下写页面。
+
+**配色在这里合流**：init 会在 `src/index.css` 的 `:root` 生成
+`--background / --foreground / --primary / --card / --muted / --border`。
+把本轮从知识库命中的那套配色填进这些变量，业务组件只消费 `bg-background` /
+`text-foreground` / `bg-primary` 这类语义类——不写裸 hex、不另造色板。
+
+**禁止**自己写"shadcn 风格的" Button/Card/Input：手写控件缺 focus-visible、disabled、
+键盘可达性和 Radix 浮层行为，一眼就差一截，这正是"自己写的组件很丑"的来源。
+已有项目组合它自己的 primitive，同样不另造平行控件。

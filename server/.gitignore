@@ -1,0 +1,15 @@
+/target
+.env
+context-eval-results/
+*.env
+!.env.example
+# 测试环境的模板同样要进库：里面没有任何密钥，只有占位和「这两项填错会踩到生产」的说明。
+# 不进库的话，别人（和智能体）根本不知道测试环境要配哪些变量。
+!.env.test.example
+
+# Stale working copies — git history already has these states.
+*.bak
+*.bak.*
+*.bak-*
+*.pre-*
+*.predeploy-bak

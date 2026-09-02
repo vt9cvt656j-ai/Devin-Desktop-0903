@@ -1,0 +1,429 @@
+/* ============================================================================
+ * 精修层 —— 让界面从"能用"变成"像个产品"
+ *
+ * 配色一个都不动。这一层动的是**排版尺度、间距节奏、层次深度**，也就是真正决定
+ * 一个界面看起来贵不贵的东西。
+ *
+ * 实测出来的问题（对着跑起来的界面量的，不是拍脑袋）：
+ *
+ *   welcome h1     23px / 700 / margin-bottom:0   —— 主标题只比正文大 9px，还没有留白
+ *   .side-tab      11px / text-overflow:clip      —— 直接**截断在字中间**："文..." "大..."
+ *   .panel__head   16px / weight 400              —— 和正文同字重，等于没有层级
+ *   聊天建议 chip   border-radius: 999px           —— 全圆胶囊，最"玩具"的一个信号
+ *   #explorer      纯色平铺                        —— 没有层次，三栏糊在一起
+ *
+ * 对应的四件事：**字阶拉开、标签改成微排版、圆角收敛、表面分层**。
+ * ========================================================================== */
+
+:root {
+  /* ---- 字阶 ----------------------------------------------------------------
+   * 原来几乎所有文字都在 11–16px 之间，没有主次。这里拉出五档，每档有明确职责。
+   * 大字负字距、小字正字距 —— 视觉尺寸越大，字母间越需要收紧才不散。 */
+  --t-display: 30px;   /* 欢迎页主标题 */
+  --t-title:   15px;   /* 面板标题、对话框标题 */
+  --t-body:    13px;   /* 正文 */
+  --t-small:  12px;    /* 次要说明 */
+  --t-label:  11px;    /* 分区微标签（大写+字距） */
+
+  --tracking-display: -0.02em;
+  --tracking-label:    0.06em;
+
+  /* ---- 间距节奏 ----
+   * 4px 基准。界面里最缺的是"呼吸"，所以面板内边距给到 16，区块间距给到 24。 */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+  --sp-4: 16px; --sp-6: 24px; --sp-8: 32px;
+
+  /* ---- 层次 ----
+   * 三层表面 + 发丝边。高级感来自"层与层之间看得出前后"，而不是到处描边。
+   * 阴影用两段：一段贴边定义轮廓，一段远投给出高度。 */
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --elev-2: 0 1px 3px rgba(0, 0, 0, 0.06), 0 4px 12px -2px rgba(0, 0, 0, 0.05);
+  --elev-3: 0 2px 4px rgba(0, 0, 0, 0.06), 0 12px 32px -8px rgba(0, 0, 0, 0.12);
+}
+
+:root[data-theme="dark"] {
+  /* 深色下阴影几乎看不见，层次要靠**更亮的表面**和发丝高光来给。 */
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --elev-2: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px -2px rgba(0, 0, 0, 0.45);
+  --elev-3: 0 2px 4px rgba(0, 0, 0, 0.5), 0 12px 32px -8px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------------------------------------------------------------------------
+ * 1. 欢迎页 —— 第一眼看到的那一屏，最值得给尺度
+ * 主标题 23 → 30px，字重收到 650（700 在这个尺寸上显胖），负字距收紧，
+ * 并且给出真正的垂直节奏。说明文字放宽行高和最大宽度，读起来才不局促。
+ * ------------------------------------------------------------------------- */
+.welcome h1 {
+  font-size: var(--t-display);
+  font-weight: 650;
+  letter-spacing: var(--tracking-display);
+  line-height: 1.15;
+  margin: 0 0 var(--sp-3);
+}
+.welcome p {
+  font-size: var(--t-body);
+  line-height: 1.65;
+  max-width: 34ch;          /* 按字数限宽比按像素限宽稳 —— 中英文都在舒适行长内 */
+  margin: 0 auto var(--sp-6);
+  color: var(--text-dim);
+}
+.welcome__actions {
+  margin-top: var(--sp-2);
+}
+
+/* ---------------------------------------------------------------------------
+ * 2. 侧栏分段控件（.seg / .seg__btn）—— 改成 shadcn Tabs 的语言
+ *
+ * 先纠正一点：这几个标签**并没有被截断**（实测 scrollWidth == clientWidth）。
+ * 截图里看到的"文…""大…"是预览窗只有 800px、把侧栏挤窄导致的，不是 bug。
+ *
+ * 真正要改的是观感：11px 太小、字重不足、选中态只有一点底色，看起来像单选按钮
+ * 而不是一组标签页。shadcn 的做法是选中项**浮起来**（底色提亮 + 一层极轻阴影），
+ * 层次一出来就立刻像产品。窄的时候整体横向滚动，而不是把字压扁。
+ * ------------------------------------------------------------------------- */
+.seg {
+  /* No pill. The segmented container was a grey bar with a raised white chip inside it, and at
+     a wide sidebar that reads as two big empty boxes with a two-character label floating in the
+     middle of each — which is what was reported. Underlined tabs carry the same information with
+     no box to look empty, and match the assistant panel's chat tabs on the other side of the
+     window. */
+  gap: 0;
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* Sit on the header's bottom border so the active underline meets it. */
+  margin-bottom: -1px;
+}
+.seg::-webkit-scrollbar { display: none; }
+
+/* 侧栏可以被拖宽拖窄，页签数量也会变（调试会话期间多一个），所以这里按容器宽度自适应，
+   而不是按固定宽度摆放。 */
+.explorer { container-type: inline-size; }
+
+/* .panel__head 是 justify-content: space-between 的 flex 容器，所以这条页签栏默认
+   按内容宽度摆放，右边留白。显式让它吃满整行，页签才谈得上"均分"。 */
+#sideTabs.seg { flex: 1 1 auto; width: 100%; min-width: 0; }
+
+.seg__btn {
+  /* Still 均分 the full width. This was already changed from `flex: 0 0 auto` once, because with
+     only two tabs left content-width sizing left a large blank on the right — do not go back. */
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  font-size: var(--t-small);
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text-dim);
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: unset;
+  transition: color 150ms ease, border-color 150ms ease;
+}
+.seg__btn:hover { color: var(--text); }
+.seg__btn.is-active,
+.seg__btn[aria-selected="true"] {
+  color: var(--accent);
+  background: transparent;
+  box-shadow: none;
+  border-bottom-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * 3. 面板标题 —— 16px/400 和正文没区别，等于没有层级
+ *
+ * 改成"微标签"：小、粗、大写、拉开字距。这是专业工具界面里最常见的分区标题做法
+ * （Figma / Linear / Xcode 都是这一路），因为它在不占高度的前提下建立了明确层级。
+ * ------------------------------------------------------------------------- */
+.panel__head {
+  height: 34px;
+  padding: 0 var(--sp-4);
+  font-size: var(--t-label);
+  font-weight: 600;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--line);
+}
+/* AI 助手那一栏的标题是带 logo 的品牌位，不该被压成微标签 */
+.panel__head--assistant {
+  font-size: var(--t-title);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-transform: none;
+  color: var(--text);
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. 聊天建议 chip —— 全圆胶囊是最"玩具"的一个信号
+ *
+ * 999px 圆角在专业工具里几乎不出现（它属于社交/消费类产品的语言）。收到 6px，
+ * 加发丝边和极轻阴影，立刻从"气泡"变成"可点的控件"。
+ * ------------------------------------------------------------------------- */
+/* **`.next-steps__chip` 不在这条规则里。** 它当初确实是个胶囊，所以被一起收进来了；
+   后来 app.css 把它重做成了「接下来」那组**多行卡片**（padding 10px 13px、不限行数），
+   而这里的 `height: 30px` 还在，于是盒子只有一行高、正文有三四行 —— 文字整段溢出到
+   框外，后面的卡片被压在溢出的文字底下，看起来就是「内容都出来了 + 第三张卡片不见了」。
+   它在 app.css 里有完整的一套（边框/底色/圆角/内距/hover），这里不要再碰。 */
+.chip,
+.chat-empty__chips button,
+.composer-suggest button {
+  height: 30px;
+  padding: 0 var(--sp-3);
+  font-size: var(--t-small);
+  font-weight: 500;
+  border-radius: var(--ui-radius-md, 6px);
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: var(--elev-1);
+  transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
+}
+.chip:hover,
+.chat-empty__chips button:hover,
+.composer-suggest button:hover {
+  background: var(--hover);
+  border-color: var(--line-strong);
+  box-shadow: var(--elev-2);
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. 表面分层 —— 三栏现在是平铺的，看不出前后
+ *
+ * 侧栏和助手栏往后退（更沉的底色），编辑器往前站（最亮）。发丝边而不是实线，
+ * 边界靠明度差建立，线只是收口。
+ * ------------------------------------------------------------------------- */
+.panel.explorer,
+.panel.assistant {
+  background: var(--panel-solid);
+}
+.editorwrap {
+  background: var(--editor-bg);
+  box-shadow: var(--elev-1);
+}
+
+/* 文件树行距不在这里。这块原本写的是 .tree-item / .tree__row / #tree [role="treeitem"]，
+   三个选择器在这套 DOM 里一个都不存在——真正的行是 app.css 里的 .row，所以这段从写下
+   那天起就没生效过，而注释还写着"原来行高挤在一起"，读起来像是已经修好了。行的度量、
+   整幅高亮和缩进导轨都在 app.css 的 .row / .children 上。 */
+
+/* ---------------------------------------------------------------------------
+ * 6. 标题栏标题 —— 窄窗口下会折成三行，把整条标题栏顶高
+ *
+ * 标题是"项目名 — Mr. Day One"，窗口一窄就换行，而 .titlebar 是固定 44px 高，
+ * 于是文字溢出、和左右两组按钮挤在一起。标题这种东西宁可截断也不该换行：
+ * 单行 + 省略号，宽度让给两侧的操作按钮。
+ * ------------------------------------------------------------------------- */
+.titlebar__title {
+  min-width: 0;                 /* flex 子项默认 min-width:auto，不加这条截不了 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--t-small);
+  font-weight: 550;
+  letter-spacing: -0.005em;
+  color: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------------------
+ * 7. 状态栏 —— 微排版，和面板标题同一套语言
+ * ------------------------------------------------------------------------- */
+.statusbar {
+  font-size: var(--t-label);
+  letter-spacing: 0.02em;
+}
+
+/* ---------------------------------------------------------------------------
+ * 7. 对话框 —— 尺度和留白
+ * shadcn 的对话框之所以显得贵，一半在留白：24px 内边距、标题和正文之间 8px、
+ * 按钮区和内容之间 24px。原来的 28/32 padding 其实够，缺的是内部的节奏。
+ * ------------------------------------------------------------------------- */
+.sheet__body {
+  padding: var(--sp-6) var(--sp-6) var(--sp-4);
+  gap: var(--sp-4);
+}
+.sheet__actions {
+  margin-top: var(--sp-2);
+  gap: var(--sp-2);
+}
+.login-title,
+.sheet__title {
+  font-size: 19px;
+  font-weight: 620;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  margin: 0;
+}
+.sheet__sub,
+.login-sub {
+  font-size: var(--t-body);
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 侧栏页签的自适应收缩
+ *
+ * 三档：正常显示图标+文字；窄了先让文字省略；再窄就只留图标（此时 title 仍在，
+ * 悬停能看到名字）。隐藏的页签必须显式 display:none —— .seg__btn 自己设了
+ * display:inline-flex，会盖掉浏览器对 [hidden] 的默认处理，否则调试页签在非调试
+ * 状态下也会占位。
+ * ------------------------------------------------------------------------ */
+.seg__btn[hidden] { display: none !important; }
+
+.seg__btn span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@container (max-width: 168px) {
+  .seg__btn { padding: 0 6px; gap: 3px; }
+}
+
+/* 两个页签在最窄的侧栏（140px 下限）里也放得开，所以不必为它们藏文字。
+   只有调试会话期间挤进第三个页签、侧栏又偏窄时才退到纯图标——名字仍在 title 里。
+   写成 :has()，这样规则的触发条件就是"确实挤了"，而不是一个猜出来的宽度。 */
+@container (max-width: 200px) {
+  .seg:has(#tabDebug:not([hidden])) .seg__btn span { display: none; }
+  .seg:has(#tabDebug:not([hidden])) .seg__btn { padding: 0; }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Git 时间线 —— 当前文件的提交历史
+ *
+ * 一条竖线串起若干节点，是"这个文件的时间轴"最直接的读法。行本身是按钮：点开就是
+ * 那次提交对这个文件的 diff。整块按容器宽度自适应，侧栏拖窄时先收元信息、再收哈希，
+ * 消息永远保留——那是唯一不能丢的信息。
+ * ------------------------------------------------------------------------ */
+.git-timeline { padding: 2px 0 6px; }
+
+.git-timeline__empty {
+  padding: 10px 12px;
+  color: var(--text-dim);
+  font-size: var(--t-small, 11px);
+}
+
+.git-timeline__row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 10px 5px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.git-timeline__row:hover { background: var(--hover); }
+
+/* 贯穿的时间轴竖线：画在行上而不是容器上，最后一行自然收口 */
+.git-timeline__row::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border, rgba(128, 128, 128, 0.28));
+}
+.git-timeline__row:first-child::before { top: 12px; }
+.git-timeline__row:last-child::before { bottom: calc(100% - 12px); }
+
+.git-timeline__dot {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin: 5px 0 0 1px;
+  border-radius: 50%;
+  background: var(--accent, #4c8eff);
+  box-shadow: 0 0 0 2px var(--panel, #1e1e1e);
+}
+
+.git-timeline__main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
+
+.git-timeline__msg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-small, 11px);
+  color: var(--text);
+}
+
+.git-timeline__meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.git-timeline__hash {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* 侧栏拖窄：先丢哈希，再丢作者/时间，消息始终留着 */
+@container (max-width: 210px) {
+  .git-timeline__hash { display: none; }
+}
+@container (max-width: 150px) {
+  .git-timeline__meta { display: none; }
+  .git-timeline__row { padding-right: 6px; }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 终端标签的「正在运行」指示
+ *
+ * 标签上原本那个 `▶` 是写死在标题字符串里的，只说明"这个终端是智能体开的"——任务
+ * 早跑完了它还在，一排终端里看不出谁还在动。这里显示的是真状态：PTY 的前台进程组
+ * 不是 shell 自己时才亮（用户自己敲的 npm run dev 一样算）。
+ *
+ * 做成一个会呼吸的小圆点而不是转圈：圆点在 22px 高的标签里不抖动、不抢视线，
+ * 静止的标签和跳动的标签放在一起，一眼就分得出来。不跑的时候整个点不占位。
+ * ------------------------------------------------------------------------ */
+.term-tab__live {
+  display: none;
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 1px;
+  border-radius: 50%;
+  background: var(--ok, #22c55e);
+}
+
+.term-tab.is-running .term-tab__live {
+  display: block;
+  animation: term-live-pulse 1.6s ease-in-out infinite;
+}
+
+/* 运行中的标签标题给一点重量，收起面板前扫一眼也能看出来 */
+.term-tab.is-running .term-tab__label { font-weight: 600; }
+
+@keyframes term-live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.82); }
+}
+
+/* 跟随系统「减少动态效果」：留颜色和位置，去掉呼吸 */
+@media (prefers-reduced-motion: reduce) {
+  .term-tab.is-running .term-tab__live { animation: none; }
+}

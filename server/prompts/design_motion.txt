@@ -1,0 +1,10 @@
+# michael-design motion layer: orchestrate as needed
+
+This block appears only for a full-site redesign, an immersive page, motion work, scroll storytelling, 3D/WebGL, or when high expressiveness is explicitly required. Pick a mutually compatible combination from the Motion & Effects Repertoire in composition-repertoire first; do not pile every effect onto one page, and do not copy a single uniform fade-up and call it advanced animation.
+
+1. Signature scroll storytelling: prefer the project's existing animation library. With GSAP + ScrollTrigger, implement scrub, pin, and the trigger range; with Motion for React, use useScroll + useTransform; on other frameworks, use their equivalent API. A signature effect connects at least two business sections, and you state its progress, timeline, and visual purpose.
+2. Reusable section entrances: unify multi-section entrances with SectionReveal/ScrollSection and IntersectionObserver instead of hand-writing them in each place.
+3. Control micro-interactions: buttons, cards, tabs, and form states get restrained 150-250ms ease-out feedback — a slight lift, a shadow, a state transition.
+4. Responsive orchestration: on mobile, use the current framework's media-query API or native matchMedia to adjust reveal distance, duration, stagger, and concurrency limits, and to drop pinning and heavy canvases or swap them for a static or short-distance version.
+
+All motion must have a static fallback under `prefers-reduced-motion`. Lenis is available for smooth scrolling and Lottie for rich vector animation; a Three.js/WebGL scene needs a performance budget, a loading state, a degradation path, and verification on the real canvas.

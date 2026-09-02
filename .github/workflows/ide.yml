@@ -1,0 +1,147 @@
+name: IDE
+
+on:
+  push:
+    # `main`/`trunk` are the intended long-term trunk names; the repo's current
+    # default branch is included so push CI runs today (cleaned up once a single
+    # trunk is settled on).
+    branches: [main, trunk, "devin/initial-implementation"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: ide
+
+jobs:
+  lint:
+    name: IDE lint + frontend (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev \
+            libgtk-3-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: ide -> target
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+  app:
+    name: Build IDE macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: ide -> target
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Compile Tauri app
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+
+  # Windows 编译门禁。这条以前不存在：push/PR 只跑 ubuntu + macos，而 67 处
+  # `cfg(target_os = "windows")` / `cfg(windows)` 分支在这两个平台上**根本不进编译单元** ——
+  # 语法错、类型错、调用不存在的 API，全都查不出来。唯一会在 windows-latest 上编译的
+  # 是 ide-package.yml，而它只能手动触发。也就是说一个打断 Windows 编译的改动可以
+  # 一路全绿地待到有人推 tag，那时版本号已经烧掉了。
+  #
+  # 只做 check 不做 build：check 几分钟就完，而完整 build + 打包在 ide-package.yml 里。
+  # （链接期那一类失败 check 查不到 —— 那条由 scripts/release-preflight.sh 的
+  # `cargo xwin build` 在打 tag 前兜着。）
+  windows-check:
+    name: Windows 编译门禁
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: ide -> target
+
+      - name: Compile-check the desktop app for Windows
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+      # sidecar 是**独立 crate**，Tauri 不会顺带编它，所以必须单独查一次。
+      - name: Compile-check the automation sidecar for Windows
+        run: cargo check --manifest-path automation-framework/Cargo.toml --all-targets
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+
+      # 这 2749 条测试此前**从来没有在 Windows 上跑过一次**：ide-package.yml 里那一步带着
+      # `if: runner.os != 'Windows'`，而那条流水线本来就只能手动触发。
+      #
+      # ⚠️ **不要把这里改回 `node --test test/*.test.mjs`。** 那条命令在 mac/Linux 上能跑
+      # 靠的是 shell 先把通配符展开好；而 windows runner 的默认外壳是 pwsh，
+      # pwsh 给原生程序传参**不做通配符展开**，加上仓库钉的 node 20 的 `--test`
+      # **不认通配符**（自带 glob 是 node 21 才有的）——结果是
+      # `Could not find '…/test/*.test.mjs'`、exit 1，**一条测试都没跑**。
+      # 这个坑上一版真的踩过：配上 continue-on-error 之后它显示成「带警告的通过」，
+      # 于是所有人以为 Windows 上跑了 2749 条，实际是 0 条。
+      # scripts/run-tests.mjs 在 JS 里自己列文件，两个平台走同一条路径（node 20 上实测过）。
+      #
+      # continue-on-error 已经删掉：这一步现在是**硬门禁**。
+      - name: Run frontend logic tests on Windows
+        run: node scripts/run-tests.mjs

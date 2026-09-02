@@ -1,0 +1,15 @@
+# michael-design scaffold layer: loaded only when a UI project genuinely starts from zero
+
+- Check the existing package.json, build config, style entry point, component directory, and theme tokens first. An existing project keeps its current framework and design system — this module is never a reason to switch stacks or rebuild the scaffold.
+- When the user specifies a stack, use it. An existing working site keeps its actual framework, language, build tool, styling approach, and component system (including server-rendered stacks such as Django/Flask/Jinja, Rails, and PHP) — do not rewrite it into React, mix in a second framework, or start a separate frontend.
+- Only when the workspace is empty, the project has no website, or the user explicitly asks for a rebuild and there is no reusable or declared stack, default to React + Tailwind CSS + shadcn/ui, using Vite + TypeScript when the default scaffold needs filling in. On that default branch, add only the shadcn/ui components the pages actually use, and wire them to the current stable Tailwind and the real build tool; do not apply this wiring to any other branch.
+
+## 默认分支的脚手架
+
+```bash
+npm create vite@latest <name> -- --template react-ts && cd <name> && npm install
+```
+
+随后按 design tokens 那一节的五步接 Tailwind + 路径别名 + shadcn（那五步是必需的，
+少任何一步 `shadcn init` 都会失败）。装完立刻 `npm run build` 验一次再往下写页面——
+那几个坑全部只在构建期暴露。

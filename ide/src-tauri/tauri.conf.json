@@ -1,0 +1,90 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mr. Day One",
+  "version": "0.4.14",
+  "identifier": "ai.devin.ide",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5174 --strictPort",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Mr. Day One",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$RESOURCE/**",
+          "$APPDATA/**",
+          "$TEMP/**"
+        ]
+      },
+      "csp": "default-src 'self'; script-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; media-src 'self' data: blob: asset: http://asset.localhost http://localhost:* http://127.0.0.1:* https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost https: http://localhost:* http://127.0.0.1:* http://0.0.0.0:* http://[::1]:*; frame-src 'self' asset: http://asset.localhost http://localhost:* http://127.0.0.1:* http://0.0.0.0:* http://[::1]:*; object-src 'self' asset: http://asset.localhost; base-uri 'self'; form-action 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Mr. Day One",
+    "homepage": "https://michaelide.xyz",
+    "windows": {
+      "wix": {
+        "upgradeCode": "EAA61F2F-23BB-5413-8FC3-6F1C83A9D20C"
+      },
+      "nsis": {
+        "languages": ["SimpChinese", "TradChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    },
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/automation-server"
+    ],
+    "macOS": {
+      "signingIdentity": "Mr Day One Local Signing"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "copyright": "Copyright (c) 2026 weiligon",
+    "shortDescription": "A macOS-style code editor with an AI assistant sidebar.",
+    "longDescription": "Mr. Day One is a native-feeling code editor built on Tauri and Monaco, with a managed AI gateway and an autonomous coding assistant."
+  },
+  "plugins": {
+    "macos-fps": {},
+    "updater": {
+      "endpoints": [
+        "https://code.mrday.one/api/ide/update"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk5QjAyOUI0QUYxRTA1RjkKUldUNUJSNnZ0Q213bWNhMkRoYVdWaTZRMVFub2YweFcvNHNmQzhTUVhrZVJUWVNHWkxPMlB1eUQK",
+      "windows": {
+        "installMode": "passive"
+      }
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "mrday"
+        ]
+      }
+    }
+  }
+}

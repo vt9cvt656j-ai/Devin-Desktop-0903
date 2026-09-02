@@ -1,0 +1,1 @@
+ Rewrite the user's code to satisfy the instruction. Output ONLY the new code for that region — no explanation, no markdown fences.

@@ -1,59 +1,133 @@
-# Michael IDE
+# Devin Desktop
 
-A native-feeling, macOS-style code editor with a built-in AI assistant sidebar — built with **Rust + Tauri** and the **Monaco** editor (the engine behind VS Code). Open a folder, edit files across tabs, and ask a centrally managed model about the code you have open.
+A small macOS app that runs a **secure, token-protected bridge** on your machine
+so Devin (and other AI agents) can **read and write files inside a single folder
+you choose** — nothing more.
 
-> Companion to [Devin Desktop](https://github.com/fendoushaonian/Devin-Desktop). Devin Desktop securely exposes a folder to cloud agents; Michael IDE is a local editor you use directly.
+It is built with **Rust** (the bridge + app core) and a **Tauri** shell with an
+Apple-style control panel. All SVG artwork is vector and theme-aware (light/dark).
 
-## Features
+| Stopped | Running |
+| --- | --- |
+| Pick a folder, choose read-only or read/write, hit **Start**. | A loopback URL + access token appear, ready to connect. |
 
-- **Three-pane layout** — file explorer, tabbed Monaco editor, AI assistant.
-- **Apple-style UI** — frosted titlebar, light/dark, SVG icons, native traffic-light window controls (overlay title bar).
-- **Real editing** — syntax highlighting for many languages, dirty-state tabs, `⌘S` to save.
-- **AI assistant** — streaming chat that automatically includes the open file (and any selection) as context.
-- **Managed model gateway** — sign in once, choose an enabled model, and use centrally managed provider credentials and billing.
-- **Extensions** — a lightweight, sandboxed extension system. Extensions add commands, command-palette entries, and status-bar items, and (with permission) read/write the editor and workspace. See [Writing a Michael IDE extension](docs/extensions.md).
+## Why
+
+Devin runs in the cloud and cannot reach your laptop's `localhost` directly.
+Devin Desktop closes that gap **safely**:
+
+- You explicitly pick **one** folder. The bridge can never touch anything outside it.
+- Every request must carry a **bearer token** that you can rotate by restarting.
+- The server binds to **loopback** only. You decide when/whether to expose it to
+  the cloud via a tunnel (e.g. Cloudflare Tunnel or ngrok).
+- A **read-only** switch disables all write/delete endpoints.
 
 ## Architecture
 
 ```
-┌── frontend (Vite + Monaco) ────────────────────────────┐
-│  file tree │ tabbed editor │ AI chat (streaming)        │
-└───────────────────────┬────────────────────────────────┘
-                        │ Tauri IPC (invoke / Channel)
-┌───────────────────────▼────────────────────────────────┐
-│  src-tauri (Rust)                                       │
-│   files.rs : read_dir / read_text_file / write_text_file│
-│   ai.rs    : ai_chat → OpenAI-compatible SSE streaming  │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────── your Mac ───────────────────────────┐
+│                                                                 │
+│   Tauri shell (src-tauri)          bridge-core (Rust lib)       │
+│   ┌──────────────────┐  start/stop ┌───────────────────────┐   │
+│   │  Apple-style UI   │───────────▶│  axum HTTP server      │   │
+│   │  (src/, dist/)    │            │  + bearer-token auth   │   │
+│   └──────────────────┘            │  + ScopedFs (1 folder) │   │
+│                                    └───────────┬───────────┘   │
+│                                       127.0.0.1:<port>         │
+└────────────────────────────────────────────────┼──────────────┘
+                                                   │  (your tunnel)
+                                                   ▼
+                                          Devin / MCP client
 ```
 
-The Rust side streams requests to the Michael gateway over HTTPS and returns tokens to the UI over a Tauri `Channel`.
+The security-sensitive logic lives in the platform-independent
+[`crates/bridge-core`](crates/bridge-core) crate so it can be unit-tested in
+isolation (path-traversal protection, auth, file ops). The Tauri app embeds it
+and manages the server lifecycle.
 
-## Develop
+## HTTP API
+
+All endpoints require `Authorization: Bearer <token>`. Paths are **relative to
+the shared folder**; absolute paths and `..` traversal are rejected.
+
+| Method | Path | Body / Query | Purpose |
+| --- | --- | --- | --- |
+| `GET`  | `/api/health` | — | Liveness + root + mode |
+| `GET`  | `/api/list`   | `?path=` | List a directory |
+| `GET`  | `/api/read`   | `?path=` | Read a file (base64) |
+| `GET`  | `/api/search` | `?q=&path=&content=&limit=` | Search names / contents |
+| `POST` | `/api/write`  | `{ path, content_base64 }` | Write a file |
+| `POST` | `/api/mkdir`  | `{ path }` | Create a directory |
+| `POST` | `/api/delete` | `{ path }` | Delete a file/directory |
+
+Write/mkdir/delete return `400` when the bridge is in read-only mode.
+
+Example:
 
 ```bash
-npm install
-npm run tauri dev      # native app (requires macOS for the full experience)
-npm run dev            # browser preview with a mock backend
+TOKEN=...        # shown in the app
+BASE=http://127.0.0.1:53412
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/list?path="
 ```
 
-`npm run dev` runs the UI in a plain browser with a mock filesystem and a mock AI echo, so the interface can be previewed without building the native shell.
+## Development
 
-## Configure the assistant
+Prerequisites: **Rust** (stable, ≥ 1.85 for the 2024 edition deps), **Node 18+**,
+and the [Tauri system dependencies](https://tauri.app/start/prerequisites/) for
+your OS.
 
-Sign in, then use the model picker in the chat composer. The desktop app connects
-to `https://code.mrday.one`; `localStorage.michael_api` remains available only as
-a development override.
+```bash
+# install frontend deps
+npm install
 
-Authentication tokens are stored locally and sent only to the Michael gateway.
+# run the core test-suite (no GUI needed)
+cargo test -p bridge-core
 
-## Extensions
+# run the app in dev mode (Rust + Vite)
+npm run tauri dev      # or: cargo tauri dev
 
-Open the **Extensions** panel (puzzle icon in the title bar) to install bundled
-samples or install your own from a `.zip`. Extensions run in a per-extension Web
-Worker sandbox and only get the capabilities their manifest declares. To build
-one, see **[Writing a Michael IDE extension](docs/extensions.md)**.
+# produce a release bundle (.app / .dmg on macOS)
+npm run tauri build
+```
+
+App icons are generated from `src-tauri/icons/source-icon.png`:
+
+```bash
+npx tauri icon src-tauri/icons/source-icon.png
+```
+
+## Connecting Devin to the bridge
+
+1. Start the bridge in the app and copy the **Local URL** and **token**.
+2. Expose loopback to the internet with a tunnel, e.g.:
+   ```bash
+   cloudflared tunnel --url http://127.0.0.1:53412
+   ```
+3. Give Devin the **public tunnel URL** and the **token**. Devin talks to the
+   HTTP API above to read/write inside your shared folder.
+
+If your machine has **no public inbound IP** — behind NAT, a corporate
+firewall, or a network that blocks foreign inbound traffic (common in mainland
+China) — you can't let the cloud connect *in*; use a reverse **outbound** tunnel
+instead. See [docs/cloudflare-tunnel.md](docs/cloudflare-tunnel.md) for a
+copy-paste Cloudflare Tunnel setup (quick test + stable named tunnel on your own
+domain + systemd), and the helper script
+[`scripts/cloudflare-tunnel.sh`](scripts/cloudflare-tunnel.sh):
+
+```bash
+# throwaway test URL
+scripts/cloudflare-tunnel.sh quick 53412
+# stable URL on your own domain (recommended)
+scripts/cloudflare-tunnel.sh named devin.example.com 53412
+```
+
+## Roadmap
+
+- Native **MCP server** adapter (stdio + HTTP) so MCP-aware clients get file
+  tools without bespoke HTTP glue.
+- Built-in tunnel management (start/stop a Cloudflare Tunnel from the UI).
+- Menu-bar / tray mode and multiple named shares.
 
 ## License
 
-MIT
+MIT © 2026 weiligon

@@ -1,0 +1,56 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ide-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
+      "port": 5174,
+      "autoPort": true
+    },
+    {
+      "name": "website",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "website",
+        "--",
+        "--port=5283",
+        "--strictPort=false"
+      ],
+      "port": 5283
+    },
+    {
+      "name": "account-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "../server/account-ui",
+        "--",
+        "--base=/"
+      ],
+      "port": 5274
+    },
+    {
+      "name": "admin-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "../server/admin-ui",
+        "--",
+        "--port=5177",
+        "--strictPort=false"
+      ],
+      "port": 5177
+    }
+  ]
+}

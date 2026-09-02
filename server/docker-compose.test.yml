@@ -1,0 +1,42 @@
+# 测试环境的**覆盖层**，不是第二份完整配置。
+#
+# 用法（永远两个 -f，顺序不能反）：
+#   docker compose -p server-test -f docker-compose.yml -f docker-compose.test.yml up -d --build
+#
+# 为什么是覆盖而不是复制一份：两份完整配置一定会漂。而这里漂的后果特别坏——
+# 测试环境和生产不一致时，"在测试上验过了"这句话就变成了假话，比没有测试环境更危险。
+# 所以生产那份是唯一事实来源，这里**只写不一样的部分**。
+#
+# 隔离靠三样东西，缺一样就会踩到生产：
+#   1. compose 项目名不同（-p server-test）→ 容器名、网络、**卷名**全部自动带前缀，
+#      于是 pgdata 变成 server-test_pgdata，和生产的 server_pgdata 是两块盘。
+#   2. 宿主端口不同（8081 vs 8080）→ 两套后端可以同时跑在一台机器上。
+#   3. 下面这几处显式覆盖：.env 文件、静态站目录、日志量。
+#
+# 一句话记住：**测试环境的数据可以随时删光，生产的不行**。所有写盘的地方都必须在这里
+# 指到别的位置，没指到的就是 bug。
+
+services:
+  postgres:
+    # 卷由项目名自动隔离，这里不用改。留着注释是为了说明"我知道它被隔离了"，
+    # 而不是"我忘了处理"。
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+  backend:
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379
+      DEPLOY_AUTO_GRANT: "0"
+      BIND_ADDR: 0.0.0.0:8080
+      DEPLOY_MAX_MB: "30"
+      # 让运行中的进程自己知道身在何处：日志、健康页、以及任何"别在生产上干这个"的
+      # 判断都可以读它。生产不设这个变量。
+      MICHAEL_ENV: "test"
+    # 端口、静态站目录、env 文件名**都不在这里覆盖**，靠 .env.test 里的 BACKEND_PORT / SITES_DIR。
+    # 原因：Compose 合并 ports 这类列表字段时是**拼接**不是替换，在这里写一行
+    # `- "127.0.0.1:8081:8080"` 会让最终配置同时发布 8080 和 8081，直接和生产抢端口。
+    # volumes 按挂载点合并（同 target 会被替换），本来可以写在这里，但为了让"两个环境
+    # 的差异集中在 .env.test 一处"，也一并走变量。

@@ -1,0 +1,10 @@
+{
+  "id": "michael.svelte-language",
+  "name": "Svelte Helper",
+  "version": "1.0.0",
+  "description": "Scaffold a basic Svelte single-file component.",
+  "author": "Mr. Day One",
+  "main": "index.js",
+  "permissions": ["editor"],
+  "contributes": { "commands": [ { "id": "svelte.scaffold", "title": "Svelte: Scaffold Component" } ] }
+}

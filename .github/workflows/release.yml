@@ -1,0 +1,14 @@
+name: Release Mr. Day One
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    uses: ./.github/workflows/ide-package.yml
+    secrets: inherit

@@ -1,0 +1,54 @@
+[package]
+name = "michael-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Michael 总后台 — central real-time backend (Axum + Postgres + Redis)"
+
+# Stand alone: do not get absorbed into the parent Devin-Desktop cargo workspace.
+[workspace]
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+# wheel 是 zip；bytes 是 reqwest 的响应体类型，抽包时要在函数间传。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+bytes = "1"
+flate2 = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+futures-util = "0.3"
+jsonwebtoken = "9"
+bcrypt = "0.15"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+anyhow = "1"
+sha2 = "0.10"   # per-user gateway cache key (DefaultHasher is not collision resistant)
+hmac = "0.12"   # Stripe webhook signature (HMAC-SHA256 over the raw request body)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
+base64 = "0.22"  # provider profile pictures, stored as data: URLs (see oauth.rs)
+
+# MSE-1 应用层加密（见 src/mse.rs 和 docs/MSE.md）。
+# 套件是 CNSA 1.0：ECDH P-384 + HKDF-SHA-384 + AES-256-GCM —— 选它不是因为更强，是
+# 因为 WebCrypto 原生就有这三样，前端因此不需要引入任何第三方密码学库。
+# 全部是 RustCrypto 的纯 Rust 实现，不引 OpenSSL。
+# ecdsa：静态密钥用它**签名**轮换的临时密钥（前向保密，见 mse.rs 的 Ephemeral）。
+# 静态密钥不再参与 ECDH（老客户端除外），只签名——所以偷到它也解不了历史流量。
+p384 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "pkcs8", "std", "arithmetic"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+zeroize = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

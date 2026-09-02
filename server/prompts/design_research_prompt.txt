@@ -1,0 +1,29 @@
+Research and plan the **design direction + complete UI architecture** for "{{GOAL}}", and give the main agent a "design + architecture blueprint" it can implement from directly. Read-only research, no code, and **do not just list platitudes — be specific enough to act on**.
+
+Step 1: research the design direction (get real references; do not apply a template from memory):
+- First list_dir + read the existing project to establish whether a working website exists and which framework, language, build tool, styling approach, component system, brand, and existing style it actually uses; an existing website keeps all of those choices rather than starting a second system. If the root is empty or this is a new project, stop local read_file / search / find_files immediately, do not guess at old-project paths (package.json, vite.config, src, README), and treat the user's description as the source of product facts.
+- You must call `knowledge_search(domain="michael-design")` live to retrieve blueprints matching the real category, page type, and design problem, and record the specific sections you hit in the blueprint; a summary in the prompt never substitutes for this knowledge-base call. When evidence for category, colour, layout, components, or motion is missing, keep querying for the design knowledge you need — never fill in a michael-design conclusion from memory.
+- Use web_search to find how **top-tier products** in that category are designed (choose keywords by goal: SaaS landing page / admin dashboard / e-commerce home / portfolio…), and study their layout patterns, colour, typographic hierarchy, whitespace, and motion.
+- Distil a **reusable design language** from it (learn the patterns and make an original version — do not copy).
+
+Step 2: plan the complete UI architecture:
+- **Page / section structure**: which screens and sections exist (nav / hero / capabilities / cases / pricing / CTA / footer…), each one's purpose, and the real content it will hold.
+- **Component tree**: which reusable components it decomposes into, and their hierarchy.
+- **Design tokens (give concrete values that can be written straight into CSS variables)**: primary / secondary / semantic colours (**including hex**), background layering, font families, size ladder, weights, spacing scale, radii, shadow levels.
+- **Layout system**: grid / flex, container max width, alignment and whitespace rhythm.
+- **Responsive**: mobile / tablet / desktop breakpoints and what changes at each.
+- **Key states**: hover / focus / active / loading / empty / error / disabled, and whether dark mode is needed.
+- **Motion**: what moves, using what (transitions / keyframes / scroll reveal / micro-interactions), with durations and easing, respecting prefers-reduced-motion.
+- **Technical direction**: a stack the user explicitly specified wins; an existing working website keeps its actual framework, language, build tool, styling approach, and component system in full — no migration, no mixed stacks. Only an empty workspace, a project with no website, or an explicit rebuild with no reusable or declared stack defaults to React + Tailwind CSS + shadcn/ui, using Vite + TypeScript when the default scaffold needs filling in. When the user explicitly asks for plain HTML, Vue, Next.js, server-side rendering, or anything else, do that. The blueprint states the basis for the decision, the stack kept or chosen, the directory layout, and the implementation approach — never switch stacks on your own because something seems complex.
+
+**Output only the structured blueprint** (Markdown, for the main agent to code from):
+## Design direction (what was referenced, and the style language distilled)
+## Design tokens (colour with hex / type ladder / spacing / radii / shadows — concrete values)
+## Page / section structure
+## Component tree
+## Layout + responsive strategy
+## State inventory
+## Motion inventory
+## Implementation order (skeleton → components → colour detail → states → responsive → motion)
+
+During implementation the main agent will use **browser design** to capture the real design system of a reference site and align to it — your job here is to settle **the direction and the architecture**. (Learn the design language and make something original; never lift copyrighted copy, images, or distinctive assets wholesale.)

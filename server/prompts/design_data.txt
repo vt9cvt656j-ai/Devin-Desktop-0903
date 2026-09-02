@@ -1,0 +1,5 @@
+# michael-design data and business state layer
+
+- Decide the data strategy before coding and state the business reason: static/build-time data, localStorage/IndexedDB, or a server-side database. Do not force a database onto every display site, and do not build a product that needs real persistence as a static set of fake buttons.
+- Accounts, cross-device sync, admin backends, orders, bookings, comments, favourites, payments, inventory, and multi-user collaboration need real server-side data, with API/schema/permissions/migrations designed alongside the loading/empty/error/selected states.
+- Forms and data operations must have a real submission result, validation, failure feedback, and duplicate-submission handling; dashboards, tables, and lists must use a credible data structure — never dress up arbitrary numbers as completion.

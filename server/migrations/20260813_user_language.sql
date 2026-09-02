@@ -1,0 +1,11 @@
+-- Interface language, stored on the account rather than in one browser.
+--
+-- It lived in localStorage, which meant the choice followed the browser: signing in on a
+-- second machine, or in the desktop app, started over in English. Language is a property
+-- of the person, not of the device they happen to be holding.
+--
+-- A BCP-47 tag, not an enum. The set of offered languages is a client decision and
+-- changes more often than the schema should; anything the client does not recognise falls
+-- back to English at render time, so an unknown tag here is harmless rather than fatal.
+-- Empty means "never chosen", which is different from having chosen English.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT '';

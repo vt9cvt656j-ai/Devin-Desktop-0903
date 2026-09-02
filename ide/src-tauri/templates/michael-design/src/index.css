@@ -1,0 +1,181 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  语义 token 层 —— 唯一允许出现 hex 的地方。
+  配色来源：michael-design / enterprise-standard #sections/curated-palette-library
+  + 本轮运行时锁定方向 design-judgment #Category Palette Harmony（route: neutral-brand，
+  "Monochrome is a complete design"）。
+  每个值都已折算成最接近的 Tailwind 族+档，业务组件只消费语义类。
+*/
+:root {
+  --background: #fafafa; /* zinc-50  — 根画布 */
+  --foreground: #09090b; /* zinc-950 — 主文字 */
+  --card: #ffffff; /* white    — 卡片/浮层表面 */
+  --card-foreground: #09090b; /* zinc-950 */
+  --popover: #ffffff; /* white */
+  --popover-foreground: #09090b; /* zinc-950 */
+  --primary: #18181b; /* zinc-900 — 主 CTA / 强调块 */
+  --primary-foreground: #fafafa; /* zinc-50 */
+  --secondary: #f4f4f5; /* zinc-100 — 次级按钮底 */
+  --secondary-foreground: #18181b; /* zinc-900 */
+  --muted: #f4f4f5; /* zinc-100 — 交替 section 底 */
+  --muted-foreground: #52525b; /* zinc-600 — 辅助文字，对 zinc-50 达 AA */
+  --accent: #e4e4e7; /* zinc-200 — hover 面 */
+  --accent-foreground: #18181b; /* zinc-900 */
+  --border: #e4e4e7; /* zinc-200 */
+  --input: #d4d4d8; /* zinc-300 */
+  --ring: #18181b; /* zinc-900 — 焦点环 */
+  --success: #059669; /* emerald-600 — 真实成功态专用 */
+  --success-foreground: #ffffff; /* white */
+  --destructive: #dc2626; /* red-600 — 真实错误态专用 */
+  --destructive-foreground: #ffffff; /* white */
+  --code-surface: #18181b; /* zinc-900 — 代码/编辑器拟真面 */
+  --code-foreground: #e4e4e7; /* zinc-200 */
+  --radius: 0.75rem;
+  --ease-reveal: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-code-surface: var(--code-surface);
+  --color-code-foreground: var(--code-foreground);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 12px);
+
+  --font-display: "Space Grotesk", "PingFang SC", "Noto Sans SC", sans-serif;
+  --font-sans: "Inter", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --animate-marquee: marquee 30s linear infinite;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background-color: var(--color-primary);
+    color: var(--color-primary-foreground);
+  }
+}
+
+/* 排版层级契约：全站复用这三个类，避免每个 section 自造字号 */
+@layer components {
+  .type-eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--color-muted-foreground);
+  }
+
+  .type-metric {
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+
+  .type-measure {
+    max-width: 42rem;
+  }
+}
+
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* 可复用分区入场：SectionReveal 只切换 data-state，参数集中在这里 */
+[data-reveal] {
+  opacity: 0;
+  transform: translateY(24px);
+  transition:
+    opacity 0.7s var(--ease-reveal),
+    transform 0.7s var(--ease-reveal);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+
+[data-reveal="visible"] {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@media (max-width: 767px) {
+  /* 移动端缩短位移：24px → 12px */
+  [data-reveal] {
+    transform: translateY(12px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  [data-reveal] {
+    transform: none;
+    transition-duration: 300ms;
+    transition-property: opacity;
+  }
+
+  .marquee-track {
+    animation: none !important;
+  }
+}

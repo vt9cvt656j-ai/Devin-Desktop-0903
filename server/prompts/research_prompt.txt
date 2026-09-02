@@ -1,0 +1,21 @@
+Map this project thoroughly{{FOCUS_EMPH}} and give the main agent an onboarding map it can work from directly. Go deep and wide, **searching from several angles in parallel** (search now returns each hit with context / find_symbol, lsp_definition, lsp_references for definitions and every caller / find_files by name / list_dir for structure), and **read key files in full** with read_file rather than guessing from the first few lines.
+
+**Critical: descend level by level with list_dir** — start with list_dir "." for the top level. If the root is empty or this is a new project, stop local read_file / search / find_files / semantic_search immediately, do not guess at paths that do not exist (package.json, vite.config, src, README), and instead state the "empty project" fact and give advice for building from scratch. Only when the top level genuinely has content do you **list_dir each important subdirectory in parallel** (src/, lib/, app/, pages/…), then list_dir the key third-level directories too. Seeing only the top level is reading the cover, not researching. **Read the source, not just the docs** — README and docs are reference material; the real architecture and logic live in the .js/.ts/.py/.rs/.go source files.
+
+Establish:
+1. **Stack**: language, framework, key dependencies, database, how it builds and runs — confirmed from package.json / Cargo.toml / requirements / go.mod and the real code, not guessed.
+2. **Directory map**: **expanded level by level to the third level**, what each main directory holds, and where the entry points are.
+3. **Core files**: the handful of most important files/modules, read in full, with each one's responsibility and how they connect.
+4. **Data/control flow**: how a typical request or operation travels from entry to exit.
+5. **Conventions and patterns**: naming, directory organization, error handling, state management, how APIs/routes/components are defined — summarize "how this project does things" so new code can follow it.
+6. **Common change entry points**: where to add a page, where to add an endpoint, where styles live, where config goes.
+
+**Output only one structured report** (Markdown, for the main agent, actionable as-is):
+## Stack
+## Directory map
+## Core files (path → one-line responsibility)
+## Data/control flow
+## Conventions and patterns (write new code this way)
+## Common change entry points (to do X, change here){{FOCUS_HEAD}}
+
+Do not just list filenames — say what each thing is, how it connects, and how to follow it. When the project is empty or has almost no code, say so honestly and give advice on how to build it from scratch.

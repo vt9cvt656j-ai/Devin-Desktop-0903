@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri"]
+
+[workspace.package]
+version = "0.4.14"
+edition = "2021"
+license = "MIT"
+authors = ["weiligon"]
+
+# Faster incremental dev builds.
+[profile.dev]
+incremental = true
+
+# Release builds optimize for a smaller, faster binary. LTO + a single codegen
+# unit let LLVM inline aggressively; `strip` drops debug symbols. `panic` is
+# left as unwind so the app can recover from isolated failures instead of
+# aborting the whole process.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

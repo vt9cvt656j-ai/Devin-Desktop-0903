@@ -1,0 +1,12 @@
+[Unit]
+Description=Michael IDE PostgreSQL and deployed-sites backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/michael-ide-deploy/server
+ExecStart=/opt/michael-ide-deploy/server/backup.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
