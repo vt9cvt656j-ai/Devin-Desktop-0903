@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bridge-core", "serdeprobe", "src-tauri"]
+members = ["crates/bridge-core", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
