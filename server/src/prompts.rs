@@ -7987,8 +7987,17 @@ mod tests {
             // 买到的是同一件事的完成度——5_650 那次把「别造下一步」换成了「真有那件事才说」，
             // 但没给出「怎么算真有」；这 80 token 补的就是那个判据。
             // 如果觉得不值，正确的修法是回去**削提示词**，不是继续抬这条线。
+            // 5_880：2026-09-01。agent_core 第 4 条末尾加了一句「互不依赖的调用放同一回复里发」
+            // （450 字节 ≈ 113 token，按本文件的估法：CJK 1 token/字，其余 4 字符/token）。
+            // **买到的是一个已经建好、却从来没被触发过的机制**：分区并发执行器
+            // （ide 的 canRunInReadSegment）只有在模型一轮发多个工具时才会被用上，而
+            // 全系统唯一说「可以一轮发多个」的那句话此前只挂在 read_file 一个工具的
+            // description 上——模型读 search / list_dir / find_files 的 schema 时拿不到任何
+            // 并行信号，而且 release 构建会把客户端那份 description 清空，自定义端点上
+            // 没人回填，那条路上这句话根本不存在。放进 agent_core 才是每轮都在的位置。
+            // 觉得不值就回去削提示词，别继续抬这条线。
             assert!(
-                est_tokens < 5_750,
+                est_tokens < 5_880,
                 "{model} ordinary system prompt is ~{est_tokens} tokens ({} bytes)",
                 system.len()
             );
@@ -8083,8 +8092,9 @@ mod tests {
         // 7_400：跟着上面 5_650 那次修订走，理由同上。
         // 7_500：2026-08-25 实测 ~7_462。跟着上面 5_750 那次走，理由同上——
         // answer_quality 在常驻层，自动化任务照样吃这一条。
+        // 7_620：跟着上面 5_880 那次走，理由同上——agent_core 在常驻层，自动化任务照样吃。
         assert!(
-            automation_tokens < 7_500,
+            automation_tokens < 7_620,
             "automation prompt should not pay the UI tax: ~{automation_tokens} tokens ({} bytes)",
             automation_system.len()
         );
@@ -8156,8 +8166,9 @@ mod tests {
         // automation 抬到 7_500）。上面那道「是不是模型已经会、只是没做」的闸问的是
         // 往 UI 层加内容，这次没有往 UI 层加任何一个字。
         // 想让这条线降回去，只有一条路：削 answer_quality，三档会一起降。
+        // 13_320：同上，agent_core 那一句从常驻层漏下来。这次同样没往 UI 层加任何一个字。
         assert!(
-            focused_tokens < 13_200,
+            focused_tokens < 13_320,
             "focused UI prompt should remain compact: ~{focused_tokens} tokens ({} bytes)",
             focused_system.len()
         );
@@ -9024,4 +9035,63 @@ mod semantic_profile_source_tests {
         let _ = super::assemble_into(&h, &mut again);
         assert_ne!(again, once, "没有幂等头时也不组装了？那这道闸测的是别的东西");
     }
+    /// 同样的输入调两次，装配出来的必须**逐字节相同**。
+    ///
+    /// # 为什么这条值得单独存在
+    ///
+    /// OpenAI / xAI 那一族是**严格前缀**的自动缓存：系统块被 `insert(0)`，它只要有一个
+    /// 字节每次不一样，后面整段对话就永远进不了缓存。线上实测 gpt-5.6-luna 的大回合
+    /// （>40k）命中率只有 27.8%，而缓存量约等于"只有工具表进了缓存、九万多 token 的
+    /// 对话历史一次都没进"—— 正是这个形状。
+    ///
+    /// 长度相同**不能**代替这条：日志里两步的 prompt_bytes 都是 23131，我一度据此判定它
+    /// 稳定，而时间戳这类东西恰恰是长度一样、内容不同。所以这里比的是内容。
+    #[test]
+    fn the_assembled_system_block_is_byte_identical_across_requests() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-ide-mode", "agent".parse().unwrap());
+        h.insert("x-ide-tools", "read_file,search,list_dir".parse().unwrap());
+        h.insert("x-ide-session-id", "sess12345678".parse().unwrap());
+        h.insert("x-ide-utc-offset-minutes", "480".parse().unwrap());
+
+        let base = serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let mut a = base.clone();
+        super::assemble_into(&h, &mut a).expect("assemble a");
+        let mut b = base.clone();
+        super::assemble_into(&h, &mut b).expect("assemble b");
+
+        let sys = |v: &serde_json::Value| -> String {
+            v.get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|arr| arr.first())
+                .map(|m| m.to_string())
+                .unwrap_or_default()
+        };
+        let (sa, sb) = (sys(&a), sys(&b));
+        if sa != sb {
+            let at = sa
+                .char_indices()
+                .zip(sb.chars())
+                .find(|((_, x), y)| x != y)
+                .map(|((i, _), _)| i)
+                .unwrap_or_else(|| sa.len().min(sb.len()));
+            let lo = at.saturating_sub(60);
+            panic!(
+                "系统块每次装配都不一样，前缀缓存从第 0 条就断了。首个差异在第 {at} 字节：\n  A: …{}…\n  B: …{}…",
+                &sa[lo..(at + 60).min(sa.len())],
+                &sb[lo..(at + 60).min(sb.len())]
+            );
+        }
+        // 工具块同理：它排在消息后面，但同样是前缀的一部分。
+        assert_eq!(
+            a.get("tools").map(|t| t.to_string()),
+            b.get("tools").map(|t| t.to_string()),
+            "工具块每次装配都不一样"
+        );
+    }
+
 }

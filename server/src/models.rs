@@ -10345,6 +10345,25 @@ pub async fn chat_completions(
         .and_then(|v| v.as_str())
         .map(String::from)
         .ok_or_else(|| AppError::bad("缺少 model"))?;
+    /*
+     * 前缀在哪一步断的。**只记日志，不改行为。**
+     *
+     * OpenAI/xAI 是严格前缀缓存：中段任何一条变了，从那点往后全不命中。线上实测
+     * gpt-5.6-luna 大回合只有 27.8%，而且**和间隔无关**（<1 分钟也是 26.9%）——
+     * 排除了缓存过期；系统块和工具块逐字节相同（prompts.rs 有测试钉着）——排除了前缀本身在变。
+     * 剩下只能是消息数组中段在变，而靠读代码猜已经猜错过两轮。这一行把它变成测量：
+     * diverged_at=N 表示公共前缀只到第 N 条，N == prev_msgs 就是纯追加（缓存最想要的形状）。
+     */
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        let run = headers.get("x-ide-run-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if let Some((at, prev, now)) = crate::prefix_probe::diverged_at(run, msgs) {
+            tracing::info!(
+                model = %model_id, run_id = run, diverged_at = at,
+                prev_msgs = prev, now_msgs = now, pure_append = at == prev,
+                "prompt prefix reuse"
+            );
+        }
+    }
     // Deliberately metadata-only: this records the requested thinking wire shape
     // without retaining prompts, messages, thinking text, or credentials.
     tracing::info!(
